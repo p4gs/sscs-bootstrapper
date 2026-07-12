@@ -1,0 +1,104 @@
+# Installs every external tool sscsb orchestrates, at the exact version pinned in
+# src/tools.rs, with a sha256 verified before the binary is ever executed.
+#
+# Why the test and coverage jobs need this at all: sscsb's suites run the REAL
+# tools. Without them installed, the tests still pass — they take the documented
+# degrade path — but they would be proving only half the contract, and the
+# coverage gate would be measuring a different program than the one users run.
+# Installing them makes CI exercise the same code paths a real user hits.
+#
+# Deliberately NOT installed: guacone, vexctl, witness, sighthound. Their absence
+# is what exercises the degrade branches, and those are part of the contract too.
+#
+# Every download is checksum-verified. Nothing here is piped into a shell.
+name: Setup sscsb tools
+description: Install the pinned external tools sscsb orchestrates (checksum-verified)
+
+runs:
+  using: composite
+  steps:
+    - name: Install pinned tools (checksum-verified)
+      shell: bash
+      env:
+        GITLEAKS_VERSION: 8.30.1
+        TRUFFLEHOG_VERSION: 3.95.9
+        SYFT_VERSION: 1.46.0
+        GRYPE_VERSION: 0.115.0
+        TRIVY_VERSION: 0.72.0
+        OSV_VERSION: 2.4.0
+        COSIGN_VERSION: 3.1.1
+        SLSA_VERIFIER_VERSION: 2.7.1
+        OPENGREP_VERSION: 1.25.0
+        ORAS_VERSION: 1.3.3
+        SEMGREP_VERSION: 1.169.0
+      run: |
+        set -euo pipefail
+        tmp="$(mktemp -d)"
+        cd "$tmp"
+
+        # Verify a downloaded file against an expected sha256, then install it.
+        # A mismatch aborts the job — the binary is never executed.
+        expect() {
+          echo "$2  $1" | sha256sum --check --status \
+            || { echo "::error::checksum mismatch for $1"; exit 1; }
+        }
+
+        # ── gitleaks / trufflehog (upstream publish a checksums.txt) ──────────
+        curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+        curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+        grep "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum --check
+        tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
+
+        curl -fsSLO "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz"
+        curl -fsSLO "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_checksums.txt"
+        grep "trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz" "trufflehog_${TRUFFLEHOG_VERSION}_checksums.txt" | sha256sum --check
+        tar -xzf "trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz" trufflehog
+
+        # ── syft / grype / trivy / oras (tarballs, sha256 from upstream) ──────
+        curl -fsSLO "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+        expect "syft_${SYFT_VERSION}_linux_amd64.tar.gz" d654f678b709eb53c393d38519d5ed7d2e57205529404018614cfefa0fb2b5ca
+        tar -xzf "syft_${SYFT_VERSION}_linux_amd64.tar.gz" syft
+
+        curl -fsSLO "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_amd64.tar.gz"
+        expect "grype_${GRYPE_VERSION}_linux_amd64.tar.gz" 3fad92940650e514c0aa2dad83526942a055e210cec09a8a59d9c024adc2b90e
+        tar -xzf "grype_${GRYPE_VERSION}_linux_amd64.tar.gz" grype
+
+        curl -fsSLO "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+        expect "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" bbb64b9695866ce4a7a8f5c9592002c5961cab378577fa3f8a040df362b9b2ea
+        tar -xzf "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" trivy
+
+        curl -fsSLO "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+        expect "oras_${ORAS_VERSION}_linux_amd64.tar.gz" 9ce999f8d2de03fc03968b29d743077a58783e545e5eaa53917ca177352d0e59
+        tar -xzf "oras_${ORAS_VERSION}_linux_amd64.tar.gz" oras
+
+        # ── bare binaries ────────────────────────────────────────────────────
+        curl -fsSL -o osv-scanner "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64"
+        expect osv-scanner 15314940c10d26af9c6649f150b8a47c1262e8fc7e17b1d1029b0e479e8ed8a0
+
+        curl -fsSL -o cosign "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-amd64"
+        expect cosign ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc
+
+        # slsa-verifier and opengrep publish signatures rather than a checksums
+        # file. These two sha256 values were computed from the published release
+        # artifacts and pinned here, so any change to the bytes at those URLs
+        # fails this step. That is a weaker guarantee than an upstream-signed
+        # manifest — it is trust-on-first-use — and it is stated plainly rather
+        # than dressed up as something stronger.
+        curl -fsSL -o slsa-verifier "https://github.com/slsa-framework/slsa-verifier/releases/download/v${SLSA_VERIFIER_VERSION}/slsa-verifier-linux-amd64"
+        expect slsa-verifier 946dbec729094195e88ef78e1734324a27869f03e2c6bd2f61cbc06bd5350339
+
+        curl -fsSL -o opengrep "https://github.com/opengrep/opengrep/releases/download/v${OPENGREP_VERSION}/opengrep_manylinux_x86"
+        expect opengrep 9ac4aebb47ba3f7b0d8fc641ac8749cb6c2f253f616131a67d9631e00d4bea33
+
+        chmod +x gitleaks trufflehog syft grype trivy oras osv-scanner cosign slsa-verifier opengrep
+        sudo mv gitleaks trufflehog syft grype trivy oras osv-scanner cosign slsa-verifier opengrep /usr/local/bin/
+
+        # semgrep is a Python package; pip pins the exact version.
+        python3 -m pip install --quiet "semgrep==${SEMGREP_VERSION}"
+
+        # Fail loudly if anything did not land — a silently absent tool would
+        # quietly downgrade the whole suite to its degrade paths.
+        for t in gitleaks trufflehog syft grype trivy oras osv-scanner cosign slsa-verifier opengrep semgrep; do
+          command -v "$t" >/dev/null || { echo "::error::$t did not install"; exit 1; }
+        done
+        echo "installed: $(for t in gitleaks trufflehog syft grype trivy oras osv-scanner cosign slsa-verifier opengrep semgrep; do printf '%s ' "$t"; done)"
