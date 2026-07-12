@@ -1073,7 +1073,10 @@ mod tests {
             *source_of(&specs, "gitdep"),
             DepSource::Git("https://example/repo".into())
         );
-        assert_eq!(*source_of(&specs, "localdep"), DepSource::Path("../x".into()));
+        assert_eq!(
+            *source_of(&specs, "localdep"),
+            DepSource::Path("../x".into())
+        );
         assert!(matches!(source_of(&specs, "altreg"), DepSource::Other(_)));
         // A rename is keyed by the REAL crate name, registry-sourced.
         assert_eq!(*source_of(&specs, "real-crate"), DepSource::Registry);
@@ -1127,8 +1130,9 @@ mod tests {
         ));
         // The replace target specifically must be represented.
         assert!(
-            specs.iter().any(|s| s.name == "github.com/pkg/errors"
-                && matches!(s.source, DepSource::Path(_))),
+            specs.iter().any(
+                |s| s.name == "github.com/pkg/errors" && matches!(s.source, DepSource::Path(_))
+            ),
             "replace to a local path must be captured: {specs:?}"
         );
     }
@@ -1146,7 +1150,10 @@ mod tests {
     #[test]
     fn dep_source_describe_and_key_are_stable() {
         assert!(DepSource::Registry.describe().is_none());
-        assert!(DepSource::Git("u".into()).describe().unwrap().contains("git"));
+        assert!(DepSource::Git("u".into())
+            .describe()
+            .unwrap()
+            .contains("git"));
         let registry = DepSpec {
             name: "serde".into(),
             source: DepSource::Registry,

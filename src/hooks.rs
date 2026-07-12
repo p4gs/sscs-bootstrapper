@@ -1137,9 +1137,9 @@ mod tests {
 not-json-noise
 {"DetectorName":"AWS","Verified":false,"SourceMetadata":{"Data":{"Filesystem":{"file":"config.toml"}}}}"#;
         let findings = parse_trufflehog_findings(stdout);
-        assert!(findings
-            .iter()
-            .any(|f| f.contains("Github") && f.contains("secrets.env") && f.contains("verified: true")));
+        assert!(findings.iter().any(|f| f.contains("Github")
+            && f.contains("secrets.env")
+            && f.contains("verified: true")));
         assert!(findings
             .iter()
             .any(|f| f.contains("AWS") && f.contains("verified: false")));
@@ -1191,7 +1191,14 @@ not-json-noise
             "--no-verify",
         ]);
         g(&["checkout", "main"]);
-        g(&["merge", "--no-ff", "--no-verify", "-m", "merge feature", "feature"]);
+        g(&[
+            "merge",
+            "--no-ff",
+            "--no-verify",
+            "-m",
+            "merge feature",
+            "feature",
+        ]);
         let merge_sha = crate::exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         assert!(
             range_declares_ai(&ctx, &merge_sha).unwrap(),
