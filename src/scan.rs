@@ -592,7 +592,22 @@ mod tests {
                  "status":"not_affected","justification":"vulnerable_code_not_present"}]}"#,
         )
         .unwrap();
-        let report = run_scan(&ctx, cfg, Some(&vex_path)).unwrap();
+        let report = match run_scan(&ctx, cfg, Some(&vex_path)) {
+            Ok(report) => report,
+            Err(e) => {
+                // Trivy downloads its vulnerability DB from a registry on first
+                // run; a transient outage or a cold/racing cache surfaces as a
+                // "DB error … json decode error: EOF" init failure. That is an
+                // environmental precondition, not a logic failure — skip, the
+                // same way the tool-absence guard above does.
+                let msg = format!("{e:#}");
+                if msg.contains("DB error") || msg.contains("failed to download") {
+                    eprintln!("skipping: scanner DB unavailable ({msg})");
+                    return;
+                }
+                panic!("run_scan failed unexpectedly: {msg}");
+            }
+        };
         assert!(report.notes.iter().any(|n| n.contains("VEX applied")));
     }
 

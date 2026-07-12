@@ -1,4 +1,5 @@
-# sscsb's own CI: build, lint, test, and the 95/95 coverage gate.
+# sscsb's own CI: build, lint, test, and the coverage gate (95% lines / 94%
+# functions — see the gate step comment for the documented functions rationale).
 #
 # The test and coverage jobs install the REAL tools sscsb orchestrates (pinned +
 # checksum-verified, see .github/actions/setup-sscsb-tools) so the suites prove
@@ -11,6 +12,15 @@ on:
   push:
     branches: ["main", "feat/**", "fix/**"]
   pull_request:
+
+# A feature-branch push with an open PR fires both the `push` and
+# `pull_request` events on the same commit. Without this, two runs execute
+# concurrently and race on the shared Trivy vulnerability-DB cache, corrupting
+# it ("json decode error: EOF"). Collapse duplicate runs per ref so only one
+# real-tool run touches the DB at a time.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
