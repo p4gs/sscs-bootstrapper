@@ -1,0 +1,299 @@
+{
+  "version": "1",
+  "frameworks": {
+    "slsa": { "name": "SLSA v1.2", "target": "Build L3 + Source L3" },
+    "ssdf": { "name": "NIST SSDF v1.2 (SP 800-218)" },
+    "cra": { "name": "EU Cyber Resilience Act (Regulation (EU) 2024/2847)" },
+    "badge": { "name": "OpenSSF Best Practices Badge (passing level)" }
+  },
+  "controls": {
+    "secrets": {
+      "name": "Secret blocking (TruffleHog + Gitleaks pre-commit/pre-push)",
+      "phase": 1,
+      "slsa": [],
+      "ssdf": ["PS.1.1", "PW.7.2"],
+      "cra": ["Annex I Part I(2)(d) (protection against unauthorised access)", "Annex I Part II §3 (effective and regular tests and reviews)"],
+      "badge": ["no_leaked_credentials"],
+      "notes": "Blocking credentials at commit/push keeps secrets out of the repo, closing the unauthorised-access vector that leaked credentials create."
+    },
+    "commit-signing": {
+      "name": "Hardware-backed human-only commit signing + approved signers + human-signed merges",
+      "phase": 1,
+      "slsa": ["Source L1: Identity Management", "Source L2: History"],
+      "ssdf": ["PS.1.1"],
+      "cra": ["Annex I Part I(2)(f) (integrity of code, commands and configuration)"],
+      "badge": [],
+      "notes": "Hardware-backed signatures cryptographically authenticate the human actor behind every commit and merge, making repository history tamper-evident."
+    },
+    "branch-protection": {
+      "name": "GitHub branch protection verification",
+      "phase": 1,
+      "slsa": ["Source L2: Continuous technical controls", "Source L3: Protected Named References"],
+      "ssdf": ["PS.1.1"],
+      "cra": ["Annex I Part I(2)(f) (integrity of code, commands and configuration)"],
+      "badge": [],
+      "notes": "Verified branch protection is the enforced technical control on protected named references that SLSA Source L3 requires and PS.1.1 code protection expects."
+    },
+    "actions-audit": {
+      "name": "Actions SHA pinning + least-privilege permissions audit",
+      "phase": 1,
+      "slsa": ["Build L3: Isolated"],
+      "ssdf": ["PO.3.2", "PS.1.1"],
+      "cra": ["Annex I Part I(2)(j) (minimise attack surfaces)"],
+      "badge": [],
+      "notes": "SHA-pinned actions and least-privilege tokens remove mutable-tag substitution and token abuse as external influences on the build (tj-actions CVE-2025-30066 class)."
+    },
+    "ai-trailers": {
+      "name": "Standardized AI commit trailers validation",
+      "phase": 1,
+      "slsa": ["Source L2: Source Provenance"],
+      "ssdf": ["PO.3.3"],
+      "cra": [],
+      "badge": [],
+      "notes": "Validated AI trailers are contemporaneous evidence of how each revision was produced — source provenance for AI-assisted changes."
+    },
+    "ai-dep-gate": {
+      "name": "Extra gating for AI-introduced dependencies and shell commands",
+      "phase": 1,
+      "slsa": [],
+      "ssdf": ["PW.4.1", "PW.4.4", "PW.7.2"],
+      "cra": ["Article 13(5) (due diligence on third-party components)"],
+      "badge": [],
+      "notes": "AI-suggested dependencies and shell commands are treated as untrusted input and receive heightened human review before acquisition (slopsquatting defense)."
+    },
+    "pr-template": {
+      "name": "AI-provenance PR template",
+      "phase": 1,
+      "slsa": [],
+      "ssdf": ["PW.7.2"],
+      "cra": [],
+      "badge": ["contribution_requirements"],
+      "notes": "The template forces AI-involvement disclosure so reviewers can scope review depth, and documents the project's contribution requirements."
+    },
+    "ai-receipts": {
+      "name": "Cryptographic AI provenance receipts (optional)",
+      "phase": 1,
+      "slsa": ["Source L2: Source Provenance"],
+      "ssdf": ["PO.3.3"],
+      "cra": [],
+      "badge": [],
+      "notes": "Signed receipts upgrade AI-involvement claims from honor-system trailers to cryptographically verifiable attestations."
+    },
+    "sbom": {
+      "name": "Syft CycloneDX SBOM generation",
+      "phase": 2,
+      "slsa": [],
+      "ssdf": ["PS.3.2"],
+      "cra": ["Annex I Part II §1 (identify and document components incl. SBOM)"],
+      "badge": [],
+      "notes": "The CycloneDX SBOM is the machine-readable component inventory CRA Annex I Part II §1 mandates and the component provenance data PS.3.2 describes."
+    },
+    "vuln-scan": {
+      "name": "Trivy + OSV-Scanner vulnerability scanning",
+      "phase": 2,
+      "slsa": [],
+      "ssdf": ["PW.4.4", "RV.1.1", "RV.1.2"],
+      "cra": ["Annex I Part I(2)(a) (no known exploitable vulnerabilities)", "Annex I Part II §2 (address vulnerabilities without delay)"],
+      "badge": ["dependency_monitoring"],
+      "notes": "Continuous scanning identifies known-vulnerable components so they are fixed before release and remediated promptly afterward."
+    },
+    "scorecard": {
+      "name": "OpenSSF Scorecard workflow",
+      "phase": 2,
+      "slsa": [],
+      "ssdf": ["PO.3.2", "PO.3.3"],
+      "cra": ["Annex I Part II §3 (effective and regular tests and reviews)"],
+      "badge": [],
+      "notes": "Scheduled Scorecard runs are a recurring, evidence-producing review of the repository's supply-chain security posture."
+    },
+    "renovate": {
+      "name": "Automated dependency updates (Renovate)",
+      "phase": 2,
+      "slsa": [],
+      "ssdf": ["PW.4.4", "RV.1.1"],
+      "cra": ["Annex I Part II §2 (address vulnerabilities without delay)"],
+      "badge": ["dependency_monitoring"],
+      "notes": "Automated update PRs shrink the window between an upstream security fix and its adoption in this project."
+    },
+    "package-trust": {
+      "name": "Package trust (existence validation, new-package approval, typosquat heuristics, lockfile-exact installs)",
+      "phase": 2,
+      "slsa": [],
+      "ssdf": ["PW.4.1", "PW.4.4"],
+      "cra": ["Article 13(5) (due diligence on third-party components)"],
+      "badge": [],
+      "notes": "Components are vetted before acquisition and installs are pinned exactly, defending against typosquatting, dependency confusion, and hallucinated package names."
+    },
+    "grype": {
+      "name": "SBOM-first vulnerability scan (Grype, optional)",
+      "phase": 2,
+      "slsa": [],
+      "ssdf": ["PW.4.4", "RV.1.1"],
+      "cra": ["Annex I Part II §1 (identify and document components incl. SBOM)", "Annex I Part II §2 (address vulnerabilities without delay)"],
+      "badge": ["dependency_monitoring"],
+      "notes": "Scanning the CycloneDX SBOM itself makes the documented component inventory the vulnerability-detection surface."
+    },
+    "socket-firewall": {
+      "name": "Malicious-package install firewall (Socket, optional)",
+      "phase": 2,
+      "slsa": [],
+      "ssdf": ["PW.4.1"],
+      "cra": ["Article 13(5) (due diligence on third-party components)"],
+      "badge": [],
+      "notes": "Install-time firewall blocks known-malicious packages before they enter the environment (Shai-Hulud/lottie-player class)."
+    },
+    "sigstore-signing": {
+      "name": "Cosign keyless artifact signing + SBOM attestation",
+      "phase": 3,
+      "slsa": ["Build L2: Provenance is Authentic"],
+      "ssdf": ["PS.2.1"],
+      "cra": ["Annex I Part I(2)(f) (integrity of software)", "Annex I Part II §7 (secure distribution of updates)"],
+      "badge": ["signed_releases"],
+      "notes": "Keyless signatures and SBOM attestations give acquirers cryptographic integrity-verification material for every released artifact."
+    },
+    "slsa-provenance": {
+      "name": "SLSA Build L3 provenance (slsa-github-generator)",
+      "phase": 3,
+      "slsa": ["Build L1: Provenance Exists", "Build L2: Provenance is Authentic", "Build L2: Hosted", "Build L3: Provenance is Unforgeable", "Build L3: Isolated"],
+      "ssdf": ["PO.3.2", "PS.2.1"],
+      "cra": ["Annex I Part I(2)(f) (integrity of software)"],
+      "badge": ["signed_releases"],
+      "notes": "The reusable trusted builder runs hosted and isolated, and its control plane signs provenance that build steps cannot forge — the Build L3 requirement set."
+    },
+    "provenance-verify": {
+      "name": "Provenance verification gates (slsa-verifier + cosign) before deploy/publish",
+      "phase": 3,
+      "slsa": ["Build L2: Provenance is Authentic", "Build L3: Provenance is Unforgeable"],
+      "ssdf": ["PW.4.4"],
+      "cra": ["Annex I Part I(2)(f) (integrity of software)", "Annex I Part II §7 (secure distribution of updates)"],
+      "badge": [],
+      "notes": "Consumer-side verification per SLSA 'Verifying artifacts': nothing deploys or publishes unless signature and provenance validate, which is what gives Build-track claims teeth."
+    },
+    "octo-sts": {
+      "name": "Short-lived GitHub credential federation (octo-sts)",
+      "phase": 3,
+      "slsa": [],
+      "ssdf": ["PO.5.1", "PS.1.1"],
+      "cra": ["Annex I Part I(2)(d) (protection against unauthorised access)"],
+      "badge": [],
+      "notes": "Federated short-lived tokens replace long-lived PATs, limiting the blast radius of CI credential theft to minutes."
+    },
+    "harden-runner": {
+      "name": "CI runner egress/tamper monitoring (Harden-Runner)",
+      "phase": 3,
+      "slsa": ["Build L3: Isolated"],
+      "ssdf": ["PO.5.1"],
+      "cra": ["Annex I Part I(2)(f) (integrity of software)"],
+      "badge": [],
+      "notes": "Egress filtering and file-tamper detection on runners keep unintended external influence out of builds (Ultralytics cache-poisoning class)."
+    },
+    "witness": {
+      "name": "in-toto witness attestations (optional)",
+      "phase": 3,
+      "slsa": ["Build L2: Provenance is Authentic", "Build L3: Provenance is Unforgeable"],
+      "ssdf": ["PO.3.3"],
+      "cra": ["Annex I Part I(2)(f) (integrity of software)"],
+      "badge": [],
+      "notes": "Optional step-level in-toto attestations extend signed, verifiable provenance from the whole build down to individual pipeline steps."
+    },
+    "sast": {
+      "name": "SAST (OpenGrep/Semgrep, local + CI)",
+      "phase": 4,
+      "slsa": [],
+      "ssdf": ["PW.7.2"],
+      "cra": ["Annex I Part I(2)(a) (no known exploitable vulnerabilities)", "Annex I Part II §3 (effective and regular tests and reviews)"],
+      "badge": ["static_analysis", "static_analysis_common_vulnerabilities"],
+      "notes": "Static analysis in pre-commit and CI finds weaknesses in human-readable code before they ship."
+    },
+    "sighthound": {
+      "name": "Fast local SAST (Sighthound, optional)",
+      "phase": 4,
+      "slsa": [],
+      "ssdf": ["PW.7.2"],
+      "cra": ["Annex I Part II §3 (effective and regular tests and reviews)"],
+      "badge": ["static_analysis"],
+      "notes": "Sub-second local SAST gives developers findings before commit; complements rather than replaces CI analysis."
+    },
+    "codeql": {
+      "name": "Deep CI SAST (CodeQL)",
+      "phase": 4,
+      "slsa": [],
+      "ssdf": ["PW.7.2"],
+      "cra": ["Annex I Part I(2)(a) (no known exploitable vulnerabilities)", "Annex I Part II §3 (effective and regular tests and reviews)"],
+      "badge": ["static_analysis", "static_analysis_common_vulnerabilities"],
+      "notes": "Dataflow/taint analysis catches injection-class vulnerabilities that lightweight pattern-based SAST misses."
+    },
+    "workflow-audit-extended": {
+      "name": "Extended workflow audit (pull_request_target misuse, credential persistence, secret echo, risky-action substitution)",
+      "phase": 4,
+      "slsa": ["Build L3: Isolated"],
+      "ssdf": ["PO.3.2", "PS.1.1"],
+      "cra": ["Annex I Part I(2)(j) (minimise attack surfaces)"],
+      "badge": [],
+      "notes": "Audits the known CI takeover paths that let untrusted code or persisted credentials influence builds and exfiltrate secrets."
+    },
+    "secure-repo": {
+      "name": "StepSecurity secure-repo onboarding",
+      "phase": 4,
+      "slsa": [],
+      "ssdf": ["PO.3.2"],
+      "cra": ["Annex I Part I(2)(j) (minimise attack surfaces)"],
+      "badge": [],
+      "notes": "Automated onboarding applies workflow hardening (pinning, least privilege, harden-runner); the specific guarantees are carried by those individual controls."
+    },
+    "wait-for-secrets": {
+      "name": "Human-in-the-loop secret injection (wait-for-secrets, optional)",
+      "phase": 4,
+      "slsa": [],
+      "ssdf": ["PO.5.1"],
+      "cra": ["Annex I Part I(2)(d) (protection against unauthorised access)"],
+      "badge": [],
+      "notes": "High-value secrets are supplied by a human at run time instead of being stored in CI configuration at all."
+    },
+    "dependency-track": {
+      "name": "Dependency-Track SBOM management platform integration",
+      "phase": 5,
+      "slsa": [],
+      "ssdf": ["PS.3.2", "RV.1.1"],
+      "cra": ["Annex I Part II §1 (identify and document components incl. SBOM)", "Annex I Part II §2 (address vulnerabilities without delay)"],
+      "badge": ["dependency_monitoring"],
+      "notes": "Continuous analysis of stored SBOMs surfaces newly published CVEs against already-shipped component inventories."
+    },
+    "guac": {
+      "name": "GUAC supply-chain knowledge graph ingestion",
+      "phase": 5,
+      "slsa": [],
+      "ssdf": ["PS.3.2", "RV.1.1"],
+      "cra": ["Annex I Part II §1 (identify and document components incl. SBOM)"],
+      "badge": [],
+      "notes": "A queryable graph over SBOMs and attestations answers blast-radius questions (which artifacts contain component X) during vulnerability response."
+    },
+    "openvex": {
+      "name": "OpenVEX generation/ingestion",
+      "phase": 5,
+      "slsa": [],
+      "ssdf": ["RV.1.2"],
+      "cra": ["Annex I Part II §2 (address vulnerabilities without delay)", "Annex I Part II §6 (facilitate information sharing on vulnerabilities)"],
+      "badge": [],
+      "notes": "VEX records exploitability triage decisions machine-readably so scanners and consumers can act on not_affected status instead of re-triaging."
+    },
+    "oras": {
+      "name": "OCI metadata storage via ORAS (optional)",
+      "phase": 5,
+      "slsa": ["Build L1: Distribute provenance (producer)"],
+      "ssdf": ["PS.2.1", "PS.3.1"],
+      "cra": ["Annex I Part II §1 (identify and document components incl. SBOM)"],
+      "badge": [],
+      "notes": "Pushing SBOMs, signatures, and attestations to the registry co-locates verification material with the artifact consumers already pull."
+    },
+    "compliance-map": {
+      "name": "Compliance map + sscsb report",
+      "phase": 5,
+      "slsa": [],
+      "ssdf": ["PO.1.1", "PO.3.3"],
+      "cra": ["Article 13 (manufacturer obligations — documented conformity evidence)"],
+      "badge": ["documentation_security"],
+      "notes": "This map plus `sscsb report` turns enabled controls into auditable, machine-readable framework-coverage evidence."
+    }
+  }
+}

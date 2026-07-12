@@ -1,0 +1,50 @@
+# sscsb: OWASP Dependency-Track quickstart (self-hosted SBOM management).
+# Matches the upstream 5.x quickstart topology (API server + frontend + postgres).
+#
+#   docker compose -f .sscsb/templates/dependency-track-compose.yml up -d
+#   # UI:  http://localhost:8081  (default admin/admin — change immediately)
+#   # API: http://localhost:8080
+#   # then: set [controls.dependency-track] url = "http://localhost:8080"
+#   #       export DTRACK_API_KEY=<key from Administration → Teams>
+#   #       sscsb sbom && sscsb dtrack upload
+services:
+  apiserver:
+    image: ghcr.io/dependencytrack/apiserver:5.0.2
+    depends_on:
+      postgres:
+        condition: service_started
+    environment:
+      ALPINE_DATABASE_MODE: external
+      ALPINE_DATABASE_URL: jdbc:postgresql://postgres:5432/dtrack
+      ALPINE_DATABASE_DRIVER: org.postgresql.Driver
+      ALPINE_DATABASE_USERNAME: dtrack
+      ALPINE_DATABASE_PASSWORD: dtrack
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - dtrack-data:/data
+    restart: unless-stopped
+
+  frontend:
+    image: ghcr.io/dependencytrack/frontend:5.0.2
+    depends_on:
+      - apiserver
+    environment:
+      API_BASE_URL: http://localhost:8080
+    ports:
+      - "127.0.0.1:8081:8080"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: dtrack
+      POSTGRES_USER: dtrack
+      POSTGRES_PASSWORD: dtrack
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  dtrack-data:
+  postgres-data:
