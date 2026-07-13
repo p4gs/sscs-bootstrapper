@@ -8,18 +8,21 @@
 # Dogfooding: this workflow must itself pass `sscsb verify actions-audit` —
 # SHA-pinned, least-privilege, harden-runner first.
 name: CI
+# `push` runs ONLY on the default branch (post-merge validation); feature
+# branches are validated through `pull_request`. This deliberately avoids
+# firing both events on the same feature-branch commit — two concurrent runs
+# race on the shared Trivy vulnerability-DB cache and on Trivy itself,
+# producing spurious DB corruption ("json decode error: EOF") and memory
+# faults. One run per commit, one Trivy at a time.
 on:
   push:
-    branches: ["main", "feat/**", "fix/**"]
+    branches: ["main"]
   pull_request:
 
-# A feature-branch push with an open PR fires both the `push` and
-# `pull_request` events on the same commit. Without this, two runs execute
-# concurrently and race on the shared Trivy vulnerability-DB cache, corrupting
-# it ("json decode error: EOF"). Collapse duplicate runs per ref so only one
-# real-tool run touches the DB at a time.
+# Belt-and-braces: collapse rapid successive pushes/PR syncs on the same ref so
+# a superseded run can't race a newer one on the shared tool caches.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
