@@ -102,3 +102,30 @@ runs:
           command -v "$t" >/dev/null || { echo "::error::$t did not install"; exit 1; }
         done
         echo "installed: $(for t in gitleaks trufflehog syft grype trivy oras osv-scanner cosign slsa-verifier opengrep semgrep; do printf '%s ' "$t"; done)"
+
+    - name: Pre-warm Trivy caches (vuln DB + misconfig checks bundle)
+      shell: bash
+      # sscsb invokes `trivy fs --scanners vuln,secret,misconfig` (documented in
+      # docs/phase-2.md and the spec). Trivy lazily downloads its vulnerability
+      # DB *and* its Rego misconfig-checks bundle from a registry on first use;
+      # a cold cache under a fresh CI runner intermittently surfaces as
+      # "DB error … json decode error: EOF" or a missing ".rego" check, which
+      # would flake the real-tool tests. Populate both caches once, up front,
+      # with retries, so every test/coverage job starts from a warm, complete
+      # cache. This provides the tool its data — it does not change behavior.
+      run: |
+        set -euo pipefail
+        warm="$(mktemp -d)"
+        : > "${warm}/go.mod"   # a trivially-scannable target
+        for attempt in 1 2 3; do
+          if trivy fs --scanners vuln,secret,misconfig --format json --quiet "${warm}" >/dev/null 2>warm.err; then
+            echo "trivy caches warm (attempt ${attempt})"
+            exit 0
+          fi
+          echo "::warning::trivy warm-up attempt ${attempt} failed; retrying"
+          cat warm.err || true
+          sleep $((attempt * 10))
+        done
+        echo "::error::trivy caches could not be warmed after 3 attempts"
+        cat warm.err || true
+        exit 1
