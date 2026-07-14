@@ -105,6 +105,18 @@ pub struct Signer {
     pub ssh_public_key: Option<String>,
     pub gpg_fingerprint: Option<String>,
     pub hardware_backed: bool,
+    /// How the key is held: tpm | fido2 | kms | github-app | piv | software.
+    /// Informational — it NEVER changes the protected-branch gate outcome; the
+    /// gate keys on `class`, not `backend`.
+    pub backend: Option<String>,
+    /// Path (repo-relative) to an out-of-band hardware-residence attestation
+    /// artifact (e.g. `ssh-keygen -O write-attestation`). Its presence lets
+    /// sscsb report `attested` instead of `declared`; it is NEVER trusted to
+    /// elevate a signer's class (see ISC-A6).
+    pub attestation_file: Option<String>,
+    /// Optional RFC3339 date after which this key must be rotated. Reported by
+    /// `verify`; not enforced in the emitted allowed_signers file.
+    pub expires: Option<String>,
 }
 
 pub const SIGNERS_TEMPLATE: &str = r#"# sscsb approved-signers policy.
@@ -122,6 +134,19 @@ pub const SIGNERS_TEMPLATE: &str = r#"# sscsb approved-signers policy.
 # hardware_backed = true                 # asserted when the key lives on a YubiKey/secure element
 # ssh_public_key = "ssh-ed25519 AAAA... you@example.com"
 # # gpg_fingerprint = "ABCD1234..."      # for gpg.format=openpgp signers
+#
+# AI agents may sign ONLY when the `agent-signing` control is enabled, and their
+# signatures are ALWAYS rejected on protected branches regardless of any other
+# field — humans, CI, and AI never share identities. When agent-signing is on:
+#
+# [[signer]]
+# principal = "agent@ci.example.com"     # a DISTINCT identity, never a human's
+# class = "ai"                           # only emitted into allowed_signers when agent-signing is on
+# backend = "github-app"                 # tpm | fido2 | kms | github-app | piv | software
+# hardware_backed = true                 # self-asserted; see attestation_file to back it up
+# # attestation_file = ".sscsb/policy/attestations/agent.bin"  # out-of-band hardware proof
+# # expires = "2027-01-01"               # reported by `sscsb verify`; rotate before this
+# ssh_public_key = "ssh-ed25519 AAAA... agent@ci.example.com"
 "#;
 
 pub fn signers_path(ctx: &Ctx) -> PathBuf {
@@ -142,6 +167,11 @@ pub fn parse_signers(text: &str) -> Result<Vec<Signer>> {
     let Some(items) = table.get("signer").and_then(|v| v.as_array()) else {
         return Ok(out);
     };
+    // A principal identifies exactly one signer. The same principal appearing
+    // twice — especially across classes — is the exact shape that would let an
+    // `ai` entry ride in on a `human` principal, so it is a hard parse error
+    // (ISC-A2), matched case-insensitively so casing can't smuggle a duplicate.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (i, item) in items.iter().enumerate() {
         let t = item
             .as_table()
@@ -151,6 +181,12 @@ pub fn parse_signers(text: &str) -> Result<Vec<Signer>> {
             .and_then(|v| v.as_str())
             .with_context(|| format!("signer #{i} missing `principal`"))?
             .to_string();
+        if !seen.insert(principal.to_ascii_lowercase()) {
+            anyhow::bail!(
+                "signer `{principal}` is listed more than once — each principal must map to a \
+                 single signer/class (humans, CI, and AI never share an identity)"
+            );
+        }
         let class = match t.get("class").and_then(|v| v.as_str()) {
             Some("human") => SignerClass::Human,
             Some("ci") => SignerClass::Ci,
@@ -174,18 +210,45 @@ pub fn parse_signers(text: &str) -> Result<Vec<Signer>> {
                 .get("hardware_backed")
                 .and_then(toml::Value::as_bool)
                 .unwrap_or(false),
+            backend: t
+                .get("backend")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            attestation_file: t
+                .get("attestation_file")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            expires: t
+                .get("expires")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         });
     }
     Ok(out)
 }
 
 /// Build the ssh allowed_signers file content from policy. AI-class signers
-/// are NEVER emitted: an AI key can never produce a "good" signature.
+/// are NEVER emitted: with agent-signing OFF (the default), an AI key can never
+/// produce a "good" signature. This is the historical, agent-unaware behavior —
+/// kept byte-identical so enabling nothing changes nothing.
 pub fn allowed_signers_content(signers: &[Signer]) -> String {
+    allowed_signers_content_inner(signers, false)
+}
+
+/// Like [`allowed_signers_content`], but emits `ai`-class keys too when
+/// `include_agents` is set. Even when an AI key IS emitted (so an agent commit
+/// can verify as `%G?=G` on a feature branch), the protected-branch gate in
+/// [`check_signing_for_range`] still rejects it on `class`, not on presence in
+/// this file — the two invariants are separate (ISC-A4).
+pub fn allowed_signers_content_with_agents(signers: &[Signer], include_agents: bool) -> String {
+    allowed_signers_content_inner(signers, include_agents)
+}
+
+fn allowed_signers_content_inner(signers: &[Signer], include_agents: bool) -> String {
     let mut out =
         String::from("# Generated by sscsb from .sscsb/policy/signers.toml — do not edit.\n");
     for s in signers {
-        if s.class == SignerClass::Ai {
+        if s.class == SignerClass::Ai && !include_agents {
             continue;
         }
         if let Some(key) = &s.ssh_public_key {
@@ -195,15 +258,23 @@ pub fn allowed_signers_content(signers: &[Signer]) -> String {
     out
 }
 
-pub fn regenerate_allowed_signers(ctx: &Ctx) -> Result<()> {
+/// Regenerate `.sscsb/policy/allowed_signers`. `include_agents` is driven by
+/// whether the `agent-signing` control is enabled; with it off, output is the
+/// historical human/ci-only file.
+pub fn regenerate_allowed_signers(ctx: &Ctx, include_agents: bool) -> Result<()> {
     let policy_dir = ctx.sscsb_dir().join("policy");
     std::fs::create_dir_all(&policy_dir)?;
     let signers = load_signers(&signers_path(ctx))?;
     std::fs::write(
         policy_dir.join("allowed_signers"),
-        allowed_signers_content(&signers),
+        allowed_signers_content_with_agents(&signers, include_agents),
     )?;
     Ok(())
+}
+
+/// Whether the (default-off) `agent-signing` control is enabled.
+pub fn agent_signing_enabled(cfg: &Config) -> bool {
+    cfg.control_enabled("agent-signing").unwrap_or(false)
 }
 
 // ─────────────────────────────── Trailers ───────────────────────────────────
@@ -757,7 +828,9 @@ fn check_signing_for_range(
         ));
     }
     // Ensure allowed_signers reflects current policy before verification.
-    regenerate_allowed_signers(ctx)?;
+    // When agent-signing is enabled, AI keys are emitted too — but the
+    // class check below still rejects them on this protected branch.
+    regenerate_allowed_signers(ctx, agent_signing_enabled(cfg))?;
 
     for sha in commits_in_range(ctx, u)? {
         let raw = exec::git(
@@ -778,7 +851,7 @@ fn check_signing_for_range(
                     s.principal == signer_principal
                         || s.gpg_fingerprint
                             .as_deref()
-                            .is_some_and(|fp| !fp.is_empty() && key_id.ends_with(fp))
+                            .is_some_and(|fp| !fp.is_empty() && key_id.eq_ignore_ascii_case(fp))
                 });
                 match matched {
                     None => problems.push(format!(
@@ -1396,6 +1469,68 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
     }
 
     #[test]
+    fn parse_signers_round_trips_backend_attestation_and_expiry_fields() {
+        let toml = "[[signer]]\nprincipal = \"agent@ci.example.com\"\nclass = \"ai\"\nbackend = \"github-app\"\nhardware_backed = true\nattestation_file = \".sscsb/policy/attestations/agent.bin\"\nexpires = \"2027-01-01\"\nssh_public_key = \"ssh-ed25519 AAAAAGENT agent@ci.example.com\"\n";
+        let signers = parse_signers(toml).unwrap();
+        assert_eq!(signers.len(), 1);
+        let s = &signers[0];
+        assert_eq!(s.class, SignerClass::Ai);
+        assert_eq!(s.backend.as_deref(), Some("github-app"));
+        assert!(s.hardware_backed);
+        assert_eq!(
+            s.attestation_file.as_deref(),
+            Some(".sscsb/policy/attestations/agent.bin")
+        );
+        assert_eq!(s.expires.as_deref(), Some("2027-01-01"));
+        // Absent optional fields stay None on a minimal human entry.
+        let minimal = parse_signers(
+            "[[signer]]\nprincipal = \"h@example.com\"\nclass = \"human\"\nssh_public_key = \"ssh-ed25519 AAAAH h@example.com\"\n",
+        )
+        .unwrap();
+        assert_eq!(minimal[0].backend, None);
+        assert_eq!(minimal[0].attestation_file, None);
+        assert_eq!(minimal[0].expires, None);
+    }
+
+    #[test]
+    fn allowed_signers_is_byte_identical_with_agents_off_and_emits_ai_only_when_on() {
+        // A human + an ai signer, both with keys.
+        let toml = "[[signer]]\nprincipal = \"human@example.com\"\nclass = \"human\"\nssh_public_key = \"ssh-ed25519 AAAAHUMAN human@example.com\"\n\n[[signer]]\nprincipal = \"agent@ci.example.com\"\nclass = \"ai\"\nbackend = \"github-app\"\nssh_public_key = \"ssh-ed25519 AAAAAGENT agent@ci.example.com\"\n";
+        let signers = parse_signers(toml).unwrap();
+
+        // Default (agent-signing OFF) output: ai key NEVER appears, and it is
+        // byte-identical to the historical agent-unaware generator.
+        let off = allowed_signers_content(&signers);
+        assert!(off.contains("human@example.com"));
+        assert!(
+            !off.contains("agent@ci.example.com"),
+            "ai key must not leak into the default allowed_signers file"
+        );
+        assert_eq!(
+            off,
+            allowed_signers_content_with_agents(&signers, false),
+            "the public helper must equal the explicit include_agents=false form"
+        );
+
+        // agent-signing ON: the ai key is emitted so an agent commit can verify
+        // as %G?=G — the human line is unchanged.
+        let on = allowed_signers_content_with_agents(&signers, true);
+        assert!(on.contains("human@example.com"));
+        assert!(on.contains("agent@ci.example.com"));
+    }
+
+    #[test]
+    fn parse_signers_rejects_a_duplicate_principal_across_classes() {
+        // The exact downgrade shape: one principal claimed as both human and ai.
+        let toml = "[[signer]]\nprincipal = \"me@example.com\"\nclass = \"human\"\nssh_public_key = \"ssh-ed25519 AAAAH me@example.com\"\n\n[[signer]]\nprincipal = \"ME@example.com\"\nclass = \"ai\"\nssh_public_key = \"ssh-ed25519 AAAAA me@example.com\"\n";
+        let err = parse_signers(toml).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("listed more than once"),
+            "duplicate principal (case-insensitive) must be rejected"
+        );
+    }
+
+    #[test]
     fn parse_signers_rejects_missing_principal() {
         let err = parse_signers("[[signer]]\nclass = \"human\"\n").unwrap_err();
         assert!(format!("{err:#}").contains("missing `principal`"));
@@ -1428,7 +1563,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
             "[[signer]]\nprincipal = \"human@example.com\"\nclass = \"human\"\nssh_public_key = \"ssh-ed25519 AAAATESTKEY human@example.com\"\n",
         )
         .unwrap();
-        regenerate_allowed_signers(&ctx).unwrap();
+        regenerate_allowed_signers(&ctx, false).unwrap();
         let content =
             std::fs::read_to_string(ctx.sscsb_dir().join("policy").join("allowed_signers"))
                 .unwrap();
@@ -1898,6 +2033,180 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(hook_pre_push(&ctx, "origin", &stdin).unwrap(), 0);
+    }
+
+    /// Build a repo with agent-signing enabled and a single `ai`-class signer
+    /// whose ed25519 key git is configured to sign with. Returns the agent
+    /// principal so callers can assert on it.
+    fn agent_signed_repo() -> (tempfile::TempDir, Ctx) {
+        let (dir, ctx) = test_repo();
+        let key = dir.path().join("id_agent");
+        let out = std::process::Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "agent@ci.example.com",
+                "-f",
+            ])
+            .arg(&key)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let pubkey = std::fs::read_to_string(key.with_extension("pub"))
+            .unwrap()
+            .trim()
+            .to_string();
+        git_ok(&ctx, &["config", "gpg.format", "ssh"]);
+        git_ok(&ctx, &["config", "user.signingkey", key.to_str().unwrap()]);
+        crate::config::set_control_enabled(&ctx.config_path(), "agent-signing", true).unwrap();
+        std::fs::write(
+            signers_path(&ctx),
+            format!(
+                "[[signer]]\nprincipal = \"agent@ci.example.com\"\nclass = \"ai\"\nbackend = \"tpm\"\nhardware_backed = true\nssh_public_key = \"{pubkey}\"\n"
+            ),
+        )
+        .unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        (dir, ctx)
+    }
+
+    #[test]
+    fn agent_signature_verifies_on_a_feature_branch_but_is_blocked_on_a_protected_branch() {
+        let (_dir, ctx) = agent_signed_repo();
+        // With agent-signing enabled, the ai key IS emitted into allowed_signers.
+        regenerate_allowed_signers(&ctx, true).unwrap();
+
+        write_file(&ctx, "feature.txt", "f\n");
+        stage(&ctx, "feature.txt");
+        git_ok(
+            &ctx,
+            &["commit", "-S", "-m", "feat: agent work", "--no-verify"],
+        );
+
+        // ISC-3: the agent commit verifies as a good signature.
+        let status = exec::git(&["log", "-1", "--format=%G?", "HEAD"], &ctx.root).unwrap();
+        assert_eq!(
+            status, "G",
+            "agent key must produce a good signature when enabled"
+        );
+        let principal = exec::git(&["log", "-1", "--format=%GS", "HEAD"], &ctx.root).unwrap();
+        assert_eq!(principal, "agent@ci.example.com");
+
+        // ISC-A4: the SAME agent-signed commit pushed to a protected branch is
+        // blocked — good signature, wrong class.
+        let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+        let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
+        assert_eq!(
+            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            1,
+            "agent signature must never satisfy the human-only protected-branch gate"
+        );
+    }
+
+    #[test]
+    fn agent_signature_is_blocked_on_protected_branch_even_with_agent_signing_disabled() {
+        // ISC-A4 must hold with the control OFF too: the ai key is then NOT in
+        // allowed_signers, so the signature can't validate → still rejected.
+        let (_dir, ctx) = agent_signed_repo();
+        crate::config::set_control_enabled(&ctx.config_path(), "agent-signing", false).unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+
+        write_file(&ctx, "feature.txt", "f\n");
+        stage(&ctx, "feature.txt");
+        git_ok(
+            &ctx,
+            &["commit", "-S", "-m", "feat: agent work", "--no-verify"],
+        );
+        let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+        let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
+        assert_eq!(hook_pre_push(&ctx, "origin", &stdin).unwrap(), 1);
+    }
+
+    #[test]
+    fn an_attestation_file_never_elevates_an_agent_key_on_a_protected_branch() {
+        // ISC-A6: attaching a hardware-attestation artifact must not change the
+        // protected-branch outcome for an ai key — it stays blocked.
+        let (dir, ctx) = agent_signed_repo();
+        let att_dir = ctx.root.join(".sscsb/policy/att");
+        std::fs::create_dir_all(&att_dir).unwrap();
+        std::fs::write(att_dir.join("agent.bin"), b"a genuine-looking attestation").unwrap();
+        // Re-write policy with the attestation_file present.
+        let pubkey = std::fs::read_to_string(dir.path().join("id_agent.pub"))
+            .unwrap()
+            .trim()
+            .to_string();
+        std::fs::write(
+            signers_path(&ctx),
+            format!(
+                "[[signer]]\nprincipal = \"agent@ci.example.com\"\nclass = \"ai\"\nbackend = \"tpm\"\nhardware_backed = true\nattestation_file = \".sscsb/policy/att/agent.bin\"\nssh_public_key = \"{pubkey}\"\n"
+            ),
+        )
+        .unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+
+        write_file(&ctx, "feature.txt", "f\n");
+        stage(&ctx, "feature.txt");
+        git_ok(
+            &ctx,
+            &["commit", "-S", "-m", "feat: agent work", "--no-verify"],
+        );
+        let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+        let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
+        assert_eq!(
+            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            1,
+            "an attestation artifact must not turn an agent key into a valid protected-branch signer"
+        );
+    }
+
+    #[test]
+    fn ai_merge_without_review_evidence_is_blocked_even_with_agent_signing_enabled() {
+        // ISC-A5: with agent-signing ON (ai key in allowed_signers), a merge of
+        // AI-declared history still needs the human review-evidence trailer.
+        let (_dir, ctx) = agent_signed_repo();
+        // Give the human path a real signer too so the merge commit itself can
+        // be human-signed; here we reuse the agent key only to sign feature
+        // work, and sign the merge with the same key to show the merge-evidence
+        // gate fires independently of the signer's class check ordering.
+        write_file(&ctx, "README.md", "# x\n");
+        stage(&ctx, "README.md");
+        git_ok(&ctx, &["commit", "-S", "-m", "chore: base", "--no-verify"]);
+        git_ok(&ctx, &["checkout", "-b", "feature"]);
+        write_file(&ctx, "feature.txt", "f\n");
+        stage(&ctx, "feature.txt");
+        git_ok(
+            &ctx,
+            &[
+                "commit",
+                "-S",
+                "-m",
+                "feat: x\n\nAI-Assisted: true\nAI-Tool: Claude Code\nAI-Model: Fable 5\nAI-Role: draft",
+                "--no-verify",
+            ],
+        );
+        git_ok(&ctx, &["checkout", "main"]);
+        git_ok(
+            &ctx,
+            &[
+                "merge",
+                "--no-ff",
+                "-S",
+                "-m",
+                "Merge branch 'feature'",
+                "--no-verify",
+                "feature",
+            ],
+        );
+        let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+        let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
+        assert_eq!(
+            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            1,
+            "AI-history merge without review evidence must stay blocked with agent-signing on"
+        );
     }
 
     // ────────────────────────── verify_* controls ──────────────────────────

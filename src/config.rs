@@ -47,6 +47,24 @@ impl Config {
         Some(self.control_table(id)?.get(key)?.as_str()?.to_string())
     }
 
+    /// A control option that is a TOML array of strings (e.g. `allowed_backends`).
+    /// `None` when the key is absent; an empty vec when it is present-but-empty.
+    pub fn control_opt_str_list(&self, id: &str, key: &str) -> Option<Vec<String>> {
+        Some(
+            self.control_table(id)?
+                .get(key)?
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        )
+    }
+
+    /// A control option that is a TOML integer (e.g. `max_key_age_days`).
+    pub fn control_opt_int(&self, id: &str, key: &str) -> Option<i64> {
+        self.control_table(id)?.get(key)?.as_integer()
+    }
+
     pub fn protected_branches(&self) -> Vec<String> {
         self.table
             .get("general")
@@ -256,6 +274,37 @@ mod tests {
         );
         assert_eq!(cfg.github_repo().as_deref(), Some("o/r"));
         assert!(!cfg.fail_open());
+    }
+
+    #[test]
+    fn control_opt_str_list_and_int_read_typed_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let sscsb = dir.path().join(".sscsb");
+        std::fs::create_dir_all(&sscsb).unwrap();
+        std::fs::write(
+            sscsb.join("config.toml"),
+            "[controls.agent-signing]\nenabled = true\nallowed_backends = [\"github-app\", \"tpm\"]\nempty_backends = []\nmax_key_age_days = 90\n",
+        )
+        .unwrap();
+        let cfg = Config::load(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            cfg.control_opt_str_list("agent-signing", "allowed_backends"),
+            Some(vec!["github-app".to_string(), "tpm".to_string()])
+        );
+        // Present-but-empty array is Some(vec![]), distinct from an absent key.
+        assert_eq!(
+            cfg.control_opt_str_list("agent-signing", "empty_backends"),
+            Some(Vec::<String>::new())
+        );
+        assert_eq!(
+            cfg.control_opt_str_list("agent-signing", "absent_key"),
+            None
+        );
+        assert_eq!(
+            cfg.control_opt_int("agent-signing", "max_key_age_days"),
+            Some(90)
+        );
+        assert_eq!(cfg.control_opt_int("agent-signing", "absent_key"), None);
     }
 
     #[test]

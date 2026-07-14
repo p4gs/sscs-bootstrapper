@@ -57,7 +57,7 @@ pub fn bootstrap(cwd: &Path) -> Result<Vec<String>> {
     )? {
         log.push("write .sscsb/policy/packages.toml".to_string());
     }
-    hooks::regenerate_allowed_signers(&ctx)?;
+    hooks::regenerate_allowed_signers(&ctx, hooks::agent_signing_enabled(cfg))?;
     log.push("write .sscsb/policy/allowed_signers (generated from signers.toml)".to_string());
 
     log.extend(workflows::install_all(&ctx, cfg)?);
