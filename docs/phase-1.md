@@ -11,6 +11,7 @@ Phase 1 puts eight controls on that boundary.
 |---------|--------------|--------------|---------|
 | `secrets` | Blocks credentials at pre-commit and pre-push | TruffleHog, Gitleaks | on |
 | `commit-signing` | Hardware-backed, human-only signing on protected branches | git + OpenSSH | on |
+| `agent-signing` | Verifiable AI-agent signatures on feature branches (never valid on protected branches); adds a server-side policy gate | git + OpenSSH, `gh`, ssh-tpm-agent | off |
 | `branch-protection` | Verifies GitHub's protected-branch rules are actually set | `gh` | on |
 | `actions-audit` | Flags mutable action refs and missing/over-broad permissions | (native) | on |
 | `ai-trailers` | Validates AI-Assisted / AI-Tool / AI-Model / AI-Role trailers | (native) | on |

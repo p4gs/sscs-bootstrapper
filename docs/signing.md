@@ -31,14 +31,14 @@ ssh_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5…"
 |-------|----------|-------------------------------|
 | `human` | commits, tags, artifacts | **yes** (this is the only class that may) |
 | `ci` | artifacts, attestations | no |
-| `ai` | nothing — see below | no |
+| `ai` | nothing by default; feature-branch commits only when the `agent-signing` control is enabled | **no** (never, either way) |
 
 From `signers.toml`, `sscsb` **generates** `.sscsb/policy/allowed_signers` — the file
 git consults to decide whether a signature verifies — and points
 `gpg.ssh.allowedSignersFile` at it. The generator has one rule that no configuration
 option can turn off:
 
-> **An `ai`-class key is never written into `allowed_signers`.**
+> **By default, an `ai`-class key is never written into `allowed_signers`.**
 
 Not written and then rejected downstream. **Not written.** The material git would need
 in order to verify an AI's signature is not present, so an AI-signed commit cannot be
@@ -47,8 +47,27 @@ and regardless of what an agent with write access to that file tries to claim ab
 itself. The one class it could name to grant itself signing power is the one class
 that gets stripped on the way out.
 
-An AI may draft any change. It may not sign, and it may not push to a protected
-branch. That is the boundary, and it is enforced in code, not in a guideline.
+An AI may draft any change. By default it may not sign at all, and it may **never**
+push to a protected branch. That is the boundary, and it is enforced in code, not in
+a guideline.
+
+### The one thing `agent-signing` changes (and the one it doesn't)
+
+There is a real, legitimate reason to want an agent's commits *signed*: on a feature
+branch, a verifiable agent signature makes the agent's work attributable and
+non-repudiable — useful when a human, a CI bot, and an AI are all committing to the
+same repo. The optional, **off-by-default** `agent-signing` control enables exactly
+that: with it on, `ai`-class keys *are* emitted into `allowed_signers`, so an agent
+commit verifies as `%G?=G` on a feature branch and `sscsb signers check` labels it
+`agent`.
+
+What it does **not** change is the protected-branch gate. That gate keys on the
+signer's **class**, read from `signers.toml` — not on presence in `allowed_signers` —
+so an agent signature is rejected on `main`/`master` whether the control is on or off.
+The two properties are separate on purpose. See [`agent-signing.md`](agent-signing.md)
+for the threat model, the backend matrix (TPM / FIDO2 / KMS / GitHub App / PIV), the
+server-side policy gate that closes the cloud/mobile hole, and why hardware-backing an
+agent key is about *non-exfiltratability*, not a human touch.
 
 ## Setting up a hardware key (recommended)
 
