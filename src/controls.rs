@@ -50,6 +50,19 @@ pub const CONTROLS: &[ControlDef] = &[
         ],
     },
     ControlDef {
+        id: "agent-signing",
+        phase: 1,
+        name: "AI agent commit signing",
+        summary: "Verifiable AI-agent signatures (distinct identity, never valid on protected branches); off by default",
+        default_enabled: false,
+        tools: &["ssh-tpm-agent"],
+        default_options: &[
+            ("require_agent_signatures", "false"),
+            ("allowed_backends", "[\"github-app\", \"tpm\", \"fido2\", \"kms\", \"piv\", \"software\"]"),
+            ("max_key_age_days", "90"),
+        ],
+    },
+    ControlDef {
         id: "branch-protection",
         phase: 1,
         name: "Branch protection verification",
@@ -389,6 +402,7 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
     match def.id {
         "secrets" => crate::hooks::verify_secrets_control(ctx, cfg),
         "commit-signing" => crate::hooks::verify_signing_control(ctx, cfg),
+        "agent-signing" => crate::signers::verify_agent_signing_control(ctx, cfg),
         "branch-protection" => crate::audit::verify_branch_protection(ctx, cfg),
         "actions-audit" => crate::audit::verify_actions_control(ctx, false),
         "workflow-audit-extended" => crate::audit::verify_actions_control(ctx, true),
@@ -488,6 +502,7 @@ mod tests {
             "guac",
             "oras",
             "ai-receipts",
+            "agent-signing",
         ] {
             assert!(
                 !control(id).unwrap().default_enabled,

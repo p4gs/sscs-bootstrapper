@@ -25,6 +25,15 @@
       "badge": [],
       "notes": "Hardware-backed signatures cryptographically authenticate the human actor behind every commit and merge, making repository history tamper-evident."
     },
+    "agent-signing": {
+      "name": "AI-agent commit signing (distinct identity; never valid on protected branches)",
+      "phase": 1,
+      "slsa": ["Source L1: Identity Management"],
+      "ssdf": ["PS.1.1", "PO.3.2"],
+      "cra": ["Annex I Part I(2)(f) (integrity of code, commands and configuration)"],
+      "badge": [],
+      "notes": "Gives an AI agent a verifiable non-human signing identity so its commits are attributable and non-repudiable on feature branches, while the human-only protected-branch gate remains intact — humans, CI, and AI never share a key. Off by default."
+    },
     "branch-protection": {
       "name": "GitHub branch protection verification",
       "phase": 1,

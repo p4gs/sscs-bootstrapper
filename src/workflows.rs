@@ -37,6 +37,11 @@ pub const ARTIFACTS: &[Artifact] = &[
         content: include_str!("../templates/configs/trufflehog.yaml"),
     },
     Artifact {
+        control: "agent-signing",
+        dest: ".github/workflows/agent-signing-verify.yml",
+        content: include_str!("../templates/workflows/agent-signing-verify.yml"),
+    },
+    Artifact {
         control: "pr-template",
         dest: ".github/PULL_REQUEST_TEMPLATE.md",
         content: include_str!("../templates/configs/pull_request_template.md"),

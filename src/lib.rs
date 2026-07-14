@@ -13,6 +13,7 @@
 //! - [`config`] — `.sscsb/config.toml`, generated from the registry
 //! - [`tools`] — pinned external-tool registry, detection, degrade messages
 //! - [`hooks`] — git hook engine (secrets, signing guard, AI trailers, gates)
+//! - [`signers`] — signer-policy classification, agent-signing control, `signers`/`agent-key` CLI
 //! - [`audit`] — GitHub Actions workflow auditing (pinning, permissions, more)
 //! - [`deps`] — package trust (existence, approval, typosquat heuristics)
 //! - [`sbom`] / [`scan`] / [`sast`] — Syft / Trivy+OSV / OpenGrep+Semgrep
@@ -36,5 +37,6 @@ pub mod provenance;
 pub mod sast;
 pub mod sbom;
 pub mod scan;
+pub mod signers;
 pub mod tools;
 pub mod workflows;

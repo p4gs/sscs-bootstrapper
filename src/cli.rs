@@ -5,7 +5,9 @@
 use crate::config;
 use crate::context::Ctx;
 use crate::controls::{self, Outcome};
-use crate::{compliance, deps, hooks, init, observability, provenance, sast, sbom, scan, tools};
+use crate::{
+    compliance, deps, hooks, init, observability, provenance, sast, sbom, scan, signers, tools,
+};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -104,8 +106,75 @@ enum Command {
         #[command(subcommand)]
         action: OrasAction,
     },
+    /// Inspect and manage the signer policy (human / ci / ai identities)
+    Signers {
+        #[command(subcommand)]
+        action: SignersAction,
+    },
+    /// Guidance for provisioning a hardware-backed / remote agent signing key
+    AgentKey {
+        #[command(subcommand)]
+        action: AgentKeyAction,
+    },
     /// Show the pinned external-tool registry and detection status
     Tools,
+}
+
+#[derive(Subcommand)]
+enum SignersAction {
+    /// List configured signers with class, backend, expiry, attestation state
+    List,
+    /// Add a signer to .sscsb/policy/signers.toml (validated before writing)
+    Add {
+        #[arg(long)]
+        principal: String,
+        /// human | ci | ai
+        #[arg(long)]
+        class: String,
+        /// SSH public key line (ssh-ed25519 AAAA... comment)
+        #[arg(long = "ssh-key")]
+        ssh_key: Option<String>,
+        /// GPG fingerprint (for gpg.format=openpgp signers)
+        #[arg(long)]
+        gpg_fingerprint: Option<String>,
+        /// tpm | fido2 | kms | github-app | piv | software
+        #[arg(long)]
+        backend: Option<String>,
+        /// Assert the key is hardware-backed / non-exportable
+        #[arg(long)]
+        hardware_backed: bool,
+        /// Rotation date, YYYY-MM-DD
+        #[arg(long)]
+        expires: Option<String>,
+    },
+    /// Classify recent commits as human / ci / agent / unsigned
+    Check {
+        /// Commit range (e.g. origin/main..HEAD); default: last 20 commits
+        range: Option<String>,
+        /// Instead of local signature classification, verify commits are
+        /// GitHub-'Verified' and committed by this login (server-side signing)
+        #[arg(long = "github-app")]
+        github_app: Option<String>,
+    },
+    /// Server-side gate: reject policy changes in base..head not made by a
+    /// human trusted BEFORE the push (reads trusted policy from `base`)
+    VerifyPolicy {
+        /// Trusted pre-push tip (e.g. github.event.before)
+        #[arg(long)]
+        base: String,
+        /// Pushed tip (e.g. github.sha)
+        #[arg(long)]
+        head: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentKeyAction {
+    /// Print setup guidance for a signing backend (github-app | tpm | ...)
+    Setup {
+        #[arg(long)]
+        backend: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -247,6 +316,8 @@ pub fn run() -> Result<ExitCode> {
         Command::Guac { action } => cmd_guac(&cwd, action),
         Command::Vex { action } => cmd_vex(&cwd, action),
         Command::Oras { action } => cmd_oras(&cwd, action),
+        Command::Signers { action } => cmd_signers(&cwd, action),
+        Command::AgentKey { action } => cmd_agent_key(action),
         Command::Tools => cmd_tools(),
     }
 }
@@ -660,6 +731,103 @@ fn cmd_oras(cwd: &std::path::Path, action: OrasAction) -> Result<ExitCode> {
     }
 }
 
+fn cmd_signers(cwd: &std::path::Path, action: SignersAction) -> Result<ExitCode> {
+    let ctx = Ctx::discover(cwd)?;
+    match action {
+        SignersAction::List => {
+            for line in signers::describe_signers(&ctx)? {
+                println!("{line}");
+            }
+            ok()
+        }
+        SignersAction::Add {
+            principal,
+            class,
+            ssh_key,
+            gpg_fingerprint,
+            backend,
+            hardware_backed,
+            expires,
+        } => {
+            let cfg = ctx.require_config()?;
+            let note = signers::add_signer(
+                &ctx,
+                cfg,
+                &signers::NewSigner {
+                    principal,
+                    class,
+                    ssh_public_key: ssh_key,
+                    gpg_fingerprint,
+                    backend,
+                    hardware_backed,
+                    expires,
+                },
+            )?;
+            println!("{note}");
+            ok()
+        }
+        SignersAction::Check { range, github_app } => {
+            let cfg = ctx.require_config()?;
+            if let Some(committer) = github_app {
+                let commits =
+                    signers::verify_github_app_commits(&ctx, cfg, &committer, range.as_deref())?;
+                let mut bad = 0u32;
+                for c in &commits {
+                    let ok_flag = c.verified && c.committer_matches;
+                    if !ok_flag {
+                        bad += 1;
+                    }
+                    println!(
+                        "{:<10} {:<9} committer={} ({})",
+                        c.sha,
+                        if ok_flag { "verified" } else { "UNVERIFIED" },
+                        c.committer,
+                        c.reason
+                    );
+                }
+                return if bad > 0 { fail(1) } else { ok() };
+            }
+            let classes = signers::classify_range(&ctx, cfg, range.as_deref())?;
+            if classes.is_empty() {
+                println!("no commits to classify");
+            }
+            for c in &classes {
+                println!("{:<10} {:<14} {}", c.sha, c.label, c.detail);
+            }
+            ok()
+        }
+        SignersAction::VerifyPolicy { base, head } => {
+            let problems = signers::verify_policy_changes(&ctx, &base, &head)?;
+            if problems.is_empty() {
+                println!("policy gate: no unauthorized policy changes in {base}..{head}");
+                return ok();
+            }
+            for p in &problems {
+                eprintln!("REJECT: {p}");
+            }
+            // A "no trusted parent" note is informational, not a hard reject.
+            let only_first_push =
+                problems.len() == 1 && problems[0].contains("no trusted parent policy");
+            if only_first_push {
+                ok()
+            } else {
+                fail(1)
+            }
+        }
+    }
+}
+
+fn cmd_agent_key(action: AgentKeyAction) -> Result<ExitCode> {
+    match action {
+        AgentKeyAction::Setup { backend } => {
+            for line in signers::agent_key_setup_guidance(&backend)? {
+                println!("{line}");
+            }
+            ok()
+        }
+    }
+}
+
 fn cmd_tools() -> Result<ExitCode> {
     println!("{:<14} {:<10} {:<12} status", "tool", "pin", "found");
     for spec in tools::TOOLS {
@@ -707,6 +875,8 @@ mod tests {
             "deps",
             "receipt",
             "provenance",
+            "signers",
+            "agent-key",
         ] {
             assert!(help.contains(cmd), "help missing `{cmd}`");
         }

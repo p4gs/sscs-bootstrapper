@@ -168,6 +168,17 @@ pub const TOOLS: &[ToolSpec] = &[
         brew: None,
         install_note: "Optional richer build-step attestation; see upstream releases.",
     },
+    ToolSpec {
+        id: "ssh-tpm-agent",
+        bin: "ssh-tpm-agent",
+        pinned_version: "0.9.0",
+        version_args: &["--version"],
+        homepage: "https://github.com/Foxboron/ssh-tpm-agent",
+        brew: None,
+        install_note: "Linux/TPM only: holds an ssh signing key inside the TPM (non-exportable). \
+                       An empty-passphrase TPM key gives touchless agent signing. \
+                       See docs/agent-signing.md; macOS/WSL have no TPM — this control degrades.",
+    },
 ];
 
 #[derive(Debug, Clone)]

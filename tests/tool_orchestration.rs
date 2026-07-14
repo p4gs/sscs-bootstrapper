@@ -775,6 +775,7 @@ fn every_control_can_be_enabled_and_verified() {
     const ALL: &[&str] = &[
         "secrets",
         "commit-signing",
+        "agent-signing",
         "branch-protection",
         "actions-audit",
         "ai-trailers",
@@ -912,6 +913,7 @@ fn verify_reports_every_control_and_strict_mode_gates_on_degraded() {
     for control in [
         "secrets",
         "commit-signing",
+        "agent-signing",
         "branch-protection",
         "actions-audit",
         "ai-trailers",
