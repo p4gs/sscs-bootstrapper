@@ -1,0 +1,53 @@
+# Server-side agent-signing policy gate.
+#
+# WHY THIS EXISTS: the client-side pre-push hook reads the signer policy from
+# the working tree, which the pushing actor controls — and in Claude Code cloud
+# / mobile there is no local hook at all. This workflow re-checks signer policy
+# on GitHub's runners, reading the TRUSTED policy from the parent commit
+# (github.event.before) and rejecting any push that changes .sscsb/policy/**
+# unless a human who was already trusted BEFORE the push signed the change.
+# That is the only thing that stops an agent (or anyone) promoting an ai/ci key
+# to `human` and using it in the same push.
+#
+# Dogfood: this template passes `sscsb verify actions-audit` (SHA-pinned,
+# least-privilege, Harden-Runner first). It is installed only when the
+# `agent-signing` control is enabled.
+name: agent-signing-policy-gate
+
+on:
+  push:
+    branches: ["{{default_branch}}"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout (full history so the parent policy is readable)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install sscsb
+        # Pin to a published version in your own copy, e.g.
+        #   cargo install --locked --version X.Y.Z sscsb
+        # cargo is preinstalled on ubuntu-latest; --locked keeps Cargo.lock exact.
+        run: cargo install --locked sscsb
+      - name: Verify no unauthorized signer-policy changes
+        env:
+          # push: github.event.before is the pre-push tip. pull_request: use the
+          # base sha. Either way, the trusted policy is read from this ref.
+          BASE: ${{ github.event.before || github.event.pull_request.base.sha }}
+          HEAD: ${{ github.sha }}
+        run: sscsb signers verify-policy --base "$BASE" --head "$HEAD"

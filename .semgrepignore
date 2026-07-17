@@ -1,0 +1,15 @@
+# OpenGrep/Semgrep ignore list for THIS repository (sscsb's own source tree).
+#
+# templates/rules/ is the source of the SAST ruleset that sscsb ships. A rule
+# file necessarily contains the pattern text it matches on — e.g. the rule that
+# flags `npm install` without --ignore-scripts contains the string it looks for —
+# so scanning a ruleset with itself produces findings that are false by
+# construction. The installed copy (.sscsb/rules) is excluded at the command
+# line for the same reason; this covers the source copy that only this repo has.
+#
+# This is NOT a suppression of a security finding. It stops the scanner from
+# analysing its own rule definitions. Nothing under templates/rules/ is executed.
+templates/rules/
+
+# Build output.
+target/
