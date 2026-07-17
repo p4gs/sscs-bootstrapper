@@ -1,5 +1,22 @@
 # SSCS Bootstrapper (`sscsb`)
 
+[![CI](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/ci.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/codeql.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/codeql.yml)
+[![SAST (OpenGrep)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/sast-opengrep.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/sast-opengrep.yml)
+[![Vulnerability Scan](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/vuln-scan.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/vuln-scan.yml)
+[![Secret Scan](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/secrets-scan.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/secrets-scan.yml)
+[![SBOM](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/sbom.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/sbom.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/p4gs/sscs-bootstrapper/badge)](https://securityscorecards.dev/viewer/?uri=github.com/p4gs/sscs-bootstrapper)
+[![SLSA Build Level 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev/spec/v1.0/levels#build-l3)
+[![Renovate enabled](https://img.shields.io/badge/renovate-enabled-brightgreen.svg)](https://docs.renovatebot.com/)
+
+> The `CI`/`CodeQL`/`SAST`/`Vulnerability Scan`/`Secret Scan`/`SBOM`/`Scorecard`
+> badges track the **default branch**. They read as pending/blank until
+> [PR #1](https://github.com/p4gs/sscs-bootstrapper/pull/1) — which introduces
+> every workflow below — merges to `main`; each then self-populates from that
+> workflow's real runs. Nothing here is a static claim standing in for a tool
+> that hasn't actually run.
+
 Software supply chain security for solo developers and small teams who write code
 with AI — bootstrapped into a git repository in one command.
 
