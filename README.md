@@ -1,17 +1,22 @@
 # SSCS Bootstrapper (`sscsb`)
 
 [![CI](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/ci.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/codeql.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/codeql.yml)
+[![SAST (OpenGrep)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/sast-opengrep.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/sast-opengrep.yml)
+[![Vulnerability Scan](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/vuln-scan.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/vuln-scan.yml)
+[![Secret Scan](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/secrets-scan.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/secrets-scan.yml)
+[![SBOM](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/sbom.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/sbom.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/p4gs/sscs-bootstrapper/badge)](https://securityscorecards.dev/viewer/?uri=github.com/p4gs/sscs-bootstrapper)
+[![SLSA Build Level 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev/spec/v1.0/levels#build-l3)
+[![Renovate enabled](https://img.shields.io/badge/renovate-enabled-brightgreen.svg)](https://docs.renovatebot.com/)
 
-> `.github/workflows/ci.yml` is this repo's only committed workflow — everything
-> else under `.github/workflows/` and `.sscsb/` is `sscsb`'s own *generated
-> output* (see `.gitignore`), kept out of version control on purpose so a
-> reviewer is never unsure whether a file is hand-authored or tool-produced.
-> That means a live CodeQL/SAST/Scorecard/SLSA/Secret-Scan/SBOM badge would be
-> unfulfillable — those workflows never actually run in *this* repo's GitHub
-> Actions, so the badge would sit permanently blank, which is exactly the kind
-> of quiet-false-assurance this tool exists to prevent. The real, live picture
-> of what's enforced *here* is `sscsb verify` / `sscsb report`, run against
-> this repo, right now — not a static badge.
+> `sscsb` now dogfoods its own generated output: `.github/workflows/`,
+> `.sscsb/`, `.gitleaks.toml`, `.trufflehog.yaml`, and `renovate.json5` are
+> committed, not gitignored, so every badge above tracks a workflow that
+> actually runs in *this* repo's GitHub Actions on the default branch — not a
+> static claim. They read pending/blank until this change reaches `main`, then
+> self-populate from real runs. For the live local picture at any commit, run
+> `sscsb verify` / `sscsb report` directly.
 
 Software supply chain security for solo developers and small teams who write code
 with AI — bootstrapped into a git repository in one command.
