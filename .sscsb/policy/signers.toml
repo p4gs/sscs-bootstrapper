@@ -1,0 +1,15 @@
+# sscsb approved-signers policy.
+#
+# Humans, CI, and AI agents must NEVER share keys or identities. Only signers
+# listed here can push to protected branches, and only `class = "human"`
+# signers satisfy the human-only protected-branch signing policy. AI agents
+# draft changes; they never sign, so no `class = "ai"` entry should ever carry
+# a key that is used for signing — the class exists so an AI-associated
+# identity can be explicitly DENIED signing rights.
+#
+# [[signer]]
+# principal = "you@example.com"          # matches allowed_signers principal
+# class = "human"                        # human | ci | ai
+# hardware_backed = true                 # asserted when the key lives on a YubiKey/secure element
+# ssh_public_key = "ssh-ed25519 AAAA... you@example.com"
+# # gpg_fingerprint = "ABCD1234..."      # for gpg.format=openpgp signers

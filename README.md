@@ -1,5 +1,23 @@
 # SSCS Bootstrapper (`sscsb`)
 
+[![CI](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/ci.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/codeql.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/codeql.yml)
+[![SAST (OpenGrep)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/sast-opengrep.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/sast-opengrep.yml)
+[![Vulnerability Scan](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/vuln-scan.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/vuln-scan.yml)
+[![Secret Scan](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/secrets-scan.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/secrets-scan.yml)
+[![SBOM](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/sbom.yml/badge.svg)](https://github.com/p4gs/sscs-bootstrapper/actions/workflows/sbom.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/p4gs/sscs-bootstrapper/badge)](https://securityscorecards.dev/viewer/?uri=github.com/p4gs/sscs-bootstrapper)
+[![SLSA Build Level 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev/spec/v1.0/levels#build-l3)
+[![Renovate enabled](https://img.shields.io/badge/renovate-enabled-brightgreen.svg)](https://docs.renovatebot.com/)
+
+> `sscsb` now dogfoods its own generated output: `.github/workflows/`,
+> `.sscsb/`, `.gitleaks.toml`, `.trufflehog.yaml`, and `renovate.json5` are
+> committed, not gitignored, so every badge above tracks a workflow that
+> actually runs in *this* repo's GitHub Actions on the default branch — not a
+> static claim. They read pending/blank until this change reaches `main`, then
+> self-populate from real runs. For the live local picture at any commit, run
+> `sscsb verify` / `sscsb report` directly.
+
 Software supply chain security for solo developers and small teams who write code
 with AI — bootstrapped into a git repository in one command.
 

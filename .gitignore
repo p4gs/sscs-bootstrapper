@@ -1,27 +1,12 @@
 /target
 .DS_Store
 
-# Dogfood state: running `sscsb init` on this repo generates the files below.
-# They are regenerable (the walkthrough in docs/example-walkthrough.md shows the
-# full set), so they are not committed — committing generated bootstrap output
-# alongside the hand-authored templates that produce it would only confuse a
-# reviewer about which is which. The tool's own CI is .github/workflows/ci.yml.
-/.sscsb/
-/.gitleaks.toml
-/.trufflehog.yaml
-/renovate.json5
-/.github/PULL_REQUEST_TEMPLATE.md
-/.github/chainguard/
-/.github/workflows/secrets-scan.yml
-/.github/workflows/sbom.yml
-/.github/workflows/vuln-scan.yml
-/.github/workflows/scorecard.yml
-/.github/workflows/release-sign.yml
-/.github/workflows/release-slsa.yml
-/.github/workflows/deploy-gate.yml
-/.github/workflows/octo-sts-example.yml
-/.github/workflows/sast-opengrep.yml
-/.github/workflows/codeql.yml
+# Runtime output (SBOMs, provenance receipts) written by `sscsb sbom` /
+# `sscsb receipt create` / `sscsb guac ingest` etc. — ephemeral, regenerated
+# on demand. This is distinct from .sscsb/config.toml, .sscsb/policy/,
+# .sscsb/hooks/, and .sscsb/rules/, which ARE committed: they're this repo's
+# actual policy, not build output.
+/.sscsb/out/
 
 # Agent worktrees from the coverage build-out.
 /.claude/
