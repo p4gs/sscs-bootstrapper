@@ -200,6 +200,15 @@ pub const CONTROLS: &[ControlDef] = &[
         default_options: &[],
     },
     ControlDef {
+        id: "github-attestations",
+        phase: 3,
+        name: "GitHub artifact attestations",
+        summary: "GitHub-native build provenance (attest-build-provenance) — additive to Cosign/SLSA, verified with `gh attestation verify`",
+        default_enabled: true,
+        tools: &["gh"],
+        default_options: &[],
+    },
+    ControlDef {
         id: "provenance-verify",
         phase: 3,
         name: "Provenance verification gates",
@@ -413,8 +422,14 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
         "vuln-scan" => crate::scan::verify_scan_control(ctx),
         "grype" => crate::sbom::verify_grype_control(ctx),
         "package-trust" => crate::deps::verify_package_trust(ctx, cfg),
-        "scorecard" | "renovate" | "codeql" | "sigstore-signing" | "slsa-provenance"
-        | "octo-sts" | "harden-runner" => crate::workflows::verify_template_control(ctx, def.id),
+        "scorecard"
+        | "renovate"
+        | "codeql"
+        | "sigstore-signing"
+        | "slsa-provenance"
+        | "github-attestations"
+        | "octo-sts"
+        | "harden-runner" => crate::workflows::verify_template_control(ctx, def.id),
         "provenance-verify" => crate::provenance::verify_provenance_control(ctx),
         "sast" => crate::sast::verify_sast_control(ctx, cfg),
         "sighthound" => crate::sast::verify_sighthound_control(ctx),

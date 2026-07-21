@@ -169,6 +169,15 @@
       "badge": ["signed_releases"],
       "notes": "The reusable trusted builder runs hosted and isolated, and its control plane signs provenance that build steps cannot forge — the Build L3 requirement set."
     },
+    "github-attestations": {
+      "name": "GitHub-native artifact attestations (actions/attest-build-provenance)",
+      "phase": 3,
+      "slsa": ["Build L1: Provenance Exists", "Build L2: Provenance is Authentic", "Build L2: Hosted"],
+      "ssdf": ["PS.2.1"],
+      "cra": ["Annex I Part I(2)(f) (integrity of software)"],
+      "badge": ["signed_releases"],
+      "notes": "A third, independent provenance trail in GitHub's own attestation store, verifiable anywhere with `gh attestation verify` and no extra tooling. Additive to the Cosign and slsa-github-generator trails; the Build L3 claim stays with the isolated trusted builder."
+    },
     "provenance-verify": {
       "name": "Provenance verification gates (slsa-verifier + cosign) before deploy/publish",
       "phase": 3,

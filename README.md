@@ -94,7 +94,7 @@ in the per-phase docs.
 |-------|------------------|------|
 | **1 — Commit integrity** | Secrets blocked pre-commit and pre-push. Hardware-backed, human-only signing enforced on protected branches. Branch protection checked. Actions audited for mutable refs and over-broad permissions. AI-provenance commit trailers, with extra gates when AI adds a dependency or a shell command. | [docs/phase-1.md](docs/phase-1.md) |
 | **2 — Know your dependencies** | CycloneDX SBOMs (Syft). Vulnerability scanning (Trivy + OSV-Scanner V2). Scorecard. Renovate with digest pinning. Package-trust: does this package *exist*, is it one edit away from a popular name, did a human approve it? | [docs/phase-2.md](docs/phase-2.md) |
-| **3 — Provenance** | Keyless signing (Cosign/Fulcio/Rekor). SBOM and provenance attestations bound to artifact digests. SLSA Build L3 provenance via the official generator, verified with slsa-verifier before anything is promoted. Short-lived credentials (Octo STS). Harden-Runner on every job. | [docs/phase-3.md](docs/phase-3.md) |
+| **3 — Provenance** | Keyless signing (Cosign/Fulcio/Rekor). SBOM and provenance attestations bound to artifact digests. SLSA Build L3 provenance via the official generator, verified with slsa-verifier before anything is promoted. GitHub-native artifact attestations, verifiable with nothing but `gh`. Short-lived credentials (Octo STS). Harden-Runner on every job. | [docs/phase-3.md](docs/phase-3.md) |
 | **4 — Code analysis** | OpenGrep SAST by default (Semgrep selectable), in pre-commit and CI. CodeQL on PRs and the default branch. Extended workflow auditing: `pull_request_target` misuse, credential persistence, secret echo, known-risky actions. | [docs/phase-4.md](docs/phase-4.md) |
 | **5 — Continuous posture** | Dependency-Track for continuous SBOM management. GUAC for the supply-chain graph. OpenVEX so "not exploitable" is a first-class, auditable answer instead of a muted alert. A machine-readable control → SLSA/SSDF/CRA map behind `sscsb report`. | [docs/phase-5.md](docs/phase-5.md) |
 
@@ -110,7 +110,7 @@ Two more docs cover the parts people get wrong:
 
 ## Controls
 
-32 controls, each with an id you can `enable`, `disable`, and `verify`:
+34 controls, each with an id you can `enable`, `disable`, and `verify`:
 
 ```sh
 sscsb status                      # what's on, what's installed
