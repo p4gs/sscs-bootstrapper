@@ -11,6 +11,7 @@ This is the phase that gets you to **SLSA Build Level 3**.
 |---------|--------------|--------------|---------|
 | `sigstore-signing` | Keyless signing + attestations bound to digests | Cosign / Fulcio / Rekor | on |
 | `slsa-provenance` | SLSA Build L3 provenance from the official generator | slsa-github-generator | on |
+| `github-attestations` | GitHub-native attestations in GitHub's own store | actions/attest-build-provenance, gh | on |
 | `provenance-verify` | Verification gate before promote / deploy / publish | slsa-verifier, Cosign | on |
 | `octo-sts` | Short-lived, repo-scoped credentials instead of PATs | Octo STS | on |
 | `harden-runner` | Egress and tamper monitoring on every job | StepSecurity Harden-Runner | on |
@@ -69,6 +70,44 @@ builder it cannot identify. `sscsb`'s Actions auditor encodes it as a **single
 named exception** for exactly that action prefix, so the rule "everything is
 SHA-pinned" stays enforceable for everything else — including any *other* reusable
 workflow you add.
+
+## GitHub-native attestations (a third trail, not a replacement)
+
+`github-attestations` installs `release-attest.yml`, which runs
+[`actions/attest-build-provenance`](https://docs.github.com/en/actions/concepts/security/artifact-attestations)
+over the same artifact set the other two release workflows build. It is
+**additive by design** — three independent provenance trails over identical
+digests, differing in where the evidence lives and what a consumer needs in
+order to check it:
+
+| Trail | Evidence lives in | Consumer verifies with |
+|-------|-------------------|------------------------|
+| `sigstore-signing` | `.sigstore.json` bundles attached to the release | `cosign verify-blob` (or `sscsb provenance verify-blob`) |
+| `slsa-provenance` | `.intoto.jsonl` attached to the release | `slsa-verifier` (or `sscsb provenance verify`) |
+| `github-attestations` | GitHub's attestation store (queried via API) | `gh attestation verify` — nothing to install beyond the `gh` CLI |
+
+The `gh` path is the lowest-friction one for downstream consumers: no cosign,
+no slsa-verifier, no bundle files to locate — the attestation travels with the
+repository, not the release assets:
+
+```sh
+gh attestation verify dist/app.tar.gz --repo OWNER/REPO \
+  --signer-workflow OWNER/REPO/.github/workflows/release-attest.yml
+```
+
+The identity rule from keyless signing applies unchanged: the installed
+workflow's in-pipeline verify job pins **both** `--repo` and
+`--signer-workflow`, because "some workflow somewhere attested this" is not a
+control — "this repository's release-attest workflow attested this" is.
+
+Two honesty notes. First, this default-workflow path produces SLSA Build
+L1/L2 provenance material; it does **not** claim L3 — the isolated trusted
+builder in `release-slsa.yml` keeps that claim, which is why both ship.
+Second, availability: attestations work on public repositories on all plans,
+but private repositories require GitHub Enterprise Cloud — on a private
+free-plan repo this workflow will fail at the attest step, and disabling the
+control (`sscsb disable github-attestations`) is the honest configuration
+there.
 
 ## Verification before promotion
 

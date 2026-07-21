@@ -97,6 +97,10 @@ enabled = true
 [controls.slsa-provenance]
 enabled = true
 
+# GitHub artifact attestations: GitHub-native build provenance (attest-build-provenance) — additive to Cosign/SLSA, verified with `gh attestation verify`
+[controls.github-attestations]
+enabled = true
+
 # Provenance verification gates: slsa-verifier + cosign verification required before promote/deploy/publish
 [controls.provenance-verify]
 enabled = true
