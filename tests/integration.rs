@@ -105,6 +105,7 @@ fn init_creates_config_hooks_policies_and_templates() {
         ".github/workflows/release-sign.yml",
         ".github/workflows/release-slsa.yml",
         ".github/workflows/release-attest.yml",
+        ".github/workflows/release-attest-sbom.yml",
         ".github/workflows/deploy-gate.yml",
         ".github/workflows/octo-sts-example.yml",
         ".github/chainguard/sscsb-automation.sts.yaml",

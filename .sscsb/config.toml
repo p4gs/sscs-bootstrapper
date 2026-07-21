@@ -101,6 +101,10 @@ enabled = true
 [controls.github-attestations]
 enabled = true
 
+# GitHub SBOM attestation bound to the artifact digest (actions/attest, sbom-path) — additive, verified with `gh attestation verify`
+[controls.sbom-attestation]
+enabled = true
+
 # Provenance verification gates: slsa-verifier + cosign verification required before promote/deploy/publish
 [controls.provenance-verify]
 enabled = true
