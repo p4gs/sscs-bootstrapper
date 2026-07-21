@@ -82,6 +82,11 @@ pub const ARTIFACTS: &[Artifact] = &[
         content: include_str!("../templates/workflows/release-attest.yml"),
     },
     Artifact {
+        control: "sbom-attestation",
+        dest: ".github/workflows/release-attest-sbom.yml",
+        content: include_str!("../templates/workflows/release-attest-sbom.yml"),
+    },
+    Artifact {
         control: "provenance-verify",
         dest: ".github/workflows/deploy-gate.yml",
         content: include_str!("../templates/workflows/deploy-gate.yml"),

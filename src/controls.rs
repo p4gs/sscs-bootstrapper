@@ -209,6 +209,15 @@ pub const CONTROLS: &[ControlDef] = &[
         default_options: &[],
     },
     ControlDef {
+        id: "sbom-attestation",
+        phase: 3,
+        name: "GitHub SBOM attestation",
+        summary: "GitHub-native SBOM attestation bound to the artifact digest (actions/attest, sbom-path) — additive, verified with `gh attestation verify`",
+        default_enabled: true,
+        tools: &["gh"],
+        default_options: &[],
+    },
+    ControlDef {
         id: "provenance-verify",
         phase: 3,
         name: "Provenance verification gates",
@@ -428,6 +437,7 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
         | "sigstore-signing"
         | "slsa-provenance"
         | "github-attestations"
+        | "sbom-attestation"
         | "octo-sts"
         | "harden-runner" => crate::workflows::verify_template_control(ctx, def.id),
         "provenance-verify" => crate::provenance::verify_provenance_control(ctx),

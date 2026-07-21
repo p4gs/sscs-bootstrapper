@@ -12,6 +12,7 @@ This is the phase that gets you to **SLSA Build Level 3**.
 | `sigstore-signing` | Keyless signing + attestations bound to digests | Cosign / Fulcio / Rekor | on |
 | `slsa-provenance` | SLSA Build L3 provenance from the official generator | slsa-github-generator | on |
 | `github-attestations` | GitHub-native attestations in GitHub's own store | actions/attest-build-provenance, gh | on |
+| `sbom-attestation` | GitHub-native SBOM attestation bound to the artifact digest | actions/attest (sbom-path), gh | on |
 | `provenance-verify` | Verification gate before promote / deploy / publish | slsa-verifier, Cosign | on |
 | `octo-sts` | Short-lived, repo-scoped credentials instead of PATs | Octo STS | on |
 | `harden-runner` | Egress and tamper monitoring on every job | StepSecurity Harden-Runner | on |
@@ -108,6 +109,41 @@ but private repositories require GitHub Enterprise Cloud — on a private
 free-plan repo this workflow will fail at the attest step, and disabling the
 control (`sscsb disable github-attestations`) is the honest configuration
 there.
+
+## SBOM attestation (the SBOM, bound to the digest)
+
+`github-attestations` attests *how* the artifact was built. `sbom-attestation`
+attests *what is in it*: it installs `release-attest-sbom.yml`, which generates
+a CycloneDX SBOM and then binds it to the artifact's digest as a signed
+attestation in GitHub's own store — verifiable the same low-friction way:
+
+```sh
+gh attestation verify dist/app.tar.gz --repo OWNER/REPO \
+  --predicate-type https://cyclonedx.org/bom \
+  --signer-workflow OWNER/REPO/.github/workflows/release-attest-sbom.yml
+```
+
+The `--predicate-type` is **not optional** here: `gh attestation verify`
+defaults to the build-provenance predicate (`https://slsa.dev/provenance/v1`),
+so an SBOM attestation is invisible unless you name its predicate type
+(`https://cyclonedx.org/bom` for CycloneDX, `https://spdx.dev/Document/v2.3` for
+SPDX). The installed verify job passes it for you.
+
+This is a genuine SBOM *attestation*, not just SBOM *generation*: the `sbom`
+control produces a CycloneDX file, but only this control cryptographically ties
+that SBOM to the exact artifact digest, so a consumer can prove the SBOM they
+hold describes the artifact they received. It uses `actions/attest` in SBOM mode
+(`sbom-path`) because `actions/attest-sbom` is **deprecated** in favour of the
+generic `attest` action; the engine is pinned to the same `v4.1.1` that
+`release-attest.yml`'s `attest-build-provenance` wrapper uses internally.
+
+Two honesty notes carry over. It is **not** mapped to SLSA — SLSA Build levels
+cover provenance, not the SBOM predicate; the obligations it satisfies are SSDF
+**PS.3.2** ("provenance data … in a software bill of materials") and CRA Annex I
+Part II(1) (a machine-readable SBOM). And the same availability caveat applies:
+public repos on all plans, private repos need GitHub Enterprise Cloud, so
+`sscsb disable sbom-attestation` is the honest configuration on a private
+free-plan repo.
 
 ## Verification before promotion
 

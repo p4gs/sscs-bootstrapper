@@ -10,7 +10,7 @@ The project is a trivial Rust crate with one dependency.
 
 ```console
 $ sscsb init
-write .sscsb/config.toml (34 controls, secure defaults)
+write .sscsb/config.toml (35 controls, secure defaults)
 write .sscsb/hooks/pre-commit (POSIX shim → `sscsb hook …`, fail-closed)
 write .sscsb/hooks/commit-msg (POSIX shim → `sscsb hook …`, fail-closed)
 write .sscsb/hooks/pre-push (POSIX shim → `sscsb hook …`, fail-closed)
@@ -30,6 +30,7 @@ write renovate.json5
 write .github/workflows/release-sign.yml
 write .github/workflows/release-slsa.yml
 write .github/workflows/release-attest.yml
+write .github/workflows/release-attest-sbom.yml
 write .github/workflows/deploy-gate.yml
 write .github/workflows/octo-sts-example.yml
 write .github/chainguard/sscsb-automation.sts.yaml
@@ -236,6 +237,8 @@ $ sscsb verify
 ...
 [PASS    ] github-attestations
            .github/workflows/release-attest.yml installed
+[PASS    ] sbom-attestation
+           .github/workflows/release-attest-sbom.yml installed
 [PASS    ] provenance-verify
            slsa-verifier: 2.7.1
            cosign: 3.1.1
@@ -251,7 +254,7 @@ $ sscsb verify
 [disabled] witness
            disabled in .sscsb/config.toml
 [PASS    ] compliance-map
-           map covers all 34 controls across SLSA/SSDF/CRA/Badge
+           map covers all 35 controls across SLSA/SSDF/CRA/Badge
 
 verify: 0 failed, 2 degraded
 ```
@@ -306,12 +309,12 @@ $ sscsb scan
 ```
 .github/PULL_REQUEST_TEMPLATE.md
 .github/chainguard/sscsb-automation.sts.yaml
-.github/workflows/{codeql,deploy-gate,octo-sts-example,release-attest,release-sign,
-                   release-slsa,sast-opengrep,sbom,scorecard,secrets-scan,vuln-scan}.yml
+.github/workflows/{codeql,deploy-gate,octo-sts-example,release-attest,release-attest-sbom,
+                   release-sign,release-slsa,sast-opengrep,sbom,scorecard,secrets-scan,vuln-scan}.yml
 .gitleaks.toml
 .trufflehog.yaml
 renovate.json5
-.sscsb/config.toml            # 34 controls, generated from the registry
+.sscsb/config.toml            # 35 controls, generated from the registry
 .sscsb/hooks/{pre-commit,commit-msg,pre-push}
 .sscsb/policy/{signers.toml,packages.toml,allowed_signers}
 .sscsb/rules/sscsb-default.yaml
