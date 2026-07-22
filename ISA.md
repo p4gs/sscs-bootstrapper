@@ -399,3 +399,129 @@ functions floor is 94% by the documented cargo-llvm-cov instance-counting artifa
 function has a passing test, and the residual is phantom per-context twins plus
 tool-Found closures for tools absent from the sandbox (guacone / witness /
 sighthound). No untested logic; no assertion-free padding.
+
+### J — Increment: OpenSSF-Scorecard scan + remediate (owner-directed 2026-07-21)
+
+Owner ran sscsb's Scorecard workflow against sscs-bootstrapper and expected the
+branch-protection findings to be remediated; audit showed sscsb had NO
+remediation-of-remote-settings capability (every GitHub-facing control was
+read-only verify) and `verify branch-protection` only checked rule-TYPE
+presence, never the granular parameters Scorecard scores. This increment adds
+the first write path + a live Scorecard scanner.
+
+- [x] ISC-146: `verify branch-protection` reads the granular ruleset parameters
+  (`dismiss_stale_reviews_on_push`, `require_code_owner_review`,
+  `require_last_push_approval`, `required_approving_review_count`, `strict`) and
+  reports each Scorecard knob, distinguishing the solo-SAFE tier from the
+  second-reviewer tier a solo maintainer cannot satisfy (probe: stubbed-gh test
+  `branch_protection_reports_scorecard_granular_fields`).
+- [x] ISC-147: NEW `sscsb harden` subcommand (first remote-write path) —
+  `harden branch-protection` sets the solo-safe knobs (`dismiss_stale`, strict);
+  DRY-RUN by default, `--apply` writes, `--require-reviews` opts into the
+  second-reviewer tier (a solo owner is left off by default so they aren't locked
+  out of self-merges). Ruleset diff/merge is pure + unit-tested; the gh GET/PUT
+  boundary is stubbed-gh tested (probe: `harden::tests` — dry-run/apply/no-ruleset).
+- [x] ISC-148: NEW `scorecard` live scan — `verify scorecard` fetches the repo's
+  Scorecard code-scanning alerts and maps each finding to a control + honest
+  status (`sscsb-fixable` / `solo-capped` / `justified-exception` / `owner-action`);
+  the CHECK_MAP + formatting are pure-tested, the gh fetch stubbed-gh tested.
+- [x] ISC-149: CODEOWNERS committed (`* @p4gs`) — required for
+  `require_code_owner_review` and Scorecard Code-Review.
+- [x] ISC-150: Gates — fmt, clippy `-D warnings`, and every new/affected test
+  pass locally; coverage is CI-authoritative (local llvm-cov aborts on the
+  pre-existing environmental git-signing failures). New network functions are
+  stubbed-gh tested per the repo's `verify_branch_protection` pattern rather than
+  ignore-regex'd.
+
+**Honest scope note:** three of the four Scorecard branch-protection warnings
+(required approvers / code-owner review / last-push approval) and Code-Review are
+STRUCTURALLY solo-capped — Scorecard assumes ≥2 reviewers and a solo maintainer
+cannot self-approve without deadlocking their own merges. sscsb sets every safe
+knob and flags the rest; it does not blindly maximize the score at the cost of
+locking the owner out. FuzzingID (0) is a separate increment (cargo-fuzz +
+ClusterFuzzLite). Applying `harden --apply` to the live repo and enabling
+settings are owner-gated (the auto-mode classifier blocks AI writes to repo
+settings, by design).
+
+- [x] ISC-151: NEW `fuzzing` control (phase 4, default-OFF — needs project fuzz
+  targets) installs `cflite-pr.yml`, the ClusterFuzzLite PR workflow Scorecard
+  detects for Rust (FuzzingID 0). SHA-pinned google/clusterfuzzlite actions,
+  harden-runner-first; passes sscsb's own actions-audit; count 35→36.
+- [x] ISC-152: Real cargo-fuzz project in `fuzz/` — 3 targets fuzzing the
+  untrusted-input parsers (`parse_trailers`, `parse_signers`, `parse_deps`) +
+  `.clusterfuzzlite/{Dockerfile,build.sh}`; sscs-bootstrapper dogfoods it.
+  VALIDATED locally: `cargo +nightly fuzz build` (full libFuzzer + ASan) exits 0
+  and produces the three target binaries build.sh copies to $OUT; `cargo fuzz
+  run parse_trailers` executes end-to-end (coverage 47→62, corpus grows, no
+  crash) — not just a type-check.
+- [x] ISC-153: Fixed a DOGFOODING GAP surfaced by fuzzing —
+  `deps::new_unapproved_deps` flagged the cargo-fuzz self-path-dep
+  (`sscsb = { path = ".." }`) as an unvetted source, blocking the repo from
+  adding cargo-fuzz. `path_resolves_within_repo` exempts in-tree path sources
+  (own code); out-of-tree paths + git/url/alias still require review (probe: unit
+  test).
+- [x] ISC-154: Unified the cross-module test PATH lock (audit shares
+  `testutil::PATH_LOCK` with harden/scorecard) so gh-stub tests never race on
+  $PATH (probe: 23 PATH tests pass together; full suite 296 pass, only the 5
+  pre-existing environmental git-signing failures).
+- [x] ISC-155: NEW `release-immutability` control (phase 3, default-OFF) installs
+  a consolidated draft-then-publish `release.yml` (build → attest-build-provenance
+  + SBOM to the attestation store → sign → upload to a DRAFT → publish once), so
+  every asset attaches before the release becomes immutable. Store-based provenance
+  is immutability-safe; the slsa-generator L3 (release-attached) trade-off is
+  documented. Count 36→37 (probe: control-list + compliance + template-audit +
+  integration must-not-install all green).
+- [x] ISC-156: Adversarial review (3-lens Workflow) before ship found + FIXED
+  real bugs — wiring lens CLEAN; the others: (HIGH) harden reported "applied ✓"
+  for `strict` when the ruleset had no required_status_checks rule (no-op PUT read
+  as success) → plan now only plans achievable changes + surfaces honest skips,
+  apply creates a missing `parameters` object, applied-count is reported;
+  (MEDIUM) release.yml signing loop swallowed cosign failures (last-iteration
+  exit status) → per-file `|| exit 1`; (LOW) put_ruleset now sends only writable
+  fields (robust to API tightening); find_branch_ruleset skips a bad entry instead
+  of aborting; harden dedupes rulesets across main/master + treats an absent
+  branch as a skip; release.yml guards re-runs against an already-published tag;
+  the --require-reviews solo-lockout warning now shows in that mode. New unit
+  tests for each (probe: harden::tests 13 pass; full suite 299 pass).
+- [x] ISC-157: PR #6 CI surfaced Trivy findings on the ClusterFuzzLite Dockerfile
+  (the file the fuzzing control's workflow needs). Remediated per the security
+  policy: DS-0001 (unpinned `:latest`) FIXED AT CODE LEVEL — base image pinned by
+  digest `gcr.io/oss-fuzz-base/base-builder-rust@sha256:4541e7f7…` (a hardening
+  tool must not ship an unpinned base). DS-0002 (runs as root) + DS-0026 (no
+  HEALTHCHECK) are documented, evidence-based waivers in a repo-root `.trivyignore`
+  (+ explicit `trivyignores:` in vuln-scan.yml): Trivy's generic runtime-container
+  rules fundamentally cannot model an ephemeral OSS-Fuzz *build* container — it
+  REQUIRES root (compiles into root-owned $OUT/$SRC/$WORK; a non-root USER breaks
+  the fuzz build) and has no service to health-check, and there is no root-free
+  way to make Rust fuzzing detectable by Scorecard. Probe: `trivy config` on the
+  Dockerfile → DS-0001 gone after the pin; `trivy fs` repo-wide honoring the
+  ignore → 0 Dockerfile findings; proven the ignore masks ONLY DS-0002/DS-0026
+  (re-scan without it shows exactly those two, nothing else).
+- [x] ISC-158: Part-B (owner ask: "ensure sscsb can also implement/remediate these
+  configs"). The fuzzing control installed only the workflow — a downstream repo
+  would get a `cflite-pr.yml` that references a Dockerfile it must invent, and any
+  Dockerfile it wrote would trip the same DS-0002/DS-0026. Completed the control:
+  it now installs a hardened, Trivy-clean ClusterFuzzLite scaffold —
+  `.clusterfuzzlite/Dockerfile` (digest-pinned), `.clusterfuzzlite/build.sh`
+  (`cargo fuzz list` loop, CUSTOMIZE stub), and the documented `.trivyignore`
+  waiver — via new fuzzing ARTIFACTS + a `{{project}}` render placeholder (slug
+  tail → the OSS-Fuzz `$SRC/<project>` path). `fuzz/` targets stay project-authored.
+  install_all is non-clobbering, so an existing `.trivyignore` is kept. Probe:
+  `enable fuzzing && init` in a throwaway `acme/widget` repo installed all three,
+  rendered `$SRC/widget`, and `trivy fs` → 0 Dockerfile findings; integration
+  must-not-install now asserts the whole scaffold stays off when fuzzing is off.
+- [x] ISC-159: Live code-scanning accounting for all 6 open Scorecard findings on
+  the repo (owner ask: "why are there ANY findings for GitHub security config
+  hardening?"). BranchProtectionID (HIGH) → remediable via `harden
+  branch-protection --apply` (the command is new in this PR and not yet applied to
+  live — the honest cause); FuzzingID (MED) → clears when this PR merges;
+  SASTID (MED) → CodeQL (push+PR) + OpenGrep (all pushes) already installed, score
+  is historical; PinnedDependenciesID (MED) @ release-slsa.yml:53 → the
+  slsa-github-generator, tag-pinned BY DESIGN (hash-pinning breaks SLSA
+  verification) — a genuine documented exception sscsb reports as
+  `justified-exception`; CodeReviewID (HIGH) + CIIBestPracticesID (LOW) →
+  structurally solo/owner-gated. Verified `verify scorecard`, `verify
+  branch-protection`, and `harden branch-protection` (dry-run) against the LIVE
+  repo (read-only). Gates green after all changes: fmt + clippy `-D warnings`
+  clean; 299 pass / 5 pre-existing environmental git-signing failures (unchanged;
+  none in touched modules).

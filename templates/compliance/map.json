@@ -196,6 +196,15 @@
       "badge": [],
       "notes": "Consumer-side verification per SLSA 'Verifying artifacts': nothing deploys or publishes unless signature and provenance validate, which is what gives Build-track claims teeth."
     },
+    "release-immutability": {
+      "name": "Immutable releases via draft-then-publish (release.yml)",
+      "phase": 3,
+      "slsa": ["Build L1: Provenance Exists", "Build L2: Provenance is Authentic"],
+      "ssdf": ["PS.1.1", "PS.3.1"],
+      "cra": ["Annex I Part II §7 (secure distribution of updates)"],
+      "badge": ["signed_releases"],
+      "notes": "Every asset attaches to a DRAFT and the release publishes ONCE, so nothing is modified after it becomes immutable (GitHub release immutability). Provenance + SBOM go to the attestation store (immutability-safe). Trade-off: slsa-github-generator L3 provenance attaches to the release, which conflicts with immutability — use release-slsa.yml (L3, mutable) OR this (immutable, store-based). Opt-in; the setting itself is UI-only (no REST API)."
+    },
     "octo-sts": {
       "name": "Short-lived GitHub credential federation (octo-sts)",
       "phase": 3,
@@ -249,6 +258,15 @@
       "cra": ["Annex I Part I(2)(a) (no known exploitable vulnerabilities)", "Annex I Part II §3 (effective and regular tests and reviews)"],
       "badge": ["static_analysis", "static_analysis_common_vulnerabilities"],
       "notes": "Dataflow/taint analysis catches injection-class vulnerabilities that lightweight pattern-based SAST misses."
+    },
+    "fuzzing": {
+      "name": "Continuous fuzzing (cargo-fuzz + ClusterFuzzLite)",
+      "phase": 4,
+      "slsa": [],
+      "ssdf": ["PW.8.2"],
+      "cra": ["Annex I Part II §3 (effective and regular tests and reviews)"],
+      "badge": ["dynamic_analysis"],
+      "notes": "Fuzz targets exercise the untrusted-input parsers (commit trailers, signer policy, dependency manifests) on every PR; ClusterFuzzLite is the integration OpenSSF Scorecard detects for Rust. Opt-in — needs project-specific fuzz targets in fuzz/."
     },
     "workflow-audit-extended": {
       "name": "Extended workflow audit (pull_request_target misuse, credential persistence, secret echo, risky-action substitution)",

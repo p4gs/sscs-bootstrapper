@@ -227,6 +227,15 @@ pub const CONTROLS: &[ControlDef] = &[
         default_options: &[],
     },
     ControlDef {
+        id: "release-immutability",
+        phase: 3,
+        name: "Immutable releases (draft-then-publish)",
+        summary: "Draft-then-publish release.yml so assets attach before publish — compatible with GitHub release immutability (Settings -> Releases); opt-in, supersedes the modular release-sign/slsa flow",
+        default_enabled: false,
+        tools: &[],
+        default_options: &[],
+    },
+    ControlDef {
         id: "octo-sts",
         phase: 3,
         name: "Octo STS federation",
@@ -282,6 +291,15 @@ pub const CONTROLS: &[ControlDef] = &[
         name: "CodeQL",
         summary: "Deep interprocedural analysis on PRs and default branch",
         default_enabled: true,
+        tools: &[],
+        default_options: &[],
+    },
+    ControlDef {
+        id: "fuzzing",
+        phase: 4,
+        name: "ClusterFuzzLite fuzzing",
+        summary: "Continuous fuzzing on PRs (cargo-fuzz + ClusterFuzzLite) — the OpenSSF-Scorecard Rust fuzzing probe; opt-in (needs project fuzz targets)",
+        default_enabled: false,
         tools: &[],
         default_options: &[],
     },
@@ -431,13 +449,15 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
         "vuln-scan" => crate::scan::verify_scan_control(ctx),
         "grype" => crate::sbom::verify_grype_control(ctx),
         "package-trust" => crate::deps::verify_package_trust(ctx, cfg),
-        "scorecard"
-        | "renovate"
+        "scorecard" => crate::scorecard::verify_scorecard_control(ctx, cfg),
+        "renovate"
         | "codeql"
+        | "fuzzing"
         | "sigstore-signing"
         | "slsa-provenance"
         | "github-attestations"
         | "sbom-attestation"
+        | "release-immutability"
         | "octo-sts"
         | "harden-runner" => crate::workflows::verify_template_control(ctx, def.id),
         "provenance-verify" => crate::provenance::verify_provenance_control(ctx),

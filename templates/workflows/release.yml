@@ -1,0 +1,100 @@
+# sscsb: immutability-compatible release (draft-then-publish). Builds, keyless-
+# signs (Cosign), SBOMs, and attests build-provenance + SBOM to GitHub's OWN
+# attestation store (immutability-safe — the store is separate from release
+# assets), uploads the signed artifacts + SBOM + bundles to a DRAFT release, then
+# publishes ONCE, so nothing is modified after the release becomes immutable.
+# Enable "release immutability" (Settings -> General -> Releases) alongside this.
+#
+# Trade-off vs release-slsa.yml: the slsa-github-generator ATTACHES SLSA L3
+# provenance to the release, which conflicts with immutability. This path uses
+# the GitHub attestation store (Build L1/L2) so the release stays immutable.
+# Use release-slsa.yml (L3, mutable) OR this (immutable, store-based) — not both.
+name: Release (immutable)
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create/publish the release + upload assets to the draft
+      id-token: write # keyless signing + attestation (Fulcio/Sigstore OIDC)
+      attestations: write # write build-provenance + SBOM to the attestation store
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      # CUSTOMIZE: replace with your real build. The default packs the source so
+      # the pipeline works end-to-end on any repo from day one.
+      - name: Build artifact
+        run: |
+          mkdir -p dist
+          git archive --format=tar.gz -o "dist/${GITHUB_REPOSITORY#*/}-${GITHUB_REF_NAME}.tar.gz" HEAD
+      - name: Refuse to release nothing
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          artifacts=(dist/*.tar.gz)
+          if [ ${#artifacts[@]} -eq 0 ]; then
+            echo "::error::no dist/*.tar.gz — nothing to release (did the build run?)"
+            exit 1
+          fi
+      - name: Attest build provenance (attestation store)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          format: cyclonedx-json
+          output-file: dist/sbom.cdx.json
+          upload-release-assets: false
+      - name: Attest the SBOM to the artifact digest (attestation store)
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/*.tar.gz
+          sbom-path: dist/sbom.cdx.json
+      # Every artifact must sign, or the step fails — a signing failure on ANY
+      # file must never let an unsigned asset reach the published (immutable)
+      # release. (`|| exit 1` per-file, not the loop's last-iteration status.)
+      - name: Keyless sign all artifacts (bundle = cert + sig + Rekor proof)
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          for f in dist/*; do
+            case "$f" in *.sigstore.json) continue ;; esac
+            cosign sign-blob "$f" --bundle "$f.sigstore.json" --yes \
+              || { echo "::error::signing failed for $f"; exit 1; }
+          done
+      # Draft-then-publish: EVERY asset write happens while the release is a
+      # DRAFT (still mutable); the final publish is the only immutable transition.
+      - name: Create draft release and upload all assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # Re-run guard: an already-PUBLISHED (immutable) release cannot be
+          # modified — exit cleanly instead of failing at the upload step.
+          if gh release view "$GITHUB_REF_NAME" --json isDraft -q .isDraft 2>/dev/null | grep -qx false; then
+            echo "::notice::$GITHUB_REF_NAME is already published (immutable) — nothing to upload"
+            exit 0
+          fi
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes \
+            || { echo "::error::failed to create draft release for $GITHUB_REF_NAME"; exit 1; }
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+      - name: Publish (assets + tag become immutable now)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

@@ -10,7 +10,7 @@ The project is a trivial Rust crate with one dependency.
 
 ```console
 $ sscsb init
-write .sscsb/config.toml (35 controls, secure defaults)
+write .sscsb/config.toml (37 controls, secure defaults)
 write .sscsb/hooks/pre-commit (POSIX shim → `sscsb hook …`, fail-closed)
 write .sscsb/hooks/commit-msg (POSIX shim → `sscsb hook …`, fail-closed)
 write .sscsb/hooks/pre-push (POSIX shim → `sscsb hook …`, fail-closed)
@@ -32,11 +32,16 @@ write .github/workflows/release-slsa.yml
 write .github/workflows/release-attest.yml
 write .github/workflows/release-attest-sbom.yml
 write .github/workflows/deploy-gate.yml
+skip .github/workflows/release.yml (control release-immutability disabled)
 write .github/workflows/octo-sts-example.yml
 write .github/chainguard/sscsb-automation.sts.yaml
 write .github/workflows/sast-opengrep.yml
 write .sscsb/rules/sscsb-default.yaml
 write .github/workflows/codeql.yml
+skip .github/workflows/cflite-pr.yml (control fuzzing disabled)
+skip .clusterfuzzlite/Dockerfile (control fuzzing disabled)
+skip .clusterfuzzlite/build.sh (control fuzzing disabled)
+skip .trivyignore (control fuzzing disabled)
 skip .github/workflows/wait-for-secrets-example.yml (control wait-for-secrets disabled)
 skip .sscsb/templates/dependency-track-compose.yml (control dependency-track disabled)
 
@@ -46,8 +51,10 @@ Bootstrap complete. Next steps:
   3. Check posture:              sscsb verify && sscsb report
 ```
 
-Note the three `skip` lines. Disabled controls do not install their artifacts — off
-means off, all the way down.
+Note the `skip` lines. Disabled controls install none of their artifacts — the
+fuzzing control, for instance, holds back its whole ClusterFuzzLite scaffold
+(workflow, Dockerfile, build script, and `.trivyignore`). Off means off, all the
+way down.
 
 ## 2. `sscsb status`
 
@@ -254,7 +261,7 @@ $ sscsb verify
 [disabled] witness
            disabled in .sscsb/config.toml
 [PASS    ] compliance-map
-           map covers all 35 controls across SLSA/SSDF/CRA/Badge
+           map covers all 37 controls across SLSA/SSDF/CRA/Badge
 
 verify: 0 failed, 2 degraded
 ```
@@ -314,7 +321,7 @@ $ sscsb scan
 .gitleaks.toml
 .trufflehog.yaml
 renovate.json5
-.sscsb/config.toml            # 35 controls, generated from the registry
+.sscsb/config.toml            # 37 controls, generated from the registry
 .sscsb/hooks/{pre-commit,commit-msg,pre-push}
 .sscsb/policy/{signers.toml,packages.toml,allowed_signers}
 .sscsb/rules/sscsb-default.yaml

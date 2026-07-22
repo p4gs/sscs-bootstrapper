@@ -130,6 +130,23 @@ fn init_creates_config_hooks_policies_and_templates() {
             .exists(),
         "dependency-track is default-off"
     );
+    assert!(
+        !repo.join(".github/workflows/cflite-pr.yml").exists(),
+        "fuzzing is default-off"
+    );
+    // The whole ClusterFuzzLite scaffold is gated behind the (default-off)
+    // fuzzing control — a repo without fuzzing gets none of it, .trivyignore
+    // included (so we never drop a waiver on a repo that has nothing to waive).
+    assert!(
+        !repo.join(".clusterfuzzlite/Dockerfile").exists()
+            && !repo.join(".clusterfuzzlite/build.sh").exists()
+            && !repo.join(".trivyignore").exists(),
+        "fuzzing scaffold (Dockerfile/build.sh/.trivyignore) is default-off"
+    );
+    assert!(
+        !repo.join(".github/workflows/release.yml").exists(),
+        "release-immutability is default-off"
+    );
     // hooksPath wired.
     let out = git(repo, &["config", "core.hooksPath"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), ".sscsb/hooks");

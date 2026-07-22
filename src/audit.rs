@@ -607,6 +607,71 @@ pub fn verify_branch_protection(ctx: &Ctx, cfg: &Config) -> VerifyResult {
         if active.contains(&"deletion") {
             messages.push(format!("{branch}: deletion protection ✓"));
         }
+
+        // OpenSSF Scorecard "Branch-Protection" alignment: the rule-type checks
+        // above only prove a rule EXISTS; Scorecard scores the granular
+        // parameters. Surface each so `sscsb verify` mirrors what Scorecard sees.
+        // Two tiers: knobs a SOLO maintainer can safely set, and knobs that
+        // structurally require a SECOND reviewer (a solo owner cannot
+        // self-approve without deadlocking their own merges — enabling those
+        // would lock the owner out, so we report, never silently fail, on them).
+        let rule_params = |ty: &str| -> Option<&serde_json::Value> {
+            rules
+                .iter()
+                .find(|r| r.get("type").and_then(|t| t.as_str()) == Some(ty))
+                .and_then(|r| r.get("parameters"))
+        };
+        if let Some(p) = rule_params("pull_request") {
+            let flag = |k: &str| p.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+            let approvals = p
+                .get("required_approving_review_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            // Solo-safe: dismissing stale approvals is a no-op when 0 approvals
+            // are required, so it never blocks a solo owner — `harden` sets it.
+            if flag("dismiss_stale_reviews_on_push") {
+                messages.push(format!("{branch}: Scorecard — stale-review dismissal ✓"));
+            } else {
+                messages.push(format!(
+                    "{branch}: Scorecard gap — stale-review dismissal off \
+                     (solo-safe; fix: `sscsb harden branch-protection --apply`)"
+                ));
+            }
+
+            // Second-reviewer tier — solo-capped.
+            for (ok, label) in [
+                (approvals >= 1, "≥1 required approving review"),
+                (flag("require_code_owner_review"), "code-owner review"),
+                (flag("require_last_push_approval"), "last-push approval"),
+            ] {
+                if ok {
+                    messages.push(format!("{branch}: Scorecard — {label} ✓"));
+                } else {
+                    messages.push(format!(
+                        "{branch}: Scorecard gap — {label} off (needs a 2nd reviewer; a \
+                         solo maintainer cannot self-approve — opt in with \
+                         `sscsb harden branch-protection --require-reviews` once you have one)"
+                    ));
+                }
+            }
+        }
+        if let Some(p) = rule_params("required_status_checks") {
+            if p.get("strict_required_status_checks_policy")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                messages.push(format!(
+                    "{branch}: Scorecard — branch-up-to-date (strict) ✓"
+                ));
+            } else {
+                messages.push(format!(
+                    "{branch}: Scorecard gap — status checks not strict \
+                     (solo-safe; fix: `sscsb harden branch-protection --apply`)"
+                ));
+            }
+        }
+
         if !gaps.is_empty() {
             outcome = Outcome::Fail;
             messages.extend(gaps);
@@ -639,7 +704,9 @@ mod tests {
     /// prepend-only mutation (never removing existing PATH entries) cannot
     /// affect any other test's tool resolution — this lock only protects our
     /// own PATH-touching tests from racing each other.
-    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Shared across modules (audit/harden/scorecard) so PATH-touching gh-stub
+    // tests never run concurrently and race on $PATH.
+    use crate::testutil::PATH_LOCK;
 
     /// RAII guard that prepends `dir` onto PATH and restores the original
     /// value on drop (including on panic, so a failing assertion never
@@ -979,6 +1046,66 @@ esac
         assert!(result.messages.iter().any(|m| m.contains("missing")
             && m.contains("could not query rules API")
             && m.contains("branch may not exist on the remote")));
+    }
+
+    #[test]
+    fn branch_protection_reports_scorecard_granular_fields() {
+        let _guard = PATH_LOCK.lock().unwrap();
+        // "aligned": every Scorecard knob set. "gaps2": all off.
+        let script = r#"#!/bin/sh
+case "$2" in
+    */rules/branches/aligned)
+        echo '[{"type":"pull_request","parameters":{"dismiss_stale_reviews_on_push":true,"require_code_owner_review":true,"require_last_push_approval":true,"required_approving_review_count":1}},{"type":"non_fast_forward"},{"type":"required_signatures"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true}}]'
+        exit 0
+        ;;
+    */rules/branches/gaps2)
+        echo '[{"type":"pull_request","parameters":{"dismiss_stale_reviews_on_push":false,"require_code_owner_review":false,"require_last_push_approval":false,"required_approving_review_count":0}},{"type":"non_fast_forward"},{"type":"required_signatures"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false}}]'
+        exit 0
+        ;;
+    *)
+        echo '[]'
+        exit 0
+        ;;
+esac
+"#;
+        let gh_dir = fake_gh(script);
+        let _path = PathPrepend::new(gh_dir.path());
+
+        let (_d, ctx) = repo();
+        let cfg_text = std::fs::read_to_string(ctx.config_path())
+            .unwrap()
+            .replace(
+                "protected_branches = [\"main\", \"master\"]",
+                "protected_branches = [\"aligned\", \"gaps2\"]",
+            )
+            .replace(
+                "# github_repo = \"owner/repo\"  # set to enable GitHub API checks",
+                "github_repo = \"acme/demo\"",
+            );
+        std::fs::write(ctx.config_path(), cfg_text).unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_branch_protection(&ctx, cfg);
+        let m = |s: &str| result.messages.iter().any(|x| x.contains(s));
+
+        // aligned branch: all Scorecard ✓
+        assert!(m("aligned: Scorecard — stale-review dismissal ✓"));
+        assert!(m("aligned: Scorecard — ≥1 required approving review ✓"));
+        assert!(m("aligned: Scorecard — code-owner review ✓"));
+        assert!(m("aligned: Scorecard — last-push approval ✓"));
+        assert!(m("aligned: Scorecard — branch-up-to-date (strict) ✓"));
+
+        // gaps2 branch: the solo-safe gap + the solo-capped tier both surfaced
+        assert!(m("gaps2: Scorecard gap — stale-review dismissal off"));
+        assert!(m("gaps2: Scorecard gap — ≥1 required approving review off"));
+        assert!(m("gaps2: Scorecard gap — code-owner review off"));
+        assert!(m("gaps2: Scorecard gap — last-push approval off"));
+        assert!(m("gaps2: Scorecard gap — status checks not strict"));
+        assert!(result
+            .messages
+            .iter()
+            .any(|x| x.contains("cannot self-approve")));
     }
 
     #[test]
