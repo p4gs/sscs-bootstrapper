@@ -483,3 +483,45 @@ settings, by design).
   branch as a skip; release.yml guards re-runs against an already-published tag;
   the --require-reviews solo-lockout warning now shows in that mode. New unit
   tests for each (probe: harden::tests 13 pass; full suite 299 pass).
+- [x] ISC-157: PR #6 CI surfaced Trivy findings on the ClusterFuzzLite Dockerfile
+  (the file the fuzzing control's workflow needs). Remediated per the security
+  policy: DS-0001 (unpinned `:latest`) FIXED AT CODE LEVEL — base image pinned by
+  digest `gcr.io/oss-fuzz-base/base-builder-rust@sha256:4541e7f7…` (a hardening
+  tool must not ship an unpinned base). DS-0002 (runs as root) + DS-0026 (no
+  HEALTHCHECK) are documented, evidence-based waivers in a repo-root `.trivyignore`
+  (+ explicit `trivyignores:` in vuln-scan.yml): Trivy's generic runtime-container
+  rules fundamentally cannot model an ephemeral OSS-Fuzz *build* container — it
+  REQUIRES root (compiles into root-owned $OUT/$SRC/$WORK; a non-root USER breaks
+  the fuzz build) and has no service to health-check, and there is no root-free
+  way to make Rust fuzzing detectable by Scorecard. Probe: `trivy config` on the
+  Dockerfile → DS-0001 gone after the pin; `trivy fs` repo-wide honoring the
+  ignore → 0 Dockerfile findings; proven the ignore masks ONLY DS-0002/DS-0026
+  (re-scan without it shows exactly those two, nothing else).
+- [x] ISC-158: Part-B (owner ask: "ensure sscsb can also implement/remediate these
+  configs"). The fuzzing control installed only the workflow — a downstream repo
+  would get a `cflite-pr.yml` that references a Dockerfile it must invent, and any
+  Dockerfile it wrote would trip the same DS-0002/DS-0026. Completed the control:
+  it now installs a hardened, Trivy-clean ClusterFuzzLite scaffold —
+  `.clusterfuzzlite/Dockerfile` (digest-pinned), `.clusterfuzzlite/build.sh`
+  (`cargo fuzz list` loop, CUSTOMIZE stub), and the documented `.trivyignore`
+  waiver — via new fuzzing ARTIFACTS + a `{{project}}` render placeholder (slug
+  tail → the OSS-Fuzz `$SRC/<project>` path). `fuzz/` targets stay project-authored.
+  install_all is non-clobbering, so an existing `.trivyignore` is kept. Probe:
+  `enable fuzzing && init` in a throwaway `acme/widget` repo installed all three,
+  rendered `$SRC/widget`, and `trivy fs` → 0 Dockerfile findings; integration
+  must-not-install now asserts the whole scaffold stays off when fuzzing is off.
+- [x] ISC-159: Live code-scanning accounting for all 6 open Scorecard findings on
+  the repo (owner ask: "why are there ANY findings for GitHub security config
+  hardening?"). BranchProtectionID (HIGH) → remediable via `harden
+  branch-protection --apply` (the command is new in this PR and not yet applied to
+  live — the honest cause); FuzzingID (MED) → clears when this PR merges;
+  SASTID (MED) → CodeQL (push+PR) + OpenGrep (all pushes) already installed, score
+  is historical; PinnedDependenciesID (MED) @ release-slsa.yml:53 → the
+  slsa-github-generator, tag-pinned BY DESIGN (hash-pinning breaks SLSA
+  verification) — a genuine documented exception sscsb reports as
+  `justified-exception`; CodeReviewID (HIGH) + CIIBestPracticesID (LOW) →
+  structurally solo/owner-gated. Verified `verify scorecard`, `verify
+  branch-protection`, and `harden branch-protection` (dry-run) against the LIVE
+  repo (read-only). Gates green after all changes: fmt + clippy `-D warnings`
+  clean; 299 pass / 5 pre-existing environmental git-signing failures (unchanged;
+  none in touched modules).

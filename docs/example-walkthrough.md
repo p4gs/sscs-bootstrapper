@@ -39,6 +39,9 @@ write .github/workflows/sast-opengrep.yml
 write .sscsb/rules/sscsb-default.yaml
 write .github/workflows/codeql.yml
 skip .github/workflows/cflite-pr.yml (control fuzzing disabled)
+skip .clusterfuzzlite/Dockerfile (control fuzzing disabled)
+skip .clusterfuzzlite/build.sh (control fuzzing disabled)
+skip .trivyignore (control fuzzing disabled)
 skip .github/workflows/wait-for-secrets-example.yml (control wait-for-secrets disabled)
 skip .sscsb/templates/dependency-track-compose.yml (control dependency-track disabled)
 
@@ -48,8 +51,10 @@ Bootstrap complete. Next steps:
   3. Check posture:              sscsb verify && sscsb report
 ```
 
-Note the three `skip` lines. Disabled controls do not install their artifacts — off
-means off, all the way down.
+Note the `skip` lines. Disabled controls install none of their artifacts — the
+fuzzing control, for instance, holds back its whole ClusterFuzzLite scaffold
+(workflow, Dockerfile, build script, and `.trivyignore`). Off means off, all the
+way down.
 
 ## 2. `sscsb status`
 

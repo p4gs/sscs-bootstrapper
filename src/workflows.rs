@@ -126,6 +126,26 @@ pub const ARTIFACTS: &[Artifact] = &[
         dest: ".github/workflows/cflite-pr.yml",
         content: include_str!("../templates/workflows/cflite-pr.yml"),
     },
+    // The ClusterFuzzLite scaffold the workflow needs: a hardened, Trivy-clean
+    // build container + build script + the documented `.trivyignore` waiver, so
+    // enabling `fuzzing` on any repo yields a Scorecard-detectable, scanner-clean
+    // fuzzing setup — not a workflow that references a Dockerfile you must invent.
+    // The `fuzz/` cargo-fuzz targets stay yours to write (project-specific).
+    Artifact {
+        control: "fuzzing",
+        dest: ".clusterfuzzlite/Dockerfile",
+        content: include_str!("../templates/clusterfuzzlite/Dockerfile"),
+    },
+    Artifact {
+        control: "fuzzing",
+        dest: ".clusterfuzzlite/build.sh",
+        content: include_str!("../templates/clusterfuzzlite/build.sh"),
+    },
+    Artifact {
+        control: "fuzzing",
+        dest: ".trivyignore",
+        content: include_str!("../templates/trivyignore"),
+    },
     Artifact {
         control: "wait-for-secrets",
         dest: ".github/workflows/wait-for-secrets-example.yml",
@@ -140,9 +160,13 @@ pub const ARTIFACTS: &[Artifact] = &[
 
 /// Render template placeholders with repo-specific values.
 pub fn render(content: &str, repo_slug: &str, default_branch: &str) -> String {
+    // `{{project}}` = the repo name (slug tail) — used by the ClusterFuzzLite
+    // scaffold for the OSS-Fuzz `$SRC/<project>` build path.
+    let project = repo_slug.rsplit('/').next().unwrap_or(repo_slug);
     content
         .replace("{{repo_slug}}", repo_slug)
         .replace("{{default_branch}}", default_branch)
+        .replace("{{project}}", project)
 }
 
 pub fn artifacts_for(control: &str) -> Vec<&'static Artifact> {

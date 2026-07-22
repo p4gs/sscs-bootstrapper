@@ -134,6 +134,15 @@ fn init_creates_config_hooks_policies_and_templates() {
         !repo.join(".github/workflows/cflite-pr.yml").exists(),
         "fuzzing is default-off"
     );
+    // The whole ClusterFuzzLite scaffold is gated behind the (default-off)
+    // fuzzing control — a repo without fuzzing gets none of it, .trivyignore
+    // included (so we never drop a waiver on a repo that has nothing to waive).
+    assert!(
+        !repo.join(".clusterfuzzlite/Dockerfile").exists()
+            && !repo.join(".clusterfuzzlite/build.sh").exists()
+            && !repo.join(".trivyignore").exists(),
+        "fuzzing scaffold (Dockerfile/build.sh/.trivyignore) is default-off"
+    );
     assert!(
         !repo.join(".github/workflows/release.yml").exists(),
         "release-immutability is default-off"
