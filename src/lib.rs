@@ -29,6 +29,7 @@ pub mod context;
 pub mod controls;
 pub mod deps;
 pub mod exec;
+pub mod harden;
 pub mod hooks;
 pub mod init;
 pub mod observability;
@@ -37,6 +38,9 @@ pub mod provenance;
 pub mod sast;
 pub mod sbom;
 pub mod scan;
+pub mod scorecard;
 pub mod signers;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod tools;
 pub mod workflows;

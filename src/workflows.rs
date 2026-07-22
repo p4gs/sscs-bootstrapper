@@ -92,6 +92,11 @@ pub const ARTIFACTS: &[Artifact] = &[
         content: include_str!("../templates/workflows/deploy-gate.yml"),
     },
     Artifact {
+        control: "release-immutability",
+        dest: ".github/workflows/release.yml",
+        content: include_str!("../templates/workflows/release.yml"),
+    },
+    Artifact {
         control: "octo-sts",
         dest: ".github/workflows/octo-sts-example.yml",
         content: include_str!("../templates/workflows/octo-sts-example.yml"),
@@ -115,6 +120,11 @@ pub const ARTIFACTS: &[Artifact] = &[
         control: "codeql",
         dest: ".github/workflows/codeql.yml",
         content: include_str!("../templates/workflows/codeql.yml"),
+    },
+    Artifact {
+        control: "fuzzing",
+        dest: ".github/workflows/cflite-pr.yml",
+        content: include_str!("../templates/workflows/cflite-pr.yml"),
     },
     Artifact {
         control: "wait-for-secrets",

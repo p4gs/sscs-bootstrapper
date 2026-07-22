@@ -1,0 +1,40 @@
+[package]
+name = "sscsb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sscsb]
+path = ".."
+
+# Isolate from the parent crate so `cargo build`/test/coverage never pull the
+# fuzz targets (which need the fuzzing sanitizer) into a normal build.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parse_trailers"
+path = "fuzz_targets/parse_trailers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_signers"
+path = "fuzz_targets/parse_signers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_deps"
+path = "fuzz_targets/parse_deps.rs"
+test = false
+doc = false
+bench = false

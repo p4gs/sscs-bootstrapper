@@ -1,5 +1,5 @@
 [approved]
-cargo = ["anyhow", "assert_cmd", "base64", "chrono", "clap", "hex", "predicates", "serde", "serde_json", "sha2", "tempfile", "toml", "toml_edit", "ureq", "yaml-rust2"]
+cargo = ["anyhow", "assert_cmd", "base64", "chrono", "clap", "hex", "predicates", "serde", "serde_json", "sha2", "tempfile", "toml", "toml_edit", "ureq", "yaml-rust2", "libfuzzer-sys", "sscsb"]
 # sscsb approved-packages baseline.
 #
 # A dependency not in this baseline (and not already in the previous manifest

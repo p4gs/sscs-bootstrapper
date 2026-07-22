@@ -651,9 +651,40 @@ impl NewDep {
     }
 }
 
+/// True if a relative `path = "<rel>"` dependency declared in `manifest`
+/// (repo-relative path) resolves to a location INSIDE the repo — the repo's own
+/// code, already reviewed here (e.g. a cargo-fuzz project's `path = ".."`).
+/// Absolute paths, or `..` components that escape above the repo root, are false.
+fn path_resolves_within_repo(manifest: &str, rel: &str) -> bool {
+    use std::path::{Component, Path};
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return false;
+    }
+    let manifest_dir = Path::new(manifest)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let mut depth: i32 = 0;
+    for c in manifest_dir.join(rel_path).components() {
+        match c {
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false; // escaped above the repo root
+                }
+            }
+            Component::CurDir => {}
+            Component::Normal(_) => depth += 1,
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
+}
+
 /// STAGED dependency changes that need a fresh trust decision. Source-aware: a
 /// previously-approved name repointed to a git/path/alias/url source is flagged,
 /// because that is a change of what code will actually run, not a no-op.
+/// In-tree path sources (own code) are exempt — see `path_resolves_within_repo`.
 pub fn new_unapproved_deps(ctx: &Ctx) -> Result<Vec<NewDep>> {
     let staged = exec::git(
         &[
@@ -691,7 +722,17 @@ pub fn new_unapproved_deps(ctx: &Ctx) -> Result<Vec<NewDep>> {
             }
             let qualified = format!("{}:{}", eco.label(), spec.name);
             if let Some(desc) = spec.source.describe() {
-                // Any non-registry source needs review, regardless of baseline.
+                // In-tree path sources — a cargo-fuzz project (or similar)
+                // depending on THIS repo's own crate — point at code that
+                // already lives in and is reviewed within this repo, not
+                // external unvetted code. Exempt them. Out-of-tree paths and
+                // git/url/alias sources still need explicit review.
+                if let DepSource::Path(p) = &spec.source {
+                    if path_resolves_within_repo(file, p) {
+                        continue;
+                    }
+                }
+                // Any other non-registry source needs review, regardless of baseline.
                 out.push(NewDep {
                     qualified,
                     reason: NewDepReason::NonRegistrySource(desc),
@@ -1614,5 +1655,18 @@ mod tests {
         assert!(
             result.messages[0].contains("sfw") || result.messages[0].contains("Socket Firewall")
         );
+    }
+
+    #[test]
+    fn path_within_repo_exempts_intree_but_not_escapes() {
+        // in-tree (own code) — exempt
+        assert!(path_resolves_within_repo("fuzz/Cargo.toml", "..")); // → repo root
+        assert!(path_resolves_within_repo("fuzz/Cargo.toml", "../src"));
+        assert!(path_resolves_within_repo("Cargo.toml", "."));
+        assert!(path_resolves_within_repo("a/b/Cargo.toml", "../.."));
+        // escapes the repo — still flagged
+        assert!(!path_resolves_within_repo("fuzz/Cargo.toml", "../.."));
+        assert!(!path_resolves_within_repo("Cargo.toml", ".."));
+        assert!(!path_resolves_within_repo("fuzz/Cargo.toml", "/etc/passwd"));
     }
 }

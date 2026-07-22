@@ -130,6 +130,14 @@ fn init_creates_config_hooks_policies_and_templates() {
             .exists(),
         "dependency-track is default-off"
     );
+    assert!(
+        !repo.join(".github/workflows/cflite-pr.yml").exists(),
+        "fuzzing is default-off"
+    );
+    assert!(
+        !repo.join(".github/workflows/release.yml").exists(),
+        "release-immutability is default-off"
+    );
     // hooksPath wired.
     let out = git(repo, &["config", "core.hooksPath"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), ".sscsb/hooks");

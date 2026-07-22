@@ -109,6 +109,10 @@ enabled = true
 [controls.provenance-verify]
 enabled = true
 
+# Immutable releases (draft-then-publish): opt-in; supersedes the modular release-sign/slsa flow. Enable when migrating to GitHub release immutability.
+[controls.release-immutability]
+enabled = false
+
 # Octo STS federation: Short-lived repo-scoped GitHub credentials replacing long-lived PATs
 [controls.octo-sts]
 enabled = true
@@ -137,6 +141,11 @@ enabled = false
 
 # CodeQL: Deep interprocedural analysis on PRs and default branch
 [controls.codeql]
+enabled = true
+
+# ClusterFuzzLite fuzzing: continuous fuzzing on PRs (cargo-fuzz + ClusterFuzzLite) — the OpenSSF-Scorecard Rust fuzzing probe; opt-in (needs project fuzz targets)
+# sscs-bootstrapper dogfoods this: it has fuzz/ targets + .clusterfuzzlite/.
+[controls.fuzzing]
 enabled = true
 
 # Extended workflow audit: pull_request_target misuse, credential persistence, secret echo, risky actions
