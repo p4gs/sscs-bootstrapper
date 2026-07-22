@@ -525,3 +525,29 @@ settings, by design).
   repo (read-only). Gates green after all changes: fmt + clippy `-D warnings`
   clean; 299 pass / 5 pre-existing environmental git-signing failures (unchanged;
   none in touched modules).
+- [x] ISC-160: Increment 4 — sscs-bootstrapper dogfoods the immutable release path.
+  Enabled `release-immutability`; DISABLED the four superseded modular controls
+  (`sigstore-signing`, `slsa-provenance`, `github-attestations`, `sbom-attestation`)
+  and removed their installed workflows (release-sign/slsa/attest/attest-sbom.yml),
+  because immutability forbids the post-publish asset writes release-slsa
+  (`upload-assets`) and release-sign (`gh release upload`) do, and because the
+  separately-rebuilt-archive attestations would bind a different digest than the
+  release ships. release.yml consolidates all of it BEFORE publish (build → attest
+  build-provenance + SBOM to the store → Cosign sign → upload to DRAFT → publish
+  once). SLSA L3 (release-attached) is the one dropped capability — documented,
+  mutually exclusive with immutability. TOOL is unchanged: every control template
+  + ARTIFACTS entry stays, so other repos still get the modular flow by default;
+  this is a repo-level opt-in only. Probe: `verify release-immutability` PASS
+  (release.yml installed), `verify actions-audit` PASS (release.yml SHA-pinned +
+  least-priv), full `verify` 0 failed / 1 degraded (pre-existing commit-signing,
+  no local key); throwaway-repo tests untouched (they enable + install these
+  controls in their own temp config).
+- [x] ISC-161: release.yml build step customized from the generic `git archive`
+  scaffold to a REAL build — `cargo build --release --locked`, packed as
+  `sscsb-<tag>-x86_64-unknown-linux-gnu.tar.gz` + `.sha256`, so the first release's
+  attestations + signature bind the actual shipped binary (Part 1: "a real build so
+  attestations populate"). Single-target x86_64-linux for v0.1.0; a cross-compile
+  matrix is a follow-up. The TEMPLATE keeps its generic `git archive` + CUSTOMIZE
+  placeholder (downstream builds are language-specific). FOLLOW-UP (TF-IMMUT-GUARD):
+  `sscsb` could warn when release-immutability is enabled alongside a superseded
+  modular control, enforcing the mutual exclusivity in-tool.

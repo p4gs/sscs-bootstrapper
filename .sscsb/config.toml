@@ -90,28 +90,38 @@ enabled = false
 # ── Phase 3 — Provenance, signing & credential federation ──
 
 # Sigstore keyless signing: Cosign keyless signing + SBOM/provenance attestations bound to digests
+# SUPERSEDED by release-immutability (draft-then-publish): Cosign signing now happens
+# INSIDE release.yml, before publish. Standalone release-sign.yml uploads sigs AFTER
+# publish, which GitHub release immutability forbids.
 [controls.sigstore-signing]
-enabled = true
+enabled = false
 
-# SLSA Build L3 provenance: slsa-github-generator reusable workflow (tag-pinned per its trust model)
+# SUPERSEDED by release-immutability: SLSA L3 (slsa-github-generator) attaches provenance
+# to the release AFTER publish — mutually exclusive with immutability (documented trade-off).
+# release.yml attests build-provenance to the attestation store (immutability-safe) instead.
 [controls.slsa-provenance]
-enabled = true
+enabled = false
 
-# GitHub artifact attestations: GitHub-native build provenance (attest-build-provenance) — additive to Cosign/SLSA, verified with `gh attestation verify`
+# SUPERSEDED by release-immutability: release.yml attests build-provenance to the store
+# internally, over the same artifact it builds — the standalone workflow would attest a
+# separately-rebuilt archive, producing an attestation for a different digest.
 [controls.github-attestations]
-enabled = true
+enabled = false
 
-# GitHub SBOM attestation bound to the artifact digest (actions/attest, sbom-path) — additive, verified with `gh attestation verify`
+# SUPERSEDED by release-immutability: release.yml attests the SBOM to the store internally,
+# bound to the artifact it actually ships (see github-attestations note).
 [controls.sbom-attestation]
-enabled = true
+enabled = false
 
 # Provenance verification gates: slsa-verifier + cosign verification required before promote/deploy/publish
 [controls.provenance-verify]
 enabled = true
 
-# Immutable releases (draft-then-publish): opt-in; supersedes the modular release-sign/slsa flow. Enable when migrating to GitHub release immutability.
+# Immutable releases (draft-then-publish): supersedes the modular release-sign/slsa flow.
+# Consolidated release.yml: build → attest build-provenance + SBOM to the store → Cosign
+# sign → upload to a DRAFT → publish once, so nothing changes after the release is immutable.
 [controls.release-immutability]
-enabled = false
+enabled = true
 
 # Octo STS federation: Short-lived repo-scoped GitHub credentials replacing long-lived PATs
 [controls.octo-sts]
