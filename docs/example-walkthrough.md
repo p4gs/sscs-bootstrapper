@@ -10,7 +10,7 @@ The project is a trivial Rust crate with one dependency.
 
 ```console
 $ sscsb init
-write .sscsb/config.toml (37 controls, secure defaults)
+write .sscsb/config.toml (42 controls, secure defaults)
 write .sscsb/hooks/pre-commit (POSIX shim → `sscsb hook …`, fail-closed)
 write .sscsb/hooks/commit-msg (POSIX shim → `sscsb hook …`, fail-closed)
 write .sscsb/hooks/pre-push (POSIX shim → `sscsb hook …`, fail-closed)
@@ -261,7 +261,7 @@ $ sscsb verify
 [disabled] witness
            disabled in .sscsb/config.toml
 [PASS    ] compliance-map
-           map covers all 37 controls across SLSA/SSDF/CRA/Badge
+           map covers all 42 controls across SLSA/SSDF/CRA/Badge
 
 verify: 0 failed, 2 degraded
 ```
@@ -321,7 +321,7 @@ $ sscsb scan
 .gitleaks.toml
 .trufflehog.yaml
 renovate.json5
-.sscsb/config.toml            # 37 controls, generated from the registry
+.sscsb/config.toml            # 42 controls, generated from the registry
 .sscsb/hooks/{pre-commit,commit-msg,pre-push}
 .sscsb/policy/{signers.toml,packages.toml,allowed_signers}
 .sscsb/rules/sscsb-default.yaml
