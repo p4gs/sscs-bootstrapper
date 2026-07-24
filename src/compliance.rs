@@ -25,7 +25,7 @@ pub fn render_report(ctx: &Ctx) -> Result<String> {
     let mut out = String::new();
     out.push_str("SSCS Bootstrapper — control → framework coverage\n");
     out.push_str(
-        "frameworks: SLSA v1.2 (Build L3 + Source L3) · NIST SSDF v1.2 · EU CRA · OpenSSF Badge\n\n",
+        "frameworks: SLSA v1.2 (Build L3 + Source L3) · NIST SSDF v1.2 · EU CRA · OSPS Baseline · OpenSSF Badge\n\n",
     );
     for phase in 1..=5u8 {
         out.push_str(&format!("Phase {phase}\n"));
@@ -41,6 +41,7 @@ pub fn render_report(ctx: &Ctx) -> Result<String> {
                 ("slsa", "SLSA"),
                 ("ssdf", "SSDF"),
                 ("cra", "CRA "),
+                ("osps", "OSPS"),
                 ("badge", "Badge"),
             ] {
                 let items: Vec<&str> = entry[key]
@@ -150,9 +151,9 @@ mod tests {
     }
 
     #[test]
-    fn frameworks_block_names_all_four() {
+    fn frameworks_block_names_all_five() {
         let m = map().unwrap();
-        for fw in ["slsa", "ssdf", "cra", "badge"] {
+        for fw in ["slsa", "ssdf", "cra", "osps", "badge"] {
             assert!(m["frameworks"].get(fw).is_some(), "missing framework {fw}");
         }
     }

@@ -809,6 +809,11 @@ fn every_control_can_be_enabled_and_verified() {
         "guac",
         "openvex",
         "oras",
+        "gittuf",
+        "model-signing",
+        "security-insights",
+        "best-practices-badge",
+        "osps-baseline",
         "compliance-map",
     ];
 
@@ -951,6 +956,11 @@ fn verify_reports_every_control_and_strict_mode_gates_on_degraded() {
         "guac",
         "openvex",
         "oras",
+        "gittuf",
+        "model-signing",
+        "security-insights",
+        "best-practices-badge",
+        "osps-baseline",
         "compliance-map",
     ] {
         assert!(

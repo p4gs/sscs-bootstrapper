@@ -111,6 +111,9 @@ fn init_creates_config_hooks_policies_and_templates() {
         ".github/chainguard/sscsb-automation.sts.yaml",
         ".gitleaks.toml",
         "renovate.json5",
+        "security-insights.yml",
+        ".sscsb/best-practices-badge.md",
+        ".sscsb/osps-baseline.md",
     ] {
         assert!(
             repo.join(expected).is_file(),
@@ -146,6 +149,15 @@ fn init_creates_config_hooks_policies_and_templates() {
     assert!(
         !repo.join(".github/workflows/release.yml").exists(),
         "release-immutability is default-off"
+    );
+    // OpenSSF default-off controls install nothing until enabled.
+    assert!(
+        !repo.join(".github/workflows/sign-models.yml").exists(),
+        "model-signing is default-off"
+    );
+    assert!(
+        !repo.join(".github/workflows/gittuf-verify.yml").exists(),
+        "gittuf is default-off"
     );
     // hooksPath wired.
     let out = git(repo, &["config", "core.hooksPath"]);

@@ -156,6 +156,32 @@ pub const ARTIFACTS: &[Artifact] = &[
         dest: ".sscsb/templates/dependency-track-compose.yml",
         content: include_str!("../templates/configs/dependency-track-compose.yml"),
     },
+    // ── OpenSSF controls ────────────────────────────────────────────────────
+    Artifact {
+        control: "security-insights",
+        dest: "security-insights.yml",
+        content: include_str!("../templates/configs/security-insights.yml"),
+    },
+    Artifact {
+        control: "best-practices-badge",
+        dest: ".sscsb/best-practices-badge.md",
+        content: include_str!("../templates/configs/best-practices-badge.md"),
+    },
+    Artifact {
+        control: "osps-baseline",
+        dest: ".sscsb/osps-baseline.md",
+        content: include_str!("../templates/configs/osps-baseline.md"),
+    },
+    Artifact {
+        control: "model-signing",
+        dest: ".github/workflows/sign-models.yml",
+        content: include_str!("../templates/workflows/sign-models.yml"),
+    },
+    Artifact {
+        control: "gittuf",
+        dest: ".github/workflows/gittuf-verify.yml",
+        content: include_str!("../templates/workflows/gittuf-verify.yml"),
+    },
 ];
 
 /// Render template placeholders with repo-specific values.

@@ -1,0 +1,41 @@
+# sscsb: gittuf — verify the repository's gittuf policy and Reference State Log
+# (RSL). gittuf adds a signed, forge-independent policy over who may change which
+# refs, so branch/tag protection is cryptographically verifiable WITHOUT trusting
+# GitHub as a single point of trust. Complements branch-protection + commit-signing.
+#
+# Pinned: gittuf 0.15.0 via gittuf-installer v0.13.0 — https://github.com/gittuf/gittuf
+# Opt-in / advanced. Initialize locally first: `gittuf trust init` + policy, then
+# push the `refs/gittuf/*` refs. This job verifies; it never mutates policy.
+name: gittuf verify
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout (full history + gittuf refs)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gittuf (pinned)
+        uses: gittuf/gittuf-installer@a9730b348241599ca1882a8844acb43cd7935bb7 # v0.13.0
+      - name: Fetch gittuf refs and verify
+        run: |
+          git fetch origin "refs/gittuf/*:refs/gittuf/*" || true
+          if ! git show-ref --quiet refs/gittuf/reference-state-log; then
+            echo "no gittuf RSL found — initialize gittuf locally and push refs/gittuf/*"
+            echo "see https://github.com/gittuf/gittuf/blob/main/docs/get-started.md"
+            exit 1
+          fi
+          gittuf verify-ref "{{default_branch}}"

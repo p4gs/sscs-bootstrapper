@@ -17,6 +17,7 @@ This is the phase that gets you to **SLSA Build Level 3**.
 | `octo-sts` | Short-lived, repo-scoped credentials instead of PATs | Octo STS | on |
 | `harden-runner` | Egress and tamper monitoring on every job | StepSecurity Harden-Runner | on |
 | `witness` | Richer in-toto attestation capture around build steps | Witness | off |
+| `model-signing` | Sign & verify ML model artifacts with Sigstore keyless signing (applies when models are present) | OpenSSF Model Signing | off |
 
 ## Keyless signing
 

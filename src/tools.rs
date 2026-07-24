@@ -179,6 +179,26 @@ pub const TOOLS: &[ToolSpec] = &[
                        An empty-passphrase TPM key gives touchless agent signing. \
                        See docs/agent-signing.md; macOS/WSL have no TPM — this control degrades.",
     },
+    ToolSpec {
+        id: "model-signing",
+        bin: "model_signing",
+        pinned_version: "1.1.1",
+        version_args: &["--version"],
+        homepage: "https://github.com/sigstore/model-transparency",
+        brew: None,
+        install_note: "OpenSSF Model Signing CLI: `pip install model-signing==1.1.1` \
+                       (invoked as `python3 -m model_signing`). Signs/verifies ML models with Sigstore.",
+    },
+    ToolSpec {
+        id: "gittuf",
+        bin: "gittuf",
+        pinned_version: "0.15.0",
+        version_args: &["version"],
+        homepage: "https://github.com/gittuf/gittuf",
+        brew: None,
+        install_note: "`go install github.com/gittuf/gittuf@v0.15.0` or download release binaries; \
+                       adds signed, forge-independent policy over git refs (RSL).",
+    },
 ];
 
 #[derive(Debug, Clone)]
