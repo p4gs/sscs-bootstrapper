@@ -13,7 +13,7 @@ use crate::controls::{Outcome, VerifyResult};
 use crate::exec;
 use crate::tools;
 use anyhow::{Context as _, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -892,7 +892,13 @@ fn check_signing_for_range(
             )),
         }
 
-        // Human-signed merge + review evidence when AI involvement declared.
+        // Human-signed merge + VALIDATED review evidence when AI involvement
+        // is declared. An earlier gate passed on the mere presence of a
+        // `Reviewed-by`/`Review-evidence` trailer KEY — no value validation,
+        // no identity resolution, no reviewer≠author check — while its
+        // trigger is a trailer the agent writes about itself. An agent could
+        // author the work, author the merge, and vouch for its own review in
+        // one commit message.
         let is_merge = parents.split_whitespace().count() > 1;
         if is_merge
             && cfg
@@ -900,15 +906,22 @@ fn check_signing_for_range(
                 .unwrap_or(true)
         {
             let trailers = parse_trailers(body);
+            // Fail closed: a gate that cannot read the merged range must not
+            // assume the range is AI-free.
             let ai_declared = trailers.get("AI-Assisted").map(String::as_str) == Some("true")
-                || range_declares_ai(ctx, &sha).unwrap_or(false);
-            let has_evidence =
-                trailers.contains_key("Reviewed-by") || trailers.contains_key("Review-evidence");
-            if ai_declared && !has_evidence {
-                problems.push(format!(
-                    "{short}: merge with declared AI involvement lacks review evidence — add \
-                     `Reviewed-by:` or `Review-evidence:` trailer to the merge commit"
-                ));
+                || range_declares_ai(ctx, &sha).unwrap_or(true);
+            if ai_declared {
+                match range_author_emails(ctx, &sha) {
+                    Ok(range_authors) => problems.extend(
+                        review_evidence_problems(&trailers, &signers, &range_authors)
+                            .into_iter()
+                            .map(|p| format!("{short}: {p}")),
+                    ),
+                    Err(err) => problems.push(format!(
+                        "{short}: could not enumerate merged-range authors to validate review \
+                         evidence: {err:#}"
+                    )),
+                }
             }
         }
     }
@@ -928,6 +941,137 @@ fn range_declares_ai(ctx: &Ctx, merge_sha: &str) -> Result<bool> {
     Ok(out
         .split('\0')
         .any(|body| parse_trailers(body).get("AI-Assisted").map(String::as_str) == Some("true")))
+}
+
+/// Author emails of the work a merge brings in (`merge^1..merge` with the
+/// merge commit itself excluded) — the people whose commits the review
+/// evidence is vouching for.
+///
+/// The exclusion is load-bearing: git's `A..B` range always contains `B`
+/// itself, so without it the merge commit's own author — the human performing
+/// the merge, whose act of reviewing is precisely the intended flow — would
+/// be counted as an author of the reviewed work, and every legitimate
+/// agent-authors/human-reviews-and-merges push would be refused as
+/// self-review. (Caught by adversarial review with an empirical POC before
+/// this ever shipped.)
+fn range_author_emails(ctx: &Ctx, merge_sha: &str) -> Result<BTreeSet<String>> {
+    let out = exec::git(
+        &[
+            "log",
+            "--format=%H %ae",
+            &format!("{merge_sha}^1..{merge_sha}"),
+        ],
+        &ctx.root,
+    )?;
+    Ok(out
+        .lines()
+        .filter_map(|l| {
+            let (sha, email) = l.trim().split_once(' ')?;
+            (sha != merge_sha && !email.is_empty()).then(|| email.to_string())
+        })
+        .collect())
+}
+
+/// Validate the review-evidence trailers on a merge with declared AI
+/// involvement. Returns problems (empty = OK).
+///
+/// What this can and cannot prove, stated honestly: a pre-push hook reads a
+/// commit message, so it cannot prove a review *happened* — the forge-side
+/// required-review rule is the enforcement for that. What it CAN refuse
+/// deterministically is a vacuous attestation: a bare trailer key with no
+/// identity, a reviewer nobody approved, an AI-class identity "reviewing" AI
+/// work, and an author vouching for their own commits. The human merge author
+/// reviewing an agent's branch commits is the intended flow and passes —
+/// the merged-range authors are the agent, not the human.
+pub fn review_evidence_problems(
+    trailers: &BTreeMap<String, String>,
+    signers: &[Signer],
+    merged_range_author_emails: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+
+    let reviewed_by = trailers
+        .get("Reviewed-by")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim();
+    if reviewed_by.is_empty() {
+        problems.push(
+            "merge with declared AI involvement lacks a `Reviewed-by: Name <email>` trailer \
+             naming a policy-approved human reviewer (a `Review-evidence:` URL alone names \
+             no reviewer)"
+                .to_string(),
+        );
+        return problems;
+    }
+
+    let Some(email) = trailer_identity_email(reviewed_by) else {
+        problems.push(format!(
+            "`Reviewed-by: {reviewed_by}` carries no identity — expected `Name <email>` (or a \
+             bare email) matching a principal in .sscsb/policy/signers.toml"
+        ));
+        return problems;
+    };
+
+    // Case-insensitive, unlike the primary signature-principal match above:
+    // that one compares two strings with the same provenance (git's %GS output
+    // is read back from the allowed_signers file this tool generates), so
+    // exact equality is guaranteed-consistent there. This one compares a
+    // HUMAN-TYPED trailer against policy, where case drift is expected and
+    // leniency on ASCII case grants nothing.
+    match signers
+        .iter()
+        .find(|s| s.principal.eq_ignore_ascii_case(&email))
+    {
+        None => problems.push(format!(
+            "reviewer `{email}` is not in the approved-signers policy — review evidence must \
+             name a `class = \"human\"` principal from .sscsb/policy/signers.toml"
+        )),
+        Some(s) if s.class != SignerClass::Human => problems.push(format!(
+            "reviewer `{email}` has class {:?} — only a human-class signer can provide review \
+             evidence for AI-assisted work (an agent cannot vouch for its own review)",
+            s.class
+        )),
+        Some(_)
+            if merged_range_author_emails
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(&email)) =>
+        {
+            problems.push(format!(
+                "reviewer `{email}` authored commit(s) in the merged range — review evidence \
+                 must come from someone other than the author of the work (agent-authored work \
+                 under the agent's own identity may be reviewed by the human merging it)"
+            ));
+        }
+        Some(_) => {}
+    }
+
+    if let Some(evidence) = trailers.get("Review-evidence") {
+        let evidence = evidence.trim();
+        let looks_like_url = evidence.contains("://");
+        let looks_like_sha = evidence.len() >= 7 && evidence.chars().all(|c| c.is_ascii_hexdigit());
+        if !(looks_like_url || looks_like_sha) {
+            problems.push(format!(
+                "`Review-evidence: {evidence}` is neither a URL nor a commit sha — point it at \
+                 the review artifact (PR URL, review comment, or reviewed commit)"
+            ));
+        }
+    }
+
+    problems
+}
+
+/// The email inside `Name <email>`, or the value itself when it is a bare
+/// address. `None` when no plausible address is present — a trailer with no
+/// identity is exactly the vacuous attestation the gate exists to refuse.
+fn trailer_identity_email(value: &str) -> Option<String> {
+    let candidate = match (value.find('<'), value.rfind('>')) {
+        (Some(open), Some(close)) if close > open => &value[open + 1..close],
+        _ => value,
+    };
+    let candidate = candidate.trim();
+    (!candidate.is_empty() && candidate.contains('@') && !candidate.contains(char::is_whitespace))
+        .then(|| candidate.to_string())
 }
 
 /// Secret scan over the outgoing commit range (TruffleHog git mode +
@@ -1970,10 +2114,31 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
     #[test]
     fn pre_push_flags_ai_merge_commits_lacking_review_evidence() {
         let (_dir, ctx, pubkey) = signed_test_repo();
+        // Two human signers: the committer, and a distinct reviewer with a
+        // key of their own. The reviewer must be policy-approved AND must not
+        // have authored the merged range — the committer authored it, so they
+        // cannot be the one vouching for its review.
+        let reviewer_key = _dir.path().join("id_reviewer");
+        let out = std::process::Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "reviewer@example.com",
+                "-f",
+            ])
+            .arg(&reviewer_key)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let reviewer_pub = std::fs::read_to_string(reviewer_key.with_extension("pub")).unwrap();
+        let reviewer_pub = reviewer_pub.trim();
         std::fs::write(
             signers_path(&ctx),
             format!(
-                "[[signer]]\nprincipal = \"sscsb-test@example.com\"\nclass = \"human\"\nhardware_backed = false\nssh_public_key = \"{pubkey}\"\n"
+                "[[signer]]\nprincipal = \"sscsb-test@example.com\"\nclass = \"human\"\nhardware_backed = false\nssh_public_key = \"{pubkey}\"\n\n[[signer]]\nprincipal = \"reviewer@example.com\"\nclass = \"human\"\nhardware_backed = false\nssh_public_key = \"{reviewer_pub}\"\n"
             ),
         )
         .unwrap();
@@ -2015,8 +2180,11 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
             "merge with AI-declared parent lacking review evidence must block"
         );
 
-        // Redo the same merge, this time with a Reviewed-by trailer on the
-        // merge commit itself — must pass.
+        // Redo the same merge, this time naming a policy-approved human
+        // reviewer who did not author the merged range — must pass. (The old
+        // gate accepted `Reviewed-by: human@example.com` here — an identity in
+        // NOBODY's policy — because it only checked that the trailer key
+        // existed. That acceptance was the defect.)
         git_ok(&ctx, &["reset", "--hard", "HEAD^"]);
         git_ok(
             &ctx,
@@ -2025,7 +2193,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
                 "--no-ff",
                 "-S",
                 "-m",
-                "Merge branch 'feature'\n\nReviewed-by: human@example.com",
+                "Merge branch 'feature'\n\nReviewed-by: reviewer@example.com",
                 "--no-verify",
                 "feature",
             ],
@@ -2033,6 +2201,218 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(hook_pre_push(&ctx, "origin", &stdin).unwrap(), 0);
+
+        // Self-review: the committer authored the merged range, so naming
+        // themselves as reviewer is refused even though they are a
+        // policy-approved human.
+        git_ok(&ctx, &["reset", "--hard", "HEAD^"]);
+        git_ok(
+            &ctx,
+            &[
+                "merge",
+                "--no-ff",
+                "-S",
+                "-m",
+                "Merge branch 'feature'\n\nReviewed-by: sscsb-test@example.com",
+                "--no-verify",
+                "feature",
+            ],
+        );
+        let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+        let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
+        assert_eq!(
+            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            1,
+            "an author vouching for their own commits must be refused"
+        );
+
+        // The two-keys-one-tap shape: the reviewer authors ONLY the merge
+        // commit itself and names themselves in Reviewed-by. Git's `A..B`
+        // range includes B, so a naive range-author check would count the
+        // merge's own author as an author of the reviewed work and refuse
+        // this exact flow — the adversarial-review CRITICAL this stage pins.
+        git_ok(&ctx, &["reset", "--hard", "HEAD^"]);
+        git_ok(
+            &ctx,
+            &[
+                "-c",
+                "user.email=reviewer@example.com",
+                "-c",
+                "user.name=Reviewer",
+                "merge",
+                "--no-ff",
+                "-S",
+                "-m",
+                "Merge branch 'feature'\n\nReviewed-by: reviewer@example.com",
+                "--no-verify",
+                "feature",
+            ],
+        );
+        let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+        let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
+        assert_eq!(
+            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            0,
+            "the merge commit's own author must not be counted as a range author"
+        );
+    }
+
+    // ── review_evidence_problems: the validation the old gate never did ─────
+
+    fn human_signer(principal: &str) -> Signer {
+        Signer {
+            principal: principal.to_string(),
+            class: SignerClass::Human,
+            ssh_public_key: None,
+            gpg_fingerprint: None,
+            hardware_backed: false,
+            backend: None,
+            attestation_file: None,
+            expires: None,
+        }
+    }
+
+    fn trailers_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn authors_of(emails: &[&str]) -> BTreeSet<String> {
+        emails.iter().map(|e| e.to_string()).collect()
+    }
+
+    #[test]
+    fn review_evidence_url_alone_names_no_reviewer_and_is_insufficient() {
+        // The old gate passed on this exact shape: a `Review-evidence` KEY
+        // with any value and no reviewer identity anywhere.
+        let problems = review_evidence_problems(
+            &trailers_of(&[("Review-evidence", "https://example.com/pr/1")]),
+            &[human_signer("reviewer@example.com")],
+            &authors_of(&["agent@ci.example.com"]),
+        );
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("names no reviewer"), "{problems:?}");
+    }
+
+    #[test]
+    fn review_evidence_rejects_a_valueless_or_identityless_reviewed_by() {
+        let signers = [human_signer("reviewer@example.com")];
+        let authors = authors_of(&["agent@ci.example.com"]);
+        let empty =
+            review_evidence_problems(&trailers_of(&[("Reviewed-by", "")]), &signers, &authors);
+        assert_eq!(empty.len(), 1, "{empty:?}");
+
+        let wordy = review_evidence_problems(
+            &trailers_of(&[("Reviewed-by", "looked fine to me")]),
+            &signers,
+            &authors,
+        );
+        assert!(wordy[0].contains("carries no identity"), "{wordy:?}");
+    }
+
+    #[test]
+    fn review_evidence_rejects_a_reviewer_outside_the_policy() {
+        let problems = review_evidence_problems(
+            &trailers_of(&[("Reviewed-by", "Some One <nobody@example.com>")]),
+            &[human_signer("reviewer@example.com")],
+            &authors_of(&["agent@ci.example.com"]),
+        );
+        assert!(
+            problems[0].contains("not in the approved-signers policy"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn review_evidence_rejects_an_ai_class_reviewer() {
+        let mut agent = human_signer("agent@ci.example.com");
+        agent.class = SignerClass::Ai;
+        let problems = review_evidence_problems(
+            &trailers_of(&[("Reviewed-by", "Agent <agent@ci.example.com>")]),
+            &[agent],
+            &authors_of(&["someone-else@example.com"]),
+        );
+        assert!(
+            problems[0].contains("only a human-class signer"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn review_evidence_rejects_a_range_author_reviewing_their_own_work() {
+        let problems = review_evidence_problems(
+            &trailers_of(&[("Reviewed-by", "Dev <dev@example.com>")]),
+            &[human_signer("dev@example.com")],
+            &authors_of(&["dev@example.com", "agent@ci.example.com"]),
+        );
+        assert!(
+            problems[0].contains("authored commit(s) in the merged range"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn review_evidence_accepts_the_human_merge_author_reviewing_agent_work() {
+        // The intended two-keys-one-tap flow: the agent authored the range
+        // under its own identity; the human reviews and merges. The human is
+        // the MERGE commit's author but not a range author — that must pass.
+        let problems = review_evidence_problems(
+            &trailers_of(&[
+                ("Reviewed-by", "Human <human@example.com>"),
+                ("Review-evidence", "https://github.com/o/r/pull/1"),
+            ]),
+            &[human_signer("human@example.com")],
+            &authors_of(&["agent@ci.example.com"]),
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn review_evidence_value_must_be_a_url_or_commit_sha_when_present() {
+        let signers = [human_signer("human@example.com")];
+        let authors = authors_of(&["agent@ci.example.com"]);
+        let bogus = review_evidence_problems(
+            &trailers_of(&[
+                ("Reviewed-by", "Human <human@example.com>"),
+                ("Review-evidence", "I promise I read it"),
+            ]),
+            &signers,
+            &authors,
+        );
+        assert!(
+            bogus[0].contains("neither a URL nor a commit sha"),
+            "{bogus:?}"
+        );
+
+        let sha = review_evidence_problems(
+            &trailers_of(&[
+                ("Reviewed-by", "Human <human@example.com>"),
+                (
+                    "Review-evidence",
+                    "0123456789abcdef0123456789abcdef01234567",
+                ),
+            ]),
+            &signers,
+            &authors,
+        );
+        assert!(sha.is_empty(), "{sha:?}");
+    }
+
+    #[test]
+    fn trailer_identity_email_parses_name_addr_and_bare_forms() {
+        assert_eq!(
+            trailer_identity_email("Justin Pagano <jp@example.com>").as_deref(),
+            Some("jp@example.com")
+        );
+        assert_eq!(
+            trailer_identity_email("jp@example.com").as_deref(),
+            Some("jp@example.com")
+        );
+        assert_eq!(trailer_identity_email("no address here"), None);
+        assert_eq!(trailer_identity_email(""), None);
+        assert_eq!(trailer_identity_email("<>"), None);
     }
 
     /// Build a repo with agent-signing enabled and a single `ai`-class signer
