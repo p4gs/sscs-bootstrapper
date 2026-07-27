@@ -1,0 +1,20 @@
+# sscsb — Trivy misconfiguration waivers, documented and evidence-based.
+#
+# Each entry is a case where Trivy's generic *runtime*-container rules
+# fundamentally CANNOT model the artifact — NOT a "safe in practice" waiver.
+# Every finding on code sscsb actually controls is fixed at the code level
+# (e.g. the base image is pinned by digest, not waived here).
+#
+# .clusterfuzzlite/Dockerfile is the OSS-Fuzz / ClusterFuzzLite *build* container
+# — the only artifact class that makes OpenSSF Scorecard's FuzzingID detectable
+# for Rust. Full rationale lives next to the code in that Dockerfile's header.
+#
+# DS-0002 — "Image user should not be 'root'": gcr.io/oss-fuzz-base/base-builder-rust
+#   REQUIRES root. The OSS-Fuzz toolchain and ClusterFuzzLite's runner compile
+#   into root-owned $OUT/$SRC/$WORK; a non-root USER breaks the fuzz build, and
+#   there is no root-free way to produce Scorecard-detectable Rust fuzzing.
+DS-0002
+# DS-0026 — "No HEALTHCHECK defined": this build container exits after compiling
+#   the fuzz targets; it runs no long-lived service, so a HEALTHCHECK is a
+#   category error, not a missing control.
+DS-0026

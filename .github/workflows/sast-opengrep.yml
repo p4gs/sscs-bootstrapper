@@ -4,7 +4,7 @@
 name: SAST (OpenGrep)
 on:
   push:
-    branches: ["main"]
+    branches: ["**"]
   pull_request:
 
 permissions:

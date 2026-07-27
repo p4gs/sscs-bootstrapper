@@ -10,7 +10,7 @@ The project is a trivial Rust crate with one dependency.
 
 ```console
 $ sscsb init
-write .sscsb/config.toml (32 controls, secure defaults)
+write .sscsb/config.toml (42 controls, secure defaults)
 write .sscsb/hooks/pre-commit (POSIX shim → `sscsb hook …`, fail-closed)
 write .sscsb/hooks/commit-msg (POSIX shim → `sscsb hook …`, fail-closed)
 write .sscsb/hooks/pre-push (POSIX shim → `sscsb hook …`, fail-closed)
@@ -21,6 +21,7 @@ write .sscsb/policy/allowed_signers (generated from signers.toml)
 write .github/workflows/secrets-scan.yml
 write .gitleaks.toml
 write .trufflehog.yaml
+skip .github/workflows/agent-signing-verify.yml (control agent-signing disabled)
 write .github/PULL_REQUEST_TEMPLATE.md
 write .github/workflows/sbom.yml
 write .github/workflows/vuln-scan.yml
@@ -28,12 +29,19 @@ write .github/workflows/scorecard.yml
 write renovate.json5
 write .github/workflows/release-sign.yml
 write .github/workflows/release-slsa.yml
+write .github/workflows/release-attest.yml
+write .github/workflows/release-attest-sbom.yml
 write .github/workflows/deploy-gate.yml
+skip .github/workflows/release.yml (control release-immutability disabled)
 write .github/workflows/octo-sts-example.yml
 write .github/chainguard/sscsb-automation.sts.yaml
 write .github/workflows/sast-opengrep.yml
 write .sscsb/rules/sscsb-default.yaml
 write .github/workflows/codeql.yml
+skip .github/workflows/cflite-pr.yml (control fuzzing disabled)
+skip .clusterfuzzlite/Dockerfile (control fuzzing disabled)
+skip .clusterfuzzlite/build.sh (control fuzzing disabled)
+skip .trivyignore (control fuzzing disabled)
 skip .github/workflows/wait-for-secrets-example.yml (control wait-for-secrets disabled)
 skip .sscsb/templates/dependency-track-compose.yml (control dependency-track disabled)
 
@@ -43,8 +51,10 @@ Bootstrap complete. Next steps:
   3. Check posture:              sscsb verify && sscsb report
 ```
 
-Note the two `skip` lines. Disabled controls do not install their artifacts — off
-means off, all the way down.
+Note the `skip` lines. Disabled controls install none of their artifacts — the
+fuzzing control, for instance, holds back its whole ClusterFuzzLite scaffold
+(workflow, Dockerfile, build script, and `.trivyignore`). Off means off, all the
+way down.
 
 ## 2. `sscsb status`
 
@@ -57,6 +67,7 @@ hooks installed: true
 Phase 1
   [on ] secrets                  Secret scanning hooks  (trufflehog:ok, gitleaks:ok)
   [on ] commit-signing           CommitSigningGuard
+  [off] agent-signing            AI agent commit signing  (ssh-tpm-agent:missing)
   [on ] branch-protection        Branch protection verification  (gh:ok)
   [on ] actions-audit            Actions pinning & permissions audit
   [on ] ai-trailers              AI commit trailers
@@ -219,6 +230,8 @@ $ sscsb verify
            git config `gpg.format` unset — see docs/signing.md for YubiKey ed25519-sk setup
            git config commit.gpgSign = false
            policy: hardware-backed keys required on protected branches
+[disabled] agent-signing
+           disabled in .sscsb/config.toml
 [DEGRADED] branch-protection
            no GitHub repo configured (general.github_repo) and no origin remote —
            cannot verify branch protection
@@ -229,6 +242,10 @@ $ sscsb verify
 [PASS    ] ai-trailers
            enforced by commit-msg hook (installed)
 ...
+[PASS    ] github-attestations
+           .github/workflows/release-attest.yml installed
+[PASS    ] sbom-attestation
+           .github/workflows/release-attest-sbom.yml installed
 [PASS    ] provenance-verify
            slsa-verifier: 2.7.1
            cosign: 3.1.1
@@ -244,7 +261,7 @@ $ sscsb verify
 [disabled] witness
            disabled in .sscsb/config.toml
 [PASS    ] compliance-map
-           map covers all 32 controls across SLSA/SSDF/CRA/Badge
+           map covers all 42 controls across SLSA/SSDF/CRA/Badge
 
 verify: 0 failed, 2 degraded
 ```
@@ -299,17 +316,17 @@ $ sscsb scan
 ```
 .github/PULL_REQUEST_TEMPLATE.md
 .github/chainguard/sscsb-automation.sts.yaml
-.github/workflows/{codeql,deploy-gate,octo-sts-example,release-sign,release-slsa,
-                   sast-opengrep,sbom,scorecard,secrets-scan,vuln-scan}.yml
+.github/workflows/{codeql,deploy-gate,octo-sts-example,release-attest,release-attest-sbom,
+                   release-sign,release-slsa,sast-opengrep,sbom,scorecard,secrets-scan,vuln-scan}.yml
 .gitleaks.toml
 .trufflehog.yaml
 renovate.json5
-.sscsb/config.toml            # 32 controls, generated from the registry
+.sscsb/config.toml            # 42 controls, generated from the registry
 .sscsb/hooks/{pre-commit,commit-msg,pre-push}
 .sscsb/policy/{signers.toml,packages.toml,allowed_signers}
 .sscsb/rules/sscsb-default.yaml
 .sscsb/out/                   # generated artifacts (gitignored)
 ```
 
-Twenty-four files, ten SHA-pinned workflows, three hooks, and a policy directory —
+Twenty-four files, eleven SHA-pinned workflows, three hooks, and a policy directory —
 from one command, on a repository that had none of it a minute earlier.

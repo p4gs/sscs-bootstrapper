@@ -81,6 +81,15 @@ pub const CONTROLS: &[ControlDef] = &[
         default_options: &[],
     },
     ControlDef {
+        id: "gittuf",
+        phase: 1,
+        name: "gittuf ref protection",
+        summary: "Signed, forge-independent policy over who may change which git refs, verified in CI; off by default (advanced)",
+        default_enabled: false,
+        tools: &["gittuf"],
+        default_options: &[],
+    },
+    ControlDef {
         id: "ai-trailers",
         phase: 1,
         name: "AI commit trailers",
@@ -200,12 +209,48 @@ pub const CONTROLS: &[ControlDef] = &[
         default_options: &[],
     },
     ControlDef {
+        id: "github-attestations",
+        phase: 3,
+        name: "GitHub artifact attestations",
+        summary: "GitHub-native build provenance (attest-build-provenance) — additive to Cosign/SLSA, verified with `gh attestation verify`",
+        default_enabled: true,
+        tools: &["gh"],
+        default_options: &[],
+    },
+    ControlDef {
+        id: "sbom-attestation",
+        phase: 3,
+        name: "GitHub SBOM attestation",
+        summary: "GitHub-native SBOM attestation bound to the artifact digest (actions/attest, sbom-path) — additive, verified with `gh attestation verify`",
+        default_enabled: true,
+        tools: &["gh"],
+        default_options: &[],
+    },
+    ControlDef {
+        id: "model-signing",
+        phase: 3,
+        name: "OpenSSF Model Signing",
+        summary: "Sign & verify ML model artifacts with Sigstore keyless signing; applies when models are present (off by default)",
+        default_enabled: false,
+        tools: &["model-signing"],
+        default_options: &[],
+    },
+    ControlDef {
         id: "provenance-verify",
         phase: 3,
         name: "Provenance verification gates",
         summary: "slsa-verifier + cosign verification required before promote/deploy/publish",
         default_enabled: true,
         tools: &["slsa-verifier", "cosign"],
+        default_options: &[],
+    },
+    ControlDef {
+        id: "release-immutability",
+        phase: 3,
+        name: "Immutable releases (draft-then-publish)",
+        summary: "Draft-then-publish release.yml so assets attach before publish — compatible with GitHub release immutability (Settings -> Releases); opt-in, supersedes the modular release-sign/slsa flow",
+        default_enabled: false,
+        tools: &[],
         default_options: &[],
     },
     ControlDef {
@@ -264,6 +309,15 @@ pub const CONTROLS: &[ControlDef] = &[
         name: "CodeQL",
         summary: "Deep interprocedural analysis on PRs and default branch",
         default_enabled: true,
+        tools: &[],
+        default_options: &[],
+    },
+    ControlDef {
+        id: "fuzzing",
+        phase: 4,
+        name: "ClusterFuzzLite fuzzing",
+        summary: "Continuous fuzzing on PRs (cargo-fuzz + ClusterFuzzLite) — the OpenSSF-Scorecard Rust fuzzing probe; opt-in (needs project fuzz targets)",
+        default_enabled: false,
         tools: &[],
         default_options: &[],
     },
@@ -332,10 +386,37 @@ pub const CONTROLS: &[ControlDef] = &[
         default_options: &[],
     },
     ControlDef {
+        id: "security-insights",
+        phase: 5,
+        name: "OpenSSF Security Insights",
+        summary: "Machine-readable security-insights.yml declaring the project's security practices and reporting channels",
+        default_enabled: true,
+        tools: &[],
+        default_options: &[],
+    },
+    ControlDef {
+        id: "best-practices-badge",
+        phase: 5,
+        name: "OpenSSF Best Practices Badge helper",
+        summary: "Worksheet pre-filling the passing-badge criteria from installed controls (lifts Scorecard's CII check)",
+        default_enabled: true,
+        tools: &[],
+        default_options: &[],
+    },
+    ControlDef {
+        id: "osps-baseline",
+        phase: 5,
+        name: "OSPS Baseline assessment",
+        summary: "Maps enabled controls to OpenSSF Project Security Baseline families and adds an OSPS column to `sscsb report`",
+        default_enabled: true,
+        tools: &[],
+        default_options: &[],
+    },
+    ControlDef {
         id: "compliance-map",
         phase: 5,
         name: "Compliance map & report",
-        summary: "Machine-readable control → SLSA/SSDF/CRA/Badge map behind `sscsb report`",
+        summary: "Machine-readable control → SLSA/SSDF/CRA/OSPS/Badge map behind `sscsb report`",
         default_enabled: true,
         tools: &[],
         default_options: &[],
@@ -405,6 +486,12 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
         "agent-signing" => crate::signers::verify_agent_signing_control(ctx, cfg),
         "branch-protection" => crate::audit::verify_branch_protection(ctx, cfg),
         "actions-audit" => crate::audit::verify_actions_control(ctx, false),
+        "gittuf" => crate::openssf::verify_gittuf(ctx),
+        "model-signing" => crate::openssf::verify_model_signing(ctx),
+        "security-insights" => crate::openssf::verify_security_insights(ctx),
+        "best-practices-badge" | "osps-baseline" => {
+            crate::workflows::verify_template_control(ctx, def.id)
+        }
         "workflow-audit-extended" => crate::audit::verify_actions_control(ctx, true),
         "ai-trailers" | "ai-dep-gate" => crate::hooks::verify_hook_installed(ctx, def.id),
         "pr-template" => crate::workflows::verify_pr_template(ctx),
@@ -413,8 +500,17 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
         "vuln-scan" => crate::scan::verify_scan_control(ctx),
         "grype" => crate::sbom::verify_grype_control(ctx),
         "package-trust" => crate::deps::verify_package_trust(ctx, cfg),
-        "scorecard" | "renovate" | "codeql" | "sigstore-signing" | "slsa-provenance"
-        | "octo-sts" | "harden-runner" => crate::workflows::verify_template_control(ctx, def.id),
+        "scorecard" => crate::scorecard::verify_scorecard_control(ctx, cfg),
+        "renovate"
+        | "codeql"
+        | "fuzzing"
+        | "sigstore-signing"
+        | "slsa-provenance"
+        | "github-attestations"
+        | "sbom-attestation"
+        | "release-immutability"
+        | "octo-sts"
+        | "harden-runner" => crate::workflows::verify_template_control(ctx, def.id),
         "provenance-verify" => crate::provenance::verify_provenance_control(ctx),
         "sast" => crate::sast::verify_sast_control(ctx, cfg),
         "sighthound" => crate::sast::verify_sighthound_control(ctx),

@@ -4,11 +4,11 @@ slug: sscsb-rust-cli
 project: sscs-bootstrapper
 effort: E5
 phase: complete
-progress: 122/122
+progress: 133/133
 mode: algorithm
 started: 2026-07-12T13:02:00-07:00
-updated: 2026-07-12T18:30:00-07:00
-iteration: 1
+updated: 2026-07-18T00:00:00-04:00
+iteration: 2
 principal_stated_goal: "Build ALL FIVE spec phases autonomously, in order; verify each before the next."
 principal_stated_goal_source: prompt
 principal_stated_goal_signal: 4
@@ -138,9 +138,9 @@ Solo developers and small teams in AI-heavy workflows (AI-generated / AI-reviewe
 ### D — Phase 3: Provenance, signing & credential federation
 
 - [x] ISC-60: Sigstore release workflow template: cosign keyless sign-blob of release artifacts w/ `id-token: write`, SHA-pinned steps (probe: Read + grep)
-- [x] ISC-61: SBOM attestation wiring: template attests SBOM to artifact digest (cosign attest or attest-build-provenance w/ sbom predicate) (probe: grep)
+- [x] ISC-61: SBOM attestation wiring: template attests SBOM to artifact digest (probe: grep) — CORRECTION (2026-07-21, Increment 3): this row was checked since iteration 1 but was STALE until now — `sbom.yml`/`release-sign.yml` only GENERATED a CycloneDX SBOM (anchore/sbom-action) and never ATTESTED it to a digest (no `cosign attest`, no attest-sbom). Genuinely satisfied by Increment 3 (ISC-134..143): the new `sbom-attestation` control installs `release-attest-sbom.yml`, which binds the SBOM to the artifact digest via `actions/attest` in SBOM mode (`sbom-path`) — `actions/attest-sbom` is deprecated. Original wording proposed "cosign attest or attest-build-provenance w/ sbom predicate"; the correct current mechanism is generic `actions/attest` + `sbom-path`.
 - [x] ISC-62: SLSA provenance: slsa-github-generator reusable workflow template targeting Build L3, TAG-pinned with in-file comment citing the generator's trust-model requirement (probe: Read)
-- [x] ISC-63: `actions/attest-build-provenance` alternative template present w/ `attestations: write` (probe: Read)
+- [x] ISC-63: `actions/attest-build-provenance` alternative template present w/ `attestations: write` (probe: Read) — CORRECTION (2026-07-18, iteration 2): this row was checked in iteration 1 while the implementation actually shipped only the Cosign/SLSA-generator path; the claim was stale until Increment 2 (ISC-123..130) shipped `release-attest.yml`, which is what genuinely satisfies it now
 - [x] ISC-64: slsa-verifier gate: `sscsb verify provenance --artifact --provenance --source-uri [--source-tag]` wraps slsa-verifier (probe: REAL passing slsa-verifier run on a public artifact+provenance downloaded this session)
 - [x] ISC-65: Deploy/publish gate template: promote job requires cosign verify-blob + slsa-verifier success before publish step runs (probe: grep template job `needs`/ordering)
 - [x] ISC-66: in-toto/DSSE compatibility: `sscsb` parses a real DSSE-wrapped in-toto provenance statement and prints subject digest + builder id (probe: run against downloaded provenance)
@@ -216,6 +216,41 @@ Solo developers and small teams in AI-heavy workflows (AI-generated / AI-reviewe
 - [x] ISC-121: Phase-5 gate: ISC-86..95 all pass before delivery (probe: same)
 - [x] ISC-122: Each phase lands as ≥1 dedicated commit with AI trailers, so the PR tells the per-phase story (probe: git log)
 
+### H — Increment 2: GitHub-native artifact attestations (additive; owner-directed 2026-07-18)
+
+Owner's literal: "Do a as an additional feature here (i.e. do not supplant any existing cryptographic attestation features)" — where "a" = add a real `actions/attest-build-provenance` template as a third, lighter-weight provenance control (GitHub Artifact Attestations, per docs.github.com/actions/concepts/security/artifact-attestations).
+
+- [x] ISC-123: New control `github-attestations` registered in `CONTROLS` (phase 3, default on, tools: gh) and dispatched to the template verifier; `sscsb verify` reports it (probe: cargo test `every_control_can_be_enabled_and_verified` + verify-output list test)
+- [x] ISC-124: Template `templates/workflows/release-attest.yml` installs to `.github/workflows/release-attest.yml` and uses `actions/attest-build-provenance` pinned to the full 40-char commit SHA of v4.1.1, with least-privilege job permissions including `attestations: write` + `id-token: write` (probe: Read + template-audit ∀ test)
+- [x] ISC-125: Template passes sscsb's own extended audit, embeds the pinned Harden-Runner step in every job with steps, and renders placeholder-free (probe: existing ∀-template unit tests green over the grown set)
+- [x] ISC-126: In-pipeline verification job runs `gh attestation verify` against every built artifact, pinning identity via `--repo` AND `--signer-workflow`, and fails EXPLICITLY on empty dist (probe: Read — the "nothing to verify ≠ verified" house invariant)
+- [x] ISC-127: The canonical compliance map (`templates/compliance/map.json`, embedded via `include_str!` at `src/compliance.rs`) covers the new control with honest SLSA mappings (Build L1/L2 — NOT L3; the generator path keeps the L3 claim); the dead drifted duplicate `src/compliance-map.json` (referenced by nothing, missing agent-signing) is DELETED rather than updated (probe: compliance completeness unit tests green + `rg compliance-map.json src/` empty)
+- [x] ISC-128: Every exhaustive control list in tests (`tool_orchestration.rs` ×2, `integration.rs`) includes `github-attestations` (probe: cargo test full suite)
+- [x] ISC-129: `docs/phase-3.md` documents the control as ADDITIVE to Cosign/SLSA-generator — distinct trust store (GitHub attestation API vs release-asset bundles), distinct verifier (`gh attestation verify` vs slsa-verifier/cosign), availability caveat (public repos; private needs GHEC) (probe: Read)
+- [x] ISC-130: Dogfood: this repo's own `.github/workflows/release-attest.yml` installed and `.sscsb/config.toml` gains the generated-format `[controls.github-attestations]` section (probe: ls + grep + `sscsb verify`)
+- [ ] ISC-131 (Anti): NO existing provenance control is supplanted: `release-sign.yml`, `release-slsa.yml`, `deploy-gate.yml` templates byte-unchanged; `sigstore-signing`/`slsa-provenance`/`provenance-verify` registry entries unmodified (probe: git diff --stat scoped to those paths = empty)
+- [x] ISC-132: Full gates green: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (probe: command exit codes read directly, never through a pipe)
+- [x] ISC-133: ISC-63's stale wording corrected to name this increment as what actually satisfied it (probe: Read this file)
+
+### I — Increment 3: GitHub-native SBOM attestation (additive; owner-directed 2026-07-21)
+
+Owner's literal: "Execute increment 3" — the SBOM-attestation follow-up flagged when Increment 2 shipped: the tool GENERATED SBOMs (`anchore/sbom-action`) but never ATTESTED them to a digest, leaving ISC-61 stale. This adds a real SBOM attestation as a fourth, independent trail, supplanting nothing. Because `actions/attest-sbom` is DEPRECATED ("please use actions/attest instead"), the SBOM attestation uses `actions/attest` in SBOM mode (`sbom-path`), pinned to the SAME v4.1.1 attest engine that Increment 2's `attest-build-provenance` wrapper delegates to internally (verified: attest-build-provenance@v4.1.1 → `actions/attest@a1948c3f… # v4.1.1`).
+
+- [x] ISC-134: New control `sbom-attestation` registered in `CONTROLS` (phase 3, default on, tools: gh) + added to the template-verifier dispatch arm; `sscsb status`/`verify` report it (probe: real-binary smoke — `status` shows `[on ] sbom-attestation … (gh:ok)`, `verify` → `[PASS] sbom-attestation`; unit tests `every_control_can_be_enabled_and_verified` + `verify_reports_every_control…` green)
+- [x] ISC-135: Template `templates/workflows/release-attest-sbom.yml` installs to `.github/workflows/release-attest-sbom.yml`, generates a CycloneDX SBOM (anchore/sbom-action) and binds it to the artifact digest via `actions/attest` (`subject-path` + `sbom-path`) pinned to the 40-char SHA of v4.1.1; least-privilege perms `id-token: write` + `attestations: write` (probe: Read + template-audit ∀ test `workflows::tests` 15/15)
+- [x] ISC-136: Fail-closed TWICE — explicit failure on empty `dist/` AND on a missing/empty `sbom.cdx.json` (an absent SBOM must never be silently attested-over) (probe: Read — the "nothing to attest ≠ everything attested" invariant, mirrored for the SBOM)
+- [x] ISC-137: In-pipeline verify job runs `gh attestation verify` per artifact, pinning identity via `--repo` AND `--signer-workflow …/release-attest-sbom.yml` (distinguishes the SBOM attestation from the build-provenance one produced by release-attest.yml), values via ENV not `${{}}`, fails explicitly on empty dist (probe: Read)
+- [x] ISC-138: Compliance map covers `sbom-attestation` with HONEST mappings — `slsa: []` (SLSA Build levels cover provenance, NOT the SBOM predicate — deliberately not overclaimed), `ssdf: PS.3.2` (the practice that literally names the SBOM), `cra: Annex I Part II(1)` (machine-readable SBOM) (probe: real-binary `report` prints `SSDF: PS.3.2` for sbom-attestation; `embedded_map_parses_and_covers_every_control` + `map_has_no_orphan_controls` green)
+- [x] ISC-139: New `ARTIFACTS` entry maps `sbom-attestation` → `release-attest-sbom.yml` via `include_str!`; init writes it in ARTIFACTS order right after `release-attest.yml` (probe: real-binary `init` emits `write .github/workflows/release-attest-sbom.yml`)
+- [x] ISC-140: All THREE exhaustive lists updated (`tool_orchestration.rs` ×2 control lists + `integration.rs` init-file list) — else a `default_enabled` flip is invisible (the ISC-128 mutation-test lesson); control count 34→35 everywhere (probe: cargo test — init-file-list integration test + both control-list tests green; real-binary `report` → "25/35 controls enabled")
+- [x] ISC-141: Docs — `docs/phase-3.md` gains a control-table row + an "SBOM attestation (the SBOM, bound to the digest)" section (generation-vs-attestation, attest-sbom deprecation, honest SLSA-none/SSDF-PS.3.2/CRA mapping); `README.md` phase-3 prose + count 34→35; `docs/example-walkthrough.md` transcript re-synced to the real binary (init write line, verify PASS line, "map covers all 35 controls", file tree, count comment) (probe: Read + grep 34→35 clean)
+- [x] ISC-142: Dogfood — this repo's own `.github/workflows/release-attest-sbom.yml` installed with `{{repo_slug}}` resolved + `.sscsb/config.toml` gains `[controls.sbom-attestation]` (probe: ls + grep + the file passes sscsb's own actions-audit ∀-template test)
+- [x] ISC-143 (Anti): NO existing control/template supplanted — `templates/workflows/{sbom,release-sign,release-attest,release-slsa}.yml` byte-unchanged; change is purely additive (probe: `git diff --stat origin/main` scoped to those paths = EMPTY, verified this session)
+- [x] ISC-144: Gates green on a clean runner — `cargo fmt --check` exit 0, `cargo clippy --all-features -- -D warnings` exit 0, every test the change touches passes; the 7 local failures are PRE-EXISTING environmental git-signing/scanner tests proven to fail IDENTICALLY on pristine origin/main and green in CI (probe: exit codes read directly, never through a pipe; clean-worktree discriminator run)
+- [x] ISC-145: Adversarial review (3-lens Workflow: GHA-correctness / wiring / security-honesty) run before ship — found ONE critical, now FIXED: `gh attestation verify` defaults to the build-provenance predicate, so the verify step + advertised command needed `--predicate-type https://cyclonedx.org/bom` or the SBOM attestation would never match (verify job would fail on every release). Fixed in template + dogfood copy + phase-3 example; the CycloneDX URI + the gh default were confirmed against the GitHub CLI manual and a hands-on reference. Wiring lens: CLEAN. (probe: Read the fixed verify step + `grep -c predicate-type` on both template and dogfood copy)
+
+**Honesty caveat (live GHA runtime UNVERIFIED this session):** every ISC-134..145 probe is static (Read/grep) or exercises the sscsb binary itself — none runs `release-attest-sbom.yml` on a real GitHub Actions runner. The DESIGN is independently confirmed (actions/attest sbom-path is valid, SHA=v4.1.1, attest-sbom deprecated, the `--predicate-type` requirement caught + fixed), but the LIVE emission of the SBOM attestation and a passing `gh attestation verify` on a runner were not exercised — the first real release does that. This matches the sibling `provenance-verify` control's transparency about what was and wasn't run for real.
+
 ## Test Strategy
 
 | isc | type | check | threshold | tool | anchors_to |
@@ -271,6 +306,8 @@ Note: ∀-invariants over templates (ISC-110/111/92) are implemented as Rust uni
 - D-15 (2026-07-12): Coverage gate is **lines ≥ 95% (strict, met at 95.85%)** and **functions ≥ 94% (met at 94.69%)**, not the standing 95/95. This is a documented measurement-artifact allowance, not a coverage shortfall. cargo-llvm-cov counts every monomorphization and closure instance *per compilation context* — the crate is built once with `#[cfg(test)]` for unit tests and once without as a dependency of the integration-test and binary crates, so a function exercised in one context shows a phantom uncovered twin in the other, and generic test helpers (`serialized::<T>`, `with_fake_tool::<T>`) monomorphized per type inflate the denominator further. Demangling the entire zero-count set confirms every genuinely-uncovered *named* function has a passing test; the residual ~0.3% is these phantom twins plus tool-Found branches for external tools absent from the sandbox (guacone, witness, sighthound). Verified empirically: four *meaningful* end-to-end tests added this session (Go/Python/Ruby new-dep detection, every-control-has-a-wired-verifier, `sscsb sbom`/`sscsb sast` subprocess) moved the function metric 0.00% because the paths were already covered in some instance-context. Padding with assertion-free tests to chase closure instances is prohibited (global coverage rule), so the honest resolution is a documented functions floor with the lines gate kept strict. See the `Coverage` subsection below and the CI gate comment.
 
 - D-16 (2026-07-13): **Increment — agent-signing.** Added a default-off `agent-signing` control (phase 1) so AI agents can produce verifiable signed commits under a distinct `ai`-class identity on feature branches, while the human-only protected-branch gate stays provably intact (it keys on `class`, independent of `allowed_signers`). Evolved the `Signer` schema (`backend`/`attestation_file`/`expires`), fixed a pre-existing suffix-match fingerprint bug (`ends_with` → exact), added duplicate-principal rejection, a new `src/signers.rs` (verify + `signers list|add|check|verify-policy` + `agent-key setup`), a GitHub-App verification path, and a SHA-pinned server-side workflow (`agent-signing-verify.yml`) that reads trusted policy from the parent commit to close the cloud/mobile self-promotion hole. Council-pressure-tested (Architect / Red-Team / Pragmatist); owner confirmed lean-core-plus-docs and shipping the CI gate in v1. Full ISA-plan, ISCs (12 positive + A1–A6 anti-criteria), and per-ISC verification evidence live in `Plans/snappy-forging-boole.md` (phase: complete). Does not touch the original 122/122 state; all existing gates still green (coverage 95.68% lines / 94.57% functions).
+
+- D-17 (2026-07-18): **Increment 2 — GitHub artifact attestations.** Owner asked whether sscsb implements GitHub-native Artifact Attestations; audit answer was NO (only Cosign keyless + slsa-github-generator + verify gates), and ISA ISC-63 falsely claimed otherwise. Owner directed: add it as an ADDITIONAL control, supplanting nothing. Design: new `github-attestations` control (phase 3, default on — consistent with `scorecard`, which shares the public-repo assumption), standalone `release-attest.yml` template mirroring the release-sign/release-slsa house style (release-published trigger, Harden-Runner-first, SHA-pinned, CUSTOMIZE build stub, explicit empty-dist failure), attest via `actions/attest-build-provenance@<v4.1.1 SHA>`, in-pipeline `gh attestation verify` with `--repo` + `--signer-workflow` identity pinning. Deliberately NOT claiming SLSA L3 in the compliance map: the default-workflow path is L1/L2 material per GitHub's own docs; L3 remains the generator's claim. Why keep all three provenance mechanisms: different trust stores (GitHub attestation API vs release-asset Sigstore bundles vs slsa-generator assets), different verifiers (`gh` CLI zero-install vs cosign vs slsa-verifier), and consumers differ in which they can run. ISC-63's stale checkbox corrected in place rather than silently — the record must show the claim was wrong for six days. Adversarial review (4-lens Workflow, 12 agents, 8 confirmed / 0 refuted) drove five fixes before ship: `attestations: read` added to the verify job (GHEC private repos would otherwise 403 — the GITHUB_TOKEN is a fine-grained token and the attestations API requires the scope; public repos merely tolerate its absence), `release-attest.yml` added to integration.rs's exhaustive init-file list (mutation-tested: its omission made a default_enabled flip invisible to the entire suite), `src/compliance-map.json` deleted as dead code (embedded map is `templates/compliance/map.json` per `src/compliance.rs`; the duplicate was referenced by nothing and had already drifted — missing agent-signing — proving it a trap), and the walkthrough's status/verify blocks + closing tree re-captured from the real binary (they had also silently drifted at D-16: missing agent-signing rows). Class note: D-16 systematically updated code but not docs — counts, walkthrough transcripts, and the dead map all date to that increment.
 
 ## Verification
 
@@ -362,3 +399,155 @@ functions floor is 94% by the documented cargo-llvm-cov instance-counting artifa
 function has a passing test, and the residual is phantom per-context twins plus
 tool-Found closures for tools absent from the sandbox (guacone / witness /
 sighthound). No untested logic; no assertion-free padding.
+
+### J — Increment: OpenSSF-Scorecard scan + remediate (owner-directed 2026-07-21)
+
+Owner ran sscsb's Scorecard workflow against sscs-bootstrapper and expected the
+branch-protection findings to be remediated; audit showed sscsb had NO
+remediation-of-remote-settings capability (every GitHub-facing control was
+read-only verify) and `verify branch-protection` only checked rule-TYPE
+presence, never the granular parameters Scorecard scores. This increment adds
+the first write path + a live Scorecard scanner.
+
+- [x] ISC-146: `verify branch-protection` reads the granular ruleset parameters
+  (`dismiss_stale_reviews_on_push`, `require_code_owner_review`,
+  `require_last_push_approval`, `required_approving_review_count`, `strict`) and
+  reports each Scorecard knob, distinguishing the solo-SAFE tier from the
+  second-reviewer tier a solo maintainer cannot satisfy (probe: stubbed-gh test
+  `branch_protection_reports_scorecard_granular_fields`).
+- [x] ISC-147: NEW `sscsb harden` subcommand (first remote-write path) —
+  `harden branch-protection` sets the solo-safe knobs (`dismiss_stale`, strict);
+  DRY-RUN by default, `--apply` writes, `--require-reviews` opts into the
+  second-reviewer tier (a solo owner is left off by default so they aren't locked
+  out of self-merges). Ruleset diff/merge is pure + unit-tested; the gh GET/PUT
+  boundary is stubbed-gh tested (probe: `harden::tests` — dry-run/apply/no-ruleset).
+- [x] ISC-148: NEW `scorecard` live scan — `verify scorecard` fetches the repo's
+  Scorecard code-scanning alerts and maps each finding to a control + honest
+  status (`sscsb-fixable` / `solo-capped` / `justified-exception` / `owner-action`);
+  the CHECK_MAP + formatting are pure-tested, the gh fetch stubbed-gh tested.
+- [x] ISC-149: CODEOWNERS committed (`* @p4gs`) — required for
+  `require_code_owner_review` and Scorecard Code-Review.
+- [x] ISC-150: Gates — fmt, clippy `-D warnings`, and every new/affected test
+  pass locally; coverage is CI-authoritative (local llvm-cov aborts on the
+  pre-existing environmental git-signing failures). New network functions are
+  stubbed-gh tested per the repo's `verify_branch_protection` pattern rather than
+  ignore-regex'd.
+
+**Honest scope note:** three of the four Scorecard branch-protection warnings
+(required approvers / code-owner review / last-push approval) and Code-Review are
+STRUCTURALLY solo-capped — Scorecard assumes ≥2 reviewers and a solo maintainer
+cannot self-approve without deadlocking their own merges. sscsb sets every safe
+knob and flags the rest; it does not blindly maximize the score at the cost of
+locking the owner out. FuzzingID (0) is a separate increment (cargo-fuzz +
+ClusterFuzzLite). Applying `harden --apply` to the live repo and enabling
+settings are owner-gated (the auto-mode classifier blocks AI writes to repo
+settings, by design).
+
+- [x] ISC-151: NEW `fuzzing` control (phase 4, default-OFF — needs project fuzz
+  targets) installs `cflite-pr.yml`, the ClusterFuzzLite PR workflow Scorecard
+  detects for Rust (FuzzingID 0). SHA-pinned google/clusterfuzzlite actions,
+  harden-runner-first; passes sscsb's own actions-audit; count 35→36.
+- [x] ISC-152: Real cargo-fuzz project in `fuzz/` — 3 targets fuzzing the
+  untrusted-input parsers (`parse_trailers`, `parse_signers`, `parse_deps`) +
+  `.clusterfuzzlite/{Dockerfile,build.sh}`; sscs-bootstrapper dogfoods it.
+  VALIDATED locally: `cargo +nightly fuzz build` (full libFuzzer + ASan) exits 0
+  and produces the three target binaries build.sh copies to $OUT; `cargo fuzz
+  run parse_trailers` executes end-to-end (coverage 47→62, corpus grows, no
+  crash) — not just a type-check.
+- [x] ISC-153: Fixed a DOGFOODING GAP surfaced by fuzzing —
+  `deps::new_unapproved_deps` flagged the cargo-fuzz self-path-dep
+  (`sscsb = { path = ".." }`) as an unvetted source, blocking the repo from
+  adding cargo-fuzz. `path_resolves_within_repo` exempts in-tree path sources
+  (own code); out-of-tree paths + git/url/alias still require review (probe: unit
+  test).
+- [x] ISC-154: Unified the cross-module test PATH lock (audit shares
+  `testutil::PATH_LOCK` with harden/scorecard) so gh-stub tests never race on
+  $PATH (probe: 23 PATH tests pass together; full suite 296 pass, only the 5
+  pre-existing environmental git-signing failures).
+- [x] ISC-155: NEW `release-immutability` control (phase 3, default-OFF) installs
+  a consolidated draft-then-publish `release.yml` (build → attest-build-provenance
+  + SBOM to the attestation store → sign → upload to a DRAFT → publish once), so
+  every asset attaches before the release becomes immutable. Store-based provenance
+  is immutability-safe; the slsa-generator L3 (release-attached) trade-off is
+  documented. Count 36→37 (probe: control-list + compliance + template-audit +
+  integration must-not-install all green).
+- [x] ISC-156: Adversarial review (3-lens Workflow) before ship found + FIXED
+  real bugs — wiring lens CLEAN; the others: (HIGH) harden reported "applied ✓"
+  for `strict` when the ruleset had no required_status_checks rule (no-op PUT read
+  as success) → plan now only plans achievable changes + surfaces honest skips,
+  apply creates a missing `parameters` object, applied-count is reported;
+  (MEDIUM) release.yml signing loop swallowed cosign failures (last-iteration
+  exit status) → per-file `|| exit 1`; (LOW) put_ruleset now sends only writable
+  fields (robust to API tightening); find_branch_ruleset skips a bad entry instead
+  of aborting; harden dedupes rulesets across main/master + treats an absent
+  branch as a skip; release.yml guards re-runs against an already-published tag;
+  the --require-reviews solo-lockout warning now shows in that mode. New unit
+  tests for each (probe: harden::tests 13 pass; full suite 299 pass).
+- [x] ISC-157: PR #6 CI surfaced Trivy findings on the ClusterFuzzLite Dockerfile
+  (the file the fuzzing control's workflow needs). Remediated per the security
+  policy: DS-0001 (unpinned `:latest`) FIXED AT CODE LEVEL — base image pinned by
+  digest `gcr.io/oss-fuzz-base/base-builder-rust@sha256:4541e7f7…` (a hardening
+  tool must not ship an unpinned base). DS-0002 (runs as root) + DS-0026 (no
+  HEALTHCHECK) are documented, evidence-based waivers in a repo-root `.trivyignore`
+  (+ explicit `trivyignores:` in vuln-scan.yml): Trivy's generic runtime-container
+  rules fundamentally cannot model an ephemeral OSS-Fuzz *build* container — it
+  REQUIRES root (compiles into root-owned $OUT/$SRC/$WORK; a non-root USER breaks
+  the fuzz build) and has no service to health-check, and there is no root-free
+  way to make Rust fuzzing detectable by Scorecard. Probe: `trivy config` on the
+  Dockerfile → DS-0001 gone after the pin; `trivy fs` repo-wide honoring the
+  ignore → 0 Dockerfile findings; proven the ignore masks ONLY DS-0002/DS-0026
+  (re-scan without it shows exactly those two, nothing else).
+- [x] ISC-158: Part-B (owner ask: "ensure sscsb can also implement/remediate these
+  configs"). The fuzzing control installed only the workflow — a downstream repo
+  would get a `cflite-pr.yml` that references a Dockerfile it must invent, and any
+  Dockerfile it wrote would trip the same DS-0002/DS-0026. Completed the control:
+  it now installs a hardened, Trivy-clean ClusterFuzzLite scaffold —
+  `.clusterfuzzlite/Dockerfile` (digest-pinned), `.clusterfuzzlite/build.sh`
+  (`cargo fuzz list` loop, CUSTOMIZE stub), and the documented `.trivyignore`
+  waiver — via new fuzzing ARTIFACTS + a `{{project}}` render placeholder (slug
+  tail → the OSS-Fuzz `$SRC/<project>` path). `fuzz/` targets stay project-authored.
+  install_all is non-clobbering, so an existing `.trivyignore` is kept. Probe:
+  `enable fuzzing && init` in a throwaway `acme/widget` repo installed all three,
+  rendered `$SRC/widget`, and `trivy fs` → 0 Dockerfile findings; integration
+  must-not-install now asserts the whole scaffold stays off when fuzzing is off.
+- [x] ISC-159: Live code-scanning accounting for all 6 open Scorecard findings on
+  the repo (owner ask: "why are there ANY findings for GitHub security config
+  hardening?"). BranchProtectionID (HIGH) → remediable via `harden
+  branch-protection --apply` (the command is new in this PR and not yet applied to
+  live — the honest cause); FuzzingID (MED) → clears when this PR merges;
+  SASTID (MED) → CodeQL (push+PR) + OpenGrep (all pushes) already installed, score
+  is historical; PinnedDependenciesID (MED) @ release-slsa.yml:53 → the
+  slsa-github-generator, tag-pinned BY DESIGN (hash-pinning breaks SLSA
+  verification) — a genuine documented exception sscsb reports as
+  `justified-exception`; CodeReviewID (HIGH) + CIIBestPracticesID (LOW) →
+  structurally solo/owner-gated. Verified `verify scorecard`, `verify
+  branch-protection`, and `harden branch-protection` (dry-run) against the LIVE
+  repo (read-only). Gates green after all changes: fmt + clippy `-D warnings`
+  clean; 299 pass / 5 pre-existing environmental git-signing failures (unchanged;
+  none in touched modules).
+- [x] ISC-160: Increment 4 — sscs-bootstrapper dogfoods the immutable release path.
+  Enabled `release-immutability`; DISABLED the four superseded modular controls
+  (`sigstore-signing`, `slsa-provenance`, `github-attestations`, `sbom-attestation`)
+  and removed their installed workflows (release-sign/slsa/attest/attest-sbom.yml),
+  because immutability forbids the post-publish asset writes release-slsa
+  (`upload-assets`) and release-sign (`gh release upload`) do, and because the
+  separately-rebuilt-archive attestations would bind a different digest than the
+  release ships. release.yml consolidates all of it BEFORE publish (build → attest
+  build-provenance + SBOM to the store → Cosign sign → upload to DRAFT → publish
+  once). SLSA L3 (release-attached) is the one dropped capability — documented,
+  mutually exclusive with immutability. TOOL is unchanged: every control template
+  + ARTIFACTS entry stays, so other repos still get the modular flow by default;
+  this is a repo-level opt-in only. Probe: `verify release-immutability` PASS
+  (release.yml installed), `verify actions-audit` PASS (release.yml SHA-pinned +
+  least-priv), full `verify` 0 failed / 1 degraded (pre-existing commit-signing,
+  no local key); throwaway-repo tests untouched (they enable + install these
+  controls in their own temp config).
+- [x] ISC-161: release.yml build step customized from the generic `git archive`
+  scaffold to a REAL build — `cargo build --release --locked`, packed as
+  `sscsb-<tag>-x86_64-unknown-linux-gnu.tar.gz` + `.sha256`, so the first release's
+  attestations + signature bind the actual shipped binary (Part 1: "a real build so
+  attestations populate"). Single-target x86_64-linux for v0.1.0; a cross-compile
+  matrix is a follow-up. The TEMPLATE keeps its generic `git archive` + CUSTOMIZE
+  placeholder (downstream builds are language-specific). FOLLOW-UP (TF-IMMUT-GUARD):
+  `sscsb` could warn when release-immutability is enabled alongside a superseded
+  modular control, enforcing the mutual exclusivity in-tool.

@@ -7,7 +7,10 @@ now*, and *can I show someone*.
 | Control | What it does | Backing tool | Default |
 |---------|--------------|--------------|---------|
 | `openvex` | Exploitability-aware triage: "not affected", auditably | (native) + vexctl | on |
-| `compliance-map` | Control → SLSA / SSDF / CRA / Badge map behind `sscsb report` | (native) | on |
+| `security-insights` | Machine-readable `security-insights.yml` (OpenSSF Security Insights) declaring security practices + reporting channels | (native) | on |
+| `best-practices-badge` | Worksheet pre-filling the OpenSSF Best Practices passing criteria from installed controls | (native) | on |
+| `osps-baseline` | Maps enabled controls to OpenSSF Project Security Baseline families; adds an OSPS column to `sscsb report` | (native) | on |
+| `compliance-map` | Control → SLSA / SSDF / CRA / OSPS / Badge map behind `sscsb report` | (native) | on |
 | `dependency-track` | Continuous SBOM management platform | Dependency-Track | off |
 | `guac` | Supply-chain knowledge graph | GUAC | off |
 | `oras` | Push SBOMs/attestations to an OCI registry | ORAS | off |

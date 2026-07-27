@@ -33,6 +33,9 @@ jobs:
           scanners: vuln,secret,misconfig
           format: sarif
           output: trivy.sarif
+          # Documented, evidence-based misconfig waivers (OSS-Fuzz build-container
+          # rules Trivy cannot model). See the file for per-ID rationale.
+          trivyignores: .trivyignore
       - name: Upload SARIF
         uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
         with:

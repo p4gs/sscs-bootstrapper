@@ -49,6 +49,19 @@ enum Command {
         #[arg(long, default_value = "text")]
         format: String,
     },
+    /// Remediate remote GitHub settings toward OpenSSF-Scorecard alignment
+    /// (branch protection today). DRY-RUN unless --apply.
+    Harden {
+        /// Control to remediate (default: branch-protection)
+        control: Option<String>,
+        /// Actually write the changes (default: print the plan only)
+        #[arg(long)]
+        apply: bool,
+        /// Also set the second-reviewer knobs (needs a 2nd maintainer; a solo
+        /// owner cannot self-approve their own PRs)
+        #[arg(long)]
+        require_reviews: bool,
+    },
     /// Git hook entry points (invoked by the installed shims)
     Hook {
         #[command(subcommand)]
@@ -305,6 +318,11 @@ pub fn run() -> Result<ExitCode> {
         Command::Disable { control } => cmd_toggle(&cwd, &control, false),
         Command::Verify { controls, strict } => cmd_verify(&cwd, &controls, strict),
         Command::Report { format } => cmd_report(&cwd, &format),
+        Command::Harden {
+            control,
+            apply,
+            require_reviews,
+        } => cmd_harden(&cwd, control.as_deref(), apply, require_reviews),
         Command::Hook { event } => cmd_hook(&cwd, event),
         Command::Sbom { format } => cmd_sbom(&cwd, format.as_deref()),
         Command::Scan { vex, grype } => cmd_scan(&cwd, vex.as_deref(), grype),
@@ -429,6 +447,43 @@ fn cmd_verify(cwd: &std::path::Path, only: &[String], strict: bool) -> Result<Ex
         fail(1)
     } else {
         ok()
+    }
+}
+
+fn cmd_harden(
+    cwd: &std::path::Path,
+    control: Option<&str>,
+    apply: bool,
+    require_reviews: bool,
+) -> Result<ExitCode> {
+    let ctx = Ctx::discover(cwd)?;
+    let cfg = ctx.require_config()?;
+    let control = control.unwrap_or("branch-protection");
+    let result = match control {
+        "branch-protection" => {
+            crate::harden::harden_branch_protection(&ctx, cfg, apply, require_reviews)
+        }
+        other => {
+            eprintln!(
+                "sscsb error: `harden` does not support control `{other}` yet \
+                 (supported: branch-protection)"
+            );
+            return fail(2);
+        }
+    };
+    let tag = if result.applied {
+        "applied "
+    } else {
+        "plan    "
+    };
+    println!("[{tag}] harden {}", result.id);
+    for line in &result.lines {
+        println!("           {line}");
+    }
+    if result.ok {
+        ok()
+    } else {
+        fail(1)
     }
 }
 

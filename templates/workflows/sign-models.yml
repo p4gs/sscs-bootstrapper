@@ -1,0 +1,71 @@
+# sscsb: OpenSSF Model Signing — sign & verify ML model artifacts with Sigstore
+# keyless signing (recorded in the public transparency log), so model provenance
+# is verifiable and tampering is detectable. Additive to the artifact-signing
+# controls; for repos that ship ML models (*.safetensors, *.onnx, *.pt, *.gguf …).
+#
+# Pinned: model-signing 1.1.1 (PyPI) — https://github.com/sigstore/model-transparency
+# Runs on demand or at release; ubuntu-latest ships python3, so no extra action.
+name: Sign ML Models
+on:
+  workflow_dispatch:
+    inputs:
+      model_path:
+        description: "Model file or directory to sign"
+        required: true
+        default: "models"
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # keyless Sigstore signing via GitHub OIDC
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install model-signing (pinned)
+        run: python3 -m pip install --user "model-signing==1.1.1"
+      - name: Sign models (Sigstore keyless)
+        env:
+          MODEL_PATH: ${{ github.event.inputs.model_path || 'models' }}
+        run: |
+          if [ ! -e "$MODEL_PATH" ]; then
+            echo "no model at $MODEL_PATH — nothing to sign"; exit 0
+          fi
+          # --use_ambient_credentials makes model_signing consume the GitHub OIDC
+          # ambient token (id-token: write) so keyless signing is non-interactive
+          # in CI; without it the CLI falls through to a browser OAuth flow that
+          # hangs on a runner.
+          python3 -m model_signing sign "$MODEL_PATH" --signature model.sig --use_ambient_credentials
+      - name: Verify signature (round-trip)
+        env:
+          MODEL_PATH: ${{ github.event.inputs.model_path || 'models' }}
+          # Derive the expected signer identity from the ACTUAL ref: the Sigstore
+          # cert SAN embeds refs/tags/<tag> on a release trigger and
+          # refs/heads/<branch> on dispatch, so hardcoding refs/heads would fail
+          # verify on every release run.
+          EXPECTED_IDENTITY: "https://github.com/${{ github.repository }}/.github/workflows/sign-models.yml@${{ github.ref }}"
+        run: |
+          if [ ! -f model.sig ]; then
+            echo "no signature produced (no model) — skipping verify"; exit 0
+          fi
+          python3 -m model_signing verify "$MODEL_PATH" --signature model.sig \
+            --identity "$EXPECTED_IDENTITY" \
+            --identity_provider "https://token.actions.githubusercontent.com"
+      - name: Upload signature
+        if: hashFiles('model.sig') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: model-signature
+          path: model.sig

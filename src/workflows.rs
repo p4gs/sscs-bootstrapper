@@ -77,9 +77,24 @@ pub const ARTIFACTS: &[Artifact] = &[
         content: include_str!("../templates/workflows/release-slsa.yml"),
     },
     Artifact {
+        control: "github-attestations",
+        dest: ".github/workflows/release-attest.yml",
+        content: include_str!("../templates/workflows/release-attest.yml"),
+    },
+    Artifact {
+        control: "sbom-attestation",
+        dest: ".github/workflows/release-attest-sbom.yml",
+        content: include_str!("../templates/workflows/release-attest-sbom.yml"),
+    },
+    Artifact {
         control: "provenance-verify",
         dest: ".github/workflows/deploy-gate.yml",
         content: include_str!("../templates/workflows/deploy-gate.yml"),
+    },
+    Artifact {
+        control: "release-immutability",
+        dest: ".github/workflows/release.yml",
+        content: include_str!("../templates/workflows/release.yml"),
     },
     Artifact {
         control: "octo-sts",
@@ -107,6 +122,31 @@ pub const ARTIFACTS: &[Artifact] = &[
         content: include_str!("../templates/workflows/codeql.yml"),
     },
     Artifact {
+        control: "fuzzing",
+        dest: ".github/workflows/cflite-pr.yml",
+        content: include_str!("../templates/workflows/cflite-pr.yml"),
+    },
+    // The ClusterFuzzLite scaffold the workflow needs: a hardened, Trivy-clean
+    // build container + build script + the documented `.trivyignore` waiver, so
+    // enabling `fuzzing` on any repo yields a Scorecard-detectable, scanner-clean
+    // fuzzing setup — not a workflow that references a Dockerfile you must invent.
+    // The `fuzz/` cargo-fuzz targets stay yours to write (project-specific).
+    Artifact {
+        control: "fuzzing",
+        dest: ".clusterfuzzlite/Dockerfile",
+        content: include_str!("../templates/clusterfuzzlite/Dockerfile"),
+    },
+    Artifact {
+        control: "fuzzing",
+        dest: ".clusterfuzzlite/build.sh",
+        content: include_str!("../templates/clusterfuzzlite/build.sh"),
+    },
+    Artifact {
+        control: "fuzzing",
+        dest: ".trivyignore",
+        content: include_str!("../templates/trivyignore"),
+    },
+    Artifact {
         control: "wait-for-secrets",
         dest: ".github/workflows/wait-for-secrets-example.yml",
         content: include_str!("../templates/workflows/wait-for-secrets-snippet.yml"),
@@ -116,13 +156,43 @@ pub const ARTIFACTS: &[Artifact] = &[
         dest: ".sscsb/templates/dependency-track-compose.yml",
         content: include_str!("../templates/configs/dependency-track-compose.yml"),
     },
+    // ── OpenSSF controls ────────────────────────────────────────────────────
+    Artifact {
+        control: "security-insights",
+        dest: "security-insights.yml",
+        content: include_str!("../templates/configs/security-insights.yml"),
+    },
+    Artifact {
+        control: "best-practices-badge",
+        dest: ".sscsb/best-practices-badge.md",
+        content: include_str!("../templates/configs/best-practices-badge.md"),
+    },
+    Artifact {
+        control: "osps-baseline",
+        dest: ".sscsb/osps-baseline.md",
+        content: include_str!("../templates/configs/osps-baseline.md"),
+    },
+    Artifact {
+        control: "model-signing",
+        dest: ".github/workflows/sign-models.yml",
+        content: include_str!("../templates/workflows/sign-models.yml"),
+    },
+    Artifact {
+        control: "gittuf",
+        dest: ".github/workflows/gittuf-verify.yml",
+        content: include_str!("../templates/workflows/gittuf-verify.yml"),
+    },
 ];
 
 /// Render template placeholders with repo-specific values.
 pub fn render(content: &str, repo_slug: &str, default_branch: &str) -> String {
+    // `{{project}}` = the repo name (slug tail) — used by the ClusterFuzzLite
+    // scaffold for the OSS-Fuzz `$SRC/<project>` build path.
+    let project = repo_slug.rsplit('/').next().unwrap_or(repo_slug);
     content
         .replace("{{repo_slug}}", repo_slug)
         .replace("{{default_branch}}", default_branch)
+        .replace("{{project}}", project)
 }
 
 pub fn artifacts_for(control: &str) -> Vec<&'static Artifact> {
