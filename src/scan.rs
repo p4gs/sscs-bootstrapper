@@ -9,7 +9,6 @@ use crate::controls::{Outcome, VerifyResult};
 use crate::exec;
 use crate::tools;
 use anyhow::{Context as _, Result};
-use std::collections::BTreeSet;
 use std::path::Path;
 
 pub const SEVERITIES: &[&str] = &["low", "medium", "high", "critical"];
@@ -27,6 +26,12 @@ pub struct VulnFinding {
     pub package: String,
     pub severity: String,
     pub source: &'static str,
+    /// The package ecosystem, when the scanner stated one (Trivy's per-result
+    /// `Type`, OSV's `package.ecosystem`), lowercased. `None` when unknown —
+    /// secrets and misconfigurations have no ecosystem, and older report
+    /// shapes may omit it. VEX product matching uses this to refuse
+    /// cross-ecosystem name collisions; see [`vex_product_matches`].
+    pub ecosystem: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -105,6 +110,12 @@ pub fn parse_trivy(stdout: &str) -> Result<Vec<VulnFinding>> {
         .and_then(|r| r.as_array())
         .unwrap_or(&Vec::new())
     {
+        // Trivy states the package ecosystem per result ("cargo", "npm",
+        // "debian", ...). Secrets and misconfigurations have none.
+        let ecosystem = result
+            .get("Type")
+            .and_then(|x| x.as_str())
+            .map(str::to_ascii_lowercase);
         for vuln in result
             .get("Vulnerabilities")
             .and_then(|x| x.as_array())
@@ -127,6 +138,7 @@ pub fn parse_trivy(stdout: &str) -> Result<Vec<VulnFinding>> {
                     .unwrap_or("UNKNOWN")
                     .to_lowercase(),
                 source: "trivy",
+                ecosystem: ecosystem.clone(),
             });
         }
         for secret in result
@@ -151,6 +163,7 @@ pub fn parse_trivy(stdout: &str) -> Result<Vec<VulnFinding>> {
                     .unwrap_or("HIGH")
                     .to_lowercase(),
                 source: "trivy",
+                ecosystem: None,
             });
         }
         for mis in result
@@ -175,6 +188,7 @@ pub fn parse_trivy(stdout: &str) -> Result<Vec<VulnFinding>> {
                     .unwrap_or("MEDIUM")
                     .to_lowercase(),
                 source: "trivy",
+                ecosystem: None,
             });
         }
     }
@@ -218,6 +232,10 @@ pub fn parse_osv(stdout: &str) -> Result<Vec<VulnFinding>> {
                 .and_then(|x| x.as_str())
                 .unwrap_or("?")
                 .to_string();
+            let ecosystem = pkg
+                .pointer("/package/ecosystem")
+                .and_then(|x| x.as_str())
+                .map(str::to_ascii_lowercase);
             for vuln in pkg
                 .get("vulnerabilities")
                 .and_then(|x| x.as_array())
@@ -236,6 +254,7 @@ pub fn parse_osv(stdout: &str) -> Result<Vec<VulnFinding>> {
                         .to_string(),
                     package: name.clone(),
                     severity,
+                    ecosystem: ecosystem.clone(),
                     source: "osv-scanner",
                 });
             }
@@ -244,8 +263,26 @@ pub fn parse_osv(stdout: &str) -> Result<Vec<VulnFinding>> {
     Ok(findings)
 }
 
-/// Apply an OpenVEX document: findings whose vuln id matches a `not_affected`
-/// or `fixed` statement are suppressed — visibly, never silently.
+/// Apply an OpenVEX document: a finding is suppressed only when a
+/// `not_affected` or `fixed` statement names BOTH its vulnerability id AND a
+/// product matching the finding's package — visibly, never silently.
+///
+/// Scope is the whole point of VEX. An earlier implementation keyed
+/// suppression on `/vulnerability/name` alone — the `products` array was
+/// parsed by nobody — so one statement scoped to `pkg:cargo/foo` suppressed
+/// that CVE in every package in the report: a document-wide wildcard nobody
+/// wrote. A statement that names no products suppresses nothing and says so
+/// in the notes, because "this CVE affects nothing anywhere" is exactly that
+/// wildcard, and OpenVEX statements are product-scoped assertions by design.
+///
+/// Product matching is name-granular within an ecosystem: findings carry no
+/// package version, so a purl pinned to a version (`pkg:cargo/itoa@1.0.11`)
+/// matches the finding for `itoa`. When BOTH the purl and the finding declare
+/// an ecosystem, they must agree — `pkg:cargo/openssl` must not suppress an
+/// OS-package `openssl` finding for the same CVE (same-name collisions across
+/// ecosystems are routine in a single Trivy filesystem scan). Each
+/// suppression row names the product id and status that matched, so any
+/// remaining over-breadth is visible in the report rather than silent.
 pub fn apply_vex(report: &mut ScanReport, vex_text: &str) -> Result<()> {
     let v: serde_json::Value = serde_json::from_str(vex_text).context("VEX is not valid JSON")?;
     anyhow::ensure!(
@@ -254,35 +291,143 @@ pub fn apply_vex(report: &mut ScanReport, vex_text: &str) -> Result<()> {
             .is_some_and(|c| c.contains("openvex.dev")),
         "not an OpenVEX document (missing openvex.dev @context)"
     );
-    let mut suppress: BTreeSet<String> = BTreeSet::new();
+    // (vulnerability id, product id, status) triples permitted to suppress.
+    let mut suppress: Vec<(String, String, String)> = Vec::new();
     for stmt in v
         .get("statements")
         .and_then(|s| s.as_array())
         .unwrap_or(&Vec::new())
     {
         let status = stmt.get("status").and_then(|s| s.as_str()).unwrap_or("");
-        if status == "not_affected" || status == "fixed" {
-            if let Some(id) = stmt.pointer("/vulnerability/name").and_then(|n| n.as_str()) {
-                suppress.insert(id.to_string());
-            }
+        if status != "not_affected" && status != "fixed" {
+            continue;
+        }
+        let Some(id) = stmt.pointer("/vulnerability/name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let products = vex_product_ids(stmt);
+        if products.is_empty() {
+            report.notes.push(format!(
+                "VEX statement for {id} names no products — it suppresses nothing \
+                 (a statement without product scope would suppress the CVE everywhere)"
+            ));
+            continue;
+        }
+        for product in products {
+            suppress.push((id.to_string(), product, status.to_string()));
         }
     }
     let before = report.findings.len();
     let mut suppressed = Vec::new();
     report.findings.retain(|f| {
-        if suppress.contains(&f.id) {
-            suppressed.push(format!("{} ({}) — VEX not_affected/fixed", f.id, f.package));
-            false
-        } else {
-            true
+        match suppress
+            .iter()
+            .find(|(id, product, _)| *id == f.id && vex_product_matches(product, f))
+        {
+            Some((_, product, status)) => {
+                suppressed.push(format!(
+                    "{} ({}) — VEX {status} for {product}",
+                    f.id, f.package
+                ));
+                false
+            }
+            None => true,
         }
     });
+    let newly_suppressed = suppressed.len();
     report.suppressed.extend(suppressed);
     report.notes.push(format!(
-        "VEX applied: {} finding(s) suppressed of {before}",
-        report.suppressed.len()
+        "VEX applied: {newly_suppressed} finding(s) suppressed of {before}"
     ));
     Ok(())
+}
+
+/// The product ids a VEX statement names. Accepts the OpenVEX object form
+/// (`{"@id": "pkg:cargo/foo"}`) and, liberally, a bare string entry.
+fn vex_product_ids(stmt: &serde_json::Value) -> Vec<String> {
+    stmt.get("products")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    p.as_str()
+                        .or_else(|| p.get("@id").and_then(|i| i.as_str()))
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Does a VEX product id name this finding's package?
+///
+/// Exact-id match, or a purl whose name component matches — gated on
+/// ecosystem agreement when both sides declare one. The gate is what stops a
+/// `pkg:cargo/openssl` statement from suppressing an OS-package `openssl`
+/// finding: purl `type` and scanner ecosystem are normalised through
+/// [`normalize_ecosystem`] and must be equal. When either side is unknown
+/// (secrets, misconfigs, older report shapes, non-purl product ids) matching
+/// falls back to name granularity — we cannot tighten on information that
+/// does not exist, and the suppression row keeps the residue visible.
+///
+/// Maven is additionally matched in its conventional `group:artifact` colon
+/// form, since scanners commonly emit GAV notation while purls use a slash.
+fn vex_product_matches(product_id: &str, finding: &VulnFinding) -> bool {
+    if product_id == finding.package {
+        return true;
+    }
+    let Some((purl_type, name)) = purl_parts(product_id) else {
+        return false;
+    };
+    if let Some(eco) = &finding.ecosystem {
+        if normalize_ecosystem(&purl_type) != normalize_ecosystem(eco) {
+            return false;
+        }
+    }
+    name == finding.package
+        || (normalize_ecosystem(&purl_type) == "maven" && name.replace('/', ":") == finding.package)
+}
+
+/// The `(type, name)` of a purl, with the version, qualifiers, and subpath
+/// stripped and `%40` decoded for scoped-npm names.
+/// `pkg:cargo/itoa@1.0.11` → `("cargo", "itoa")`; `pkg:npm/%40scope/name@1.2`
+/// → `("npm", "@scope/name")`; `pkg:golang/github.com/foo/bar` →
+/// `("golang", "github.com/foo/bar")`.
+fn purl_parts(purl: &str) -> Option<(String, String)> {
+    let rest = purl.strip_prefix("pkg:")?;
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    // Scoped npm names encode their own `@` as `%40`, so a literal `@` only
+    // ever introduces the version.
+    let rest = rest.split('@').next().unwrap_or(rest);
+    let (purl_type, name_path) = rest.split_once('/')?;
+    (!purl_type.is_empty() && !name_path.is_empty()).then(|| {
+        (
+            purl_type.to_ascii_lowercase(),
+            name_path.replace("%40", "@"),
+        )
+    })
+}
+
+/// Map scanner ecosystem vocabulary and purl types onto one namespace so
+/// `crates.io` (OSV) and `cargo` (purl, Trivy) compare equal. Unknown labels
+/// pass through lowercased — two unknowns still have to agree with each
+/// other, which is strictly safer than ignoring them.
+fn normalize_ecosystem(label: &str) -> String {
+    let l = label.to_ascii_lowercase();
+    match l.as_str() {
+        "crates.io" => "cargo".into(),
+        "go" => "golang".into(),
+        // Trivy reports Java findings under archive/build-file types; their
+        // coordinates are Maven GAV, purl type "maven".
+        "jar" | "pom" | "gradle" | "gradle-lockfile" | "sbt" => "maven".into(),
+        "packagist" => "composer".into(),
+        "rubygems" => "gem".into(),
+        "debian" | "ubuntu" => "deb".into(),
+        "alpine" => "apk".into(),
+        "redhat" | "centos" | "rocky" | "alma" | "almalinux" | "fedora" | "oracle" | "amazon"
+        | "suse" | "opensuse" | "opensuse-leap" => "rpm".into(),
+        _ => l,
+    }
 }
 
 /// Does the report breach the configured severity threshold?
@@ -477,6 +622,203 @@ mod tests {
         let mut report = ScanReport::default();
         let err = apply_vex(&mut report, "not json at all").unwrap_err();
         assert!(format!("{err:#}").contains("not valid JSON"));
+    }
+
+    fn finding(id: &str, package: &str) -> VulnFinding {
+        VulnFinding {
+            id: id.to_string(),
+            package: package.to_string(),
+            severity: "high".to_string(),
+            source: "trivy",
+            ecosystem: None,
+        }
+    }
+
+    fn eco_finding(id: &str, package: &str, ecosystem: &str) -> VulnFinding {
+        VulnFinding {
+            ecosystem: Some(ecosystem.to_string()),
+            ..finding(id, package)
+        }
+    }
+
+    /// The defect this scoping exists to kill: one statement scoped to a
+    /// single product acting as a document-wide wildcard for its CVE.
+    #[test]
+    fn vex_statement_scoped_to_one_package_does_not_suppress_the_same_cve_elsewhere() {
+        let mut report = ScanReport {
+            findings: vec![
+                finding("CVE-2024-0001", "foo"),
+                finding("CVE-2024-0001", "bar"),
+            ],
+            ..Default::default()
+        };
+        let vex = r#"{"@context":"https://openvex.dev/ns/v0.2.0","statements":[
+            {"vulnerability":{"name":"CVE-2024-0001"},"products":[{"@id":"pkg:cargo/foo"}],
+             "status":"not_affected","justification":"vulnerable_code_not_present"}]}"#;
+        apply_vex(&mut report, vex).unwrap();
+        assert_eq!(
+            report.findings.len(),
+            1,
+            "the out-of-scope finding survives"
+        );
+        assert_eq!(report.findings[0].package, "bar");
+        assert_eq!(report.suppressed.len(), 1);
+        assert!(
+            report.suppressed[0].contains("foo") && report.suppressed[0].contains("pkg:cargo/foo"),
+            "the suppression row names the product that matched: {}",
+            report.suppressed[0]
+        );
+    }
+
+    #[test]
+    fn vex_statement_with_no_products_suppresses_nothing_and_is_noted() {
+        let mut report = ScanReport {
+            findings: vec![finding("CVE-2024-0001", "foo")],
+            ..Default::default()
+        };
+        let vex = r#"{"@context":"https://openvex.dev/ns/v0.2.0","statements":[
+            {"vulnerability":{"name":"CVE-2024-0001"},
+             "status":"not_affected","justification":"vulnerable_code_not_present"}]}"#;
+        apply_vex(&mut report, vex).unwrap();
+        assert_eq!(report.findings.len(), 1, "nothing may be suppressed");
+        assert!(report.suppressed.is_empty());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("names no products") && n.contains("CVE-2024-0001")),
+            "the impotent statement must be visible in the notes: {:?}",
+            report.notes
+        );
+    }
+
+    #[test]
+    fn vex_version_pinned_purl_matches_the_unversioned_finding_name() {
+        // Findings carry no version, so a version-pinned purl matches at name
+        // granularity — documented behavior, visible via the suppression row.
+        let mut report = ScanReport {
+            findings: vec![finding("CVE-2024-0001", "itoa")],
+            ..Default::default()
+        };
+        let vex = r#"{"@context":"https://openvex.dev/ns/v0.2.0","statements":[
+            {"vulnerability":{"name":"CVE-2024-0001"},"products":[{"@id":"pkg:cargo/itoa@1.0.11"}],
+             "status":"not_affected","justification":"vulnerable_code_not_present"}]}"#;
+        apply_vex(&mut report, vex).unwrap();
+        assert!(report.findings.is_empty());
+        assert!(report.suppressed[0].contains("pkg:cargo/itoa@1.0.11"));
+    }
+
+    #[test]
+    fn purl_parts_handles_the_shapes_scanners_emit() {
+        let parts = |p: &str| purl_parts(p).map(|(t, n)| format!("{t} {n}"));
+        assert_eq!(
+            parts("pkg:cargo/itoa@1.0.11").as_deref(),
+            Some("cargo itoa")
+        );
+        assert_eq!(parts("pkg:cargo/foo").as_deref(), Some("cargo foo"));
+        assert_eq!(
+            parts("pkg:npm/%40scope/name@1.2").as_deref(),
+            Some("npm @scope/name")
+        );
+        assert_eq!(
+            parts("pkg:golang/github.com/foo/bar@v1.0.0").as_deref(),
+            Some("golang github.com/foo/bar")
+        );
+        assert_eq!(
+            parts("pkg:cargo/foo@1.0?checksum=abc").as_deref(),
+            Some("cargo foo")
+        );
+        assert_eq!(parts("not-a-purl"), None);
+        assert_eq!(parts("pkg:cargo/"), None);
+    }
+
+    /// The adversarial-review HIGH: same bare package name in two ecosystems,
+    /// one ecosystem-scoped statement. Only the matching ecosystem's finding
+    /// may be suppressed.
+    #[test]
+    fn vex_cargo_statement_does_not_suppress_a_same_named_package_in_another_ecosystem() {
+        let mut report = ScanReport {
+            findings: vec![
+                eco_finding("CVE-2024-0001", "openssl", "cargo"),
+                eco_finding("CVE-2024-0001", "openssl", "debian"),
+            ],
+            ..Default::default()
+        };
+        let vex = r#"{"@context":"https://openvex.dev/ns/v0.2.0","statements":[
+            {"vulnerability":{"name":"CVE-2024-0001"},"products":[{"@id":"pkg:cargo/openssl"}],
+             "status":"not_affected","justification":"vulnerable_code_not_present"}]}"#;
+        apply_vex(&mut report, vex).unwrap();
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].ecosystem.as_deref(), Some("debian"));
+        assert_eq!(report.suppressed.len(), 1);
+    }
+
+    #[test]
+    fn vex_ecosystem_aliases_bridge_scanner_and_purl_vocabulary() {
+        // OSV says "crates.io"; the purl type is "cargo". They must agree.
+        let mut report = ScanReport {
+            findings: vec![eco_finding("CVE-2024-0001", "itoa", "crates.io")],
+            ..Default::default()
+        };
+        let vex = r#"{"@context":"https://openvex.dev/ns/v0.2.0","statements":[
+            {"vulnerability":{"name":"CVE-2024-0001"},"products":[{"@id":"pkg:cargo/itoa"}],
+             "status":"not_affected","justification":"vulnerable_code_not_present"}]}"#;
+        apply_vex(&mut report, vex).unwrap();
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    #[test]
+    fn vex_matches_maven_gav_colon_notation() {
+        let mut report = ScanReport {
+            findings: vec![eco_finding(
+                "CVE-2021-44228",
+                "org.apache.logging.log4j:log4j-core",
+                "jar",
+            )],
+            ..Default::default()
+        };
+        let vex = r#"{"@context":"https://openvex.dev/ns/v0.2.0","statements":[
+            {"vulnerability":{"name":"CVE-2021-44228"},
+             "products":[{"@id":"pkg:maven/org.apache.logging.log4j/log4j-core@2.17.0"}],
+             "status":"fixed"}]}"#;
+        apply_vex(&mut report, vex).unwrap();
+        // "jar" (Trivy's Java type) normalises to "maven", so the GAV colon
+        // form matches the purl slash form.
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        // Same through OSV's literal "maven" label:
+        let mut agreeing = ScanReport {
+            findings: vec![eco_finding(
+                "CVE-2021-44228",
+                "org.apache.logging.log4j:log4j-core",
+                "maven",
+            )],
+            ..Default::default()
+        };
+        apply_vex(
+            &mut agreeing,
+            r#"{"@context":"https://openvex.dev/ns/v0.2.0","statements":[
+            {"vulnerability":{"name":"CVE-2021-44228"},
+             "products":[{"@id":"pkg:maven/org.apache.logging.log4j/log4j-core@2.17.0"}],
+             "status":"fixed"}]}"#,
+        )
+        .unwrap();
+        assert!(agreeing.findings.is_empty(), "{:?}", agreeing.findings);
+        assert!(agreeing.suppressed[0].contains("VEX fixed for"));
+    }
+
+    #[test]
+    fn vex_unknown_ecosystem_falls_back_to_name_matching() {
+        // A finding with no ecosystem (older shapes, secrets) cannot be
+        // tightened — name granularity is the documented fallback.
+        let mut report = ScanReport {
+            findings: vec![finding("CVE-2024-0001", "foo")],
+            ..Default::default()
+        };
+        let vex = r#"{"@context":"https://openvex.dev/ns/v0.2.0","statements":[
+            {"vulnerability":{"name":"CVE-2024-0001"},"products":[{"@id":"pkg:cargo/foo"}],
+             "status":"not_affected","justification":"vulnerable_code_not_present"}]}"#;
+        apply_vex(&mut report, vex).unwrap();
+        assert!(report.findings.is_empty());
     }
 
     // ── orchestration: real Trivy + OSV-Scanner against throwaway repos ──────
