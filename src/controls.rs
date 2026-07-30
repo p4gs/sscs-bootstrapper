@@ -172,6 +172,20 @@ pub const CONTROLS: &[ControlDef] = &[
         default_options: &[("registry_check", "true"), ("typosquat_check", "true")],
     },
     ControlDef {
+        id: "bumblebee",
+        phase: 2,
+        name: "Bumblebee endpoint exposure scan",
+        summary: "Inventory installed packages, MCP servers, editor/browser extensions and agent skills; match against known-compromise catalogs",
+        default_enabled: false,
+        tools: &["bumblebee"],
+        // `baseline`, not `project`: the artifact classes this control exists to
+        // find (MCP configs, editor/browser extensions, agent skills, Homebrew
+        // receipts) live under user-global roots. `project` pins the scan to the
+        // repository, where none of them are — and for a Rust repo it inventories
+        // nothing at all, since bumblebee has no cargo ecosystem.
+        default_options: &[("profile", "\"baseline\""), ("catalog", "\"\"")],
+    },
+    ControlDef {
         id: "grype",
         phase: 2,
         name: "Grype (optional)",
@@ -499,6 +513,7 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
         "sbom" => crate::sbom::verify_sbom_control(ctx),
         "vuln-scan" => crate::scan::verify_scan_control(ctx),
         "grype" => crate::sbom::verify_grype_control(ctx),
+        "bumblebee" => crate::bumblebee::verify_bumblebee_control(ctx, cfg),
         "package-trust" => crate::deps::verify_package_trust(ctx, cfg),
         "scorecard" => crate::scorecard::verify_scorecard_control(ctx, cfg),
         "renovate"

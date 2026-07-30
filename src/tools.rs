@@ -77,6 +77,17 @@ pub const TOOLS: &[ToolSpec] = &[
         install_note: "Release binaries: https://github.com/anchore/grype/releases",
     },
     ToolSpec {
+        id: "bumblebee",
+        bin: "bumblebee",
+        pinned_version: "0.1.2",
+        version_args: &["version"],
+        homepage: "https://github.com/perplexityai/bumblebee",
+        brew: Some("bumblebee"),
+        install_note: "Read-only endpoint inventory scanner (Go, zero dependencies). \
+                       Release binaries: https://github.com/perplexityai/bumblebee/releases \
+                       — exposure catalogs must use schema_version \"0.1.0\".",
+    },
+    ToolSpec {
         id: "cosign",
         bin: "cosign",
         pinned_version: "3.1.1",
