@@ -285,113 +285,163 @@ pub fn verify_bumblebee_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
         );
     }
 
-    let catalog_path = ctx.root.join(&catalog);
+    match plan_scan(
+        &ctx.root,
+        &catalog,
+        cfg.control_opt_str(CONTROL, "profile").as_deref(),
+    ) {
+        Err(refusal) => refusal,
+        Ok(plan) => {
+            let mut args: Vec<&str> = vec![
+                "scan",
+                "--profile",
+                plan.profile,
+                "--exposure-catalog",
+                &plan.catalog_arg,
+                "--findings-only",
+            ];
+            // NOTE: --root REPLACES the profile's roots, it does not narrow them
+            // (bumblebee's own help: "use --root to override"). For `project` that
+            // is the intent — scope the scan to this repository. For `baseline` it
+            // would destroy the very roots the control exists to read (MCP configs,
+            // editor and browser extensions, agent skills, Homebrew receipts), so
+            // --root is never passed there.
+            if plan.profile == "project" {
+                args.push("--root");
+                args.push(&plan.root);
+            }
+
+            match exec::run(CONTROL, &args, Some(&ctx.root)) {
+                Err(e) => VerifyResult::new(
+                    CONTROL,
+                    Outcome::Fail,
+                    vec![format!("bumblebee scan could not be executed: {e:#}")],
+                ),
+                Ok(out) => evaluate_scan(
+                    &version,
+                    plan.profile,
+                    &catalog,
+                    plan.coerced.as_deref(),
+                    &out,
+                ),
+            }
+        }
+    }
+}
+
+/// Everything decided before the scan runs.
+#[derive(Debug)]
+pub struct ScanPlan {
+    pub profile: &'static str,
+    pub catalog_arg: String,
+    pub root: String,
+    /// Set when config named a profile we did not recognise and narrowed it.
+    pub coerced: Option<String>,
+}
+
+/// Decide whether a scan should run at all, and with what arguments.
+///
+/// `Err(VerifyResult)` is a refusal: a reason the scan must not be trusted even
+/// though bumblebee would happily exit 0. Reads the filesystem (catalog
+/// existence and entry count) but touches no PATH and spawns no subprocess, so
+/// every refusal is reachable in a test with nothing but a tempdir.
+pub fn plan_scan(
+    root: &std::path::Path,
+    catalog: &str,
+    profile_opt: Option<&str>,
+) -> std::result::Result<ScanPlan, VerifyResult> {
+    let refuse = |messages: Vec<String>| VerifyResult::new(CONTROL, Outcome::Fail, messages);
+
+    let catalog_path = root.join(catalog);
     let catalog_arg = if catalog_path.exists() {
         catalog_path.display().to_string()
     } else {
-        catalog.clone()
+        catalog.to_string()
     };
 
-    // A catalog that resolves to zero entries makes every scan tautologically
-    // clean. Refuse before running rather than reporting the empty result as a
-    // pass. (A catalog path that does not exist at all is caught by the tool
-    // itself with exit 2 and is handled below.)
+    // A catalog that resolves to zero usable entries makes every scan
+    // tautologically clean. Refuse before running rather than reporting the empty
+    // result as a pass. (A path that does not exist at all is caught by the tool
+    // itself with exit 2 and handled in `evaluate_scan`.)
     let resolved = std::path::Path::new(&catalog_arg);
     if resolved.exists() {
         match count_catalog_entries(resolved) {
             Ok(0) => {
-                return VerifyResult::new(
-                    CONTROL,
-                    Outcome::Fail,
-                    vec![
-                        format!("exposure catalog `{catalog}` resolved to 0 usable entries"),
-                        "bumblebee exits 0 and reports a clean scan against a catalog with no \
-                         criteria — that is a scan that checked nothing, not a clean endpoint"
-                            .into(),
-                        "entries whose only versions are \"*\" match nothing: v0.1.2 matches \
-                         exact (ecosystem, name, version), so the README's wildcard syntax \
-                         silently never fires"
-                            .into(),
-                        "check the catalog has a non-empty `entries` array with concrete \
-                         versions and schema_version \"0.1.0\"; a directory is merged \
-                         non-recursively over its *.json children"
-                            .into(),
-                    ],
-                )
+                return Err(refuse(vec![
+                    format!("exposure catalog `{catalog}` resolved to 0 usable entries"),
+                    "bumblebee exits 0 and reports a clean scan against a catalog with no \
+                     criteria — that is a scan that checked nothing, not a clean endpoint"
+                        .into(),
+                    "entries whose only versions are \"*\" match nothing: v0.1.2 matches \
+                     exact (ecosystem, name, version), so the README's wildcard syntax \
+                     silently never fires"
+                        .into(),
+                    "check the catalog has a non-empty `entries` array with concrete \
+                     versions and schema_version \"0.1.0\"; a directory is merged \
+                     non-recursively over its *.json children"
+                        .into(),
+                ]));
             }
             Ok(_) => {}
             Err(e) => {
-                return VerifyResult::new(
-                    CONTROL,
-                    Outcome::Fail,
-                    vec![format!(
-                        "exposure catalog `{catalog}` could not be read: {e}"
-                    )],
-                )
+                return Err(refuse(vec![format!(
+                    "exposure catalog `{catalog}` could not be read: {e}"
+                )]));
             }
         }
     }
 
-    let prof_opt = cfg.control_opt_str(CONTROL, "profile");
-    let prof = profile_from(prof_opt.as_deref());
-    // Silently coercing an unrecognised profile would hide a config typo behind
-    // a narrower scan that then reports clean. Name it instead.
-    let coerced = prof_opt
-        .as_deref()
+    let profile = profile_from(profile_opt);
+    // Silently coercing an unrecognised profile would hide a config typo behind a
+    // narrower scan that then reports clean. Name it instead.
+    let coerced = profile_opt
         .map(str::trim)
-        .filter(|p| !p.is_empty() && *p != prof)
+        .filter(|p| !p.is_empty() && *p != profile)
         .map(str::to_string);
 
-    let root = ctx.root.display().to_string();
+    let root_str = root.display().to_string();
     // bumblebee declares --root as "repeatable or comma-separated", so a comma
     // anywhere in the repository path is parsed as a root separator and the scan
-    // silently targets two paths that do not exist. There is no escaping syntax,
-    // so refuse rather than scan the wrong thing and call it clean.
-    if prof == "project" && root.contains(',') {
-        return VerifyResult::new(
-            CONTROL,
-            Outcome::Fail,
-            vec![
-                format!("repository path contains a comma and cannot be passed as --root: {root}"),
-                "bumblebee treats commas in --root as separators, so this path would be split \
-                 into roots that do not exist and the scan would examine nothing"
-                    .into(),
-                "set profile = \"baseline\" in [controls.bumblebee] (which needs no --root), \
-                 or move the repository to a path without a comma"
-                    .into(),
-            ],
-        );
+    // silently targets paths that do not exist. There is no escaping syntax, so
+    // refuse rather than scan the wrong thing and call it clean.
+    if profile == "project" && root_str.contains(',') {
+        return Err(refuse(vec![
+            format!("repository path contains a comma and cannot be passed as --root: {root_str}"),
+            "bumblebee treats commas in --root as separators, so this path would be split \
+             into roots that do not exist and the scan would examine nothing"
+                .into(),
+            "set profile = \"baseline\" in [controls.bumblebee] (which needs no --root), \
+             or move the repository to a path without a comma"
+                .into(),
+        ]));
     }
 
-    let mut args: Vec<&str> = vec![
-        "scan",
-        "--profile",
-        prof,
-        "--exposure-catalog",
-        &catalog_arg,
-        "--findings-only",
-    ];
-    // NOTE: --root REPLACES the profile's roots, it does not narrow them
-    // (bumblebee's own help: "use --root to override"). For `project` that is the
-    // intent — scope the scan to this repository. For `baseline` it would destroy
-    // the very roots the control exists to read (MCP configs, editor and browser
-    // extensions, agent skills, Homebrew receipts), so --root is never passed there.
-    if prof == "project" {
-        args.push("--root");
-        args.push(&root);
-    }
+    Ok(ScanPlan {
+        profile,
+        catalog_arg,
+        root: root_str,
+        coerced,
+    })
+}
 
-    let out = match exec::run(CONTROL, &args, Some(&ctx.root)) {
-        Ok(o) => o,
-        Err(e) => {
-            return VerifyResult::new(
-                CONTROL,
-                Outcome::Fail,
-                vec![format!("bumblebee scan could not be executed: {e:#}")],
-            )
-        }
-    };
-
+/// Turn a finished bumblebee invocation into an outcome.
+///
+/// Split out from `verify_bumblebee_control` deliberately: every decision that
+/// matters lives here and none of it touches the filesystem, PATH, or a
+/// subprocess, so it is testable by construction. The repo's `with_fake_tool`
+/// harness mutates the process-global `PATH` under a mutex, which races against
+/// any sibling test that reads PATH without taking that mutex — and on a machine
+/// where the real `bumblebee` is installed, losing that race silently swaps the
+/// fake for the real binary. Rather than ship tests that flake, the policy is
+/// exercised directly and only the thin detect-and-exec wrapper above is left to
+/// the end-to-end checks against the real binary.
+fn evaluate_scan(
+    version: &str,
+    prof: &str,
+    catalog: &str,
+    coerced: Option<&str>,
+    out: &exec::CmdOutput,
+) -> VerifyResult {
     // Exit 2 is a scan error (unsupported catalog schema, unreadable root). The
     // tool's own stderr is more precise than anything we could synthesise, so it
     // is passed through rather than summarised.
@@ -504,6 +554,310 @@ pub fn verify_bumblebee_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Build a finished invocation without touching PATH or a subprocess.
+    fn out(stdout: &str, stderr: &str, status: i32) -> exec::CmdOutput {
+        exec::CmdOutput {
+            status,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    fn summary(status: &str, timed_out: bool, inventoried: u64) -> String {
+        format!(
+            r#"{{"record_type":"scan_summary","status":"{status}","timed_out":{timed_out},"package_records_emitted":0,"package_records_suppressed":{inventoried}}}"#
+        )
+    }
+
+    fn eval(stdout: &str, stderr: &str, status: i32) -> VerifyResult {
+        evaluate_scan(
+            "0.1.2",
+            "baseline",
+            "catalog.json",
+            None,
+            &out(stdout, stderr, status),
+        )
+    }
+
+    // ── plan_scan: the refusals that happen BEFORE bumblebee is ever invoked ──
+
+    fn cat(dir: &std::path::Path, name: &str, entries: &str) {
+        std::fs::write(
+            dir.join(name),
+            format!(r#"{{"schema_version":"0.1.0","entries":[{entries}]}}"#),
+        )
+        .unwrap();
+    }
+
+    const USABLE: &str = r#"{"id":"E1","ecosystem":"npm","package":"p","versions":["1.0.0"]}"#;
+
+    #[test]
+    fn plan_resolves_a_repo_relative_catalog_to_an_absolute_path() {
+        let d = tempfile::tempdir().unwrap();
+        cat(d.path(), "catalog.json", USABLE);
+        let plan = plan_scan(d.path(), "catalog.json", Some("baseline")).expect("should proceed");
+        assert_eq!(plan.profile, "baseline");
+        assert!(
+            plan.catalog_arg.ends_with("catalog.json") && plan.catalog_arg.starts_with('/'),
+            "a repo-relative catalog must be passed absolute: {}",
+            plan.catalog_arg
+        );
+        assert!(plan.coerced.is_none());
+    }
+
+    #[test]
+    fn plan_passes_an_unresolvable_catalog_through_for_the_tool_to_reject() {
+        let d = tempfile::tempdir().unwrap();
+        // Nonexistent: bumblebee itself errors with exit 2 and a precise message,
+        // which is better than anything we could synthesise.
+        let plan = plan_scan(d.path(), "/nope/missing.json", Some("baseline")).expect("proceeds");
+        assert_eq!(plan.catalog_arg, "/nope/missing.json");
+    }
+
+    #[test]
+    fn plan_refuses_a_wildcard_only_catalog() {
+        let d = tempfile::tempdir().unwrap();
+        cat(d.path(), "catalog.json", r#"{"id":"W","versions":["*"]}"#);
+        let r = plan_scan(d.path(), "catalog.json", Some("baseline")).expect_err("must refuse");
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(
+            r.messages[0].contains("0 usable entries"),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn plan_refuses_an_empty_catalog_directory() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("catalogs")).unwrap();
+        let r = plan_scan(d.path(), "catalogs", Some("baseline")).expect_err("must refuse");
+        assert!(
+            r.messages[0].contains("0 usable entries"),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// The comma case: bumblebee splits --root on commas with no escaping syntax,
+    /// so a comma in the repo path would silently scan nothing.
+    #[test]
+    fn plan_refuses_a_comma_in_the_repo_path_under_the_project_profile() {
+        let d = tempfile::tempdir().unwrap();
+        let odd = d.path().join("has,comma");
+        std::fs::create_dir(&odd).unwrap();
+        cat(&odd, "catalog.json", USABLE);
+        let r = plan_scan(&odd, "catalog.json", Some("project")).expect_err("must refuse");
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(r.messages[0].contains("comma"), "{:?}", r.messages);
+    }
+
+    /// ...but `baseline` never passes --root, so the same path is fine there.
+    #[test]
+    fn plan_allows_a_comma_in_the_repo_path_under_baseline() {
+        let d = tempfile::tempdir().unwrap();
+        let odd = d.path().join("has,comma");
+        std::fs::create_dir(&odd).unwrap();
+        cat(&odd, "catalog.json", USABLE);
+        let plan = plan_scan(&odd, "catalog.json", Some("baseline"))
+            .expect("baseline needs no --root, so a comma is harmless");
+        assert_eq!(plan.profile, "baseline");
+    }
+
+    #[test]
+    fn plan_records_a_coerced_profile_so_a_typo_is_not_silent() {
+        let d = tempfile::tempdir().unwrap();
+        cat(d.path(), "catalog.json", USABLE);
+        let plan = plan_scan(d.path(), "catalog.json", Some("deep")).expect("proceeds");
+        assert_eq!(plan.profile, "project", "deep must never widen scope");
+        assert_eq!(plan.coerced.as_deref(), Some("deep"));
+    }
+
+    #[test]
+    fn plan_does_not_report_coercion_when_the_profile_was_absent_or_exact() {
+        let d = tempfile::tempdir().unwrap();
+        cat(d.path(), "catalog.json", USABLE);
+        for opt in [
+            None,
+            Some("project"),
+            Some("baseline"),
+            Some("  baseline  "),
+        ] {
+            let plan = plan_scan(d.path(), "catalog.json", opt).expect("proceeds");
+            assert!(
+                plan.coerced.is_none(),
+                "{opt:?} is not a coercion worth reporting"
+            );
+        }
+    }
+
+    #[test]
+    fn nonzero_exit_fails_and_passes_the_tools_own_stderr_through() {
+        let r = eval(
+            "",
+            "unsupported exposure catalog schema_version \"0.2.0\"",
+            2,
+        );
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(r.messages[0].contains("exit 2"), "{:?}", r.messages);
+        assert!(
+            r.messages[1].contains("schema_version"),
+            "the tool's own message must survive verbatim: {:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_with_no_stderr_still_fails_and_says_so() {
+        let r = eval("", "", 2);
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(r.messages[1].contains("no stderr"), "{:?}", r.messages);
+    }
+
+    #[test]
+    fn a_timed_out_scan_fails_rather_than_reporting_clean() {
+        let r = eval(&summary("complete", true, 400), "", 0);
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(r.messages[0].contains("TIMED OUT"), "{:?}", r.messages);
+    }
+
+    #[test]
+    fn a_non_complete_status_fails_and_names_the_status() {
+        let r = eval(&summary("partial", false, 400), "", 0);
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(r.messages[0].contains("partial"), "{:?}", r.messages);
+    }
+
+    #[test]
+    fn a_stream_with_no_summary_at_all_fails() {
+        let r = eval("", "", 0);
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(
+            r.messages[0].contains("no scan_summary"),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn an_incomplete_scan_reports_unparsable_line_count_too() {
+        let r = eval("not json\n", "", 0);
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(
+            r.messages.iter().any(|m| m.contains("1 unparsable")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// The regression the review caught: a completed scan that inventoried
+    /// nothing is not a clean endpoint.
+    #[test]
+    fn a_scan_that_inventoried_nothing_fails_instead_of_passing() {
+        let r = evaluate_scan(
+            "0.1.2",
+            "project",
+            "catalog.json",
+            None,
+            &out(&summary("complete", false, 0), "", 0),
+        );
+        assert_eq!(
+            r.outcome,
+            Outcome::Fail,
+            "zero subjects must never read as clean"
+        );
+        assert!(r.messages[0].contains("inventoried 0"), "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("baseline")),
+            "must point at the fix: {:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn a_completed_scan_with_subjects_and_no_findings_passes_and_reports_the_count() {
+        let r = eval(&summary("complete", false, 148), "", 0);
+        assert_eq!(r.outcome, Outcome::Pass);
+        assert!(
+            r.messages[0].contains("148"),
+            "a pass must say how much it looked at: {:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn a_pass_still_reports_unparsable_lines_as_a_note() {
+        let r = eval(
+            &format!("garbage\n{}", summary("complete", false, 5)),
+            "",
+            0,
+        );
+        assert_eq!(r.outcome, Outcome::Pass);
+        assert!(
+            r.messages.iter().any(|m| m.contains("unparsable")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn findings_fail_and_name_each_artifact_with_its_catalog_id() {
+        let r = eval(
+            &format!("{FINDING}\n{}", summary("complete", false, 148)),
+            "",
+            0,
+        );
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(
+            r.messages[0].contains("1 known-compromised"),
+            "{:?}",
+            r.messages
+        );
+        assert!(
+            r.messages[1].contains("bumblebee") && r.messages[1].contains("TEST-EXACT"),
+            "artifact and catalog id must both appear: {:?}",
+            r.messages
+        );
+    }
+
+    /// Findings are truncated in the message list, but the COUNT must stay
+    /// truthful or a reader concludes there were only 20.
+    #[test]
+    fn more_than_twenty_findings_are_truncated_but_the_count_is_not() {
+        let mut stream = String::new();
+        for i in 0..25 {
+            stream.push_str(&format!(
+                r#"{{"record_type":"finding","severity":"high","catalog_id":"C{i}","package_name":"p{i}","version":"1.0.0","ecosystem":"npm"}}"#
+            ));
+            stream.push('\n');
+        }
+        stream.push_str(&summary("complete", false, 900));
+        let r = eval(&stream, "", 0);
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(r.messages[0].contains("25"), "{:?}", r.messages[0]);
+        assert!(
+            r.messages.iter().any(|m| m.contains("and 5 more")),
+            "truncation must be declared: {:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn a_coerced_profile_is_surfaced_on_an_otherwise_clean_pass() {
+        let r = evaluate_scan(
+            "0.1.2",
+            "project",
+            "catalog.json",
+            Some("deep"),
+            &out(&summary("complete", false, 10), "", 0),
+        );
+        assert_eq!(r.outcome, Outcome::Pass);
+        assert!(
+            r.messages.iter().any(|m| m.contains("`deep`")),
+            "a silently-narrowed scope must be surfaced: {:?}",
+            r.messages
+        );
+    }
 
     /// A real v0.1.2 finding record, captured from an actual scan rather than
     /// hand-written, so the field names are the tool's and not our guess.
