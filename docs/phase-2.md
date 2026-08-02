@@ -11,6 +11,7 @@ the question the AI era added — *is this package even real?*
 | `scorecard` | Scores the repository's own security posture | Scorecard (CI) | on |
 | `renovate` | Dependency updates, digest-pinned, lockfile maintenance | Renovate | on |
 | `package-trust` | Existence checks, typosquat heuristics, human approval | (native) | on |
+| `bumblebee` | Known-compromised packages, MCP servers, extensions and agent skills present on the endpoint | Bumblebee | off |
 | `grype` | SBOM-first vulnerability scanning | Grype | off |
 | `socket-firewall` | Malicious-package blocking at install time | Socket | off |
 
@@ -120,6 +121,58 @@ view of everything the other phases do from the inside.
 - `osvVulnerabilityAlerts` — vulnerability-driven updates from OSV.
 - `lockFileMaintenance` — keeps the lockfile fresh, which is what makes
   lockfile-exact scanning meaningful.
+
+## Endpoint exposure — the machine, not the repository
+
+Every other control in this phase asks a question about the *repository*. **Bumblebee**
+(`sscsb enable bumblebee`) asks one about the *machine the work happens on*: is anything
+installed here that appears in a catalog of known-compromised releases?
+
+That is a different surface, and it is the one the 2024-2026 worm campaigns actually
+landed on. Bumblebee inventories npm, PyPI, Go, RubyGems and Composer packages — and,
+more to the point, **MCP server configs, editor extensions, browser extensions, agent
+skills, and Homebrew receipts**. Nothing else in `sscsb` looks at those.
+
+```sh
+sscsb enable bumblebee
+# .sscsb/config.toml
+#   [controls.bumblebee]
+#   profile = "baseline"     # user-global roots (default) | "project" to scope to this repo
+#   catalog = ""             # path to a JSON exposure catalog, or a directory of them
+sscsb verify bumblebee
+```
+
+It reads only static files — no `npm ls`, no `pip show`, no source-file reads — and the
+binary is Go with a zero-dependency `go.mod`.
+
+**Three things worth knowing before you trust the output:**
+
+- **Findings do not change bumblebee's exit code.** A scan that matches a compromised
+  package exits `0`, exactly like a clean one. `sscsb` parses the NDJSON record stream
+  rather than the exit status; a control that gated on `$?` would pass through every
+  compromise it found.
+- **A scan that cannot be shown to have finished is a `FAIL`, not a pass.** "Zero
+  findings" and "the scan died early" produce the same empty result, so `sscsb` requires
+  bumblebee's end-of-run `scan_summary` record before it will report clean.
+- **Catalogs use `schema_version` `"0.1.0"`, and wildcards do not work.** Upstream's
+  README documents `"0.2.0"` and `versions: ["*"]`; the shipped v0.1.2 binary rejects the
+  former outright and silently matches nothing on the latter. Matching is exact
+  `(ecosystem, name, version)`. A catalog written from the README is a gate that never
+  fires — so `sscsb` refuses to count a wildcard-only entry as criteria and fails the
+  control rather than reporting a clean scan that checked nothing.
+- **`profile = "project"` scopes the scan to the repository**, which for most repos means
+  none of the MCP / extension / agent-skill roots are reached, and for a Rust repo means
+  nothing is inventoried at all. If a scan inventories zero artifacts the control `FAIL`s
+  rather than calling the endpoint clean. The default is `baseline` for that reason.
+
+`sscsb` ships **no** catalog. A stale threat feed that reports clean is worse than no
+feed, so the catalog is yours to point at — upstream publishes them under `threat_intel/`.
+With no catalog configured the control reports `INFO` and says so, because an inventory
+with nothing to match against is context, not a passing security control.
+
+Off by default: it needs a catalog you may not have, which is the same reason
+Dependency-Track and GUAC are off. Note also that bumblebee has **no Cargo/Rust
+ecosystem** — for a Rust repository the value is the endpoint surface, not the lockfile.
 
 ## The optional two
 

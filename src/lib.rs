@@ -22,6 +22,7 @@
 //! - [`compliance`] — control → SLSA/SSDF/CRA/Badge map and `sscsb report`
 
 pub mod audit;
+pub mod bumblebee;
 pub mod cli;
 pub mod compliance;
 pub mod config;

@@ -159,6 +159,16 @@
       "notes": "Components are vetted before acquisition and installs are pinned exactly, defending against typosquatting, dependency confusion, and hallucinated package names.",
       "osps": ["OSPS-QA-02"]
     },
+    "bumblebee": {
+      "name": "Bumblebee endpoint exposure scan (optional)",
+      "phase": 2,
+      "slsa": [],
+      "ssdf": ["RV.1.1"],
+      "cra": ["Article 13(5) (due diligence on third-party components)", "Annex I Part II §2 (address vulnerabilities without delay)"],
+      "badge": ["dependency_monitoring"],
+      "notes": "Detection counterpart to socket-firewall's prevention: finds known-compromised packages, MCP servers, editor/browser extensions and agent skills ALREADY present on the development endpoint. Scope is the developer machine, not the shipped artifact — the CRA mappings are the due-diligence and vulnerability-response obligations this evidence feeds, not a product-conformance claim. No SLSA mapping: build provenance is unrelated. No OSPS mapping claimed rather than guessing an ID.",
+      "osps": []
+    },
     "grype": {
       "name": "SBOM-first vulnerability scan (Grype, optional)",
       "phase": 2,
