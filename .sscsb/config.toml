@@ -22,10 +22,13 @@ trufflehog = true
 gitleaks = true
 pre_push_range_scan = true
 
-# CommitSigningGuard: Hardware-backed, human-only signing enforced on protected branches at pre-push
+# CommitSigningGuard: human-only signing enforced on protected branches at pre-push.
+# require_hardware_backed relaxed 2026-08-09 (principal decision, applies to all
+# repos) to admit a 1Password-vaulted SSH key (software-backed, not a physical
+# security key) — 1Password is the standing SSH-signing-key store going forward.
 [controls.commit-signing]
 enabled = true
-require_hardware_backed = true
+require_hardware_backed = false
 require_review_evidence_for_ai_merges = true
 
 # Branch protection verification: Verify GitHub protected-branch rules (PRs, no force-push, signatures, checks)
