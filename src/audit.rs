@@ -382,17 +382,63 @@ fn audit_lockfile_exact(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
     }
 }
 
-fn audit_harden_runner(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
-    for (name, job) in jobs(doc) {
-        // Reusable-workflow jobs have no steps of their own.
-        if job["uses"].as_str().is_some() {
-            continue;
+/// Whether ONE job runs under Harden-Runner.
+///
+/// Harden-Runner protects the job whose step list it heads — not the file it
+/// happens to appear in, and never a `#`-commented mention of itself. The
+/// question is therefore only answerable per job, off the parsed document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HardenRunner {
+    /// The job's first step is `step-security/harden-runner@…`.
+    Present,
+    /// The job delegates to a reusable workflow and has no steps of its own,
+    /// so no harden-runner step can be added here — hardening is the called
+    /// workflow's responsibility. Carries the `uses:` target.
+    Reusable(String),
+    /// The job runs its own steps without starting them under harden-runner.
+    Absent,
+}
+
+fn harden_runner_of(job: &Yaml) -> HardenRunner {
+    // A reusable-workflow job has no steps of its own to harden.
+    if let Some(uses) = job["uses"].as_str() {
+        if steps(job).is_empty() {
+            return HardenRunner::Reusable(uses.to_string());
         }
-        let first_uses = steps(job)
-            .first()
-            .and_then(|s| s["uses"].as_str())
-            .unwrap_or("");
-        if !first_uses.starts_with("step-security/harden-runner@") {
+    }
+    let first_uses = steps(job)
+        .first()
+        .and_then(|s| s["uses"].as_str())
+        .unwrap_or("");
+    if first_uses.starts_with("step-security/harden-runner@") {
+        HardenRunner::Present
+    } else {
+        HardenRunner::Absent
+    }
+}
+
+/// Per-job Harden-Runner status for one parsed workflow document.
+fn harden_runner_jobs(doc: &Yaml) -> Vec<(String, HardenRunner)> {
+    jobs(doc)
+        .into_iter()
+        .map(|(name, job)| (name.to_string(), harden_runner_of(job)))
+        .collect()
+}
+
+/// Per-job Harden-Runner status for a workflow file's raw text, across EVERY
+/// YAML document in it. Parsing is the point: a substring search over the text
+/// matches commented-out references and cannot tell one job from another.
+///
+/// An empty result means the file declares no jobs at all — which proves
+/// nothing about harden-runner, and callers must not read it as a pass.
+pub fn harden_runner_status(content: &str) -> Result<Vec<(String, HardenRunner)>> {
+    let docs = YamlLoader::load_from_str(content).context("parsing workflow YAML")?;
+    Ok(docs.iter().flat_map(harden_runner_jobs).collect())
+}
+
+fn audit_harden_runner(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
+    for (name, status) in harden_runner_jobs(doc) {
+        if status == HardenRunner::Absent {
             findings.push(Finding::new(
                 Severity::Warn,
                 file,
