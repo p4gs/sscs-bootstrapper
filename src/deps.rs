@@ -1014,14 +1014,12 @@ pub fn typosquat_suspect(eco: Ecosystem, name: &str) -> Option<&'static str> {
 
 pub fn verify_package_trust(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     let mut messages = Vec::new();
-    if !crate::hooks::hooks_installed(ctx) {
-        return VerifyResult::new(
-            "package-trust",
-            Outcome::Fail,
-            vec!["hooks not installed — run `sscsb init`".into()],
-        );
+    let hooks = crate::hooks::hook_integrity(ctx);
+    if let Some(blocked) = hooks.blocking("package-trust") {
+        return blocked;
     }
     messages.push("new-package approval gate enforced in commit-msg hook".into());
+    messages.extend(hooks.messages.iter().cloned());
     let outcome = if packages_policy_path(ctx).is_file() {
         // A baseline that cannot be parsed is not a baseline of zero packages —
         // it is a baseline nobody can read, and the commit gate that consumes it
@@ -1061,7 +1059,7 @@ pub fn verify_package_trust(ctx: &Ctx, cfg: &Config) -> VerifyResult {
         messages
             .push("registry existence validation on `sscsb deps check` (anti-slopsquat)".into());
     }
-    VerifyResult::new("package-trust", outcome, messages)
+    VerifyResult::new("package-trust", outcome.weakest(hooks.outcome), messages)
 }
 
 pub fn verify_socket_control(ctx: &Ctx) -> VerifyResult {

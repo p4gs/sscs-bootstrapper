@@ -439,7 +439,11 @@ fn cmd_status(cwd: &std::path::Path) -> Result<ExitCode> {
             "MISSING — run `sscsb init`"
         }
     );
-    println!("hooks installed: {}", hooks::hooks_installed(&ctx));
+    let hook_state = hooks::hook_integrity(&ctx);
+    println!("hooks: {}", hook_state.outcome.symbol());
+    for m in &hook_state.messages {
+        println!("  {m}");
+    }
     println!();
     for phase in 1..=5u8 {
         println!("Phase {phase}");
