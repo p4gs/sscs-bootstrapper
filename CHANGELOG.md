@@ -10,6 +10,57 @@ versions.
 
 ### Fixed
 
+- **A file committed to the repository silently muted the scanners.** Trivy
+  reads `trivy.yaml` and `.trivyignore` from the directory it scans;
+  OSV-Scanner reads `osv-scanner.toml` from the tree. None of it is asked
+  for — committing the file is the entire install step. Measured on one
+  fixture: a `trivy.yaml` of `severity: [CRITICAL]` took a scan from 3 findings
+  to 1, and one `[[IgnoredVulns]]` entry took OSV-Scanner from 8 to 6, with not
+  one `note:` or `suppressed:` line to show for it.
+  The fix **inherits the waiver and reports it**, rather than overriding it —
+  these files are legitimate, and this repository's own `.trivyignore` is the
+  example (two container rules that genuinely cannot model an OSS-Fuzz build
+  image, with per-ID rationale in the file). Overriding them would break that
+  class of documented waiver, and would push anyone who needs one into turning
+  the control off. So suppression is honoured and *named*, the way `apply_vex`
+  already did it, in two layers:
+  - the scanners' own suppression channels — Trivy's `--show-suppressed` and
+    OSV-Scanner's stderr — now yield one `suppressed:` row per muted finding,
+    carrying the source (`.trivyignore`, a VEX document) and the reason its
+    author wrote. OSV-Scanner states this on stderr and nowhere in its JSON,
+    not even under `--all-vulns`; discarding stderr on success was what made
+    an `osv-scanner.toml` invisible.
+  - `sscsb` names every scanner-config file it finds and what that file does.
+    This is the only signal there is for `trivy.yaml` narrowing, which Trivy
+    reports nothing about even under `--show-suppressed` (measured on 0.72.0),
+    and it is the backstop if a scanner's output shape changes underneath the
+    first layer. `sscsb verify` states the same inventory without changing the
+    verdict: a documented waiver is a decision, not a failure.
+- **A severity we could not determine ranked below `low`, so real advisories
+  could not breach the gate.** `severity_rank` ended in `.unwrap_or(0)`: every
+  string that was not one of `low|medium|high|critical` ranked *beneath the
+  weakest severity*, and therefore could not breach any threshold. Three
+  consequences, all measured against live tools:
+  - `parse_osv` read severity only from `/database_specific/severity`, a field
+    RUSTSEC and PYSEC records do not carry — 13 of 25 findings in an
+    `osv-scanner 2.4.0` run landed as `unknown` and could not breach
+    `fail_on = "high"`. Severity is now recovered from the fields those records
+    *do* populate: the OSV `severity` array's CVSS vectors (scored with the
+    CVSS v3.0/v3.1 base-score formula) and `affected[].database_specific.cvss`.
+    Where a record states a rating more than one way, the highest wins.
+  - GHSA's `MODERATE` ranked 0 because it is not the literal string `medium`.
+    The two vocabularies are now bridged.
+  - What remains genuinely unrated breaches *every* threshold rather than
+    passing as `low`, and is reported as a note with its count. The way to
+    waive one is a VEX statement — visibly, like every other suppression.
+  A CVSS v4.0 vector is left undetermined rather than guessed at; scoring it
+  needs the v4 macro-vector tables, and inventing a band is how a gate starts
+  lying.
+- **A typo'd `fail_on` silently became the strictest setting.** `fail_on =
+  "error"` ranked 0, i.e. `low`, i.e. everything breaches — a broken gate that
+  looks like a working one. A `fail_on` that is not a severity is now an error
+  naming the valid values. Case and stray whitespace (`"HIGH "`) are still
+  accepted as the threshold their author meant.
 - **Five controls reported `PASS` for checks that never ran.** `sscsb`'s value
   rests on a green `verify --strict` meaning the named controls actually work,
   and `--strict` only escalates `DEGRADED` — so a false `PASS` sailed straight

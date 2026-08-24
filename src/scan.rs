@@ -13,11 +13,58 @@ use std::path::Path;
 
 pub const SEVERITIES: &[&str] = &["low", "medium", "high", "critical"];
 
-pub fn severity_rank(s: &str) -> usize {
+/// The rank of a severity label, weakest first — or `None` when the label is
+/// not a severity this scale recognises.
+///
+/// The `Option` is the whole point. This used to end in `.unwrap_or(0)`, so
+/// EVERY unrecognised string ranked below `low`: a finding whose severity we
+/// could not determine could not breach any threshold, and neither could a
+/// GHSA advisory rated `MODERATE`, because that is not the literal string
+/// `medium`. A severity we could not determine is not a low severity, and
+/// callers must decide what to do about it rather than inheriting a silent
+/// floor — see [`breaches_threshold`], which fails closed on `None`.
+///
+/// Vocabulary is normalised where two databases name the same rung
+/// differently: OSV/GHSA say `MODERATE` where this scale says `medium`.
+/// Everything else is compared case-insensitively after trimming, so a
+/// stray-whitespace `"HIGH "` in config is the threshold its author meant
+/// rather than a string that silently means something else.
+pub fn severity_rank(s: &str) -> Option<usize> {
+    let label = s.trim();
+    let label = if label.eq_ignore_ascii_case("moderate") {
+        "medium"
+    } else {
+        label
+    };
     SEVERITIES
         .iter()
-        .position(|x| x.eq_ignore_ascii_case(s))
-        .unwrap_or(0)
+        .position(|x| x.eq_ignore_ascii_case(label))
+}
+
+/// How many findings carry a severity no source could determine.
+///
+/// These are not low-severity findings; they are findings we cannot rank. The
+/// count is reported so the reader can see the size of the undetermined set
+/// rather than discovering it as an unexplained threshold breach.
+pub fn undetermined_severity_count(report: &ScanReport) -> usize {
+    report
+        .findings
+        .iter()
+        .filter(|f| severity_rank(&f.severity).is_none())
+        .count()
+}
+
+/// The note explaining an undetermined-severity set, or `None` when every
+/// finding could be ranked.
+fn undetermined_severity_note(report: &ScanReport) -> Option<String> {
+    let n = undetermined_severity_count(report);
+    (n > 0).then(|| {
+        format!(
+            "{n} finding(s) carry no severity this scan could determine — they breach \
+             every threshold rather than ranking below `low`. Waive one deliberately, \
+             and visibly, with a VEX statement (`sscsb vex create`)"
+        )
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +92,10 @@ pub struct ScanReport {
 pub fn run_scan(ctx: &Ctx, cfg: &Config, vex_path: Option<&Path>) -> Result<ScanReport> {
     let mut report = ScanReport::default();
     let mut ran = 0u32;
+
+    // Before anything runs: say what configuration the scanners are about to
+    // pick up out of the repository. See `scanner_config_notes`.
+    report.notes.extend(scanner_config_notes(&ctx.root));
 
     if tools::is_available("trivy") {
         ran += 1;
@@ -76,8 +127,214 @@ pub fn run_scan(ctx: &Ctx, cfg: &Config, vex_path: Option<&Path>) -> Result<Scan
             .with_context(|| format!("reading VEX {}", vex.display()))?;
         apply_vex(&mut report, &vex_text)?;
     }
+    if let Some(note) = undetermined_severity_note(&report) {
+        report.notes.push(note);
+    }
     let _ = cfg;
     Ok(report)
+}
+
+/// `trivy.yaml` keys that REDUCE what a scan can report, and what each does.
+///
+/// Trivy has many settings; these are the ones whose effect is, in the output,
+/// indistinguishable from a clean scan. Operational keys (`cache`, `timeout`,
+/// `db.repository` for an air-gapped mirror) narrow nothing and are reported
+/// as present without being called out.
+const TRIVY_NARROWING_KEYS: &[(&str, &str)] = &[
+    ("severity", "only these severities are reported at all"),
+    ("ignorefile", "ignore entries are read from another path"),
+    ("ignore-policy", "a Rego policy decides what is dropped"),
+    ("scan.scanners", "only these scanners run"),
+    ("scan.skip-dirs", "these directories are never scanned"),
+    ("scan.skip-files", "these files are never scanned"),
+    ("scan.offline-scan", "no advisory lookups are performed"),
+    (
+        "vulnerability.ignore-unfixed",
+        "vulnerabilities without a fix are dropped",
+    ),
+    ("vulnerability.type", "only these package types are scanned"),
+    (
+        "secret.config",
+        "custom secret rules, which can disable built-in ones",
+    ),
+    (
+        "db.skip-update",
+        "the vulnerability database is not refreshed",
+    ),
+];
+
+/// Report the scanner configuration this repository hands the scanners.
+///
+/// Trivy reads `trivy.yaml` and `.trivyignore` from the directory it is run
+/// in; OSV-Scanner reads `osv-scanner.toml` from the tree it scans. Neither is
+/// asked for — committing the file is enough. Measured on one fixture: a
+/// `trivy.yaml` of `severity: [CRITICAL]` took a scan from 3 findings to 1,
+/// and an `osv-scanner.toml` with one `[[IgnoredVulns]]` entry took 8 to 6.
+/// Nothing in either scanner's JSON said a word about it.
+///
+/// **The deliberate choice here is to inherit, and report — not to override.**
+/// These files are legitimate: this repository's own `.trivyignore` waives two
+/// container rules that genuinely cannot model an OSS-Fuzz build image, with
+/// per-ID rationale in the file. Passing `--config`/`--ignorefile` to neutralise
+/// them would break that class of documented waiver, and — worse — would push
+/// anyone who needs one into disabling the control outright. The defect was
+/// never that suppression exists; it is that it was silent. So suppression is
+/// honoured and *named*, exactly as [`apply_vex`] does it.
+///
+/// Two layers, because one is not enough:
+/// * the scanners' own suppression channels — Trivy's `--show-suppressed` and
+///   OSV-Scanner's stderr — itemise each muted finding with its reason;
+/// * this function names the files and what they change, which is the only
+///   signal for `trivy.yaml` narrowing (Trivy reports nothing for it even
+///   under `--show-suppressed` — measured on 0.72.0) and the backstop if a
+///   scanner's output shape ever changes underneath the first layer.
+pub fn scanner_config_notes(root: &Path) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(note) = trivy_config_note(&root.join("trivy.yaml")) {
+        notes.push(note);
+    }
+    for name in [".trivyignore", ".trivyignore.yaml"] {
+        if let Some(note) = trivy_ignorefile_note(&root.join(name), name) {
+            notes.push(note);
+        }
+    }
+    if let Some(note) = osv_config_note(&root.join("osv-scanner.toml")) {
+        notes.push(note);
+    }
+    notes
+}
+
+fn trivy_config_note(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let head = "scanner config: trivy.yaml is present and trivy loads it automatically";
+    let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(&text) else {
+        // Unparseable to us is not "absent": trivy may still act on it.
+        return Some(format!(
+            "{head} — sscsb could not parse it to say what it does"
+        ));
+    };
+    let Some(doc) = docs.first() else {
+        return Some(format!("{head} — it is empty"));
+    };
+    let narrowing: Vec<String> = TRIVY_NARROWING_KEYS
+        .iter()
+        .filter_map(|(key, effect)| {
+            let node = yaml_at(doc, key);
+            (!node.is_badvalue()).then(|| format!("{key}={} ({effect})", yaml_summary(node)))
+        })
+        .collect();
+    Some(if narrowing.is_empty() {
+        format!("{head} — no key in it narrows what this scan reports")
+    } else {
+        format!(
+            "{head}, and it NARROWS this scan: {}. Findings excluded this way are \
+             not reported by trivy at all, here or in its own suppression list",
+            narrowing.join("; ")
+        )
+    })
+}
+
+/// Walk a dotted path (`scan.skip-dirs`) into a YAML document. Missing nodes
+/// come back as `BadValue`, which is how the caller tests for absence.
+fn yaml_at<'a>(doc: &'a yaml_rust2::Yaml, dotted: &str) -> &'a yaml_rust2::Yaml {
+    let mut node = doc;
+    for key in dotted.split('.') {
+        node = &node[key];
+    }
+    node
+}
+
+fn yaml_summary(node: &yaml_rust2::Yaml) -> String {
+    use yaml_rust2::Yaml;
+    match node {
+        Yaml::String(s) => s.clone(),
+        Yaml::Boolean(b) => b.to_string(),
+        Yaml::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(yaml_summary)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        // Anything else (a bare key with no value, a number, a nested map)
+        // gets a presence marker: the point of the note is WHICH key narrows
+        // the scan, and the file is right there to read for the detail.
+        _ => "set".to_string(),
+    }
+}
+
+fn trivy_ignorefile_note(path: &Path, name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let entries: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    let preview = entries
+        .iter()
+        .take(8)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ellipsis = if entries.len() > 8 { ", …" } else { "" };
+    Some(format!(
+        "scanner config: {name} is present with {} entr(ies){}{preview}{ellipsis} — \
+         suppressions it causes are listed individually as `suppressed:` rows",
+        entries.len(),
+        if entries.is_empty() { "" } else { ": " },
+    ))
+}
+
+fn osv_config_note(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let head = "scanner config: osv-scanner.toml is present and osv-scanner loads it automatically";
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Some(format!(
+            "{head} — sscsb could not parse it to say what it does"
+        ));
+    };
+    let entries = |key: &str, field: &str| -> Vec<String> {
+        table
+            .get(key)
+            .and_then(toml::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|e| {
+                        e.get(field)
+                            .and_then(toml::Value::as_str)
+                            .unwrap_or("?")
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let ignored = entries("IgnoredVulns", "id");
+    let overrides = entries("PackageOverrides", "name");
+    if ignored.is_empty() && overrides.is_empty() {
+        return Some(format!("{head} — it names no vulnerabilities or packages"));
+    }
+    let mut parts = Vec::new();
+    if !ignored.is_empty() {
+        parts.push(format!(
+            "ignores {} ({})",
+            ignored.len(),
+            ignored.join(", ")
+        ));
+    }
+    if !overrides.is_empty() {
+        parts.push(format!(
+            "overrides {} package(s) ({})",
+            overrides.len(),
+            overrides.join(", ")
+        ));
+    }
+    Some(format!(
+        "{head}: it {} — an ignore entry mutes the whole alias group, and each \
+         filtered entry is listed as a `suppressed:` row",
+        parts.join(" and ")
+    ))
 }
 
 fn run_trivy(ctx: &Ctx, report: &mut ScanReport) -> Result<()> {
@@ -91,6 +348,12 @@ fn run_trivy(ctx: &Ctx, report: &mut ScanReport) -> Result<()> {
             "--format",
             "json",
             "--quiet",
+            // Trivy honours a `.trivyignore` it finds in the scan directory,
+            // and without this it reports the survivors only. This asks it to
+            // itemise what it muted, so a waiver stays a waiver but stops
+            // being invisible. It changes nothing about which findings are
+            // reported as findings.
+            "--show-suppressed",
             &root,
         ],
         Some(&ctx.root),
@@ -99,7 +362,86 @@ fn run_trivy(ctx: &Ctx, report: &mut ScanReport) -> Result<()> {
         anyhow::bail!("trivy failed (exit {}): {}", out.status, out.stderr.trim());
     }
     report.findings.extend(parse_trivy(&out.stdout)?);
+    let suppressed = parse_trivy_suppressions(&out.stdout)?;
+    if !suppressed.is_empty() {
+        report.notes.push(format!(
+            "trivy: {} finding(s) suppressed by configuration trivy loaded from the \
+             repository — each is listed as a `suppressed:` row",
+            suppressed.len()
+        ));
+        report.suppressed.extend(suppressed);
+    }
     Ok(())
+}
+
+/// The suppressions Trivy itself reports under `--show-suppressed`: one row
+/// per finding an ignore file, an ignore policy, or a VEX document muted.
+///
+/// This is the same contract [`apply_vex`] holds itself to — suppression is
+/// honoured and *named*, never silent. Trivy states the source (`.trivyignore`,
+/// a policy path, a VEX document) and the statement its author wrote, so the
+/// row can carry the reason rather than just the count.
+///
+/// It does NOT cover everything a config file can do: `trivy.yaml` narrowing
+/// (a `severity` allowlist, `skip-dirs`, disabled scanners) filters findings
+/// before they are ever findings, and Trivy reports nothing at all for it —
+/// measured on 0.72.0. That gap is why [`scanner_config_notes`] exists.
+pub fn parse_trivy_suppressions(stdout: &str) -> Result<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(stdout).context("trivy output not JSON")?;
+    let mut rows = Vec::new();
+    for result in v
+        .get("Results")
+        .and_then(|r| r.as_array())
+        .unwrap_or(&Vec::new())
+    {
+        let target = result
+            .get("Target")
+            .and_then(|x| x.as_str())
+            .unwrap_or("this repository");
+        for modified in result
+            .get("ExperimentalModifiedFindings")
+            .and_then(|x| x.as_array())
+            .unwrap_or(&Vec::new())
+        {
+            let status = modified
+                .get("Status")
+                .and_then(|x| x.as_str())
+                .unwrap_or("modified");
+            let source = modified
+                .get("Source")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("trivy configuration");
+            let finding = modified.get("Finding");
+            let id = finding
+                .and_then(|f| {
+                    f.get("VulnerabilityID")
+                        .or_else(|| f.get("ID"))
+                        .or_else(|| f.get("RuleID"))
+                })
+                .and_then(|x| x.as_str())
+                .unwrap_or("?");
+            let package = finding
+                .and_then(|f| f.get("PkgName"))
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(target);
+            let statement = modified
+                .get("Statement")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim();
+            let reason = if statement.is_empty() {
+                String::new()
+            } else {
+                format!(": {statement}")
+            };
+            rows.push(format!(
+                "{id} ({package}) — trivy {status} via {source}{reason}"
+            ));
+        }
+    }
+    Ok(rows)
 }
 
 pub fn parse_trivy(stdout: &str) -> Result<Vec<VulnFinding>> {
@@ -210,7 +552,67 @@ fn run_osv(ctx: &Ctx, report: &mut ScanReport) -> Result<()> {
             .push("osv-scanner: no packages found to scan".into()),
         code => anyhow::bail!("osv-scanner failed (exit {code}): {}", out.stderr.trim()),
     }
+    // What an `osv-scanner.toml` muted is stated on stderr and nowhere in the
+    // JSON — including under `--all-vulns`. Discarding stderr on success is
+    // what made a committed config file invisible.
+    let (suppressed, notes) = osv_filter_report(&out.stderr);
+    if !suppressed.is_empty() {
+        report.notes.push(format!(
+            "osv-scanner: {} entr(ies) filtered out by configuration it loaded from the \
+             repository — each is listed as a `suppressed:` row",
+            suppressed.len()
+        ));
+    }
+    report.suppressed.extend(suppressed);
+    report.notes.extend(notes);
     Ok(())
+}
+
+/// Read OSV-Scanner's own account of what its config filtered, off stderr.
+///
+/// Returns `(suppressed rows, notes)`. The shapes below are `osv-scanner
+/// 2.4.0`'s, captured from live runs:
+///
+/// ```text
+/// Loaded filter from: /repo/osv-scanner.toml
+/// RUSTSEC-2021-0003 and 2 aliases have been filtered out because: <reason>
+/// RUSTSEC-2020-0159 has been filtered out because: <reason>
+/// Package crates.io/atty/0.2.14 has been filtered out because: <reason>
+/// ```
+///
+/// Note the two verb forms: an entry with aliases says "have been", a lone one
+/// says "has been". Matching only the singular silently dropped exactly the
+/// alias-group case — the one that mutes the most.
+///
+/// The match is deliberately loose — the marker phrase, not a full grammar —
+/// so a wording change costs detail rather than the whole signal, and
+/// [`scanner_config_notes`] still reports the file either way.
+fn osv_filter_report(stderr: &str) -> (Vec<String>, Vec<String>) {
+    const FILTERED: &str = " been filtered out because:";
+    let mut suppressed = Vec::new();
+    let mut notes = Vec::new();
+    for line in stderr.lines().map(str::trim) {
+        if let Some(path) = line.strip_prefix("Loaded filter from:") {
+            notes.push(format!(
+                "osv-scanner loaded a filter config from the repository: {}",
+                path.trim()
+            ));
+        } else if let Some((subject, reason)) = line.split_once(FILTERED) {
+            // "X and N aliases" keeps the alias count, which matters: an
+            // ignore entry mutes the whole alias group, not one id. The verb
+            // is left out of the subject, whichever form it took.
+            let subject = subject.trim();
+            let subject = subject
+                .strip_suffix(" have")
+                .or_else(|| subject.strip_suffix(" has"))
+                .unwrap_or(subject);
+            suppressed.push(format!(
+                "{subject} — osv-scanner filtered out: {}",
+                reason.trim()
+            ));
+        }
+    }
+    (suppressed, notes)
 }
 
 pub fn parse_osv(stdout: &str) -> Result<Vec<VulnFinding>> {
@@ -241,11 +643,7 @@ pub fn parse_osv(stdout: &str) -> Result<Vec<VulnFinding>> {
                 .and_then(|x| x.as_array())
                 .unwrap_or(&Vec::new())
             {
-                let severity = vuln
-                    .pointer("/database_specific/severity")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("unknown")
-                    .to_lowercase();
+                let severity = osv_severity(vuln);
                 findings.push(VulnFinding {
                     id: vuln
                         .get("id")
@@ -261,6 +659,186 @@ pub fn parse_osv(stdout: &str) -> Result<Vec<VulnFinding>> {
         }
     }
     Ok(findings)
+}
+
+/// The severity of one OSV vulnerability record, recovered from whichever of
+/// the fields advisories ACTUALLY populate — `"unknown"` only when the record
+/// states no rating anywhere.
+///
+/// Reading `/database_specific/severity` alone was measurably not enough.
+/// Against a live `osv-scanner 2.4.0` run, RUSTSEC and PYSEC records do not
+/// carry that field at all (a RUSTSEC record's `database_specific` is
+/// `{"license": "CC0-1.0"}`), so they all landed as `unknown`. The ratings
+/// those records do carry live in two other places, both read here:
+///
+/// * the OSV `severity` array — `[{"type": "CVSS_V3", "score": "CVSS:3.1/…"}]`;
+/// * `affected[].database_specific.cvss`, where RUSTSEC repeats the vector.
+///
+/// When a record states a rating more than one way — GHSA carries both a
+/// `MODERATE` label and a CVSS vector — the HIGHEST determinable rating wins.
+/// A gate should not be argued down by the weaker of two ratings the same
+/// advisory asserts, and the rows disagree rarely and narrowly in practice.
+///
+/// Only CVSS v3.0/v3.1 vectors are scored. A v4.0 vector needs the v4
+/// macro-vector lookup tables, and guessing a band from a vector we cannot
+/// score would be inventing a rating; such a record stays undetermined, which
+/// now fails closed and visibly rather than passing as `low`. (In practice a
+/// v4-rated advisory is a modern GHSA one, which also carries the label read
+/// first.)
+fn osv_severity(vuln: &serde_json::Value) -> String {
+    let mut candidates: Vec<String> = Vec::new();
+
+    // The database's own label: GHSA says LOW / MODERATE / HIGH / CRITICAL.
+    if let Some(label) = vuln
+        .pointer("/database_specific/severity")
+        .and_then(|x| x.as_str())
+    {
+        candidates.push(label.to_string());
+    }
+    // The OSV `severity` array — CVSS vectors.
+    for entry in vuln
+        .get("severity")
+        .and_then(|x| x.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(sev) = entry
+            .get("score")
+            .and_then(|x| x.as_str())
+            .and_then(severity_from_cvss_vector)
+        {
+            candidates.push(sev.to_string());
+        }
+    }
+    // RUSTSEC repeats the vector per affected range.
+    for affected in vuln
+        .get("affected")
+        .and_then(|x| x.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(sev) = affected
+            .pointer("/database_specific/cvss")
+            .and_then(|x| x.as_str())
+            .and_then(severity_from_cvss_vector)
+        {
+            candidates.push(sev.to_string());
+        }
+    }
+
+    candidates
+        .iter()
+        .filter_map(|c| severity_rank(c))
+        .max()
+        .map_or_else(
+            || "unknown".to_string(),
+            |rank| SEVERITIES[rank].to_string(),
+        )
+}
+
+/// The severity band of a CVSS vector, via its base score. `None` for any
+/// vector we cannot score exactly — never a guess.
+fn severity_from_cvss_vector(vector: &str) -> Option<&'static str> {
+    let score = cvss_v3_base_score(vector)?;
+    // The CVSS v3 qualitative severity rating scale. 0.0 is "None" upstream;
+    // this scale has no rung below `low`, and the record did state a score, so
+    // it ranks `low` rather than counting as undetermined.
+    Some(match score {
+        s if s < 4.0 => "low",
+        s if s < 7.0 => "medium",
+        s if s < 9.0 => "high",
+        _ => "critical",
+    })
+}
+
+/// CVSS v3.0/v3.1 base score from a vector string, per the first.org
+/// specification. `None` when the string is not a v3 base vector or is missing
+/// a mandatory base metric — an incomplete vector is not a low score.
+fn cvss_v3_base_score(vector: &str) -> Option<f64> {
+    let (version, metrics) = vector.trim().split_once('/')?;
+    if version != "CVSS:3.1" && version != "CVSS:3.0" {
+        return None;
+    }
+    let pairs: Vec<(&str, &str)> = metrics
+        .split('/')
+        .filter_map(|p| p.split_once(':'))
+        .collect();
+    let get = |key: &str| {
+        pairs
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| *value)
+    };
+
+    let scope_changed = match get("S")? {
+        "U" => false,
+        "C" => true,
+        _ => return None,
+    };
+    let attack_vector = match get("AV")? {
+        "N" => 0.85,
+        "A" => 0.62,
+        "L" => 0.55,
+        "P" => 0.2,
+        _ => return None,
+    };
+    let attack_complexity = match get("AC")? {
+        "L" => 0.77,
+        "H" => 0.44,
+        _ => return None,
+    };
+    // Privileges Required is scored higher when the scope changes.
+    let privileges_required = match (get("PR")?, scope_changed) {
+        ("N", _) => 0.85,
+        ("L", false) => 0.62,
+        ("L", true) => 0.68,
+        ("H", false) => 0.27,
+        ("H", true) => 0.50,
+        _ => return None,
+    };
+    let user_interaction = match get("UI")? {
+        "N" => 0.85,
+        "R" => 0.62,
+        _ => return None,
+    };
+    let impact_weight = |metric: &str| match metric {
+        "H" => Some(0.56),
+        "L" => Some(0.22),
+        "N" => Some(0.0),
+        _ => None,
+    };
+    let confidentiality = impact_weight(get("C")?)?;
+    let integrity = impact_weight(get("I")?)?;
+    let availability = impact_weight(get("A")?)?;
+
+    let iss = 1.0 - ((1.0 - confidentiality) * (1.0 - integrity) * (1.0 - availability));
+    let impact = if scope_changed {
+        7.52 * (iss - 0.029) - 3.25 * (iss - 0.02f64).powi(15)
+    } else {
+        6.42 * iss
+    };
+    if impact <= 0.0 {
+        return Some(0.0);
+    }
+    let exploitability =
+        8.22 * attack_vector * attack_complexity * privileges_required * user_interaction;
+    let raw = if scope_changed {
+        1.08 * (impact + exploitability)
+    } else {
+        impact + exploitability
+    };
+    Some(cvss_roundup(raw.min(10.0)))
+}
+
+/// The CVSS v3.1 `Roundup` function: round up to one decimal place, defined
+/// on integers so floating-point representation cannot round 8.6 down to 8.5.
+fn cvss_roundup(x: f64) -> f64 {
+    let scaled = (x * 100_000.0).round() as i64;
+    if scaled % 10_000 == 0 {
+        scaled as f64 / 100_000.0
+    } else {
+        ((scaled as f64 / 10_000.0).floor() + 1.0) / 10.0
+    }
 }
 
 /// Apply an OpenVEX document: a finding is suppressed only when a
@@ -431,12 +1009,35 @@ fn normalize_ecosystem(label: &str) -> String {
 }
 
 /// Does the report breach the configured severity threshold?
-pub fn breaches_threshold(report: &ScanReport, fail_on: &str) -> bool {
-    let threshold = severity_rank(fail_on);
-    report
+///
+/// Two things this refuses to do silently, both of which it used to:
+///
+/// 1. **Rank an undetermined severity below `low`.** A finding whose severity
+///    no source stated breaches EVERY threshold. We cannot show it is below
+///    the line, so it is above it; the alternative is a gate that a missing
+///    field can walk straight through. [`parse_osv`] recovers a real rating
+///    wherever the advisory carries one precisely so this set stays small,
+///    and a documented waiver is still available through VEX — visibly.
+/// 2. **Turn a typo'd threshold into the strictest setting.** `fail_on =
+///    "error"` used to rank 0, i.e. `low`, i.e. everything breaches: a
+///    misconfiguration that *looks* like it is working. A `fail_on` that is
+///    not a severity is a configuration error and says so.
+pub fn breaches_threshold(report: &ScanReport, fail_on: &str) -> Result<bool> {
+    let threshold = severity_rank(fail_on).with_context(|| {
+        format!(
+            "`fail_on` is not a severity: {fail_on:?} (valid: {}). \
+             Fix `[controls.vuln-scan] fail_on` in .sscsb/config.toml",
+            SEVERITIES.join(", ")
+        )
+    })?;
+    Ok(report
         .findings
         .iter()
-        .any(|f| severity_rank(&f.severity) >= threshold)
+        .any(|f| match severity_rank(&f.severity) {
+            Some(rank) => rank >= threshold,
+            // Undetermined: not provably below the line, so treated as above it.
+            None => true,
+        }))
 }
 
 pub fn verify_scan_control(ctx: &Ctx) -> VerifyResult {
@@ -454,6 +1055,12 @@ pub fn verify_scan_control(ctx: &Ctx) -> VerifyResult {
             }
         }
     }
+    // Which tools are installed is only half of what this control depends on;
+    // the other half is what the repository tells them to skip. `verify` is
+    // where a reviewer looks, so the inventory is stated here too. It does not
+    // move the verdict: a documented waiver is a decision, not a failure —
+    // see `scanner_config_notes` for why inherit-and-report is the contract.
+    messages.extend(scanner_config_notes(&ctx.root));
     VerifyResult::new("vuln-scan", outcome, messages)
 }
 
@@ -473,10 +1080,10 @@ mod tests {
             findings,
             ..Default::default()
         };
-        assert!(breaches_threshold(&report, "high"));
-        assert!(!breaches_threshold(&ScanReport::default(), "low"));
+        assert!(breaches_threshold(&report, "high").unwrap());
+        assert!(!breaches_threshold(&ScanReport::default(), "low").unwrap());
         // Raising the threshold to critical: the high finding no longer breaches.
-        assert!(!breaches_threshold(&report, "critical"));
+        assert!(!breaches_threshold(&report, "critical").unwrap());
     }
 
     #[test]
@@ -487,6 +1094,9 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].id, "GHSA-xxxx");
         assert_eq!(findings[0].source, "osv-scanner");
+        // GHSA's MODERATE is this scale's `medium`, not an unrecognised
+        // string that ranks below `low`.
+        assert_eq!(findings[0].severity, "medium");
     }
 
     #[test]
@@ -515,7 +1125,90 @@ mod tests {
     fn severity_ranks_are_ordered() {
         assert!(severity_rank("critical") > severity_rank("high"));
         assert!(severity_rank("high") > severity_rank("medium"));
-        assert_eq!(severity_rank("unknown-thing"), severity_rank("low"));
+        assert!(severity_rank("medium") > severity_rank("low"));
+    }
+
+    /// H6: `severity_rank` ended in `.unwrap_or(0)`, so every string that was
+    /// not one of the four labels ranked BELOW `low` — an unrateable advisory
+    /// and a GHSA `MODERATE` alike. Both halves are asserted here.
+    #[test]
+    fn an_undetermined_severity_is_not_a_low_severity() {
+        // Not a severity: no rank at all, rather than the weakest rank.
+        assert_eq!(severity_rank("unknown"), None);
+        assert_eq!(severity_rank("unknown-thing"), None);
+        assert_eq!(severity_rank(""), None);
+        // ...and it is strictly not `low`, which does have a rank.
+        assert!(severity_rank("low").is_some());
+
+        // A finding we cannot rank breaches every threshold, including the
+        // most permissive one, because nothing shows it is below the line.
+        let report = ScanReport {
+            findings: vec![VulnFinding {
+                id: "RUSTSEC-2024-0375".into(),
+                package: "atty".into(),
+                severity: "unknown".into(),
+                source: "osv-scanner",
+                ecosystem: Some("crates.io".into()),
+            }],
+            ..Default::default()
+        };
+        for threshold in SEVERITIES {
+            assert!(
+                breaches_threshold(&report, threshold).unwrap(),
+                "an undetermined severity must breach `{threshold}`"
+            );
+        }
+        // And it is counted and explained rather than merely gating.
+        assert_eq!(undetermined_severity_count(&report), 1);
+        let note = undetermined_severity_note(&report).expect("note");
+        assert!(
+            note.contains("1 finding(s)") && note.contains("VEX"),
+            "{note}"
+        );
+        assert_eq!(undetermined_severity_note(&ScanReport::default()), None);
+    }
+
+    /// H6: GHSA rates advisories `MODERATE`; the scale says `medium`. Before
+    /// normalisation that string was unrecognised, so every GitHub-rated
+    /// moderate advisory ranked below `low` and could not breach `medium`.
+    #[test]
+    fn ghsa_moderate_ranks_as_medium() {
+        assert_eq!(severity_rank("MODERATE"), severity_rank("medium"));
+        let report = ScanReport {
+            findings: vec![VulnFinding {
+                id: "GHSA-wcg3-cvx6-7396".into(),
+                package: "time".into(),
+                severity: "moderate".into(),
+                source: "osv-scanner",
+                ecosystem: Some("crates.io".into()),
+            }],
+            ..Default::default()
+        };
+        assert!(breaches_threshold(&report, "medium").unwrap());
+        assert!(breaches_threshold(&report, "low").unwrap());
+        // It is a real rating, so it does NOT breach a higher threshold —
+        // this is a recovered severity, not a fail-closed unknown.
+        assert!(!breaches_threshold(&report, "high").unwrap());
+    }
+
+    /// H6, inverse hazard: a typo'd threshold used to rank 0 — the STRICTEST
+    /// setting — so a misconfigured gate looked like a working one.
+    #[test]
+    fn a_fail_on_that_is_not_a_severity_is_an_error_not_the_strictest_setting() {
+        let report = ScanReport {
+            findings: parse_trivy(TRIVY_SAMPLE).unwrap(),
+            ..Default::default()
+        };
+        for typo in ["none", "error", "HIGH!", "", "criticalish"] {
+            let err = breaches_threshold(&report, typo).unwrap_err().to_string();
+            assert!(
+                err.contains("not a severity") && err.contains("low, medium, high, critical"),
+                "a {typo:?} threshold must name the valid values: {err}"
+            );
+        }
+        // Case and stray whitespace are the author's intent, not a typo.
+        assert!(breaches_threshold(&report, "HIGH ").unwrap());
+        assert!(!breaches_threshold(&report, " Critical").unwrap());
     }
 
     #[test]
@@ -595,6 +1288,112 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].id, "GHSA-unrated");
         assert_eq!(findings[0].severity, "unknown");
+        // ...and "unknown" is not a rank, so it cannot slip under a gate.
+        assert_eq!(severity_rank(&findings[0].severity), None);
+    }
+
+    /// H6: RUSTSEC and PYSEC records carry no `/database_specific/severity` —
+    /// reading only that field rated 13 of 25 findings `unknown` in a live
+    /// `osv-scanner 2.4.0` run. These are the record shapes those databases
+    /// actually emit, captured from that run.
+    #[test]
+    fn parse_osv_recovers_severity_from_the_fields_advisories_actually_populate() {
+        // RUSTSEC-2021-0003 (smallvec): no database_specific.severity; the
+        // rating lives in the OSV `severity` array as a CVSS vector. 9.8.
+        let rustsec_vector = r#"{"results":[{"packages":[{"package":{"name":"smallvec","ecosystem":"crates.io"},
+            "vulnerabilities":[{"id":"RUSTSEC-2021-0003","database_specific":{"license":"CC0-1.0"},
+             "severity":[{"score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H","type":"CVSS_V3"}]}]}]}]}"#;
+        let findings = parse_osv(rustsec_vector).unwrap();
+        assert_eq!(findings[0].severity, "critical", "{:?}", findings[0]);
+
+        // RUSTSEC-2020-0071 (time): the same vector, in the other place
+        // RUSTSEC puts it — affected[].database_specific.cvss. 6.2.
+        let rustsec_affected = r#"{"results":[{"packages":[{"package":{"name":"time","ecosystem":"crates.io"},
+            "vulnerabilities":[{"id":"RUSTSEC-2020-0071","database_specific":{"license":"CC0-1.0"},
+             "affected":[{"database_specific":{"cvss":"CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+             "informational":null}}]}]}]}]}"#;
+        let findings = parse_osv(rustsec_affected).unwrap();
+        assert_eq!(findings[0].severity, "medium", "{:?}", findings[0]);
+
+        // GHSA states a label AND a vector. The label is normalised onto this
+        // scale, and where the two disagree the higher rating wins — a gate is
+        // not argued down by the weaker of two ratings one record asserts.
+        let ghsa = r#"{"results":[{"packages":[{"package":{"name":"smallvec","ecosystem":"crates.io"},
+            "vulnerabilities":[{"id":"GHSA-43w2-9j62-hq99",
+             "database_specific":{"severity":"MODERATE","github_reviewed":true},
+             "severity":[{"score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H","type":"CVSS_V3"}]}]}]}]}"#;
+        let findings = parse_osv(ghsa).unwrap();
+        assert_eq!(findings[0].severity, "critical", "{:?}", findings[0]);
+
+        // A label with no vector is still recovered, canonicalised.
+        let label_only = r#"{"results":[{"packages":[{"package":{"name":"atty"},
+            "vulnerabilities":[{"id":"GHSA-g98v-hv3f-hcfr","database_specific":{"severity":"MODERATE"}}]}]}]}"#;
+        assert_eq!(parse_osv(label_only).unwrap()[0].severity, "medium");
+
+        // A vector we cannot score exactly is NOT guessed at: the v4
+        // macro-vector tables are not implemented, so this stays undetermined
+        // (which fails closed) rather than being invented as some band.
+        let v4_only = r#"{"results":[{"packages":[{"package":{"name":"foo"},
+            "vulnerabilities":[{"id":"GHSA-v4","severity":[{"score":"CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N","type":"CVSS_V4"}]}]}]}]}"#;
+        assert_eq!(parse_osv(v4_only).unwrap()[0].severity, "unknown");
+    }
+
+    /// The base-score arithmetic, checked against published CVSS values —
+    /// a recovered severity is only worth having if the score is right.
+    #[test]
+    fn cvss_v3_base_scores_match_the_published_values() {
+        let score = |v: &str| cvss_v3_base_score(v).expect("scorable vector");
+        // RUSTSEC-2021-0003 / CVE-2021-25900, rated 9.8 by NVD and GHSA.
+        assert_eq!(score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"), 9.8);
+        // CVE-2020-26235 (time), 6.2 — GHSA's MODERATE.
+        assert_eq!(score("CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"), 6.2);
+        // Log4Shell, the canonical scope-changed 10.0.
+        assert_eq!(score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"), 10.0);
+        // Heartbleed's v3 vector, 7.5.
+        assert_eq!(score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"), 7.5);
+        // Scope-changed with partial impact: 6.4 (exercises the 1.08 factor).
+        assert_eq!(score("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:L/I:L/A:N"), 6.4);
+        // Low band, and the v3.0 prefix is accepted too.
+        assert_eq!(score("CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:N/A:N"), 3.1);
+        // No impact at all scores 0.0 — the impact<=0 branch.
+        assert_eq!(score("CVSS:3.0/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:N"), 0.0);
+
+        // Bands, including the 0.0 "None" case which has no lower rung here.
+        assert_eq!(
+            severity_from_cvss_vector("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+            Some("critical")
+        );
+        assert_eq!(
+            severity_from_cvss_vector("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"),
+            Some("high")
+        );
+        assert_eq!(
+            severity_from_cvss_vector("CVSS:3.0/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:N"),
+            Some("low")
+        );
+
+        // Nothing we cannot score exactly is guessed at.
+        for unscorable in [
+            "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+            "CVSS:2.0/AV:N/AC:L/Au:N/C:P/I:P/A:P",
+            "AV:N/AC:L/Au:N/C:P/I:P/A:P",
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H", // missing mandatory A
+            "CVSS:3.1/AV:X/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", // bogus metric value
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:X/C:H/I:H/A:H", // bogus scope
+            "CVSS:3.1/AV:N/AC:X/PR:N/UI:N/S:U/C:H/I:H/A:H", // bogus complexity
+            "CVSS:3.1/AV:N/AC:L/PR:X/UI:N/S:U/C:H/I:H/A:H", // bogus privileges
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:X/S:U/C:H/I:H/A:H", // bogus interaction
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:X/I:H/A:H", // bogus impact
+            "not a vector",
+            "",
+        ] {
+            assert_eq!(
+                cvss_v3_base_score(unscorable),
+                None,
+                "must not invent a score for {unscorable:?}"
+            );
+            assert_eq!(severity_from_cvss_vector(unscorable), None);
+        }
     }
 
     #[test]
@@ -871,8 +1670,8 @@ mod tests {
         }
         // Threshold gating stays monotonic with severity regardless of what
         // the real scanners returned.
-        let breached_low = breaches_threshold(&report, "low");
-        let breached_crit = breaches_threshold(&report, "critical");
+        let breached_low = breaches_threshold(&report, "low").unwrap();
+        let breached_crit = breaches_threshold(&report, "critical").unwrap();
         assert!(
             !breached_crit || breached_low,
             "anything that breaches `critical` must also breach `low`"
@@ -987,5 +1786,202 @@ mod tests {
         } else {
             assert_eq!(result.outcome, Outcome::Degraded);
         }
+    }
+
+    // ── H5: scanner configuration the repository supplies ───────────────────
+
+    /// Every file the scanners pick up on their own is named, along with what
+    /// it does — the part a `trivy.yaml` narrowing never reveals any other way.
+    #[test]
+    fn scanner_config_files_are_reported_with_what_they_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(
+            scanner_config_notes(root).is_empty(),
+            "a repo with no scanner config has nothing to report"
+        );
+
+        std::fs::write(
+            root.join("trivy.yaml"),
+            "severity:\n  - CRITICAL\n\
+             scan:\n  skip-dirs:\n    - vendor\n\
+             ignorefile: waivers/custom.ignore\n\
+             vulnerability:\n  ignore-unfixed: true\n\
+             db:\n  skip-update:\n\
+             timeout: 5m\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".trivyignore"),
+            "# documented waiver\nDS-0002\nDS-0026\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("osv-scanner.toml"),
+            "[[IgnoredVulns]]\nid = \"RUSTSEC-2021-0003\"\nreason = \"reviewed\"\n\n\
+             [[PackageOverrides]]\nname = \"atty\"\nignore = true\n",
+        )
+        .unwrap();
+        let notes = scanner_config_notes(root).join("\n");
+
+        // trivy.yaml: named, and its narrowing keys spelled out with values.
+        assert!(notes.contains("trivy.yaml"), "{notes}");
+        assert!(notes.contains("NARROWS"), "{notes}");
+        assert!(notes.contains("severity=[CRITICAL]"), "{notes}");
+        assert!(notes.contains("scan.skip-dirs=[vendor]"), "{notes}");
+        // Every value shape a real trivy.yaml uses renders readably.
+        assert!(
+            notes.contains("ignorefile=waivers/custom.ignore"),
+            "{notes}"
+        );
+        assert!(
+            notes.contains("vulnerability.ignore-unfixed=true"),
+            "{notes}"
+        );
+        // A key present with no value still narrows, and still shows up.
+        assert!(notes.contains("db.skip-update=set"), "{notes}");
+        // An operational key is not misreported as a narrowing one.
+        assert!(!notes.contains("timeout="), "{notes}");
+
+        // .trivyignore: entry count and the ids, comments excluded.
+        assert!(
+            notes.contains(".trivyignore is present with 2 entr"),
+            "{notes}"
+        );
+        assert!(notes.contains("DS-0002, DS-0026"), "{notes}");
+        assert!(!notes.contains("documented waiver"), "{notes}");
+
+        // osv-scanner.toml: what it ignores and what it overrides.
+        assert!(notes.contains("osv-scanner.toml"), "{notes}");
+        assert!(notes.contains("ignores 1 (RUSTSEC-2021-0003)"), "{notes}");
+        assert!(notes.contains("overrides 1 package(s) (atty)"), "{notes}");
+    }
+
+    /// A config file we cannot read is still a config file the scanner acts
+    /// on: unparseable must report presence, never absence.
+    #[test]
+    fn unparseable_scanner_config_is_reported_as_present_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("trivy.yaml"), "\tthis: [is not: yaml\n").unwrap();
+        std::fs::write(root.join("osv-scanner.toml"), "not [ valid toml\n").unwrap();
+        let notes = scanner_config_notes(root).join("\n");
+        assert_eq!(notes.matches("could not parse it").count(), 2, "{notes}");
+        assert!(notes.contains("trivy.yaml is present"), "{notes}");
+        assert!(notes.contains("osv-scanner.toml is present"), "{notes}");
+
+        // An empty or effect-free config says so rather than implying muting.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("trivy.yaml"), "timeout: 5m\n").unwrap();
+        std::fs::write(dir.path().join("osv-scanner.toml"), "# nothing\n").unwrap();
+        std::fs::write(dir.path().join(".trivyignore"), "# only a comment\n").unwrap();
+        let notes = scanner_config_notes(dir.path()).join("\n");
+        assert!(notes.contains("no key in it narrows"), "{notes}");
+        assert!(
+            notes.contains("names no vulnerabilities or packages"),
+            "{notes}"
+        );
+        assert!(
+            notes.contains(".trivyignore is present with 0 entr"),
+            "{notes}"
+        );
+
+        // A completely empty trivy.yaml parses to no documents at all.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("trivy.yaml"), "").unwrap();
+        assert!(scanner_config_notes(dir.path())[0].contains("it is empty"));
+    }
+
+    /// Trivy's own suppression channel, as it reports it under
+    /// `--show-suppressed` — the row carries the source and the author's
+    /// statement, not just a count.
+    #[test]
+    fn parse_trivy_suppressions_names_the_source_and_the_stated_reason() {
+        let sample = r#"{"Results":[{"Target":"Cargo.lock","Type":"cargo","Vulnerabilities":[],
+            "ExperimentalModifiedFindings":[
+              {"Type":"vulnerability","Status":"ignored","Statement":"reviewed 2026-08",
+               "Source":".trivyignore",
+               "Finding":{"VulnerabilityID":"CVE-2021-25900","PkgName":"smallvec"}},
+              {"Type":"vulnerability","Status":"not_affected","Statement":"",
+               "Source":"vex.json",
+               "Finding":{"VulnerabilityID":"CVE-2020-26235","PkgName":"time"}}]},
+            {"Target":"Dockerfile","ExperimentalModifiedFindings":[
+              {"Status":"ignored","Source":".trivyignore","Finding":{"ID":"DS-0002"}}]},
+            {"Target":"clean.lock","Vulnerabilities":[]}]}"#;
+        let rows = parse_trivy_suppressions(sample).unwrap();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(
+            rows[0],
+            "CVE-2021-25900 (smallvec) — trivy ignored via .trivyignore: reviewed 2026-08"
+        );
+        // No statement: the row still names id, package, status and source.
+        assert_eq!(
+            rows[1],
+            "CVE-2020-26235 (time) — trivy not_affected via vex.json"
+        );
+        // A misconfiguration has no PkgName; the target stands in for it.
+        assert_eq!(
+            rows[2],
+            "DS-0002 (Dockerfile) — trivy ignored via .trivyignore"
+        );
+
+        // A report with no suppressions produces no rows, and a non-JSON blob
+        // is an error rather than a silent empty list.
+        assert!(parse_trivy_suppressions(TRIVY_SAMPLE).unwrap().is_empty());
+        assert!(parse_trivy_suppressions("not json").is_err());
+    }
+
+    /// OSV-Scanner states its filtering on stderr and nowhere else — not in
+    /// the JSON, not even under `--all-vulns`. Both verb forms it uses are
+    /// parsed; matching only the singular dropped exactly the alias-group
+    /// case, which is the one that mutes the most.
+    #[test]
+    fn osv_filter_report_reads_both_verb_forms_off_stderr() {
+        let stderr = "Scanning dir /repo\n\
+             Loaded filter from: /repo/osv-scanner.toml\n\
+             RUSTSEC-2021-0003 and 2 aliases have been filtered out because: not reachable\n\
+             RUSTSEC-2020-0159 has been filtered out because: accepted risk\n\
+             Package crates.io/atty/0.2.14 has been filtered out because: unmaintained, pinned\n\
+             Filtered 3 vulnerabilities from output\n";
+        let (suppressed, notes) = osv_filter_report(stderr);
+        assert_eq!(
+            suppressed,
+            vec![
+                "RUSTSEC-2021-0003 and 2 aliases — osv-scanner filtered out: not reachable",
+                "RUSTSEC-2020-0159 — osv-scanner filtered out: accepted risk",
+                "Package crates.io/atty/0.2.14 — osv-scanner filtered out: unmaintained, pinned",
+            ]
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("/repo/osv-scanner.toml"), "{:?}", notes);
+
+        // An ordinary run says nothing of the sort.
+        let (suppressed, notes) = osv_filter_report("Scanning dir /repo\nEnd status: 1 dirs\n");
+        assert!(suppressed.is_empty() && notes.is_empty());
+    }
+
+    /// `verify` is where a reviewer looks, so the inventory is stated there
+    /// too — without moving the verdict, because a documented waiver is a
+    /// decision rather than a failure.
+    #[test]
+    fn verify_scan_control_reports_repository_supplied_scanner_config() {
+        let (_d, ctx) = fresh_bootstrapped_repo();
+        let clean = verify_scan_control(&ctx);
+        assert!(!clean.messages.iter().any(|m| m.contains("scanner config")));
+
+        std::fs::write(ctx.root.join(".trivyignore"), "CVE-2021-25900\n").unwrap();
+        let with_config = verify_scan_control(&ctx);
+        assert!(
+            with_config
+                .messages
+                .iter()
+                .any(|m| m.contains("scanner config") && m.contains(".trivyignore")),
+            "{:?}",
+            with_config.messages
+        );
+        assert_eq!(
+            with_config.outcome, clean.outcome,
+            "a documented waiver is not a control failure"
+        );
     }
 }

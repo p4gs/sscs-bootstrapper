@@ -615,7 +615,10 @@ fn cmd_scan(cwd: &std::path::Path, vex: Option<&std::path::Path>, grype: bool) -
     let fail_on = cfg
         .control_opt_str("vuln-scan", "fail_on")
         .unwrap_or_else(|| "high".to_string());
-    if scan::breaches_threshold(&report, &fail_on) {
+    // A `fail_on` that is not a severity is a configuration error, not the
+    // strictest setting — it surfaces here rather than silently gating on
+    // everything.
+    if scan::breaches_threshold(&report, &fail_on)? {
         println!("threshold breached (fail_on = {fail_on})");
         return fail(1);
     }
