@@ -223,7 +223,7 @@ cargo build --release
 cargo test               # unit + integration + library + tool-orchestration suites
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-cargo llvm-cov --ignore-filename-regex '(main\.rs|cli\.rs)'   # 95% line / 95% fn floor
+cargo llvm-cov --ignore-filename-regex '(main\.rs|cli\.rs)'   # gate: 95% lines / 94% functions (see ci.yml)
 ```
 
 The suites run the **real tools** where they are installed (a real `slsa-verifier`
