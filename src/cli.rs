@@ -266,7 +266,16 @@ enum ReceiptAction {
         sign: bool,
     },
     /// Verify a receipt against the repository
-    Verify { receipt: PathBuf },
+    Verify {
+        receipt: PathBuf,
+        /// Expected cosign certificate identity for the receipt's signature
+        /// bundle (default: cosign_identity under [controls.ai-receipts])
+        #[arg(long)]
+        identity: Option<String>,
+        /// OIDC issuer for that identity (default: cosign_issuer, else GitHub)
+        #[arg(long)]
+        issuer: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -737,14 +746,21 @@ fn cmd_receipt(cwd: &std::path::Path, action: ReceiptAction) -> Result<ExitCode>
             let path = provenance::create_receipt(&ctx, &commit, &out_dir)?;
             println!("receipt written: {}", path.display());
             if sign {
-                let bundle = path.with_extension("json.sigstore.json");
+                let bundle = provenance::receipt_bundle_path(&path);
                 let log = provenance::cosign_sign_blob(&ctx, &path, &bundle)?;
                 println!("signed: {} \n{log}", bundle.display());
             }
             ok()
         }
-        ReceiptAction::Verify { receipt } => {
-            println!("{}", provenance::verify_receipt(&ctx, &receipt)?);
+        ReceiptAction::Verify {
+            receipt,
+            identity,
+            issuer,
+        } => {
+            println!(
+                "{}",
+                provenance::verify_receipt(&ctx, &receipt, identity.as_deref(), issuer.as_deref())?
+            );
             ok()
         }
     }

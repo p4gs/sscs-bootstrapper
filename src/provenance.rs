@@ -214,8 +214,7 @@ pub fn create_receipt(ctx: &Ctx, commit: &str, out_dir: &Path) -> Result<std::pa
     let file_name = receipt_file_name(commit, &sha)?;
     let patch = exec::git(&["show", "--format=", "--no-color", &sha], &ctx.root)?;
     let patch_digest = hex::encode(Sha256::digest(patch.as_bytes()));
-    let body = exec::git(&["log", "-1", "--format=%B", &sha], &ctx.root)?;
-    let trailers = crate::hooks::parse_trailers(&body);
+    let claim = AiClaim::from_commit(ctx, &sha)?;
     let statement = serde_json::json!({
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [{
@@ -224,10 +223,10 @@ pub fn create_receipt(ctx: &Ctx, commit: &str, out_dir: &Path) -> Result<std::pa
         }],
         "predicateType": RECEIPT_PREDICATE_TYPE,
         "predicate": {
-            "aiAssisted": trailers.get("AI-Assisted").cloned().unwrap_or_else(|| "undeclared".into()),
-            "aiTool": trailers.get("AI-Tool").cloned(),
-            "aiModel": trailers.get("AI-Model").cloned(),
-            "aiRole": trailers.get("AI-Role").cloned(),
+            "aiAssisted": claim.assisted,
+            "aiTool": claim.tool,
+            "aiModel": claim.model,
+            "aiRole": claim.role,
             "patchSha256": patch_digest,
             "generatedBy": format!("sscsb {}", env!("CARGO_PKG_VERSION")),
             "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -266,9 +265,118 @@ fn receipt_file_name(commit: &str, sha: &str) -> Result<String> {
     Ok(format!("receipt-{}.json", sha.get(..12).unwrap_or(sha)))
 }
 
-/// Verify a receipt against the repository: recompute the commit's patch
-/// digest and compare.
-pub fn verify_receipt(ctx: &Ctx, receipt_path: &Path) -> Result<String> {
+/// The AI claim a receipt makes about a commit: exactly the four trailers
+/// `create_receipt` reads, in one place so creation and verification cannot
+/// drift apart.
+#[derive(Debug, PartialEq, Eq)]
+struct AiClaim {
+    assisted: String,
+    tool: Option<String>,
+    model: Option<String>,
+    role: Option<String>,
+}
+
+impl AiClaim {
+    /// What the repository says, right now, about `sha`.
+    fn from_commit(ctx: &Ctx, sha: &str) -> Result<Self> {
+        let body = exec::git(
+            &["log", "-1", "--format=%B", "--end-of-options", sha],
+            &ctx.root,
+        )?;
+        let t = crate::hooks::parse_trailers(&body);
+        Ok(AiClaim {
+            assisted: t
+                .get("AI-Assisted")
+                .cloned()
+                .unwrap_or_else(|| "undeclared".into()),
+            tool: t.get("AI-Tool").cloned(),
+            model: t.get("AI-Model").cloned(),
+            role: t.get("AI-Role").cloned(),
+        })
+    }
+
+    /// What the receipt says.
+    fn from_predicate(predicate: &serde_json::Value) -> Self {
+        let field = |k: &str| {
+            predicate
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        AiClaim {
+            assisted: field("aiAssisted").unwrap_or_else(|| "undeclared".into()),
+            tool: field("aiTool"),
+            model: field("aiModel"),
+            role: field("aiRole"),
+        }
+    }
+
+    /// Field-by-field differences, `self` being the receipt's claim.
+    fn differences_from(&self, commit: &AiClaim) -> Vec<String> {
+        let show = |v: &Option<String>| match v {
+            Some(s) => format!("{s:?}"),
+            None => "absent".to_string(),
+        };
+        let mut out = Vec::new();
+        if self.assisted != commit.assisted {
+            out.push(format!(
+                "aiAssisted: receipt claims {:?}, commit says {:?}",
+                self.assisted, commit.assisted
+            ));
+        }
+        for (name, mine, theirs) in [
+            ("aiTool", &self.tool, &commit.tool),
+            ("aiModel", &self.model, &commit.model),
+            ("aiRole", &self.role, &commit.role),
+        ] {
+            if mine != theirs {
+                out.push(format!(
+                    "{name}: receipt claims {}, commit says {}",
+                    show(mine),
+                    show(theirs)
+                ));
+            }
+        }
+        out
+    }
+}
+
+/// Where `receipt create --sign` puts a receipt's cosign bundle. One function
+/// so the writer and the reader cannot disagree about the name — until now
+/// nothing read it at all.
+pub fn receipt_bundle_path(receipt: &Path) -> std::path::PathBuf {
+    let mut name = receipt.as_os_str().to_os_string();
+    name.push(".sigstore.json");
+    std::path::PathBuf::from(name)
+}
+
+/// The default OIDC issuer for keyless signatures made in GitHub Actions.
+pub const GITHUB_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+/// Verify a receipt against the repository:
+///
+/// 1. the commit's patch still hashes to the digest the receipt binds, and
+/// 2. the commit still declares the AI tool/model/role the receipt claims, and
+/// 3. any cosign bundle sitting beside the receipt actually verifies.
+///
+/// Reported (M8): only (1) existed. A receipt's whole purpose is to bind a
+/// commit to a DECLARED AI tool, model and role, and that declaration was the
+/// one thing never checked — a receipt whose `aiTool` said "Claude Code" while
+/// the commit's trailer said something else verified happily, because the patch
+/// bytes were untouched. `--sign` wrote a bundle that nothing ever read, so a
+/// signed receipt and an unsigned one verified identically.
+///
+/// `identity`/`issuer` come from the command line and fall back to
+/// `[controls.ai-receipts]` `cosign_identity`/`cosign_issuer`. A bundle that is
+/// PRESENT but cannot be checked — no identity to check it against, or no
+/// cosign — is an error, not a footnote: "receipt verified" must not be
+/// printable next to a signature nobody looked at.
+pub fn verify_receipt(
+    ctx: &Ctx,
+    receipt_path: &Path,
+    identity: Option<&str>,
+    issuer: Option<&str>,
+) -> Result<String> {
     let text = std::fs::read_to_string(receipt_path)?;
     let v: serde_json::Value = serde_json::from_str(&text).context("receipt is not JSON")?;
     anyhow::ensure!(
@@ -307,8 +415,74 @@ pub fn verify_receipt(ctx: &Ctx, receipt_path: &Path) -> Result<String> {
         "receipt DIGEST MISMATCH for {commit}: receipt claims {claimed}, repository has {actual} \
          — the commit or the receipt has been tampered with"
     );
+
+    // The claim itself. The patch digest proves the commit's CONTENT is the one
+    // the receipt was made from; it says nothing about the AI declaration, which
+    // lives in the commit message and is the thing the receipt exists to bind.
+    let declared = AiClaim::from_predicate(
+        v.get("predicate")
+            .context("receipt missing predicate — nothing to check the commit against")?,
+    );
+    let recorded = AiClaim::from_commit(ctx, commit)?;
+    let differences = declared.differences_from(&recorded);
+    anyhow::ensure!(
+        differences.is_empty(),
+        "receipt CLAIM MISMATCH for {commit}: {} \
+         — the receipt no longer describes the commit it names",
+        differences.join("; ")
+    );
+
+    // Any signature sitting beside the receipt.
+    let signature = verify_receipt_signature(ctx, receipt_path, identity, issuer)?;
+
     Ok(format!(
-        "receipt verified: commit {commit} patch digest {actual} matches"
+        "receipt verified: commit {commit} patch digest {actual} matches; \
+         AI claim matches the commit trailers (aiAssisted={}, aiTool={}); {signature}",
+        declared.assisted,
+        declared.tool.as_deref().unwrap_or("absent"),
+    ))
+}
+
+/// Check the cosign bundle beside `receipt_path`, if there is one.
+///
+/// Fails closed in both directions a signature can be unverifiable: no identity
+/// to check it against, and no cosign to check it with. Either way the caller
+/// must not go on to print "receipt verified".
+fn verify_receipt_signature(
+    ctx: &Ctx,
+    receipt_path: &Path,
+    identity: Option<&str>,
+    issuer: Option<&str>,
+) -> Result<String> {
+    let bundle = receipt_bundle_path(receipt_path);
+    if !bundle.is_file() {
+        return Ok(format!(
+            "no signature bundle at {} (`sscsb receipt create --sign` writes one)",
+            bundle.display()
+        ));
+    }
+    let opt = |key: &str| {
+        ctx.config
+            .as_ref()
+            .and_then(|c| c.control_opt_str("ai-receipts", key))
+            .filter(|s| !s.trim().is_empty())
+    };
+    let identity = identity
+        .map(str::to_string)
+        .or_else(|| opt("cosign_identity"));
+    let identity = identity.context(
+        "this receipt is SIGNED but there is no identity to verify the signature against — \
+         pass `--identity <certificate identity>` or set cosign_identity under \
+         [controls.ai-receipts] in .sscsb/config.toml. A signature nobody checks is not \
+         evidence, so this is a failure rather than a warning",
+    )?;
+    let issuer = issuer
+        .map(str::to_string)
+        .or_else(|| opt("cosign_issuer"))
+        .unwrap_or_else(|| GITHUB_OIDC_ISSUER.to_string());
+    cosign_verify_blob(ctx, receipt_path, &bundle, &identity, &issuer)?;
+    Ok(format!(
+        "signature verified against identity {identity} (issuer {issuer})"
     ))
 }
 
@@ -348,7 +522,8 @@ pub fn verify_provenance_control(ctx: &Ctx) -> VerifyResult {
 pub fn verify_receipts_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     let mut messages = vec![
         "receipts: `sscsb receipt create [commit]` → .sscsb/out/receipts/, \
-         `sscsb receipt verify <file>` recomputes the patch digest"
+         `sscsb receipt verify <file>` recomputes the patch digest, re-reads the commit's \
+         AI trailers, and verifies any cosign bundle beside the receipt"
             .into(),
     ];
     let sign = cfg
@@ -623,7 +798,7 @@ mod tests {
         assert_eq!(doc["predicate"]["aiRole"], "draft");
         assert_eq!(doc["predicate"]["aiAssisted"], "true");
 
-        let ok = verify_receipt(&ctx, &receipt).unwrap();
+        let ok = verify_receipt(&ctx, &receipt, None, None).unwrap();
         assert!(ok.contains("receipt verified"));
 
         // Tampered digest is caught — this is the tamper-detection contract;
@@ -634,7 +809,7 @@ mod tests {
             text.replacen("\"sha256\": \"", "\"sha256\": \"ff", 1),
         )
         .unwrap();
-        let err = verify_receipt(&ctx, &receipt).unwrap_err();
+        let err = verify_receipt(&ctx, &receipt, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("DIGEST MISMATCH"));
 
         // A non-receipt JSON file is rejected.
@@ -644,8 +819,148 @@ mod tests {
             r#"{"predicateType":"https://slsa.dev/provenance/v1"}"#,
         )
         .unwrap();
-        let err = verify_receipt(&ctx, &other).unwrap_err();
+        let err = verify_receipt(&ctx, &other, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("not an sscsb AI provenance receipt"));
+    }
+
+    /// Reported (M8): the receipt's actual CLAIM was never verified.
+    ///
+    /// A receipt exists to bind a commit to a declared AI tool, model and role.
+    /// Verification only recomputed the patch digest — which proves the
+    /// commit's CONTENT is what the receipt was made from and says nothing
+    /// about the declaration, because the trailers live in the commit message
+    /// and are not part of `git show --format=`. So a receipt claiming one tool
+    /// over a commit declaring another verified happily, at exit 0.
+    #[test]
+    fn verify_receipt_rejects_a_claim_the_commit_no_longer_supports() {
+        let (_d, ctx) = repo();
+        write(&ctx, "a.txt", "a\n");
+        commit_all(
+            &ctx,
+            "feat: x\n\nAI-Assisted: true\nAI-Tool: Claude Code\nAI-Model: Fable 5\nAI-Role: draft",
+        );
+        let out_dir = ctx.sscsb_dir().join("out").join("receipts");
+        let receipt = create_receipt(&ctx, "HEAD", &out_dir).unwrap();
+        let genuine = std::fs::read_to_string(&receipt).unwrap();
+
+        // Every field, edited one at a time. The patch digest is left alone in
+        // each case, which is exactly why the digest check cannot see any of
+        // them: the commit's bytes are untouched.
+        let forgeries = [
+            ("aiTool", serde_json::json!("Some Other Tool")),
+            ("aiModel", serde_json::json!("Some Other Model")),
+            ("aiRole", serde_json::json!("author")),
+            ("aiAssisted", serde_json::json!("false")),
+            // Dropping the declaration entirely is the most useful forgery of
+            // all: it launders AI-assisted work into apparently unassisted work.
+            ("aiTool", serde_json::json!(null)),
+        ];
+        for (field, value) in forgeries {
+            let mut doc: serde_json::Value = serde_json::from_str(&genuine).unwrap();
+            doc["predicate"][field] = value.clone();
+            let forged = ctx.root.join("forged-claim.json");
+            std::fs::write(&forged, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+            let err = verify_receipt(&ctx, &forged, None, None).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("CLAIM MISMATCH") && msg.contains(field),
+                "editing {field} to {value} must be caught and named: {msg}"
+            );
+        }
+
+        // The unedited receipt still verifies, and says so about the claim.
+        let ok = verify_receipt(&ctx, &receipt, None, None).unwrap();
+        assert!(ok.contains("AI claim matches"), "{ok}");
+        assert!(ok.contains("Claude Code"), "{ok}");
+    }
+
+    /// The other half of M8: `--sign` wrote a cosign bundle beside the receipt
+    /// and NOTHING ever read it, so a signed receipt and an unsigned one
+    /// verified identically. A signature that is present but unchecked must not
+    /// be printable next to the words "receipt verified".
+    #[test]
+    fn verify_receipt_refuses_a_signed_receipt_it_cannot_check() {
+        let (_d, ctx) = repo();
+        write(&ctx, "a.txt", "a\n");
+        commit_all(&ctx, "feat: x\n\nAI-Assisted: true");
+        let out_dir = ctx.sscsb_dir().join("out").join("receipts");
+        let receipt = create_receipt(&ctx, "HEAD", &out_dir).unwrap();
+
+        // No bundle: verification says plainly that there is nothing to check.
+        let ok = verify_receipt(&ctx, &receipt, None, None).unwrap();
+        assert!(ok.contains("no signature bundle"), "{ok}");
+
+        // A bundle appears, and there is no identity to check it against.
+        let bundle = receipt_bundle_path(&receipt);
+        std::fs::write(&bundle, r#"{"not":"a real bundle"}"#).unwrap();
+        let err = verify_receipt(&ctx, &receipt, None, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("SIGNED but there is no identity"), "{msg}");
+        assert!(msg.contains("--identity"), "names the fix: {msg}");
+
+        // With an identity, the bogus bundle is actually put to cosign, and
+        // fails. (When cosign is absent the degrade message is the failure —
+        // either way it must not be an Ok.)
+        let err = verify_receipt(
+            &ctx,
+            &receipt,
+            Some("https://github.com/example/repo/.github/workflows/release.yml@refs/heads/main"),
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cosign verify-blob FAILED") || msg.contains("cosign not found"),
+            "a bogus bundle must never verify: {msg}"
+        );
+    }
+
+    /// A cosign that says yes is believed, and the identity it was checked
+    /// against is named in the verdict — an operator must be able to see WHICH
+    /// identity a receipt was accepted for. The identity also comes from
+    /// config, so a repo can set its signing policy once.
+    #[test]
+    fn verify_receipt_reports_the_identity_a_signature_was_checked_against() {
+        let (_d, ctx) = repo();
+        write(&ctx, "a.txt", "a\n");
+        commit_all(&ctx, "feat: x\n\nAI-Assisted: true\nAI-Tool: Claude Code");
+        let out_dir = ctx.sscsb_dir().join("out").join("receipts");
+        let receipt = create_receipt(&ctx, "HEAD", &out_dir).unwrap();
+        std::fs::write(receipt_bundle_path(&receipt), r#"{"a":"bundle"}"#).unwrap();
+
+        let script = "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'cosign 0.0.0'; exit 0; \
+                      fi\necho 'Verified OK' 1>&2\nexit 0\n";
+        let ok = with_fake_tool("cosign", script, || {
+            verify_receipt(
+                &ctx,
+                &receipt,
+                Some("ci@example.invalid"),
+                Some("https://issuer"),
+            )
+        })
+        .unwrap();
+        assert!(ok.contains("signature verified"), "{ok}");
+        assert!(ok.contains("ci@example.invalid"), "{ok}");
+        assert!(ok.contains("https://issuer"), "{ok}");
+
+        // Same thing, but the identity comes from .sscsb/config.toml.
+        let cfg_path = ctx.config_path();
+        let text = std::fs::read_to_string(&cfg_path).unwrap().replace(
+            "cosign_identity = \"\"",
+            "cosign_identity = \"from-config@example.invalid\"",
+        );
+        assert!(
+            text.contains("from-config@example.invalid"),
+            "the generated [controls.ai-receipts] block changed shape — fix this test"
+        );
+        std::fs::write(&cfg_path, text).unwrap();
+        let ctx2 = Ctx::discover(&ctx.root).unwrap();
+        let ok = with_fake_tool("cosign", script, || {
+            verify_receipt(&ctx2, &receipt, None, None)
+        })
+        .unwrap();
+        assert!(ok.contains("from-config@example.invalid"), "{ok}");
     }
 
     /// A receipt's `gitCommit` is untrusted input — it is the thing under
@@ -678,7 +993,7 @@ mod tests {
             let forged = ctx.root.join("forged.json");
             std::fs::write(&forged, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
 
-            let err = verify_receipt(&ctx, &forged)
+            let err = verify_receipt(&ctx, &forged, None, None)
                 .expect_err("a receipt whose gitCommit is a git option must not verify");
             let msg = format!("{err:#}");
             assert!(
@@ -710,7 +1025,7 @@ mod tests {
         for rev in ["HEAD", "HEAD~1", "main"] {
             let receipt = create_receipt(&ctx, rev, &out_dir)
                 .unwrap_or_else(|e| panic!("revision expression {rev:?} must still work: {e:#}"));
-            let ok = verify_receipt(&ctx, &receipt).unwrap();
+            let ok = verify_receipt(&ctx, &receipt, None, None).unwrap();
             assert!(
                 ok.contains("receipt verified"),
                 "{rev} receipt should verify"
@@ -818,12 +1133,13 @@ mod tests {
     #[test]
     fn verify_receipt_reports_unreadable_file_and_malformed_json() {
         let (_d, ctx) = repo();
-        let err = verify_receipt(&ctx, &ctx.root.join("does-not-exist.json")).unwrap_err();
+        let err =
+            verify_receipt(&ctx, &ctx.root.join("does-not-exist.json"), None, None).unwrap_err();
         assert!(!format!("{err:#}").is_empty());
 
         let bad = ctx.root.join("bad.json");
         std::fs::write(&bad, "not json").unwrap();
-        let err = verify_receipt(&ctx, &bad).unwrap_err();
+        let err = verify_receipt(&ctx, &bad, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("receipt is not JSON"));
     }
 
@@ -837,7 +1153,7 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
-        let err = verify_receipt(&ctx, &missing_commit).unwrap_err();
+        let err = verify_receipt(&ctx, &missing_commit, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("missing gitCommit digest"));
 
         let missing_sha = ctx.root.join("missing-sha.json");
@@ -850,7 +1166,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let err = verify_receipt(&ctx, &missing_sha).unwrap_err();
+        let err = verify_receipt(&ctx, &missing_sha, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("missing sha256 digest"));
     }
 

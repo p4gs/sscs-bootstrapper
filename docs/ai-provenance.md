@@ -113,11 +113,30 @@ A receipt is an **in-toto statement** binding:
 - the AI tool, model, and role from the trailers,
 - the author and timestamp.
 
-`sscsb receipt verify` recomputes the patch digest from the repository and compares.
-If the commit was amended, rebased, or otherwise altered after the receipt was
-issued, the digest no longer matches and verification **fails loudly** with
-`DIGEST MISMATCH`. The receipt attests to a specific patch, not to a commit message
-that claims things about a patch.
+`sscsb receipt verify` checks three things, and fails loudly on any of them:
+
+1. **The patch.** The commit's patch is re-hashed and compared. If the commit was
+   amended, rebased, or otherwise altered after the receipt was issued, the digest
+   no longer matches: `DIGEST MISMATCH`. The receipt attests to a specific patch,
+   not to a commit message that claims things about a patch.
+2. **The claim.** The commit's AI trailers are re-read and compared against what
+   the receipt says about the tool, model and role: `CLAIM MISMATCH`. The trailers
+   live in the commit *message*, so they are not covered by the patch digest — a
+   receipt whose `aiTool` disagrees with the commit it names is not evidence of
+   anything, and dropping the declaration outright would otherwise launder
+   AI-assisted work into apparently unassisted work.
+3. **The signature**, when there is one. A `<receipt>.sigstore.json` bundle beside
+   the receipt is verified with cosign against an expected certificate identity:
+
+   ```sh
+   sscsb receipt verify <receipt> --identity <cert identity> [--issuer <oidc issuer>]
+   ```
+
+   The identity and issuer can also be set once per repo as `cosign_identity` and
+   `cosign_issuer` under `[controls.ai-receipts]` in `.sscsb/config.toml`. A receipt
+   that IS signed but has no identity to check the signature against **fails**
+   rather than passing quietly: a signature nobody checks is not evidence, and
+   "receipt verified" must not be printable next to one.
 
 Signed with `--sign`, the receipt carries a Sigstore keyless signature bound to your
 OIDC identity — the same trust model as [phase 3](phase-3.md), no key to steal.

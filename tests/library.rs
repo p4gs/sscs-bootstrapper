@@ -964,7 +964,7 @@ fn receipts_bind_commits_and_detect_tampering() {
     assert_eq!(doc["predicate"]["aiTool"], "Claude Code");
     assert_eq!(doc["predicate"]["aiRole"], "draft");
 
-    let ok = provenance::verify_receipt(&ctx, &receipt).unwrap();
+    let ok = provenance::verify_receipt(&ctx, &receipt, None, None).unwrap();
     assert!(ok.contains("receipt verified"));
 
     // Tampered digest is caught.
@@ -974,7 +974,7 @@ fn receipts_bind_commits_and_detect_tampering() {
         text.replacen("\"sha256\": \"", "\"sha256\": \"ff", 1),
     )
     .unwrap();
-    let err = provenance::verify_receipt(&ctx, &receipt).unwrap_err();
+    let err = provenance::verify_receipt(&ctx, &receipt, None, None).unwrap_err();
     assert!(format!("{err:#}").contains("DIGEST MISMATCH"));
 
     // A non-receipt JSON file is rejected.
@@ -984,7 +984,7 @@ fn receipts_bind_commits_and_detect_tampering() {
         r#"{"predicateType":"https://slsa.dev/provenance/v1"}"#,
     )
     .unwrap();
-    let err = provenance::verify_receipt(&ctx, &other).unwrap_err();
+    let err = provenance::verify_receipt(&ctx, &other, None, None).unwrap_err();
     assert!(format!("{err:#}").contains("not an sscsb AI provenance receipt"));
 }
 

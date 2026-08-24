@@ -135,7 +135,18 @@ pub const CONTROLS: &[ControlDef] = &[
         summary: "Optional cryptographic receipts linking commits to AI tool/model/role",
         default_enabled: false,
         tools: &["cosign"],
-        default_options: &[("sign_with_cosign", "false")],
+        default_options: &[
+            ("sign_with_cosign", "false"),
+            // Empty means "no signature policy configured". A receipt that IS
+            // signed but has no identity to check the signature against fails
+            // verification rather than passing quietly — see
+            // `provenance::verify_receipt_signature`.
+            ("cosign_identity", "\"\""),
+            (
+                "cosign_issuer",
+                "\"https://token.actions.githubusercontent.com\"",
+            ),
+        ],
     },
     // ───────────────────────── Phase 2 — Dependencies & vulnerabilities ─────
     ControlDef {
