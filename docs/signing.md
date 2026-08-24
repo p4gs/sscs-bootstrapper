@@ -4,6 +4,58 @@ The rule this whole system is built around:
 
 > **Humans, CI, and AI never share a key.**
 
+## The five-environment model (`sscsb signing`)
+
+Commits originate from more than one place, and each place has a different
+*actor* and a different *signer*. `sscsb signing` implements and verifies the
+whole map from one command — programmatically where it can, with numbered
+step-by-step guidance where a native app or a web toggle technically can't be
+scripted.
+
+| Environment | Actor | Signer | Forge badge |
+|-------------|-------|--------|-------------|
+| `human-local` | you | OS-keystore / Secure-Enclave key, **tap-gated** | Verified (strongest) |
+| `agent-claude-code` | AI agent | the agent's **own** key, **distinct identity**, unregistered | **Unverified by design** |
+| `cloud-claude` | bot | forge App server-side, or unsigned drafts | Verified-as-bot / Unverified |
+| `github-web` | you | forge web-flow key (account-anchored) | Verified |
+| `codespaces` | you | forge-managed signing (opt-in, trusted repos) | Verified |
+
+Invariants sscsb enforces: the agent **never** signs or authors as the human;
+the agent key is **never** registered on the human's forge account (its commits
+honestly show *Unverified* — that is the correct state, an *unsigned* commit is
+the failure); *Verified-as-human* always traces to a real human action (a
+hardware tap locally; an authenticated account for web/Codespaces). This mirrors
+the Linux-kernel rule that only a human certifies (DCO), and CISA/OpenSSF's
+phishing-resistant-MFA guidance for the account-anchored lanes.
+
+### Commands
+
+```sh
+sscsb signing status                         # probe every lane, show its state
+sscsb signing setup human-local              # converge your enclave lane + `git sign` alias
+sscsb signing setup agent-claude-code \
+  --agent-name '<name>' --agent-email '<email>'   # give the agent its own identity+key
+sscsb signing setup github-web --confirm     # do the guided steps, then record you did them
+sscsb signing verify                         # report card + recent-history classification
+```
+
+`setup` on the two **local** lanes is fully programmatic (git config, the
+env-proof `git sign` alias, an SSH keypair for the agent, the `allowed_signers`
+entries, a JSON-merge into the agent harness's settings — backed up and
+validated, never clobbered). It **refuses** to proceed if the agent identity
+would collide with yours (identity blur). The **cloud/web/Codespaces** lanes are
+guided — sscsb prints the exact numbered steps (enroll a passkey, enable
+vigilant mode, authorize the App, turn on Codespaces GPG verification) and, once
+you confirm with `--confirm`, records a dated attestation in
+`.sscsb/policy/signing-model.toml` that `verify` re-checks for staleness (180d).
+
+The **`git sign` alias** deserves a callout: inside an AI-agent session a bare
+`git commit` signs as the *agent* (the session's `GIT_CONFIG_*` env wins). `git
+sign` forces your human key via `-c` overrides — which outrank that env — so it
+signs as *you* whether you run it in your own terminal or the agent runs it for
+your review. It is the seam where a human tap ships code.
+
+
 A signature is a claim about *who*. The moment a human's signing key is reachable by
 a CI job — or by an agent running on the human's laptop — the signature stops
 answering the question it exists to answer. So `sscsb` classifies every identity,

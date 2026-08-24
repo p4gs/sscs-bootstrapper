@@ -94,6 +94,7 @@ fn init_creates_config_hooks_policies_and_templates() {
         ".sscsb/policy/signers.toml",
         ".sscsb/policy/packages.toml",
         ".sscsb/policy/allowed_signers",
+        ".sscsb/policy/signing-model.toml",
         ".sscsb/rules/sscsb-default.yaml",
         ".github/PULL_REQUEST_TEMPLATE.md",
         ".github/workflows/secrets-scan.yml",
@@ -851,4 +852,536 @@ fn tools_command_lists_registry_with_pins() {
         assert!(stdout.contains(tool), "tools output missing {tool}");
     }
     assert!(!stdout.contains("latest"), "no pin may be 'latest'");
+}
+
+// ─────────────── the five-environment commit-signing model (CLI) ────────────
+//
+// `sscsb signing` probes and converges the MACHINE, so every test here runs
+// against a throwaway one: an isolated HOME plus an isolated git *global*
+// config (`GIT_CONFIG_GLOBAL` governs both reads and writes), and a fake `gh`
+// on PATH so the forge-facing probes are deterministic and offline. Nothing
+// below can reach the developer's real ~/.gitconfig, ~/.claude, or the network.
+
+/// A throwaway machine for the signing lanes.
+struct FakeMachine {
+    dir: tempfile::TempDir,
+}
+
+impl FakeMachine {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".ssh")).unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("gitconfig"), "").unwrap();
+        let m = FakeMachine { dir };
+        // Answers the only two endpoints the signing lanes call.
+        m.set_gh(
+            "#!/bin/sh\ncase \"$2\" in\n  user) echo '{\"two_factor_authentication\": true}' ;;\n  \
+             repos/*) printf 'human@example.invalid\\ttrue\\tvalid\\n' ;;\n  *) exit 1 ;;\nesac\n",
+        );
+        m
+    }
+
+    fn home(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn gitconfig(&self) -> PathBuf {
+        self.dir.path().join("gitconfig")
+    }
+
+    /// Replace the fake `gh` this machine puts on PATH.
+    fn set_gh(&self, script: &str) {
+        let path = self.dir.path().join("bin/gh");
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    fn git(&self, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .args(args)
+            .env("HOME", self.home())
+            .env("GIT_CONFIG_GLOBAL", self.gitconfig())
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_COUNT", "0")
+            .output()
+            .expect("git runs")
+    }
+
+    /// `git config --global <key> <value>` on the fixture machine.
+    fn set(&self, key: &str, value: &str) {
+        let out = self.git(&["config", "--global", key, value]);
+        assert!(
+            out.status.success(),
+            "fixture git config {key}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The machine's current global value for `key`, if any.
+    fn get(&self, key: &str) -> Option<String> {
+        let out = self.git(&["config", "--global", key]);
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    fn write_home(&self, rel: &str, content: &str) -> PathBuf {
+        let path = self.home().join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// The inputs a human brings before `setup human-local` runs: a signing key
+    /// on disk, an allowed_signers file, and a git identity.
+    fn with_human_identity(&self) -> PathBuf {
+        let key = self.write_home(".ssh/git_signing_key.pub", "ssh-ed25519 AAAAC3Nz human\n");
+        self.write_home(
+            ".ssh/allowed_signers",
+            "me@example.invalid ssh-ed25519 AAAAC3Nz\n",
+        );
+        self.set("user.signingkey", key.to_str().unwrap());
+        self.set("user.email", "me@example.invalid");
+        self.set("user.name", "Human Example");
+        key
+    }
+}
+
+/// `sscsb` bound to a throwaway repo AND a throwaway machine.
+fn sscsb_on(repo: &Path, machine: &FakeMachine) -> AssertCommand {
+    let path = format!(
+        "{}:{}",
+        machine.home().join("bin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut cmd = sscsb(repo);
+    cmd.env("HOME", machine.home())
+        .env("GIT_CONFIG_GLOBAL", machine.gitconfig())
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "0")
+        .env("PATH", path);
+    cmd
+}
+
+fn stdout_of(out: &assert_cmd::assert::Assert) -> String {
+    String::from_utf8_lossy(&out.get_output().stdout).to_string()
+}
+
+#[test]
+fn signing_status_reports_every_lane_and_names_each_gap() {
+    let dir = throwaway_repo();
+    let machine = FakeMachine::new();
+
+    let assert = sscsb_on(dir.path(), &machine)
+        .args(["signing", "status"])
+        .assert()
+        .success();
+    let stdout = stdout_of(&assert);
+
+    for lane in [
+        "human-local",
+        "agent-claude-code",
+        "cloud-claude",
+        "github-web",
+        "codespaces",
+    ] {
+        assert!(stdout.contains(lane), "status omits `{lane}`: {stdout}");
+    }
+    // Each lane's state is rendered, and an unconfigured machine shows both an
+    // incomplete local lane and a lane that only guided setup can advance.
+    assert!(stdout.contains("PARTIAL"), "{stdout}");
+    assert!(stdout.contains("GUIDED"), "{stdout}");
+    // Gaps are named with their remedy, not merely counted.
+    assert!(
+        stdout.contains("git global user.signingkey unset"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("commit.gpgsign not enabled globally"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("agent settings not found"), "{stdout}");
+    assert!(stdout.contains("sscsb signing setup"), "{stdout}");
+}
+
+#[test]
+fn signing_setup_human_local_converges_the_machine_and_status_then_agrees() {
+    // The feature's core promise, end to end through the real binary: one
+    // `setup` turns a partially-configured lane into a configured one, and the
+    // writes are real `git config --global` state.
+    let dir = throwaway_repo();
+    let machine = FakeMachine::new();
+    machine.with_human_identity();
+
+    let assert = sscsb_on(dir.path(), &machine)
+        .args(["signing", "setup", "human-local"])
+        .assert()
+        .success();
+    let stdout = stdout_of(&assert);
+    assert!(
+        stdout.contains("set git global gpg.format = ssh"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("env-proof `git sign` alias"), "{stdout}");
+    // Steps that cannot be automated are numbered rather than silently skipped.
+    assert!(
+        stdout.contains("Manual steps sscsb cannot perform"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Register your human key"), "{stdout}");
+
+    assert_eq!(machine.get("gpg.format").as_deref(), Some("ssh"));
+    assert_eq!(machine.get("commit.gpgsign").as_deref(), Some("true"));
+    let alias = machine.get("alias.sign").expect("alias.sign written");
+    assert!(
+        alias.contains("-c user.email='me@example.invalid'")
+            && alias.contains("-c commit.gpgsign=true"),
+        "alias must pin the human identity via -c overrides: {alias}"
+    );
+
+    let status = stdout_of(
+        &sscsb_on(dir.path(), &machine)
+            .args(["signing", "status"])
+            .assert()
+            .success(),
+    );
+    assert!(
+        status.contains("[CONFIGURED] human-local"),
+        "status must agree with setup: {status}"
+    );
+}
+
+#[test]
+fn signing_setup_dry_run_previews_without_touching_the_machine() {
+    let dir = throwaway_repo();
+    let machine = FakeMachine::new();
+    machine.with_human_identity();
+    let before = std::fs::read_to_string(machine.gitconfig()).unwrap();
+
+    let assert = sscsb_on(dir.path(), &machine)
+        .args(["signing", "setup", "human-local", "--dry-run"])
+        .assert()
+        .success();
+    assert!(
+        stdout_of(&assert).contains("gpg.format"),
+        "must still preview"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(machine.gitconfig()).unwrap(),
+        before,
+        "--dry-run mutated the global git config"
+    );
+    assert!(machine.get("alias.sign").is_none());
+}
+
+#[test]
+fn signing_setup_rejects_an_unknown_environment_and_lists_the_valid_ids() {
+    let dir = throwaway_repo();
+    let machine = FakeMachine::new();
+
+    let assert = sscsb_on(dir.path(), &machine)
+        .args(["signing", "setup", "laptop"])
+        .assert()
+        .code(2);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(stderr.contains("unknown environment `laptop`"), "{stderr}");
+    assert!(stderr.contains("human-local"), "{stderr}");
+    assert!(stderr.contains("codespaces"), "{stderr}");
+}
+
+#[test]
+fn signing_setup_agent_provisions_a_distinct_identity_without_clobbering_settings() {
+    // The highest-blast-radius write in the module: it must back up the
+    // existing agent settings, preserve every unrelated key, and give the agent
+    // its OWN key and email — never the human's.
+    //
+    // ssh-keygen is used unconditionally (as elsewhere in this suite): the
+    // agent lane cannot mint a key without it, so its absence is a real
+    // failure, not a reason to skip.
+    let dir = throwaway_repo();
+    let machine = FakeMachine::new();
+    machine.with_human_identity();
+    machine.write_home(
+        ".claude/settings.json",
+        r#"{"model":"opus","env":{"UNRELATED":"keep-me"}}"#,
+    );
+
+    sscsb_on(dir.path(), &machine)
+        .args([
+            "signing",
+            "setup",
+            "agent-claude-code",
+            "--agent-name",
+            "Test Agent",
+            "--agent-email",
+            "agent@example.invalid",
+        ])
+        .assert()
+        .success();
+
+    // The pre-existing file was backed up verbatim before being rewritten.
+    let backup = machine.home().join(".claude/settings.json.sscsb-backup");
+    assert!(
+        backup.exists(),
+        "existing agent settings were not backed up"
+    );
+    assert!(std::fs::read_to_string(&backup)
+        .unwrap()
+        .contains("keep-me"));
+
+    let merged: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(machine.home().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(merged["model"], "opus", "unrelated keys must survive");
+    assert_eq!(merged["env"]["UNRELATED"], "keep-me");
+    let block = merged["env"].as_object().unwrap();
+    let values: Vec<&str> = block
+        .iter()
+        .filter(|(k, _)| k.starts_with("GIT_CONFIG_VALUE_"))
+        .filter_map(|(_, v)| v.as_str())
+        .collect();
+    assert!(values.contains(&"agent@example.invalid"), "{values:?}");
+    assert!(
+        !values.contains(&"me@example.invalid"),
+        "the agent must never author as the human: {values:?}"
+    );
+
+    // A real, distinct agent key was generated, and it is NOT the human's.
+    let agent_key = machine.home().join(".ssh/jai_agent_signing_key");
+    assert!(agent_key.exists(), "agent key was not generated");
+    assert_ne!(
+        machine.get("user.signingkey").unwrap(),
+        agent_key.to_string_lossy(),
+        "agent and human must not share a key"
+    );
+    // allowed_signers maps the agent to its own address so its signatures are
+    // locally verifiable AS the agent.
+    let allowed = std::fs::read_to_string(machine.home().join(".ssh/allowed_signers")).unwrap();
+    assert!(allowed.contains("agent@example.invalid"), "{allowed}");
+
+    let status = stdout_of(
+        &sscsb_on(dir.path(), &machine)
+            .args(["signing", "status"])
+            .assert()
+            .success(),
+    );
+    assert!(
+        status.contains("[CONFIGURED] agent-claude-code"),
+        "{status}"
+    );
+}
+
+#[test]
+fn signing_setup_agent_refuses_to_forge_the_humans_identity() {
+    // The single hard refusal in the model: if the agent's email is the
+    // human's, setup must stop and write nothing at all.
+    let dir = throwaway_repo();
+    let machine = FakeMachine::new();
+    machine.with_human_identity();
+
+    let assert = sscsb_on(dir.path(), &machine)
+        .args([
+            "signing",
+            "setup",
+            "agent-claude-code",
+            "--agent-name",
+            "Impostor",
+            "--agent-email",
+            "me@example.invalid",
+        ])
+        .assert()
+        .code(1);
+    let stdout = stdout_of(&assert);
+    assert!(stdout.contains("REFUSED"), "{stdout}");
+    assert!(stdout.contains("forge your identity"), "{stdout}");
+
+    assert!(
+        !machine.home().join(".claude/settings.json").exists(),
+        "a refused setup must not create agent settings"
+    );
+    assert!(!machine.home().join(".ssh/jai_agent_signing_key").exists());
+}
+
+#[test]
+fn signing_setup_cloud_writes_the_repo_attribution_block_once() {
+    let dir = throwaway_repo();
+    let repo = dir.path();
+    let machine = FakeMachine::new();
+
+    let first = stdout_of(
+        &sscsb_on(repo, &machine)
+            .args(["signing", "setup", "cloud-claude"])
+            .assert()
+            .success(),
+    );
+    assert!(first.contains("wrote attribution block"), "{first}");
+    assert!(first.contains("Authorize the Claude GitHub App"), "{first}");
+
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(repo.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(settings["attribution"]["sessionUrl"], true);
+
+    // Re-running recognises its own work instead of rewriting the file.
+    let second = stdout_of(
+        &sscsb_on(repo, &machine)
+            .args(["signing", "setup", "cloud-claude"])
+            .assert()
+            .success(),
+    );
+    assert!(
+        second.contains("already has an attribution block"),
+        "{second}"
+    );
+}
+
+#[test]
+fn confirming_a_guided_lane_records_a_dated_attestation_that_verify_reads_back() {
+    // github-web and codespaces live behind web toggles with no read API, so
+    // the recorded confirmation date is the only evidence `verify` has.
+    let dir = throwaway_repo();
+    let repo = dir.path();
+    init_sscsb(repo);
+    let machine = FakeMachine::new();
+
+    let setup = stdout_of(
+        &sscsb_on(repo, &machine)
+            .args(["signing", "setup", "github-web", "--confirm"])
+            .assert()
+            .success(),
+    );
+    assert!(setup.contains("Enable vigilant mode"), "{setup}");
+    assert!(setup.contains("recorded 2 attestation(s)"), "{setup}");
+
+    let policy =
+        std::fs::read_to_string(repo.join(".sscsb/policy/signing-model.toml")).expect("policy");
+    assert!(policy.contains("[github-web]"), "{policy}");
+    assert!(policy.contains("vigilant_mode"), "{policy}");
+    assert!(policy.contains("phishing_resistant_mfa"), "{policy}");
+
+    let verify = stdout_of(
+        &sscsb_on(repo, &machine)
+            .args(["signing", "verify"])
+            .assert()
+            .success(),
+    );
+    assert!(
+        verify.contains("[ATTESTED ] github-web"),
+        "a lane confirmed today must read as attested: {verify}"
+    );
+    // Lanes never confirmed stay visibly pending, with the command to fix them.
+    assert!(
+        verify.contains("gpg_verification: not attested"),
+        "{verify}"
+    );
+    assert!(verify.contains("some lanes pending"), "{verify}");
+}
+
+#[test]
+fn confirming_a_guided_lane_under_dry_run_records_nothing() {
+    let dir = throwaway_repo();
+    let repo = dir.path();
+    init_sscsb(repo);
+    let machine = FakeMachine::new();
+
+    // `sscsb init` scaffolds the policy file as an all-commented template; a
+    // dry-run --confirm must leave it exactly that way.
+    let policy_path = repo.join(".sscsb/policy/signing-model.toml");
+    let before = std::fs::read_to_string(&policy_path).expect("init scaffolds the template");
+
+    let out = stdout_of(
+        &sscsb_on(repo, &machine)
+            .args(["signing", "setup", "codespaces", "--confirm", "--dry-run"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("[dry-run] --confirm would record"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(&policy_path).unwrap(),
+        before,
+        "--dry-run recorded an attestation"
+    );
+
+    // And `verify` still reports the lane as unattested.
+    let verify = stdout_of(
+        &sscsb_on(repo, &machine)
+            .args(["signing", "verify"])
+            .assert()
+            .success(),
+    );
+    assert!(
+        verify.contains("gpg_verification: not attested"),
+        "{verify}"
+    );
+}
+
+#[test]
+fn signing_verify_classifies_recent_history_against_the_model() {
+    let dir = throwaway_repo();
+    let repo = dir.path();
+    init_sscsb(repo);
+    git_ok(
+        repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/p4gs/sscs-bootstrapper.git",
+        ],
+    );
+    let machine = FakeMachine::new();
+    machine.set_gh(
+        "#!/bin/sh\ncase \"$2\" in\n  user) echo '{\"two_factor_authentication\": true}' ;;\n  \
+         repos/*) printf 'agent@example.invalid\\tfalse\\tunknown_key\\n' ;;\n  *) exit 1 ;;\nesac\n",
+    );
+
+    let verify = stdout_of(
+        &sscsb_on(repo, &machine)
+            .args(["signing", "verify"])
+            .assert()
+            .success(),
+    );
+    assert!(verify.contains("recent-history classification"), "{verify}");
+    assert!(
+        verify.contains("expected for the agent lane"),
+        "an unregistered key on the agent lane is the DESIGNED state, and the \
+         report must say so rather than flag it: {verify}"
+    );
+}
+
+#[test]
+fn signing_verify_fails_only_when_the_agent_wears_the_humans_identity() {
+    // Absence is a to-do (exit 0, lanes pending); identity blur is a breach.
+    let dir = throwaway_repo();
+    let repo = dir.path();
+    let machine = FakeMachine::new();
+    machine.with_human_identity();
+
+    sscsb_on(repo, &machine)
+        .args(["signing", "verify"])
+        .assert()
+        .success();
+
+    // Hand the agent the human's own email.
+    machine.write_home(
+        ".claude/settings.json",
+        r#"{"env":{"GIT_CONFIG_COUNT":"1","GIT_CONFIG_KEY_0":"user.email","GIT_CONFIG_VALUE_0":"me@example.invalid"}}"#,
+    );
+
+    let assert = sscsb_on(repo, &machine)
+        .args(["signing", "verify"])
+        .assert()
+        .code(1);
+    let stdout = stdout_of(&assert);
+    assert!(stdout.contains("[FAIL     ] agent-claude-code"), "{stdout}");
+    assert!(stdout.contains("IDENTITY BLUR"), "{stdout}");
 }

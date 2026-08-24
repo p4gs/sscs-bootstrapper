@@ -57,6 +57,13 @@ pub fn bootstrap(cwd: &Path) -> Result<Vec<String>> {
     )? {
         log.push("write .sscsb/policy/packages.toml".to_string());
     }
+    if workflows::write_if_absent(
+        &ctx.root,
+        ".sscsb/policy/signing-model.toml",
+        crate::signing_setup::SIGNING_MODEL_TEMPLATE,
+    )? {
+        log.push("write .sscsb/policy/signing-model.toml".to_string());
+    }
     hooks::regenerate_allowed_signers(&ctx, hooks::agent_signing_enabled(cfg))?;
     log.push("write .sscsb/policy/allowed_signers (generated from signers.toml)".to_string());
 

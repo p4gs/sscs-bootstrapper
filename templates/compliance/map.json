@@ -49,6 +49,15 @@
       "notes": "Gives an AI agent a verifiable non-human signing identity so its commits are attributable and non-repudiable on feature branches, while the human-only protected-branch gate remains intact — humans, CI, and AI never share a key. Off by default.",
       "osps": []
     },
+    "signing-model": {
+      "name": "Five-environment commit-signing model (human enclave / distinct agent identity / cloud-web-Codespaces lanes)",
+      "phase": 1,
+      "slsa": ["Source: Two-party trust foundations (signed, attributable commits per actor)"],
+      "ssdf": ["PO.3.2", "PS.1.1"],
+      "cra": ["Annex I Part I(2)(d) (protection against unauthorised access)", "Annex I Part I(2)(f) (integrity of software)"],
+      "badge": [],
+      "notes": "Implements the machine-wide signing model: the human's tap-gated enclave key is the only source of Verified-as-human; the AI agent signs with its own unregistered key (honestly Unverified on the forge); cloud/web/Codespaces lanes are guided to their account-anchored equivalents. Aligned with the Linux kernel's rule that only a human certifies (DCO) and CISA/OpenSSF phishing-resistant-MFA guidance."
+    },
     "branch-protection": {
       "name": "GitHub branch protection verification",
       "phase": 1,

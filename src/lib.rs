@@ -42,6 +42,7 @@ pub mod sbom;
 pub mod scan;
 pub mod scorecard;
 pub mod signers;
+pub mod signing_setup;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod tools;

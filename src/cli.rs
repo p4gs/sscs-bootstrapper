@@ -129,8 +129,38 @@ enum Command {
         #[command(subcommand)]
         action: AgentKeyAction,
     },
+    /// The five-environment commit-signing model (status / setup / verify)
+    Signing {
+        #[command(subcommand)]
+        action: SigningAction,
+    },
     /// Show the pinned external-tool registry and detection status
     Tools,
+}
+
+#[derive(Subcommand)]
+enum SigningAction {
+    /// Probe all five environments and report each lane's state
+    Status,
+    /// Converge one environment: programmatic where possible, guided steps otherwise
+    Setup {
+        /// Environment id: human-local | agent-claude-code | cloud-claude | github-web | codespaces
+        env: String,
+        /// Preview changes without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Agent commit author name (agent-claude-code only)
+        #[arg(long)]
+        agent_name: Option<String>,
+        /// Agent commit author email — must NOT be a verified email on your GitHub account
+        #[arg(long)]
+        agent_email: Option<String>,
+        /// Record today's date as the attestation for a guided lane (github-web/codespaces/cloud-claude)
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Report card across all five environments (probes + attestation freshness + history)
+    Verify,
 }
 
 #[derive(Subcommand)]
@@ -336,7 +366,39 @@ pub fn run() -> Result<ExitCode> {
         Command::Oras { action } => cmd_oras(&cwd, action),
         Command::Signers { action } => cmd_signers(&cwd, action),
         Command::AgentKey { action } => cmd_agent_key(action),
+        Command::Signing { action } => cmd_signing(&cwd, action),
         Command::Tools => cmd_tools(),
+    }
+}
+
+fn cmd_signing(cwd: &std::path::Path, action: SigningAction) -> Result<ExitCode> {
+    let ctx = Ctx::discover(cwd)?;
+    match action {
+        SigningAction::Status => {
+            let code = crate::signing_setup::cmd_signing_status(&ctx)?;
+            Ok(ExitCode::from(code as u8))
+        }
+        SigningAction::Setup {
+            env,
+            dry_run,
+            agent_name,
+            agent_email,
+            confirm,
+        } => {
+            let code = crate::signing_setup::cmd_signing_setup(
+                &ctx,
+                &env,
+                !dry_run,
+                agent_name.as_deref(),
+                agent_email.as_deref(),
+                confirm,
+            )?;
+            Ok(ExitCode::from(code as u8))
+        }
+        SigningAction::Verify => {
+            let code = crate::signing_setup::cmd_signing_verify(&ctx)?;
+            Ok(ExitCode::from(code as u8))
+        }
     }
 }
 
