@@ -440,6 +440,34 @@ mod tests {
         assert!(err.contains("3 invalid value(s)"), "{err}");
     }
 
+    /// The message has to name what is actually in the file, whatever the user
+    /// typed — the whole point is that the reader can see their own value and
+    /// the type it turned out to be.
+    #[test]
+    fn the_type_error_quotes_the_offending_value_back() {
+        for (body, expected) in [
+            ("[general]\ngithub_repo = true\n", "found boolean (true)"),
+            ("[general]\nfail_open = 1.5\n", "found float (1.5)"),
+            ("[general]\ngithub_repo = [\"a\"]\n", "found array ([…])"),
+            (
+                "[general]\ngithub_repo = 1979-05-27\n",
+                "found datetime (1979-05-27)",
+            ),
+            (
+                "[controls.secrets]\ngitleaks = { on = true }\n",
+                "found table ({…})",
+            ),
+            (
+                "[controls.agent-signing]\nmax_key_age_days = 90.5\n",
+                "must be an integer, found float (90.5)",
+            ),
+        ] {
+            let (_d, loaded) = load_config(body);
+            let err = format!("{:#}", loaded.unwrap_err());
+            assert!(err.contains(expected), "{body} → {err}");
+        }
+    }
+
     /// A section or key sscsb does not know is the forward-compatible case — a
     /// config written by another version — so it must still load. It is also
     /// how a typo looks, so it is said out loud rather than swallowed.

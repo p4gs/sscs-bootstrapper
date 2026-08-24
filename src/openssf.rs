@@ -845,6 +845,43 @@ mod tests {
         assert!(!complete.incomplete);
     }
 
+    /// A capped tally must read as a floor, not a total — `50+`, not `50`.
+    #[test]
+    fn model_signing_reports_a_capped_count_as_a_floor() {
+        let (_d, ctx) = repo();
+        // Two directories, each already over the cap, so whichever the scan
+        // reaches first leaves the other unwalked — the flag must not depend on
+        // the order the filesystem hands entries back.
+        for dir in ["weights-a", "weights-b"] {
+            std::fs::create_dir(ctx.root.join(dir)).unwrap();
+            for i in 0..=MODEL_SCAN_MATCH_CAP {
+                std::fs::write(ctx.root.join(format!("{dir}/m{i:03}.safetensors")), b"\x00")
+                    .unwrap();
+            }
+        }
+        std::fs::write(
+            ctx.root.join(".github/workflows/sign-models.yml"),
+            "name: Sign ML Models\non:\n  workflow_dispatch:\n",
+        )
+        .unwrap();
+
+        let r = verify_model_signing(&ctx);
+        // The count is what was collected before the cap stopped it, marked as
+        // a floor — never a bare number implying the whole tree was tallied.
+        let (count, rest) = r.messages[0].split_once(' ').unwrap();
+        assert!(
+            rest.starts_with("model file(s) detected"),
+            "{:?}",
+            r.messages
+        );
+        let floor: usize = count
+            .strip_suffix('+')
+            .expect(&r.messages[0])
+            .parse()
+            .unwrap();
+        assert!(floor >= MODEL_SCAN_MATCH_CAP, "{:?}", r.messages);
+    }
+
     /// The match cap is the other truncation: the count reported must not claim
     /// to be the whole tally when collection stopped early.
     #[test]
@@ -1044,6 +1081,66 @@ mod tests {
             r.messages
                 .iter()
                 .any(|m| m.contains("must be a version string")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// A `url` still holding a generator placeholder belongs to the unfinished-
+    /// starter branch, not to the malformed-value branch — otherwise `sscsb
+    /// init` would install a file its own verifier fails.
+    #[test]
+    fn security_insights_leaves_placeholder_urls_to_the_starter_branch() {
+        let (_d, ctx) = repo();
+        std::fs::write(
+            ctx.root.join("security-insights.yml"),
+            "header:\n  schema-version: \"2.0.0\"\n  url: \"REPLACE-ME: publish this file first\"\nproject:\n  name: \"x\"\n  administrators:\n    - name: \"m\"\n      primary: true\n",
+        )
+        .unwrap();
+        let r = verify_security_insights(&ctx);
+        assert_eq!(r.outcome, Outcome::Info, "{:?}", r.messages);
+        assert!(r.messages.iter().any(|m| m.contains("placeholder")));
+    }
+
+    /// YAML resolves an unquoted version to whatever type it looks like. A
+    /// float and a boolean are both "what version did this file claim", and
+    /// neither is one, so both are reported rather than shrugged at.
+    #[test]
+    fn security_insights_reads_an_unquoted_version_whatever_type_it_became() {
+        let (_d, ctx) = repo();
+        let path = ctx.root.join("security-insights.yml");
+        for (written, expect) in [("2.0", "`2.0`"), ("true", "`true`")] {
+            std::fs::write(
+                &path,
+                format!("header:\n  schema-version: {written}\n  url: \"https://example.com\"\nproject:\n  name: \"x\"\n  administrators:\n    - name: \"m\"\n      primary: true\n"),
+            )
+            .unwrap();
+            let r = verify_security_insights(&ctx);
+            assert_eq!(r.outcome, Outcome::Fail, "{written}: {:?}", r.messages);
+            assert!(
+                r.messages
+                    .iter()
+                    .any(|m| m.contains(expect) && m.contains("not a MAJOR.MINOR.PATCH")),
+                "{written}: {:?}",
+                r.messages
+            );
+        }
+    }
+
+    /// The bounded read hands back bytes, so a file that is not text at all is
+    /// a named refusal rather than a parser error about a stray byte.
+    #[test]
+    fn security_insights_reports_a_file_that_is_not_text() {
+        let (_d, ctx) = repo();
+        std::fs::write(
+            ctx.root.join("security-insights.yml"),
+            [0xffu8, 0xfe, 0x00, 0x01],
+        )
+        .unwrap();
+        let r = verify_security_insights(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("not valid UTF-8")),
             "{:?}",
             r.messages
         );
