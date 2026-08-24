@@ -386,8 +386,65 @@ fn run_trivy(ctx: &Ctx, report: &mut ScanReport) -> Result<()> {
 /// (a `severity` allowlist, `skip-dirs`, disabled scanners) filters findings
 /// before they are ever findings, and Trivy reports nothing at all for it —
 /// measured on 0.72.0. That gap is why [`scanner_config_notes`] exists.
+/// The top-level keys that identify a document as a Trivy report.
+///
+/// `Results` alone is NOT a sufficient marker: measured on trivy 0.72.0, a
+/// scan of a finding-free tree emits the envelope with no `Results` key at
+/// all (`SchemaVersion`, `Trivy`, `ReportID`, `CreatedAt`, `ArtifactName`,
+/// `ArtifactType`). Keying the check on `Results` would have turned every
+/// clean scan into an error.
+const TRIVY_REPORT_MARKERS: &[&str] = &["Results", "SchemaVersion", "ArtifactName", "ArtifactType"];
+
+/// The top-level key that identifies a document as an OSV-Scanner report.
+///
+/// Measured on osv-scanner 2.4.0, a clean scan over a real lockfile emits
+/// `{"results":[],…}` — present and empty — so requiring it costs a clean
+/// scan nothing. A package-free tree exits 128 with empty stdout, which
+/// [`run_osv`] handles before any parsing happens.
+const OSV_REPORT_MARKERS: &[&str] = &["results"];
+
+/// Parse a scanner's stdout as that scanner's report, refusing a document
+/// that is valid JSON but is not that report.
+///
+/// The asymmetry this closes: non-JSON was rejected loudly, while `{}`, `[]`,
+/// or any unrelated JSON document parsed happily into zero findings — no
+/// error, no note. The report then read "0 findings" and the gate exited 0.
+/// A scanner that returned something unexpected is exactly when you want to
+/// be told, so an unreadable document is an error rather than a clean bill of
+/// health. A document lacking any recognisable marker is not clean; it is
+/// output nobody parsed.
+///
+/// Two ways a document fails, both named: no recognisable top-level marker,
+/// or a marker present whose findings container is not a list. The marker set
+/// is deliberately liberal — any one key is enough — so a future field rename
+/// costs an error message rather than every clean scan.
+fn scanner_report(
+    stdout: &str,
+    tool: &str,
+    markers: &[&str],
+    container: &str,
+) -> Result<serde_json::Value> {
+    let v: serde_json::Value =
+        serde_json::from_str(stdout).with_context(|| format!("{tool} output not JSON"))?;
+    anyhow::ensure!(
+        markers.iter().any(|k| v.get(k).is_some()),
+        "{tool} output is JSON, but not in {tool}'s report shape: none of {} at the top level. \
+         A document this cannot read is not a clean scan — reading it as zero findings would \
+         pass the gate on output nobody parsed",
+        markers.join(", ")
+    );
+    if let Some(found) = v.get(container) {
+        anyhow::ensure!(
+            found.is_array() || found.is_null(),
+            "{tool} output is JSON, but not in {tool}'s report shape: `{container}` is present \
+             and is not a list of results. A document this cannot read is not a clean scan"
+        );
+    }
+    Ok(v)
+}
+
 pub fn parse_trivy_suppressions(stdout: &str) -> Result<Vec<String>> {
-    let v: serde_json::Value = serde_json::from_str(stdout).context("trivy output not JSON")?;
+    let v = scanner_report(stdout, "trivy", TRIVY_REPORT_MARKERS, "Results")?;
     let mut rows = Vec::new();
     for result in v
         .get("Results")
@@ -445,7 +502,7 @@ pub fn parse_trivy_suppressions(stdout: &str) -> Result<Vec<String>> {
 }
 
 pub fn parse_trivy(stdout: &str) -> Result<Vec<VulnFinding>> {
-    let v: serde_json::Value = serde_json::from_str(stdout).context("trivy output not JSON")?;
+    let v = scanner_report(stdout, "trivy", TRIVY_REPORT_MARKERS, "Results")?;
     let mut findings = Vec::new();
     for result in v
         .get("Results")
@@ -616,8 +673,7 @@ fn osv_filter_report(stderr: &str) -> (Vec<String>, Vec<String>) {
 }
 
 pub fn parse_osv(stdout: &str) -> Result<Vec<VulnFinding>> {
-    let v: serde_json::Value =
-        serde_json::from_str(stdout).context("osv-scanner output not JSON")?;
+    let v = scanner_report(stdout, "osv-scanner", OSV_REPORT_MARKERS, "results")?;
     let mut findings = Vec::new();
     for result in v
         .get("results")
@@ -859,8 +915,10 @@ fn cvss_roundup(x: f64) -> f64 {
 /// an ecosystem, they must agree — `pkg:cargo/openssl` must not suppress an
 /// OS-package `openssl` finding for the same CVE (same-name collisions across
 /// ecosystems are routine in a single Trivy filesystem scan). Each
-/// suppression row names the product id and status that matched, so any
-/// remaining over-breadth is visible in the report rather than silent.
+/// suppression row names the product id and status that matched AND the
+/// ecosystem of the finding it removed, so any remaining over-breadth — a
+/// bare-name product id matching in several ecosystems at once — is visible
+/// in the report rather than silent.
 pub fn apply_vex(report: &mut ScanReport, vex_text: &str) -> Result<()> {
     let v: serde_json::Value = serde_json::from_str(vex_text).context("VEX is not valid JSON")?;
     anyhow::ensure!(
@@ -903,8 +961,17 @@ pub fn apply_vex(report: &mut ScanReport, vex_text: &str) -> Result<()> {
             .find(|(id, product, _)| *id == f.id && vex_product_matches(product, f))
         {
             Some((_, product, status)) => {
+                // The ecosystem is part of WHICH finding was waived, not
+                // decoration. A product id that is a bare name declares no
+                // ecosystem, so it matches by name in every ecosystem at
+                // once; without this, those suppressions printed as identical
+                // rows and their reach could not be read off the report.
+                let eco = match &f.ecosystem {
+                    Some(eco) => format!(" [{eco}]"),
+                    None => String::new(),
+                };
                 suppressed.push(format!(
-                    "{} ({}) — VEX {status} for {product}",
+                    "{} ({}{eco}) — VEX {status} for {product}",
                     f.id, f.package
                 ));
                 false
@@ -943,10 +1010,19 @@ fn vex_product_ids(stmt: &serde_json::Value) -> Vec<String> {
 /// ecosystem agreement when both sides declare one. The gate is what stops a
 /// `pkg:cargo/openssl` statement from suppressing an OS-package `openssl`
 /// finding: purl `type` and scanner ecosystem are normalised through
-/// [`normalize_ecosystem`] and must be equal. When either side is unknown
-/// (secrets, misconfigs, older report shapes, non-purl product ids) matching
-/// falls back to name granularity — we cannot tighten on information that
-/// does not exist, and the suppression row keeps the residue visible.
+/// [`normalize_ecosystem`] and must be equal. Normalisation is load-bearing,
+/// not cosmetic: the canonical purl and the label a scanner emits for the
+/// same registry are usually different strings.
+///
+/// When either side is unknown (secrets, misconfigs, older report shapes,
+/// non-purl product ids) matching falls back to name granularity. This is
+/// deliberate, and it is not a hole in the ecosystem gate: a bare product id
+/// is a namespace-free assertion, so there is no ecosystem for it to cross.
+/// Requiring one would not tighten the gate — it would turn every bare-name
+/// statement into a silent no-op, which is the failure this module exists to
+/// prevent. The residue is bounded to statements whose author wrote no
+/// namespace, and [`apply_vex`] states the ecosystem of each finding it
+/// suppressed so the reach of such a statement is readable in the report.
 ///
 /// Maven is additionally matched in its conventional `group:artifact` colon
 /// form, since scanners commonly emit GAV notation while purls use a slash.
@@ -990,16 +1066,46 @@ fn purl_parts(purl: &str) -> Option<(String, String)> {
 /// `crates.io` (OSV) and `cargo` (purl, Trivy) compare equal. Unknown labels
 /// pass through lowercased — two unknowns still have to agree with each
 /// other, which is strictly safer than ignoring them.
+///
+/// The three vocabularies disagree systematically, not occasionally:
+///
+/// * a **purl** names the ecosystem by its REGISTRY (`pypi`, `npm`, `gem`);
+/// * **OSV** names it by the registry too, but spells it its own way
+///   (`crates.io`, `Packagist`, `RubyGems`);
+/// * **Trivy** names it by the MANIFEST it read the dependency out of, so one
+///   registry answers to several labels.
+///
+/// That last row is the one that bites, because the manifest labels are the
+/// ones a real scan emits and the registry label is the one `sscsb vex create`
+/// writes. Measured on trivy 0.72.0, one fixture tree per file:
+/// `requirements.txt` → `pip`, `poetry.lock` → `poetry`, `Pipfile.lock` →
+/// `pipenv`, `yarn.lock` → `yarn`, `pnpm-lock.yaml` → `pnpm`, `go.mod` →
+/// `gomod`, `Gemfile.lock` → `bundler`, `*.deps.json` → `dotnet-core`,
+/// `pom.xml` → `pom`, `package-lock.json` → `npm`, `Cargo.lock` → `cargo`,
+/// `composer.lock` → `composer`, `packages.lock.json` → `nuget`. Without the
+/// aliases below, the canonical `pkg:pypi/…` matched no Python finding Trivy
+/// can produce — a waiver that suppressed nothing and said nothing.
+///
+/// Aliasing only ever loosens the gate, so every entry has to be a genuine
+/// identity: these map manifests onto the single registry they resolve
+/// against, never two registries onto each other.
 fn normalize_ecosystem(label: &str) -> String {
     let l = label.to_ascii_lowercase();
     match l.as_str() {
         "crates.io" => "cargo".into(),
-        "go" => "golang".into(),
+        "go" | "gomod" | "gobinary" => "golang".into(),
         // Trivy reports Java findings under archive/build-file types; their
         // coordinates are Maven GAV, purl type "maven".
         "jar" | "pom" | "gradle" | "gradle-lockfile" | "sbt" => "maven".into(),
+        // Python: one registry (PyPI), one manifest label per tool.
+        "pip" | "poetry" | "pipenv" | "uv" | "python-pkg" => "pypi".into(),
+        // JavaScript: alternative clients, all resolving against the npm
+        // registry.
+        "yarn" | "pnpm" | "bun" | "node-pkg" => "npm".into(),
         "packagist" => "composer".into(),
-        "rubygems" => "gem".into(),
+        "rubygems" | "bundler" | "gemspec" => "gem".into(),
+        "dotnet-core" => "nuget".into(),
+        "conda-pkg" => "conda".into(),
         "debian" | "ubuntu" => "deb".into(),
         "alpine" => "apk".into(),
         "redhat" | "centos" | "rocky" | "alma" | "almalinux" | "fedora" | "oracle" | "amazon"
@@ -1221,6 +1327,110 @@ mod tests {
     fn parse_osv_rejects_non_json_output() {
         let err = parse_osv("this is not json").unwrap_err();
         assert!(format!("{err:#}").contains("not JSON"));
+    }
+
+    /// M4: non-JSON failed loudly while wrong-shaped JSON failed silently,
+    /// which is backwards. `{}`, `[]`, and any unrelated document all read as
+    /// zero findings — no error, no note — so a scanner that returned
+    /// something unexpected reported a clean repository and exited 0. A
+    /// document with no recognisable marker is not clean; it is unreadable.
+    #[test]
+    fn parse_trivy_rejects_json_that_is_not_a_trivy_report() {
+        for wrong_shape in [
+            "{}",
+            "[]",
+            "null",
+            "42",
+            r#""a string""#,
+            r#"{"results":[]}"#, // OSV's envelope, handed to the wrong parser
+            r#"{"error":"failed to download vulnerability DB"}"#,
+            r#"[{"Results":[]}]"#, // the right key at the wrong nesting
+            r#"{"SchemaVersion":2,"Results":"broken"}"#, // envelope, unreadable body
+        ] {
+            let Err(err) = parse_trivy(wrong_shape) else {
+                panic!("{wrong_shape} must not read as a clean scan");
+            };
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not in trivy's report shape"),
+                "{wrong_shape} must be named unreadable, not counted as zero findings: {msg}"
+            );
+            // The same document through the suppression channel, which reads
+            // the same stdout and had the same silent-empty behaviour.
+            assert!(
+                parse_trivy_suppressions(wrong_shape).is_err(),
+                "{wrong_shape} must not read as zero suppressions either"
+            );
+        }
+    }
+
+    /// The other half of M4: a genuinely clean scan must still read clean and
+    /// gate green. This is the exact envelope `trivy fs --format json`
+    /// emitted for a finding-free tree on 0.72.0 — note it carries NO
+    /// `Results` key at all, so keying the shape check on `Results` would
+    /// have turned every clean scan into an error.
+    #[test]
+    fn parse_trivy_accepts_the_resultless_envelope_a_clean_scan_emits() {
+        const CLEAN: &str = r#"{"SchemaVersion":2,"Trivy":{"Version":"0.72.0"},
+            "ReportID":"01a03580-c434-7ad9-a00b-bc960132a8b2",
+            "CreatedAt":"2026-08-24T16:40:26.420713-04:00",
+            "ArtifactName":".","ArtifactType":"filesystem"}"#;
+        let findings = parse_trivy(CLEAN).expect("a clean scan is readable");
+        assert!(findings.is_empty());
+        assert!(parse_trivy_suppressions(CLEAN).unwrap().is_empty());
+        let report = ScanReport {
+            findings,
+            ..Default::default()
+        };
+        assert!(
+            !breaches_threshold(&report, "low").unwrap(),
+            "a clean scan must still pass the strictest threshold"
+        );
+        // An explicitly empty result list is equally clean.
+        assert!(parse_trivy(r#"{"SchemaVersion":2,"Results":[]}"#)
+            .unwrap()
+            .is_empty());
+        assert!(parse_trivy(r#"{"SchemaVersion":2,"Results":null}"#)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// M4, OSV half: `results` is the marker. Measured on osv-scanner 2.4.0,
+    /// a clean scan over a real lockfile emits `{"results":[],...}` — the key
+    /// is present — so requiring it costs no clean scan anything.
+    #[test]
+    fn parse_osv_rejects_json_that_is_not_an_osv_report() {
+        for wrong_shape in [
+            "{}",
+            "[]",
+            "null",
+            "42",
+            r#"{"Results":[]}"#, // Trivy's envelope, handed to the wrong parser
+            r#"{"error":"unsupported lockfile"}"#,
+            r#"[{"results":[]}]"#,
+            r#"{"results":"none"}"#, // marker present, body unreadable
+        ] {
+            let Err(err) = parse_osv(wrong_shape) else {
+                panic!("{wrong_shape} must not read as a clean scan");
+            };
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not in osv-scanner's report shape"),
+                "{wrong_shape} must be named unreadable, not counted as zero findings: {msg}"
+            );
+        }
+    }
+
+    /// The false-positive guard for the OSV half: the exact envelope
+    /// osv-scanner 2.4.0 emitted for a clean scan of a real `Cargo.lock`.
+    #[test]
+    fn parse_osv_accepts_the_empty_results_envelope_a_clean_scan_emits() {
+        const CLEAN: &str = r#"{"results":[],"experimental_config":{"licenses":
+            {"summary":false,"allowlist":null}}}"#;
+        assert!(parse_osv(CLEAN)
+            .expect("a clean scan is readable")
+            .is_empty());
+        assert!(parse_osv(r#"{"results":null}"#).unwrap().is_empty());
     }
 
     // A realistic multi-target Trivy report: one target with a dependency
@@ -1564,6 +1774,127 @@ mod tests {
              "status":"not_affected","justification":"vulnerable_code_not_present"}]}"#;
         apply_vex(&mut report, vex).unwrap();
         assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    /// M3(b): a purl names an ecosystem by its REGISTRY (`pypi`, `npm`,
+    /// `golang`, `gem`, `nuget`); Trivy names it by the MANIFEST it read the
+    /// dependency out of. Measured on trivy 0.72.0 against one fixture tree:
+    /// `requirements.txt` → `pip`, `poetry.lock` → `poetry`, `Pipfile.lock` →
+    /// `pipenv`, `yarn.lock` → `yarn`, `pnpm-lock.yaml` → `pnpm`, `go.mod` →
+    /// `gomod`, `Gemfile.lock` → `bundler`, `*.deps.json` → `dotnet-core`.
+    ///
+    /// Every one of those disagrees with the canonical purl `sscsb vex create`
+    /// writes, so the ecosystem gate rejected the match and the waiver
+    /// suppressed nothing — the exact silent no-op VEX exists to avoid. The
+    /// canonical `pkg:pypi/...` form was inert against every Python finding
+    /// Trivy can produce.
+    #[test]
+    fn vex_canonical_purl_matches_the_manifest_named_ecosystems_scanners_emit() {
+        let waiver = |purl_type: &str, package: &str| {
+            format!(
+                r#"{{"@context":"https://openvex.dev/ns/v0.2.0","statements":[
+                {{"vulnerability":{{"name":"CVE-2024-0001"}},
+                 "products":[{{"@id":"pkg:{purl_type}/{package}"}}],
+                 "status":"not_affected","justification":"vulnerable_code_not_present"}}]}}"#
+            )
+        };
+        // (canonical purl type, package, the label a scanner actually emits)
+        let bridged = [
+            ("pypi", "requests", "pip"),
+            ("pypi", "requests", "poetry"),
+            ("pypi", "requests", "pipenv"),
+            ("pypi", "requests", "PyPI"), // OSV's own spelling, cased
+            ("npm", "lodash", "yarn"),
+            ("npm", "lodash", "pnpm"),
+            ("golang", "github.com/gin-gonic/gin", "gomod"),
+            ("gem", "rack", "bundler"),
+            ("nuget", "Newtonsoft.Json", "dotnet-core"),
+        ];
+        for (purl_type, package, ecosystem) in bridged {
+            let mut report = ScanReport {
+                findings: vec![eco_finding("CVE-2024-0001", package, ecosystem)],
+                ..Default::default()
+            };
+            apply_vex(&mut report, &waiver(purl_type, package)).unwrap();
+            assert!(
+                report.findings.is_empty(),
+                "pkg:{purl_type}/{package} must waive the same package reported \
+                 under the scanner's `{ecosystem}` label, not silently miss it"
+            );
+        }
+
+        // The gate is bridged, not dropped: a Python waiver still may not
+        // reach a same-named package from any other registry.
+        for foreign in ["debian", "alpine", "npm", "cargo", "gomod"] {
+            let mut report = ScanReport {
+                findings: vec![eco_finding("CVE-2024-0001", "requests", foreign)],
+                ..Default::default()
+            };
+            apply_vex(&mut report, &waiver("pypi", "requests")).unwrap();
+            assert_eq!(
+                report.findings.len(),
+                1,
+                "a pypi waiver must not reach a `{foreign}` package of the same name"
+            );
+        }
+    }
+
+    /// M3(a), REBUTTED — the bare-name fallback is the design, not a defect.
+    ///
+    /// A product id that is a bare name declares no ecosystem, so there is no
+    /// ecosystem for it to cross. Refusing the match would not tighten the
+    /// gate; it would turn every bare-name statement into a silent no-op —
+    /// the failure mode this module exists to prevent, and the one that
+    /// pushes an operator into disabling the control outright.
+    ///
+    /// What the design does owe is legibility, since it rests on the claim
+    /// that "the suppression row keeps the residue visible". It did not:
+    /// findings of the same name in different ecosystems produced textually
+    /// IDENTICAL rows, so a reader could not see how far a name-only waiver
+    /// reached. Each row now states the ecosystem it hit.
+    #[test]
+    fn vex_bare_product_name_matches_by_name_alone_and_each_row_names_its_ecosystem() {
+        let mut report = ScanReport {
+            findings: vec![
+                eco_finding("CVE-2024-0001", "openssl", "cargo"),
+                eco_finding("CVE-2024-0001", "openssl", "debian"),
+                finding("CVE-2024-0001", "openssl"),
+            ],
+            ..Default::default()
+        };
+        let vex = r#"{"@context":"https://openvex.dev/ns/v0.2.0","statements":[
+            {"vulnerability":{"name":"CVE-2024-0001"},"products":["openssl"],
+             "status":"not_affected","justification":"vulnerable_code_not_present"}]}"#;
+        apply_vex(&mut report, vex).unwrap();
+
+        // Deliberate: a namespace-free assertion matches by name, everywhere.
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(report.suppressed.len(), 3);
+
+        // ...and its breadth is readable — three suppressions are three
+        // distinct facts on the page, not one fact printed three times.
+        assert!(
+            report.suppressed[0].contains("[cargo]"),
+            "{}",
+            report.suppressed[0]
+        );
+        assert!(
+            report.suppressed[1].contains("[debian]"),
+            "{}",
+            report.suppressed[1]
+        );
+        assert!(
+            !report.suppressed[2].contains('['),
+            "a finding with no ecosystem must not be given one: {}",
+            report.suppressed[2]
+        );
+        let distinct: std::collections::HashSet<&String> = report.suppressed.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "a name-only waiver's reach must not read as one repeated row: {:?}",
+            report.suppressed
+        );
     }
 
     #[test]
