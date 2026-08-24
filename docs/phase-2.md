@@ -166,6 +166,15 @@ that fails to compile. Only that shape is exempt: `boto` still shadows `boto3`
 in length), and every one of these names still goes through the existence check,
 which is the arm that actually knows whether a name is real.
 
+**What counts as a declaration.** `pyproject.toml` is read as TOML, never scanned
+line by line, and every section that installs code is read: PEP 621 `[project]`
+and its extras, PEP 735 `[dependency-groups]`, **Poetry**
+(`[tool.poetry.dependencies]`, the legacy `dev-dependencies`, per-group
+dependencies, and `[[tool.poetry.source]]`), PDM, uv and Hatch. Poetry's
+`git`/`path`/`url`/`source` origins are classified like any other non-registry
+source, so repointing a Poetry dependency is a fresh trust decision rather than
+an unchanged name.
+
 **Human approval.** New packages introduced by a **staged** manifest change are
 compared against the previous revision and against your approved baseline. Anything
 new and unapproved blocks the commit — and if the commit is AI-assisted, it needs

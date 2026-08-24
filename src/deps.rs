@@ -384,11 +384,25 @@ fn python_requirement_spec(req: &str) -> Option<DepSpec> {
     Some(DepSpec { name, source })
 }
 
+/// The two file shapes that share `Ecosystem::PyPi`: a `pyproject.toml` (TOML)
+/// and a `requirements.txt` (line-oriented). Nothing hands the filename down
+/// here, so the content decides — and a TOML document that announces itself as a
+/// pyproject is parsed as one and NEVER line-scanned.
+///
+/// The old rule was "line-scan whenever the TOML parse produced nothing", and it
+/// produced a garbage trust baseline. A Poetry manifest declares its
+/// dependencies in `[tool.poetry.dependencies]`, so the PEP 621 read found
+/// nothing, fell through, and scanned TOML source as if it were pip
+/// requirements: `python = "^3.11"` became a dependency called `python`,
+/// `version = "0.1.0"` became one called `version`, and the real dependencies
+/// were never seen at all. Those fictions then got written into
+/// `.sscsb/policy/packages.toml` by `deps baseline` and asked about on PyPI by
+/// `deps check`.
 fn python_specs(content: &str) -> BTreeSet<DepSpec> {
     let mut out = BTreeSet::new();
     if let Ok(table) = content.parse::<toml::Table>() {
-        pyproject_specs(&table, &mut out);
-        if !out.is_empty() {
+        if is_pyproject(&table) {
+            pyproject_specs(&table, &mut out);
             return out;
         }
     }
@@ -398,12 +412,24 @@ fn python_specs(content: &str) -> BTreeSet<DepSpec> {
     out
 }
 
-/// Every place PEP 621 / PEP 735 let a pyproject.toml declare installable code.
+/// A `pyproject.toml` announces itself with one of the four tables that can
+/// legitimately open one: PEP 518 `[build-system]`, PEP 621 `[project]`,
+/// PEP 735 `[dependency-groups]`, or a `[tool.…]` section. A requirements.txt
+/// is not valid TOML at all once it contains a single requirement line, so this
+/// only has to be right about documents that already parsed.
+fn is_pyproject(table: &toml::Table) -> bool {
+    ["build-system", "project", "dependency-groups", "tool"]
+        .iter()
+        .any(|k| table.contains_key(*k))
+}
+
+/// Every place a pyproject.toml declares installable code.
 ///
-/// Reading only `[project].dependencies` left two whole sections invisible:
+/// Reading only `[project].dependencies` left whole sections invisible:
 /// `[project.optional-dependencies]` (extras — `pip install pkg[dev]` installs
-/// them, and CI almost always does) and `[dependency-groups]` (PEP 735, where
-/// modern tooling puts dev dependencies).
+/// them, and CI almost always does), `[dependency-groups]` (PEP 735, where
+/// modern tooling puts dev dependencies), and everything any non-PEP-621 build
+/// backend declares under `[tool]`.
 fn pyproject_specs(table: &toml::Table, out: &mut BTreeSet<DepSpec>) {
     let project = table.get("project").and_then(|p| p.as_table());
     if let Some(arr) = project
@@ -428,6 +454,149 @@ fn pyproject_specs(table: &toml::Table, out: &mut BTreeSet<DepSpec>) {
             // requirement strings and `as_str` skips them.
             if let Some(arr) = list.as_array() {
                 push_python_reqs(arr, out);
+            }
+        }
+    }
+    if let Some(tool) = table.get("tool").and_then(|t| t.as_table()) {
+        if let Some(poetry) = tool.get("poetry").and_then(|p| p.as_table()) {
+            poetry_specs(poetry, out);
+        }
+        tool_requirement_arrays(tool, out);
+    }
+}
+
+/// Poetry, which is neither PEP 621 nor pip.
+///
+/// Its dependencies live under `[tool.poetry]`, and — uniquely among the
+/// formats here — they are a TABLE of `name = constraint` rather than an array
+/// of PEP 508 strings. Constraints may be a bare version string, an inline table
+/// naming a `git`/`path`/`url`/`source` origin, or an ARRAY of such tables when
+/// one package is constrained differently per Python version.
+fn poetry_specs(poetry: &toml::Table, out: &mut BTreeSet<DepSpec>) {
+    let mut tables: Vec<&toml::Table> = Vec::new();
+    // `dev-dependencies` is the pre-1.2 spelling; `[tool.poetry.group.<g>]` is
+    // the current one. Both are still in the wild and both install code.
+    for key in ["dependencies", "dev-dependencies"] {
+        if let Some(t) = poetry.get(key).and_then(|v| v.as_table()) {
+            tables.push(t);
+        }
+    }
+    if let Some(groups) = poetry.get("group").and_then(|v| v.as_table()) {
+        for group in groups.values() {
+            if let Some(t) = group
+                .as_table()
+                .and_then(|g| g.get("dependencies"))
+                .and_then(|v| v.as_table())
+            {
+                tables.push(t);
+            }
+        }
+    }
+    for t in tables {
+        for (name, val) in t {
+            // `python = "^3.11"` is the interpreter constraint, not a package —
+            // and it is one of the two names the old line scan invented.
+            if name == "python" {
+                continue;
+            }
+            push_poetry_dep(name, val, out);
+        }
+    }
+    // `[[tool.poetry.source]]` is Poetry's `--extra-index-url`: it re-points
+    // where names may resolve from, which is a trust decision about every
+    // dependency in the file, not about one package.
+    if let Some(sources) = poetry.get("source").and_then(|v| v.as_array()) {
+        for s in sources {
+            if let Some(url) = s
+                .as_table()
+                .and_then(|t| t.get("url"))
+                .and_then(|v| v.as_str())
+            {
+                out.insert(DepSpec {
+                    name: url.to_string(),
+                    source: DepSource::Index(url.to_string()),
+                });
+            }
+        }
+    }
+}
+
+fn push_poetry_dep(name: &str, val: &toml::Value, out: &mut BTreeSet<DepSpec>) {
+    // `foo = [{ version = "1", python = "<3.9" }, { version = "2" }]` — one
+    // package, several constrained alternatives, each with its own source.
+    if let Some(arr) = val.as_array() {
+        for entry in arr {
+            push_poetry_dep(name, entry, out);
+        }
+        return;
+    }
+    if let Some(name) = python_req_name(name) {
+        out.insert(DepSpec {
+            name,
+            source: poetry_dep_source(val),
+        });
+    }
+}
+
+fn poetry_dep_source(val: &toml::Value) -> DepSource {
+    let Some(t) = val.as_table() else {
+        return DepSource::Registry; // `requests = "^2.31"`
+    };
+    if let Some(u) = t.get("git").and_then(|v| v.as_str()) {
+        DepSource::Git(u.to_string())
+    } else if let Some(p) = t.get("path").and_then(|v| v.as_str()) {
+        DepSource::Path(p.to_string())
+    } else if let Some(u) = t.get("url").and_then(|v| v.as_str()) {
+        DepSource::Url(u.to_string())
+    } else if let Some(s) = t.get("source").and_then(|v| v.as_str()) {
+        // Pinned to a named `[[tool.poetry.source]]` rather than PyPI.
+        DepSource::Other(format!("poetry source {s}"))
+    } else {
+        DepSource::Registry // `requests = { version = "^2.31" }`
+    }
+}
+
+/// The remaining `[tool.<x>]` sections that hold plain PEP 508 requirement
+/// strings in arrays. They all decompose the same way, so they share one reader
+/// rather than each growing a parser.
+fn tool_requirement_arrays(tool: &toml::Table, out: &mut BTreeSet<DepSpec>) {
+    // PDM: `[tool.pdm.dev-dependencies]` is a table of named groups.
+    if let Some(groups) = tool
+        .get("pdm")
+        .and_then(|v| v.as_table())
+        .and_then(|p| p.get("dev-dependencies"))
+        .and_then(|v| v.as_table())
+    {
+        for list in groups.values() {
+            if let Some(arr) = list.as_array() {
+                push_python_reqs(arr, out);
+            }
+        }
+    }
+    // uv, before it adopted PEP 735: a single `[tool.uv] dev-dependencies` array.
+    if let Some(arr) = tool
+        .get("uv")
+        .and_then(|v| v.as_table())
+        .and_then(|u| u.get("dev-dependencies"))
+        .and_then(|v| v.as_array())
+    {
+        push_python_reqs(arr, out);
+    }
+    // Hatch: one array per environment.
+    if let Some(envs) = tool
+        .get("hatch")
+        .and_then(|v| v.as_table())
+        .and_then(|h| h.get("envs"))
+        .and_then(|v| v.as_table())
+    {
+        for env in envs.values() {
+            let Some(env) = env.as_table() else {
+                continue;
+            };
+            for key in ["dependencies", "extra-dependencies"] {
+                if let Some(arr) = env.get(key).and_then(|v| v.as_array()) {
+                    push_python_reqs(arr, out);
+                }
             }
         }
     }
@@ -1869,24 +2038,155 @@ mod tests {
         assert_eq!(deps, BTreeSet::from(["pydantic".to_string()]));
     }
 
+    /// M10: a pyproject.toml is never line-scanned as if it were pip
+    /// requirements.
+    ///
+    /// It used to be, whenever the PEP 621 read came up empty — and a
+    /// line-oriented scan of TOML source does not find dependencies, it finds
+    /// bare keys. A minimal pyproject.toml declaring no dependencies at all
+    /// yielded two: `name` and `version`.
     #[test]
-    fn parse_python_pyproject_without_a_dependencies_array_falls_back_to_a_line_scan() {
-        // A minimal PEP 621 pyproject.toml with no `[project.dependencies]`
-        // array is still valid TOML, so parsing does not early-return; it
-        // falls through to the requirements.txt-shaped scan of the same raw
-        // text. That scan is line-oriented and does not understand TOML
-        // table syntax, so it picks up bare keys like `name`/`version` as
-        // candidate names — a known limitation (see the accompanying report:
-        // Poetry-style `[tool.poetry.dependencies]` manifests hit this same
-        // path and deserve first-class parsing instead of this accidental
-        // fallback).
+    fn a_pyproject_declaring_nothing_yields_nothing_not_its_own_toml_keys() {
         let deps = parse_deps(
             Ecosystem::PyPi,
             "[project]\nname = \"mypkg\"\nversion = \"0.1.0\"\n",
         );
-        assert_eq!(
-            deps,
-            BTreeSet::from(["name".to_string(), "version".to_string()])
+        assert!(
+            deps.is_empty(),
+            "a pyproject.toml with no dependency section declares no \
+             dependencies; `name`/`version` are TOML keys, not packages: {deps:?}"
+        );
+
+        // A build-system-only pyproject is the same story.
+        assert!(parse_deps(
+            Ecosystem::PyPi,
+            "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+        )
+        .is_empty());
+
+        // …and the requirements.txt path is untouched: a real requirements file
+        // is not valid TOML, so it still line-scans.
+        assert!(parse_deps(Ecosystem::PyPi, "requests==2.31.0\nflask>=2\n").contains("requests"));
+    }
+
+    /// M10: Poetry manifests produced a garbage trust baseline.
+    ///
+    /// Poetry declares dependencies in `[tool.poetry.dependencies]`, so the
+    /// PEP 621 read found nothing and the file fell through to the pip line
+    /// scan. The result was not "some dependencies missed" — it was
+    /// `python` and `version` written into `.sscsb/policy/packages.toml` as
+    /// approved packages, and the real dependencies never seen at all.
+    #[test]
+    fn poetry_dependencies_are_parsed_instead_of_line_scanned_into_nonsense() {
+        let specs = python_specs(
+            "[tool.poetry]\n\
+             name = \"mypkg\"\n\
+             version = \"0.1.0\"\n\
+             [tool.poetry.dependencies]\n\
+             python = \"^3.11\"\n\
+             requests = \"^2.31\"\n\
+             pydantic = { version = \"^2.0\", extras = [\"email\"] }\n\
+             evil = { git = \"https://evil.example/x.git\", branch = \"main\" }\n\
+             localpkg = { path = \"../localpkg\" }\n\
+             wheelpkg = { url = \"https://evil.example/x.whl\" }\n\
+             privpkg = { version = \"^1\", source = \"corp\" }\n\
+             [tool.poetry.dev-dependencies]\n\
+             pytest = \"^7\"\n\
+             [tool.poetry.group.docs.dependencies]\n\
+             sphinx = \"^7\"\n\
+             [[tool.poetry.source]]\n\
+             name = \"corp\"\n\
+             url = \"https://corp.example/simple\"\n",
+        );
+        let names: BTreeSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+
+        // The real dependencies, from all three declaration shapes.
+        assert!(names.contains("requests"), "{specs:?}");
+        assert!(names.contains("pydantic"), "{specs:?}");
+        assert!(
+            names.contains("pytest"),
+            "legacy dev-dependencies: {specs:?}"
+        );
+        assert!(names.contains("sphinx"), "poetry groups: {specs:?}");
+
+        // The nonsense the line scan used to invent.
+        assert!(
+            !names.contains("python"),
+            "`python` is the interpreter constraint, not a package: {specs:?}"
+        );
+        assert!(
+            !names.contains("version") && !names.contains("name"),
+            "TOML keys are not packages: {specs:?}"
+        );
+
+        // Sources are classified, so a repointed Poetry dependency is a fresh
+        // trust decision rather than a name that looks unchanged.
+        assert!(matches!(source_of(&specs, "evil"), DepSource::Git(_)));
+        assert!(matches!(source_of(&specs, "localpkg"), DepSource::Path(_)));
+        assert!(matches!(source_of(&specs, "wheelpkg"), DepSource::Url(_)));
+        assert!(matches!(source_of(&specs, "privpkg"), DepSource::Other(_)));
+        assert_eq!(*source_of(&specs, "requests"), DepSource::Registry);
+        assert_eq!(*source_of(&specs, "pydantic"), DepSource::Registry);
+        assert!(
+            specs
+                .iter()
+                .any(|s| matches!(s.source, DepSource::Index(_))
+                    && s.name.contains("corp.example")),
+            "an added [[tool.poetry.source]] re-points every name in the file: {specs:?}"
+        );
+    }
+
+    /// Poetry's multi-constraint form is one package with several alternatives,
+    /// each of which may carry its own source.
+    #[test]
+    fn poetry_multiple_constraint_dependencies_are_read_per_alternative() {
+        let specs = python_specs(
+            "[tool.poetry.dependencies]\n\
+             backport = [\n\
+               { version = \"^1.0\", python = \"<3.9\" },\n\
+               { git = \"https://evil.example/backport.git\", python = \">=3.9\" },\n\
+             ]\n",
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name == "backport" && s.source == DepSource::Registry),
+            "{specs:?}"
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name == "backport" && matches!(s.source, DepSource::Git(_))),
+            "the git alternative must be its own trust unit: {specs:?}"
+        );
+    }
+
+    /// The other `[tool.*]` backends that hold plain requirement arrays. Each
+    /// used to line-scan into its own group NAME (`test`, `lint`) instead of the
+    /// packages inside it.
+    #[test]
+    fn pdm_uv_and_hatch_dependency_sections_are_parsed() {
+        let pdm = parse_deps(
+            Ecosystem::PyPi,
+            "[tool.pdm.dev-dependencies]\ntest = [\"pytest>=7\"]\nlint = [\"ruff\"]\n",
+        );
+        assert!(pdm.contains("pytest") && pdm.contains("ruff"), "{pdm:?}");
+        assert!(!pdm.contains("test") && !pdm.contains("lint"), "{pdm:?}");
+
+        let uv = parse_deps(
+            Ecosystem::PyPi,
+            "[tool.uv]\ndev-dependencies = [\"pytest>=7\", \"mypy\"]\n",
+        );
+        assert!(uv.contains("pytest") && uv.contains("mypy"), "{uv:?}");
+
+        let hatch = parse_deps(
+            Ecosystem::PyPi,
+            "[tool.hatch.envs.default]\ndependencies = [\"coverage\"]\n\
+             [tool.hatch.envs.docs]\nextra-dependencies = [\"mkdocs\"]\n",
+        );
+        assert!(
+            hatch.contains("coverage") && hatch.contains("mkdocs"),
+            "{hatch:?}"
         );
     }
 
