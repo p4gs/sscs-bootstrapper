@@ -646,7 +646,8 @@ fn cmd_deps(cwd: &std::path::Path, action: DepsAction) -> Result<ExitCode> {
     let ctx = Ctx::discover(cwd)?;
     match action {
         DepsAction::Check { offline } => {
-            let (problems, notes) = deps::deps_check(&ctx, offline)?;
+            let checks = deps::TrustChecks::from_config(ctx.config.as_ref());
+            let (problems, notes) = deps::deps_check(&ctx, checks, offline)?;
             for n in &notes {
                 println!("note: {n}");
             }
@@ -665,7 +666,8 @@ fn cmd_deps(cwd: &std::path::Path, action: DepsAction) -> Result<ExitCode> {
             force,
             offline,
         } => {
-            let warnings = deps::approval_warnings(&package, offline);
+            let checks = deps::TrustChecks::from_config(ctx.config.as_ref());
+            let warnings = deps::approval_warnings(&package, checks, offline);
             if !warnings.is_empty() {
                 for w in &warnings {
                     eprintln!("  ✗ {w}");
@@ -692,11 +694,15 @@ fn cmd_deps(cwd: &std::path::Path, action: DepsAction) -> Result<ExitCode> {
             // resolves its code, so validating it against the public registry
             // would hand back an unrelated same-named package as its verdict.
             let current = deps::current_dep_specs(&ctx)?;
+            // Read once: the config does not change between packages, and
+            // re-reading it per dependency only invites the two halves of one
+            // run to disagree.
+            let checks = deps::TrustChecks::from_config(ctx.config.as_ref());
             let mut approved = 0usize;
             let mut skipped = Vec::new();
             for (eco, spec) in current {
                 let pkg = format!("{}:{}", eco.label(), spec.name);
-                let warnings = deps::approval_warnings_for(&pkg, &spec.source, offline);
+                let warnings = deps::approval_warnings_for(&pkg, &spec.source, checks, offline);
                 if warnings.is_empty() {
                     deps::approve_package(&ctx, &pkg)?;
                     approved += 1;

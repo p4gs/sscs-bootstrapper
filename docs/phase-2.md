@@ -148,6 +148,36 @@ typosquat shape is an adjacent transposition (`tokoi` for `tokio`, `reqeusts` fo
 through. Hyphen/underscore confusion (`serde-json` for `serde_json`) is caught
 separately.
 
+Both checks are individually switchable, and the switches are real — they gate
+every place the check runs, not just the sentence `sscsb verify` prints about them:
+
+```toml
+[controls.package-trust]
+enabled = true
+registry_check = true    # false: no public existence lookup (private/air-gapped registries)
+typosquat_check = true   # false: no edit-distance heuristic (a name legitimately close to a popular one)
+```
+
+"Every place" is three: `sscsb deps check`, the warnings printed when you approve
+a package, and the **commit-msg gate that actually blocks**. A toggle reaching
+only the advisory two would be the defect these keys were fixed for — you switch
+the heuristic off because your dependency is legitimately one edit from a popular
+name, and it still stops your commit.
+
+Switching an annotation off never switches the *gate* off: a new unapproved
+dependency is still blocked, it is simply no longer also described as a possible
+typosquat. And neither key can re-enable resolving a `path`/`git`/`url`
+dependency by name — that is a correctness rule, not a policy setting. A public
+package sharing a path dependency's name is an unrelated package, and no
+configuration should be able to bring that confusion back.
+
+Turning either off is reported by `sscsb verify` as an `INFO`, naming the check
+that is not running — a control working with half its checks off must not read the
+same as one working whole. `sscsb deps check` says the same thing in its own
+output, once per run, for the same reason it explains why a path dependency was
+not resolved: a check that did not run has to say so, or "checked and found
+nothing" and "never checked" are the same silence.
+
 **Human approval.** New packages introduced by a **staged** manifest change are
 compared against the previous revision and against your approved baseline. Anything
 new and unapproved blocks the commit — and if the commit is AI-assisted, it needs

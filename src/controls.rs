@@ -69,10 +69,16 @@ pub const CONTROLS: &[ControlDef] = &[
         summary: "Machine-wide signing posture: human enclave lane, distinct agent identity, cloud/web/Codespaces guidance",
         default_enabled: true,
         tools: &[],
-        default_options: &[
-            ("agent", "\"claude-code\""),
-            ("human_backend", "\"secretive\""),
-        ],
+        // No options. `agent = "claude-code"` and `human_backend = "secretive"`
+        // used to be emitted here as "generalization seams" and were read by
+        // nothing: `Environment::ALL` has one hard-coded AI variant and
+        // `SigningPaths` hard-codes Secretive's container path, so a user who set
+        // `human_backend = "1password"` still got Secretive probes and no
+        // indication their setting was ignored. Honouring them means implementing
+        // multi-backend and multi-agent support — a feature, not a default — and
+        // until that exists an inert key is worse than no key, because it reads as
+        // a control the user has set.
+        default_options: &[],
     },
     ControlDef {
         id: "branch-protection",
@@ -295,7 +301,15 @@ pub const CONTROLS: &[ControlDef] = &[
         summary: "StepSecurity Harden-Runner egress/tamper monitoring in every workflow",
         default_enabled: true,
         tools: &[],
-        default_options: &[("egress_policy", "\"audit\"")],
+        // No options. `egress_policy = "audit"` was emitted here and read by
+        // nothing: every workflow template hard-codes `egress-policy: audit`, and
+        // `render` substitutes only repo_slug/default_branch/project. The value
+        // this key appeared to offer is `block`, which harden-runner enforces
+        // against an `allowed-endpoints` allowlist that sscsb cannot synthesise —
+        // a generated `block` with no allowlist breaks the first `actions/checkout`
+        // in every workflow. Offering that from a config key is a trap, so egress
+        // policy stays a per-repo decision made in the workflow file.
+        default_options: &[],
     },
     ControlDef {
         id: "witness",
@@ -611,7 +625,14 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("source is readable");
-            let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            // Production code only. A key whose only "reader" is an assertion in
+            // its own test module is still a key that does nothing at runtime,
+            // and every module in this crate puts its `#[cfg(test)]` block last.
+            let production = match text.find("#[cfg(test)]") {
+                Some(i) => &text[..i],
+                None => &text[..],
+            };
+            let collapsed = production.split_whitespace().collect::<Vec<_>>().join(" ");
             out.push((
                 path.file_name().unwrap().to_string_lossy().to_string(),
                 collapsed,
@@ -735,6 +756,49 @@ mod tests {
             checked >= 8,
             "expected to check several option fallbacks, found {checked} — the scan \
              stopped matching real call sites"
+        );
+    }
+
+    /// M21. `.sscsb/config.toml` is generated from `default_options`, so every
+    /// key in that table becomes a line in the user's config that looks like a
+    /// control they have set. Four of them were read by nothing at all —
+    /// `signing-model.agent`, `signing-model.human_backend`,
+    /// `package-trust.typosquat_check`, `harden-runner.egress_policy` — and a
+    /// fifth, `package-trust.registry_check`, changed only the sentence `sscsb
+    /// verify` printed while the check itself ran regardless.
+    ///
+    /// An inert key is worse than a missing one: it answers "is this on?" with a
+    /// value that means nothing. So every key must be reachable through a
+    /// `Config::control_opt_*` accessor in production code, or not be emitted.
+    #[test]
+    fn every_generated_config_key_has_a_reader() {
+        let accessor = format!("control_{}_", "opt");
+        let sources = collapsed_sources();
+        let mut orphans = Vec::new();
+        for c in CONTROLS {
+            for (key, _) in c.default_options {
+                // The id may be a literal or a module `CONTROL` const, so match on
+                // the key argument and require an accessor call immediately
+                // before it: `control_opt_str(CONTROL, "catalog")`,
+                // `control_opt_bool("secrets", "gitleaks")`.
+                let needle = format!("\"{key}\")");
+                let read = sources.iter().any(|(file, text)| {
+                    file != "controls.rs"
+                        && text.match_indices(&needle).any(|(i, _)| {
+                            let window = &text[i.saturating_sub(80)..i];
+                            window.contains(&accessor)
+                        })
+                });
+                if !read {
+                    orphans.push(format!("[controls.{}] {key}", c.id));
+                }
+            }
+        }
+        assert!(
+            orphans.is_empty(),
+            "these keys are written into every generated config and read by nothing — \
+             wire them to behaviour or stop emitting them: {}",
+            orphans.join(", ")
         );
     }
 

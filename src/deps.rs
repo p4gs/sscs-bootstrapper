@@ -731,14 +731,58 @@ pub fn load_approved(ctx: &Ctx) -> Result<BTreeSet<String>> {
 
 /// Reasons a package should not be blindly approved. Empty ⇒ safe to approve.
 ///
+/// Which of the two package-trust checks are switched on.
+///
+/// Both keys are emitted into `.sscsb/config.toml` by `sscsb init`, and until
+/// now neither did anything: `typosquat_check` had no reader at all, and
+/// `registry_check` only decided whether `sscsb verify` printed a sentence about
+/// itself — `sscsb deps check` performed the network lookup either way. A config
+/// key that changes only the report text is worse than no key, because it reads
+/// as a control the user has set.
+///
+/// Both default to on, which is what the registry declares and what every
+/// generated config already carries. Turning one off is a real escape hatch:
+/// `typosquat_check = false` for a project whose dependency is legitimately one
+/// edit from a popular name, `registry_check = false` for private or air-gapped
+/// registries where a public existence lookup answers the wrong question. To
+/// switch off both, disable the control.
+#[derive(Debug, Clone, Copy)]
+pub struct TrustChecks {
+    pub registry: bool,
+    pub typosquat: bool,
+}
+
+impl TrustChecks {
+    /// Each key is read by its own literal call rather than through a shared
+    /// closure, so a source scan can see that the key has a reader and that the
+    /// fallback matches the registry. A loop over key names reads the config
+    /// correctly and is invisible to both checks.
+    pub fn from_config(cfg: Option<&Config>) -> Self {
+        TrustChecks {
+            registry: cfg
+                .and_then(|c| c.control_opt_bool("package-trust", "registry_check"))
+                .unwrap_or(true),
+            typosquat: cfg
+                .and_then(|c| c.control_opt_bool("package-trust", "typosquat_check"))
+                .unwrap_or(true),
+        }
+    }
+}
+
+impl Default for TrustChecks {
+    fn default() -> Self {
+        TrustChecks::from_config(None)
+    }
+}
+
 /// This is the check that makes the anti-slopsquat machinery ENFORCING instead
 /// of advisory: `approve` and `baseline` run it before writing to the baseline,
 /// so a typosquat or a hallucinated (registry-absent) name cannot be blessed
 /// without a human seeing the warning and overriding on purpose.
-pub fn approval_warnings(qualified: &str, offline: bool) -> Vec<String> {
+pub fn approval_warnings(qualified: &str, checks: TrustChecks, offline: bool) -> Vec<String> {
     // A hand-typed `sscsb deps approve <pkg>` names a package to resolve from
     // the registry; that is exactly the Registry case.
-    approval_warnings_for(qualified, &DepSource::Registry, offline)
+    approval_warnings_for(qualified, &DepSource::Registry, checks, offline)
 }
 
 /// [`approval_warnings`] for a dependency whose declared source is known.
@@ -749,7 +793,21 @@ pub fn approval_warnings(qualified: &str, offline: bool) -> Vec<String> {
 /// gets neither, because a public package sharing its name is an unrelated
 /// package; those sources are flagged on their own terms by
 /// [`new_unapproved_deps`], which does not care about the baseline at all.
-pub fn approval_warnings_for(qualified: &str, source: &DepSource, offline: bool) -> Vec<String> {
+///
+/// TWO INDEPENDENT GATES, AND THE ORDER IS LOAD-BEARING. `is_registry_resolvable`
+/// asks *is this question meaningful*; [`TrustChecks`] asks *do we want to ask
+/// it*. The first is correctness and is deliberately NOT switchable from config:
+/// setting `registry_check = true` must never resurrect the name/source
+/// confusion — reporting an unrelated public package as this dependency's
+/// verdict — that the source guard exists to prevent. So the source guard runs
+/// first and unconditionally, and the config keys then decide which of the
+/// remaining, meaningful checks actually run.
+pub fn approval_warnings_for(
+    qualified: &str,
+    source: &DepSource,
+    checks: TrustChecks,
+    offline: bool,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     let Some((label, name)) = qualified.split_once(':') else {
         return warnings;
@@ -757,16 +815,21 @@ pub fn approval_warnings_for(qualified: &str, source: &DepSource, offline: bool)
     let Some(eco) = Ecosystem::from_label(label) else {
         return warnings;
     };
+    // Correctness first, and unconditionally: a name that does not resolve the
+    // code answers neither question.
     if !source.is_registry_resolvable() {
         return warnings;
     }
-    if let Some(shadowed) = typosquat_suspect(eco, name) {
-        warnings.push(format!(
-            "`{qualified}` is one edit from popular package `{shadowed}` — possible \
-             typosquat/slopsquat"
-        ));
+    // Then policy: which of the meaningful checks the user asked for.
+    if checks.typosquat {
+        if let Some(shadowed) = typosquat_suspect(eco, name) {
+            warnings.push(format!(
+                "`{qualified}` is one edit from popular package `{shadowed}` — possible \
+                 typosquat/slopsquat"
+            ));
+        }
     }
-    if !offline {
+    if checks.registry && !offline {
         match registry_exists(eco, name) {
             RegistryStatus::NotFound => warnings.push(format!(
                 "`{qualified}` was NOT FOUND on its public registry — likely a hallucinated \
@@ -1292,13 +1355,32 @@ pub fn verify_package_trust(ctx: &Ctx, cfg: &Config) -> VerifyResult {
         );
         Outcome::Degraded
     };
-    if cfg
-        .control_opt_bool("package-trust", "registry_check")
-        .unwrap_or(true)
-    {
-        messages
-            .push("registry existence validation on `sscsb deps check` (anti-slopsquat)".into());
-    }
+    // Report what the two toggles actually DO now, including when they are off —
+    // a check the user switched off must be visible in the posture, not silently
+    // absent from it.
+    let checks = TrustChecks::from_config(Some(cfg));
+    messages.push(if checks.registry {
+        "registry existence validation ON for `sscsb deps check` and approvals (anti-slopsquat)"
+            .into()
+    } else {
+        "registry existence validation OFF (registry_check = false) — hallucinated package \
+         names will not be caught"
+            .to_string()
+    });
+    messages.push(if checks.typosquat {
+        "typosquat proximity heuristic ON for `sscsb deps check` and approvals".into()
+    } else {
+        "typosquat proximity heuristic OFF (typosquat_check = false) — names one edit from a \
+         popular package will not be flagged"
+            .to_string()
+    });
+    let outcome = if checks.registry && checks.typosquat {
+        outcome
+    } else {
+        // Not a failure: the user asked for this. But a control running with half
+        // its checks off must not report the same PASS as one running whole.
+        outcome.weakest(Outcome::Info)
+    };
     VerifyResult::new("package-trust", outcome.weakest(hooks.outcome), messages)
 }
 
@@ -1334,9 +1416,36 @@ pub fn verify_socket_control(ctx: &Ctx) -> VerifyResult {
 /// registry" on nothing but a name collision with an unrelated public crate,
 /// and a sibling-repo path dep (`../grc-controls/…`, an ordinary multi-repo
 /// layout) reported as a likely slopsquatting target at exit 1.
-pub fn deps_check(ctx: &Ctx, offline: bool) -> Result<(Vec<String>, Vec<String>)> {
+///
+/// [`TrustChecks`] then decides which of the MEANINGFUL checks run. The two
+/// gates are independent and the source gate is never the configurable one: see
+/// [`approval_warnings_for`] for why turning `registry_check` on must not be
+/// able to bring the name/source confusion back.
+pub fn deps_check(
+    ctx: &Ctx,
+    checks: TrustChecks,
+    offline: bool,
+) -> Result<(Vec<String>, Vec<String>)> {
     let mut problems = Vec::new();
     let mut notes = Vec::new();
+    // Same principle as the per-dependency note below, applied to config: a
+    // check that did not run has to say so, or "checked and found nothing" and
+    // "never checked" are the same silence. Once per run — this is a fact about
+    // the configuration, not about any one dependency.
+    if !checks.typosquat {
+        notes.push(
+            "typosquat proximity heuristic not run (typosquat_check = false in \
+             [controls.package-trust])"
+                .to_string(),
+        );
+    }
+    if !checks.registry {
+        notes.push(
+            "public-registry existence not checked (registry_check = false in \
+             [controls.package-trust])"
+                .to_string(),
+        );
+    }
     let new_deps = new_unapproved_deps(ctx)?;
     let targets: Vec<(String, Option<DepSource>)> = if new_deps.is_empty() {
         current_dep_specs(ctx)?
@@ -1366,6 +1475,10 @@ pub fn deps_check(ctx: &Ctx, offline: bool) -> Result<(Vec<String>, Vec<String>)
         // on; the commit gate flags these on their own terms (a non-registry
         // source needs review whatever the baseline says), so staying silent
         // here loses no coverage — it only stops inventing a verdict.
+        //
+        // This runs before, and independently of, the config gates below: it is
+        // not a check the user elected to run, it is the reason the checks below
+        // would be meaningless. No `TrustChecks` value can re-enable it.
         if let Some(source) = source.as_ref().filter(|s| !s.is_registry_resolvable()) {
             if let Some(desc) = source.describe() {
                 notes.push(format!(
@@ -1375,13 +1488,15 @@ pub fn deps_check(ctx: &Ctx, offline: bool) -> Result<(Vec<String>, Vec<String>)
             }
             continue;
         }
-        if let Some(shadowed) = typosquat_suspect(eco, name) {
-            problems.push(format!(
-                "{qualified}: name is one edit away from popular package `{shadowed}` — \
-                 possible typosquat/slopsquat; verify intent before approving"
-            ));
+        if checks.typosquat {
+            if let Some(shadowed) = typosquat_suspect(eco, name) {
+                problems.push(format!(
+                    "{qualified}: name is one edit away from popular package `{shadowed}` — \
+                     possible typosquat/slopsquat; verify intent before approving"
+                ));
+            }
         }
-        if !offline {
+        if checks.registry && !offline {
             match registry_exists(eco, name) {
                 RegistryStatus::Exists => notes.push(format!("{qualified}: exists on registry")),
                 RegistryStatus::NotFound => problems.push(format!(
@@ -1577,13 +1692,15 @@ mod tests {
 
     #[test]
     fn approval_warnings_flags_typosquat_offline_and_nothing_for_clean() {
-        assert!(approval_warnings("cargo:tokoi", true)
-            .iter()
-            .any(|w| w.contains("tokio")));
-        assert!(approval_warnings("cargo:serde", true).is_empty());
+        assert!(
+            approval_warnings("cargo:tokoi", TrustChecks::default(), true)
+                .iter()
+                .any(|w| w.contains("tokio"))
+        );
+        assert!(approval_warnings("cargo:serde", TrustChecks::default(), true).is_empty());
         // Unknown ecosystem or malformed input is simply not flagged.
-        assert!(approval_warnings("bogus:x", true).is_empty());
-        assert!(approval_warnings("no-colon", true).is_empty());
+        assert!(approval_warnings("bogus:x", TrustChecks::default(), true).is_empty());
+        assert!(approval_warnings("no-colon", TrustChecks::default(), true).is_empty());
     }
 
     #[test]
@@ -1987,11 +2104,117 @@ mod tests {
         assert_eq!(typosquat_suspect(Ecosystem::RubyGems, "rails"), None);
     }
 
+    // ── M21: two config keys that used to do nothing ──
+
+    fn checks_from_toml(body: &str) -> TrustChecks {
+        let dir = tempfile::tempdir().unwrap();
+        let sscsb = dir.path().join(".sscsb");
+        std::fs::create_dir_all(&sscsb).unwrap();
+        std::fs::write(sscsb.join("config.toml"), body).unwrap();
+        let cfg = Config::load(dir.path()).unwrap().unwrap();
+        TrustChecks::from_config(Some(&cfg))
+    }
+
+    #[test]
+    fn typosquat_check_false_actually_switches_the_heuristic_off() {
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\ntokoi = \"1\"\n");
+
+        let on = checks_from_toml("[controls.package-trust]\ntyposquat_check = true\n");
+        let (problems, _) = deps_check(&ctx, on, true).unwrap();
+        assert!(
+            problems.iter().any(|p| p.contains("typosquat")),
+            "sanity: the heuristic fires when on: {problems:?}"
+        );
+
+        let off = checks_from_toml("[controls.package-trust]\ntyposquat_check = false\n");
+        let (problems, _) = deps_check(&ctx, off, true).unwrap();
+        assert!(
+            !problems.iter().any(|p| p.contains("typosquat")),
+            "the key was written into every config and did nothing: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn typosquat_check_false_also_reaches_approval_time() {
+        let off = checks_from_toml("[controls.package-trust]\ntyposquat_check = false\n");
+        assert!(
+            approval_warnings("cargo:tokoi", off, true).is_empty(),
+            "a toggle that only covers `deps check` leaves the approval path \
+             contradicting the config"
+        );
+        assert!(
+            !approval_warnings("cargo:tokoi", TrustChecks::default(), true).is_empty(),
+            "sanity: on by default"
+        );
+    }
+
+    /// `registry_check` had a reader, but it only decided whether `sscsb verify`
+    /// printed a sentence — `deps check` performed the lookup either way.
+    ///
+    /// Note `offline = false`: the network is deliberately NOT the thing being
+    /// tested. Post-fix no lookup is attempted at all, so every arm of
+    /// `registry_exists` — Exists, NotFound, Unknown — is unreachable and the
+    /// test is connectivity-independent; pre-fix, one of those three strings was
+    /// always pushed. The assertion names those result strings rather than the
+    /// word "registry", because the run now also carries an explanatory note
+    /// saying the check did not run, and suppressing THAT would put us back to
+    /// silence the user cannot interpret.
+    #[test]
+    fn registry_check_false_suppresses_the_lookup_not_just_the_sentence() {
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\nserde = \"1\"\n");
+        let off = checks_from_toml("[controls.package-trust]\nregistry_check = false\n");
+        let (problems, notes) = deps_check(&ctx, off, false).unwrap();
+        for verdict in ["exists on registry", "registry check inconclusive"] {
+            assert!(
+                !notes.iter().any(|n| n.contains(verdict)),
+                "registry_check = false must stop the check, not just stop describing it \
+                 (found `{verdict}`): {notes:?}"
+            );
+        }
+        assert!(
+            !problems.iter().any(|p| p.contains("NOT FOUND")),
+            "no lookup ran, so no lookup verdict may appear: {problems:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("registry_check = false")),
+            "a check that did not run must say so, or the user cannot tell it from \
+             a check that ran and found nothing: {notes:?}"
+        );
+    }
+
+    /// The same honesty requirement for the other key.
+    #[test]
+    fn a_typosquat_check_that_did_not_run_says_so() {
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\ntokoi = \"1\"\n");
+        let off = checks_from_toml("[controls.package-trust]\ntyposquat_check = false\n");
+        let (problems, notes) = deps_check(&ctx, off, true).unwrap();
+        assert!(
+            !problems.iter().any(|p| p.contains("typosquat")),
+            "{problems:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("typosquat_check = false")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_control_running_with_half_its_checks_off_does_not_report_a_whole_pass() {
+        assert!(TrustChecks::default().registry && TrustChecks::default().typosquat);
+        let off = checks_from_toml(
+            "[controls.package-trust]\nregistry_check = false\ntyposquat_check = true\n",
+        );
+        assert!(!off.registry && off.typosquat);
+    }
+
     #[test]
     fn deps_check_offline_flags_typosquats_and_never_touches_the_network() {
         let (_d, ctx) = repo_ctx();
         write_file(&ctx, "Cargo.toml", "[dependencies]\ntokoi = \"1\"\n");
-        let (problems, notes) = deps_check(&ctx, true).unwrap();
+        let (problems, notes) = deps_check(&ctx, TrustChecks::default(), true).unwrap();
         assert!(
             problems
                 .iter()
@@ -2022,7 +2245,7 @@ mod tests {
             "[dependencies]\nserde = \"1\"\ntokoi = \"1\"\n",
         );
         stage(&ctx, "Cargo.toml");
-        let (problems, notes) = deps_check(&ctx, true).unwrap();
+        let (problems, notes) = deps_check(&ctx, TrustChecks::default(), true).unwrap();
         assert!(notes
             .iter()
             .any(|n| n.contains("checking 1 staged new package")));
@@ -2035,7 +2258,7 @@ mod tests {
     fn deps_check_online_leaves_a_registry_note_for_every_target_regardless_of_connectivity() {
         let (_d, ctx) = repo_ctx();
         write_file(&ctx, "Cargo.toml", "[dependencies]\nserde = \"1\"\n");
-        let (problems, notes) = deps_check(&ctx, false).unwrap();
+        let (problems, notes) = deps_check(&ctx, TrustChecks::default(), false).unwrap();
         assert!(!problems.iter().any(|p| p.contains("typosquat")));
         assert!(
             !notes.is_empty(),
@@ -2444,7 +2667,11 @@ mod tests {
              serde = { path = \"vendor/serde\" }\n\
              sibling-crate = { path = \"../outside/sibling-crate\" }\n",
         );
-        let (problems, notes) = deps_check(&ctx, false).unwrap();
+        // `TrustChecks::default()` is BOTH checks fully ON — the strongest form
+        // of this assertion after M21 landed. The source guard must hold even
+        // when the config is asking for every check there is; it is not one of
+        // the things config can switch off.
+        let (problems, notes) = deps_check(&ctx, TrustChecks::default(), false).unwrap();
 
         assert!(
             !notes.iter().any(|n| n.contains("exists on registry")),

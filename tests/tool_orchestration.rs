@@ -379,6 +379,69 @@ fn download(url: &str, dest: &Path) -> bool {
 
 // ───────────────────────── package trust (network) ──────────────────────────
 
+/// The commit gate is the third place the typosquat heuristic runs, and the only
+/// one that blocks. This drives the REAL binary end to end — config file on disk
+/// through `sscsb hook commit-msg` to the message on stderr — because the
+/// in-process tests construct `TrustChecks` directly and therefore cannot prove
+/// the hook consults the config at all.
+///
+/// Both halves matter: the annotation must disappear when the key is off, and
+/// the dependency must still be blocked, because suppressing a NOTE must never
+/// suppress the GATE.
+#[test]
+fn typosquat_check_false_reaches_the_commit_gate_through_the_real_binary() {
+    let dir = rust_repo();
+    let repo = dir.path();
+    let msg = repo.join("COMMIT_EDITMSG");
+    std::fs::write(&msg, "chore: add a dependency\n").unwrap();
+    // A registry-sourced name one edit from `tokio`: the heuristic's own case.
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n         [dependencies]\nitoa = \"1.0.11\"\ntokoi = \"1\"\n",
+    )
+    .unwrap();
+    git_ok(repo, &["add", "Cargo.toml"]);
+
+    let cfg_path = repo.join(".sscsb").join("config.toml");
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(
+        cfg.contains("typosquat_check = true"),
+        "the generated config is expected to carry the key"
+    );
+
+    // On (as generated): the gate blocks AND names the shadowed package.
+    let on = sscsb(repo)
+        .args(["hook", "commit-msg", msg.to_str().unwrap()])
+        .assert()
+        .failure();
+    let on_err = String::from_utf8_lossy(&on.get_output().stderr).to_string();
+    assert!(
+        on_err.contains("one edit from popular package") && on_err.contains("tokio"),
+        "sanity: the enforcing gate names a registry-sourced typosquat: {on_err}"
+    );
+
+    // Off: same commit, same dependency — annotation gone, gate still closed.
+    std::fs::write(
+        &cfg_path,
+        cfg.replace("typosquat_check = true", "typosquat_check = false"),
+    )
+    .unwrap();
+    let off = sscsb(repo)
+        .args(["hook", "commit-msg", msg.to_str().unwrap()])
+        .assert()
+        .failure();
+    let off_err = String::from_utf8_lossy(&off.get_output().stderr).to_string();
+    assert!(
+        !off_err.contains("one edit from popular package"),
+        "typosquat_check = false must reach the gate that actually blocks, or the \
+         config contradicts itself where it matters most: {off_err}"
+    );
+    assert!(
+        off_err.contains("not in the approved baseline"),
+        "suppressing the annotation must NOT unblock the dependency: {off_err}"
+    );
+}
+
 #[test]
 fn deps_check_flags_nonexistent_and_typosquat_packages() {
     let dir = rust_repo();
