@@ -557,6 +557,13 @@ pub fn verify_github_app_commits(
         .or_else(|| ctx.origin_slug())
         .context("no GitHub repo configured (general.github_repo) and no origin remote")?;
 
+    // `range` is deliberately NOT `--end-of-options`-guarded, unlike the
+    // receipt path in provenance.rs. Its contract is "extra `git log`
+    // selection arguments", and callers legitimately pass options (`-n1`), so
+    // the guard would break the documented use. The C1 argument-injection class
+    // does not apply: this value comes from the operator's own command line, so
+    // an option-shaped range is self-inflicted by someone who already has a
+    // shell — unlike a receipt, which is a file handed to you by someone else.
     let mut log_args = vec!["log", "--format=%H"];
     match range {
         Some(r) => log_args.push(r),

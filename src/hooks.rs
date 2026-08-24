@@ -798,6 +798,20 @@ fn commits_in_range(ctx: &Ctx, u: &RefUpdate) -> Result<Vec<String>> {
     // verified. A cap would leave commits beyond it unverified for signing —
     // an unsigned commit deep in a large push could reach the branch. Large
     // pushes are rare; correctness wins over the walk time.
+    // These shas arrive on pre-push stdin. `git rev-list` inherits git's diff
+    // options — `--output=<file>` included — so an option-shaped sha would
+    // write a file instead of listing commits, and this gate would then see an
+    // EMPTY commit list and wave the push through. Fail closed on anything that
+    // is not a bare object name.
+    //
+    // `--end-of-options` is not usable here: `--not --remotes` must follow the
+    // revision, and `--end-of-options` would swallow them.
+    for sha in [&u.local_sha, &u.remote_sha] {
+        anyhow::ensure!(
+            sha.starts_with(ZERO_SHA_PREFIX) || exec::is_object_name(sha),
+            "refusing to run git with {sha:?}, which is not a git object name"
+        );
+    }
     let range_out = if u.remote_sha.starts_with(ZERO_SHA_PREFIX) {
         // New remote branch: verify commits not already on any remote ref.
         exec::git(&["rev-list", &u.local_sha, "--not", "--remotes"], &ctx.root)?
