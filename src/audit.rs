@@ -53,7 +53,52 @@ pub const RISKY_ACTION_SUBSTITUTIONS: &[(&str, &str)] = &[
 /// The one sanctioned non-SHA pin: slsa-github-generator MUST be referenced by
 /// semver tag for slsa-verifier to validate the trusted builder ref
 /// (upstream README, slsa-verifier issue #12).
-const TAG_PIN_EXCEPTION_PREFIX: &str = "slsa-framework/slsa-github-generator";
+const TAG_PIN_EXCEPTION_REPO: &str = "slsa-framework/slsa-github-generator";
+
+/// Does this action path belong to the one repository the tag-pin exception
+/// names?
+///
+/// A `starts_with` prefix test does not answer that question: it also matches
+/// `slsa-framework/slsa-github-generator-anything`, a DIFFERENT repository
+/// under the same owner, which would have inherited a licence to use mutable
+/// refs from a rule written for exactly one builder. The exception ends at the
+/// repository boundary — the path is either the repo itself or a `/`-separated
+/// path inside it.
+fn is_tag_pin_exception(action: &str) -> bool {
+    action == TAG_PIN_EXCEPTION_REPO
+        || action
+            .strip_prefix(TAG_PIN_EXCEPTION_REPO)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Does this `uses:` reference an actions/checkout-shaped action?
+///
+/// The credential-persistence hazard belongs to the BEHAVIOUR, not to the
+/// `actions` org: a fork (`myorg/checkout`) or a re-publish
+/// (`myorg/checkout-action`, `myorg/action-checkout`) leaves the same
+/// GITHUB_TOKEN in `.git/config` for every later step to read. Matching the
+/// literal string `actions/checkout@` asked the question of one publisher and
+/// silently exempted all the others.
+///
+/// Deliberately narrow: the repository name, minus a conventional
+/// `action-`/`-action` decoration, must BE `checkout`. An action whose name
+/// merely contains the word is not one.
+fn is_checkout_action(uses: &str) -> bool {
+    let action = uses.split('@').next().unwrap_or(uses);
+    let Some(repo) = action.split('/').nth(1) else {
+        return false;
+    };
+    let lower = repo.to_ascii_lowercase();
+    let stem = lower.strip_prefix("action-").unwrap_or(&lower);
+    let stem = stem.strip_suffix("-action").unwrap_or(stem);
+    stem == "checkout"
+}
+
+/// A YAML document that holds nothing — what a trailing `---` separator
+/// produces. It is not a second workflow and owes no findings.
+fn is_blank_doc(doc: &Yaml) -> bool {
+    matches!(doc, Yaml::Null | Yaml::BadValue)
+}
 
 fn is_full_sha(s: &str) -> bool {
     s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
@@ -70,29 +115,64 @@ fn is_semver_tag(s: &str) -> bool {
             .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
-/// Audit one workflow document.
+/// Prefix each finding raised by one document of a multi-document file with
+/// which document it came from — otherwise the operator gets a finding they
+/// cannot locate in the file.
+fn locate(findings: &mut [Finding], index: usize, total: usize) {
+    if total < 2 {
+        return;
+    }
+    for f in findings.iter_mut() {
+        f.message = format!("document {}: {}", index + 1, f.message);
+    }
+}
+
+/// Audit one workflow file — EVERY YAML document in it.
+///
+/// A `---` separator used to end the audit: only `docs.first()` was ever
+/// examined, so any jobs, actions or permissions living below the separator
+/// were reported as clean without being looked at. Whether GitHub itself runs
+/// a second document is beside the point — sscsb must not call a file clean on
+/// the strength of the half it read.
 pub fn audit_workflow(file: &str, content: &str, extended: bool) -> Result<Vec<Finding>> {
     let docs =
         YamlLoader::load_from_str(content).with_context(|| format!("parsing YAML in {file}"))?;
-    let Some(doc) = docs.first() else {
+    let live: Vec<&Yaml> = docs.iter().filter(|d| !is_blank_doc(d)).collect();
+    if live.is_empty() {
         return Ok(vec![Finding::new(
             Severity::Warn,
             file,
             "empty workflow file".into(),
         )]);
-    };
+    }
     let mut findings = Vec::new();
+    if live.len() > 1 {
+        findings.push(Finding::new(
+            Severity::Warn,
+            file,
+            format!(
+                "file holds {} YAML documents — a GitHub Actions workflow file is a single \
+                 document, so at least one of these is not the workflow anyone thinks is \
+                 running; all of them were audited rather than assumed inert",
+                live.len()
+            ),
+        ));
+    }
+    for (i, doc) in live.iter().enumerate() {
+        let mut of_doc = Vec::new();
+        audit_permissions(file, doc, &mut of_doc);
+        audit_uses_refs(file, doc, &mut of_doc);
 
-    audit_permissions(file, doc, &mut findings);
-    audit_uses_refs(file, doc, &mut findings);
-
-    if extended {
-        audit_pull_request_target(file, doc, content, &mut findings);
-        audit_checkout_credentials(file, doc, &mut findings);
-        audit_secret_exposure(file, doc, &mut findings);
-        audit_risky_actions(file, doc, &mut findings);
-        audit_lockfile_exact(file, doc, &mut findings);
-        audit_harden_runner(file, doc, &mut findings);
+        if extended {
+            audit_pull_request_target(file, doc, content, &mut of_doc);
+            audit_checkout_credentials(file, doc, &mut of_doc);
+            audit_secret_exposure(file, doc, &mut of_doc);
+            audit_risky_actions(file, doc, &mut of_doc);
+            audit_lockfile_exact(file, doc, &mut of_doc);
+            audit_harden_runner(file, doc, &mut of_doc);
+        }
+        locate(&mut of_doc, i, live.len());
+        findings.extend(of_doc);
     }
     Ok(findings)
 }
@@ -157,7 +237,7 @@ fn check_uses_ref(file: &str, uses: &str, findings: &mut Vec<Finding>) {
     if is_full_sha(r) {
         return;
     }
-    if action.starts_with(TAG_PIN_EXCEPTION_PREFIX) && is_semver_tag(r) {
+    if is_tag_pin_exception(action) && is_semver_tag(r) {
         findings.push(Finding::new(
             Severity::Info,
             file,
@@ -195,16 +275,23 @@ fn composite_action_uses(doc: &Yaml) -> Vec<String> {
 pub fn audit_action_file(file: &str, content: &str) -> Result<Vec<Finding>> {
     let docs =
         YamlLoader::load_from_str(content).with_context(|| format!("parsing YAML in {file}"))?;
-    let Some(doc) = docs.first() else {
+    let live: Vec<&Yaml> = docs.iter().filter(|d| !is_blank_doc(d)).collect();
+    if live.is_empty() {
         return Ok(vec![Finding::new(
             Severity::Warn,
             file,
             "empty action file".into(),
         )]);
-    };
+    }
     let mut findings = Vec::new();
-    for uses in composite_action_uses(doc) {
-        check_uses_ref(file, &uses, &mut findings);
+    // Same reasoning as `audit_workflow`: a `---` is not the end of the file.
+    for (i, doc) in live.iter().enumerate() {
+        let mut of_doc = Vec::new();
+        for uses in composite_action_uses(doc) {
+            check_uses_ref(file, &uses, &mut of_doc);
+        }
+        locate(&mut of_doc, i, live.len());
+        findings.extend(of_doc);
     }
     Ok(findings)
 }
@@ -285,9 +372,10 @@ fn audit_checkout_credentials(file: &str, doc: &Yaml, findings: &mut Vec<Finding
             let Some(uses) = step["uses"].as_str() else {
                 continue;
             };
-            if !uses.starts_with("actions/checkout@") {
+            if !is_checkout_action(uses) {
                 continue;
             }
+            let action = uses.split('@').next().unwrap_or(uses);
             let persist = &step["with"]["persist-credentials"];
             let disabled = persist.as_bool() == Some(false) || persist.as_str() == Some("false");
             if !disabled {
@@ -295,8 +383,9 @@ fn audit_checkout_credentials(file: &str, doc: &Yaml, findings: &mut Vec<Finding
                     Severity::Warn,
                     file,
                     format!(
-                        "job `{name}`: actions/checkout without `persist-credentials: false` — \
-                         the GITHUB_TOKEN stays on disk for later steps to exfiltrate"
+                        "job `{name}`: `{action}` checks out code without \
+                         `persist-credentials: false` — the GITHUB_TOKEN stays on disk for later \
+                         steps to exfiltrate"
                     ),
                 ));
             }
@@ -1240,6 +1329,133 @@ esac
             .messages
             .iter()
             .any(|x| x.contains("cannot self-approve")));
+    }
+
+    /// M13(a): the tag-pin exception was a `starts_with` PREFIX test, so any
+    /// repository whose path merely begins with the sanctioned one inherited
+    /// permission to use a mutable ref. The exception belongs to exactly one
+    /// repository.
+    #[test]
+    fn tag_pin_exception_does_not_extend_to_lookalike_repositories() {
+        for lookalike in [
+            "slsa-framework/slsa-github-generator-evil/.github/workflows/generator_generic_slsa3.yml",
+            "slsa-framework/slsa-github-generator2",
+        ] {
+            let wf = format!(
+                "on: push\npermissions: {{}}\njobs:\n  p:\n    permissions:\n      \
+                 id-token: write\n    uses: {lookalike}@v2.1.0\n"
+            );
+            let f = audit_workflow("w.yml", &wf, false).unwrap();
+            assert!(
+                f.iter()
+                    .any(|x| x.severity == Severity::Error && x.message.contains("mutable ref")),
+                "`{lookalike}` is a different repository and must not inherit the tag-pin \
+                 exception: {f:?}"
+            );
+        }
+
+        // The genuine repository, and its reusable workflows, keep it.
+        for genuine in [
+            "slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml",
+            "slsa-framework/slsa-github-generator",
+        ] {
+            let wf = format!(
+                "on: push\npermissions: {{}}\njobs:\n  p:\n    permissions:\n      \
+                 id-token: write\n    uses: {genuine}@v2.1.0\n"
+            );
+            let f = audit_workflow("w.yml", &wf, false).unwrap();
+            assert!(
+                f.iter().all(|x| x.severity != Severity::Error),
+                "the sanctioned exception must survive: {f:?}"
+            );
+            assert!(f.iter().any(|x| x.message.contains("tag-pinned by design")));
+        }
+    }
+
+    /// M13(b): the credential-persistence check matched the literal string
+    /// `actions/checkout@`, so a fork or re-publish of the same action — which
+    /// leaves the same GITHUB_TOKEN on disk — was never asked the question.
+    #[test]
+    fn checkout_credential_check_covers_forks_and_republished_actions() {
+        for fork in [
+            "myorg/checkout",
+            "myorg/checkout-action",
+            "MyOrg/Checkout",
+            "myorg/action-checkout",
+        ] {
+            let wf = format!(
+                "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    \
+                 runs-on: ubuntu-latest\n    steps:\n      \
+                 - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920\n      \
+                 - uses: {fork}@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
+            );
+            let f = audit_workflow("w.yml", &wf, true).unwrap();
+            assert!(
+                f.iter()
+                    .any(|x| x.message.contains("persist-credentials") && x.message.contains(fork)),
+                "`{fork}` checks out code with the same token exposure: {f:?}"
+            );
+        }
+
+        // Setting it still silences the check, whoever publishes the action.
+        let wf = "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    \
+                  runs-on: ubuntu-latest\n    steps:\n      \
+                  - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920\n      \
+                  - uses: myorg/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n        \
+                  with:\n          persist-credentials: false\n";
+        let f = audit_workflow("w.yml", wf, true).unwrap();
+        assert!(f.is_empty(), "no finding is owed here: {f:?}");
+
+        // And an action that merely mentions checkout in a longer name is not
+        // a checkout — this rule must not invent findings.
+        let wf = "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    \
+                  runs-on: ubuntu-latest\n    steps:\n      \
+                  - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920\n      \
+                  - uses: myorg/checkout-secrets-to-disk@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n";
+        let f = audit_workflow("w.yml", wf, true).unwrap();
+        assert!(f.is_empty(), "not a checkout action: {f:?}");
+    }
+
+    /// M13(c): only `docs.first()` was ever audited, so everything after a
+    /// `---` separator was reported as clean without being looked at.
+    #[test]
+    fn every_yaml_document_in_a_workflow_file_is_audited() {
+        let wf = format!("{PINNED_OK}---\non: push\npermissions:\n  contents: read\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n");
+        let f = audit_workflow("w.yml", &wf, false).unwrap();
+        assert!(
+            f.iter().any(|x| x.severity == Severity::Error
+                && x.message.contains("mutable ref")
+                && x.message.contains("document 2")),
+            "the second document must be audited and located: {f:?}"
+        );
+        assert!(
+            f.iter()
+                .any(|x| x.severity == Severity::Warn && x.message.contains("2 YAML documents")),
+            "the reader must be told the file is multi-document: {f:?}"
+        );
+
+        // A trailing separator is an empty document, not a hidden workflow.
+        let f = audit_workflow("w.yml", &format!("{PINNED_OK}---\n"), true).unwrap();
+        assert!(f.is_empty(), "a trailing `---` owes no finding: {f:?}");
+
+        // A file that is nothing BUT a separator declares no workflow at all —
+        // it used to audit an empty document and report the file as clean.
+        let f = audit_workflow("w.yml", "---\n", false).unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].message.contains("empty workflow file"));
+    }
+
+    /// Composite action definitions hide the same way.
+    #[test]
+    fn every_yaml_document_in_a_composite_action_is_audited() {
+        let action = "name: setup\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n---\nname: shadow\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@v4\n";
+        let f = audit_action_file("a.yml", action).unwrap();
+        assert!(
+            f.iter().any(|x| x.severity == Severity::Error
+                && x.message.contains("mutable ref")
+                && x.message.contains("document 2")),
+            "{f:?}"
+        );
     }
 
     #[test]
