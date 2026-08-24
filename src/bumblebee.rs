@@ -12,7 +12,7 @@
 //!
 //! ## Tool contract (established empirically against bumblebee v0.1.2, not from docs)
 //!
-//! Three behaviours drive this implementation and none of them are guessable:
+//! Four behaviours drive this implementation and none of them are guessable:
 //!
 //! 1. **Findings do not change the exit code.** A scan that matches a compromised
 //!    package exits `0`, exactly like a clean one; `2` means the scan itself
@@ -29,6 +29,18 @@
 //!    therefore matches nothing — a gate that always passes. `sscsb` cannot fix
 //!    the matcher, so `count_catalog_entries` refuses to count a wildcard-only
 //!    entry as criteria and the run fails before it can report a false clean.
+//! 4. **What the scan could not read is reported ONLY on stderr, and only there.**
+//!    stdout carries `finding` and `scan_summary` records; `record_type=diagnostic`
+//!    rows go to stderr as NDJSON with a `level`, an optional `path`, and a
+//!    `message`. A config bumblebee cannot parse produces
+//!    `{"level":"warn","path":"…/mcp_config.json","message":"parse MCP config:
+//!    unexpected end of JSON input"}` there — while the run still exits `0` and
+//!    emits a `status:"complete"` summary. Reading stdout alone therefore turns a
+//!    dropped subject into silence inside a PASS, so `parse_diagnostics` reads
+//!    stderr on every run, not just failed ones. Fatal errors arrive on the same
+//!    stream as bare non-JSON text (`unsupported exposure catalog
+//!    schema_version …`), so the parser keeps unrecognised lines rather than
+//!    dropping them.
 //!
 //! ## Three ways a bumblebee run can be empty, none of which mean "clean"
 //!
@@ -148,6 +160,102 @@ fn str_field(v: &serde_json::Value, key: &str) -> String {
         .and_then(|x| x.as_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+/// A `record_type=diagnostic` row. bumblebee writes these to **stderr**, one
+/// NDJSON object per line, and they are the only place it says what it could
+/// NOT read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub level: String,
+    /// The file the diagnostic is about, when it names one.
+    pub path: Option<String>,
+    pub message: String,
+}
+
+impl Diagnostic {
+    /// Does this diagnostic report something the scan could not do?
+    ///
+    /// `info` is bookkeeping — "default roots: 19 present, 85 candidate paths
+    /// absent", "scan complete: …", "no MCP servers parsed" — and appears on
+    /// every run. Anything above it is bumblebee reporting that a subject it was
+    /// asked to examine was dropped. Measured on a real v0.1.2 `baseline` run
+    /// over 464,986 files and 19 roots: 3 diagnostics, of which exactly one was
+    /// `warn`, and it named a genuinely malformed file. Non-`info` is rare, and
+    /// when it fires it means something.
+    fn is_problem(&self) -> bool {
+        !matches!(self.level.as_str(), "info" | "debug" | "trace" | "")
+    }
+
+    fn render(&self) -> String {
+        match &self.path {
+            Some(p) => format!("{}: {p} — {}", self.level, self.message),
+            None => format!("{}: {}", self.level, self.message),
+        }
+    }
+}
+
+/// What bumblebee said on stderr.
+#[derive(Debug, Default)]
+pub struct Diagnostics {
+    pub entries: Vec<Diagnostic>,
+    /// stderr lines that are not diagnostic records. bumblebee's fatal errors
+    /// arrive this way — a `schema_version` rejection is the bare line
+    /// `unsupported exposure catalog schema_version "0.2.0" (supported: "0.1.0")`
+    /// with no JSON around it — as would a runtime panic. Kept verbatim so the
+    /// tool's own words reach the user rather than our paraphrase of them.
+    pub plain: Vec<String>,
+}
+
+impl Diagnostics {
+    fn problems(&self) -> Vec<&Diagnostic> {
+        self.entries.iter().filter(|d| d.is_problem()).collect()
+    }
+
+    fn informational(&self) -> usize {
+        self.entries.iter().filter(|d| !d.is_problem()).count()
+    }
+}
+
+/// Parse bumblebee's stderr stream.
+///
+/// Exists because the exit code and the stdout record stream together do not
+/// carry everything the tool established: a config it could not parse is
+/// reported ONLY here, at `warn`, and the run still exits 0 with a well-formed
+/// `complete` summary. Reading stdout alone therefore turns "I could not read
+/// this MCP config" into silence inside a PASS.
+///
+/// Tolerant by construction: a line that is not a diagnostic record — valid JSON
+/// or not — is kept as `plain` rather than dropped, because the one thing this
+/// function must never do is lose output.
+pub fn parse_diagnostics(stderr: &str) -> Diagnostics {
+    let mut out = Diagnostics::default();
+    for line in stderr.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .filter(|v| v.get("record_type").and_then(|x| x.as_str()) == Some("diagnostic"));
+        match record {
+            Some(v) => out.entries.push(Diagnostic {
+                level: v
+                    .get("level")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                path: v.get("path").and_then(|x| x.as_str()).map(str::to_string),
+                message: v
+                    .get("message")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("(no message)")
+                    .to_string(),
+            }),
+            None => out.plain.push(line.to_string()),
+        }
+    }
+    out
 }
 
 /// How many exposure entries does this catalog path actually resolve to?
@@ -505,6 +613,19 @@ fn evaluate_scan(
         );
     }
 
+    let mut result = evaluate_records(version, prof, catalog, coerced, out);
+    apply_diagnostics(&mut result, &parse_diagnostics(&out.stderr));
+    result
+}
+
+/// The stdout half of the verdict: everything decidable from the record stream.
+fn evaluate_records(
+    version: &str,
+    prof: &str,
+    catalog: &str,
+    coerced: Option<&str>,
+    out: &exec::CmdOutput,
+) -> VerifyResult {
     let records = parse_records(&out.stdout);
 
     // A run that did not finish did not establish anything. Empty findings from a
@@ -593,6 +714,68 @@ fn evaluate_scan(
         messages.push(format!("… and {} more", records.exposures.len() - 20));
     }
     VerifyResult::new(CONTROL, Outcome::Fail, messages)
+}
+
+/// How many problem diagnostics are spelled out before the rest are counted.
+const DIAGNOSTIC_LIMIT: usize = 10;
+
+/// Fold what bumblebee said on stderr into the verdict the record stream
+/// produced.
+///
+/// The stderr stream was previously read only when the exit code was non-zero,
+/// which discarded it on every successful run — and a successful run is exactly
+/// where it matters, because a subject bumblebee could not read is reported
+/// there at `warn` while the run still exits 0 and emits a `complete` summary.
+/// Observed on a real machine: a malformed MCP config was dropped from the scan
+/// and the control reported PASS.
+///
+/// A dropped subject weakens a clean verdict rather than invalidating it — the
+/// artifacts that WERE read were genuinely matched — so a would-be `Pass`
+/// becomes `Degraded`, the same rung `package-trust` uses when its approved
+/// baseline cannot be read. `--strict` catches it; a plain `verify` reports it
+/// without failing the build. Outcomes that are already weaker are left alone:
+/// `weakest` never promotes.
+fn apply_diagnostics(result: &mut VerifyResult, diags: &Diagnostics) {
+    let problems = diags.problems();
+    if !problems.is_empty() {
+        result.messages.push(format!(
+            "bumblebee could not read {} subject(s) it was asked to examine — those artifacts \
+             were NOT matched against the catalog",
+            problems.len()
+        ));
+        for d in problems.iter().take(DIAGNOSTIC_LIMIT) {
+            result.messages.push(d.render());
+        }
+        if problems.len() > DIAGNOSTIC_LIMIT {
+            result.messages.push(format!(
+                "… and {} more diagnostic(s)",
+                problems.len() - DIAGNOSTIC_LIMIT
+            ));
+        }
+        result.outcome = result.outcome.clone().weakest(Outcome::Degraded);
+    }
+    // Routine per-run bookkeeping ("default roots: 19 present…", "scan complete:
+    // …"). Counted rather than reprinted: the point is that the user knows the
+    // stream exists and is not being hidden, not that four lines of provenance
+    // are pasted into every report.
+    let informational = diags.informational();
+    if informational > 0 {
+        result.messages.push(format!(
+            "note: {informational} informational diagnostic(s) from the scan"
+        ));
+    }
+    // Anything bumblebee wrote that was not a diagnostic record. On a successful
+    // run this should be empty; if it is not, it is the tool saying something we
+    // have no schema for, and dropping it is how the schema stays unknown.
+    for line in diags.plain.iter().take(3) {
+        result.messages.push(format!("stderr: {line}"));
+    }
+    if diags.plain.len() > 3 {
+        result.messages.push(format!(
+            "… and {} more stderr line(s)",
+            diags.plain.len() - 3
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -826,6 +1009,151 @@ mod tests {
             r.messages[0].contains("148"),
             "a pass must say how much it looked at: {:?}",
             r.messages
+        );
+    }
+
+    // ── M19: stderr diagnostics, which a successful run is the ONLY place for ──
+
+    /// Captured verbatim from a real v0.1.2 `baseline` run. bumblebee reached
+    /// this MCP config, could not parse it, dropped it from the inventory, and
+    /// still exited 0 with a `status:"complete"` summary.
+    const WARN_DIAG: &str = r#"{"record_type":"diagnostic","run_id":"08dd","time":"2026-08-24T20:43:03.635305Z","level":"warn","path":"/Users/p4gs/.gemini/config/mcp_config.json","message":"parse MCP config: unexpected end of JSON input"}"#;
+    /// Routine bookkeeping from the same run.
+    const INFO_DIAG: &str = r#"{"record_type":"diagnostic","run_id":"08dd","level":"info","message":"default roots: 19 present, 85 candidate paths absent (use --root to override)"}"#;
+
+    /// The finding, in one test: bumblebee reports what it could not read ONLY
+    /// on stderr, and the exit code stays 0. Reading stdout alone reported a
+    /// dropped MCP config as a clean endpoint.
+    #[test]
+    fn a_subject_the_scan_could_not_read_is_surfaced_and_weakens_a_clean_verdict() {
+        let r = eval(&summary("complete", false, 148), WARN_DIAG, 0);
+        assert_eq!(
+            r.outcome,
+            Outcome::Degraded,
+            "a scan that dropped a subject has not established that subject is clean: {:?}",
+            r.messages
+        );
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("mcp_config.json") && m.contains("unexpected end of JSON")),
+            "the tool's own diagnostic must survive verbatim: {:?}",
+            r.messages
+        );
+        assert!(
+            r.messages.iter().any(|m| m.contains("could not read 1")),
+            "the count of dropped subjects must be stated: {:?}",
+            r.messages
+        );
+    }
+
+    /// The other half: routine `info` chatter must NOT weaken a clean run, or
+    /// every scan degrades and the signal is worthless.
+    #[test]
+    fn informational_diagnostics_are_counted_without_weakening_a_pass() {
+        let r = eval(&summary("complete", false, 148), INFO_DIAG, 0);
+        assert_eq!(r.outcome, Outcome::Pass);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("1 informational diagnostic")),
+            "the stream must be acknowledged rather than hidden: {:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn diagnostics_are_reported_on_a_findings_fail_too_and_never_promote_it() {
+        let r = eval(
+            &format!("{FINDING}\n{}", summary("complete", false, 148)),
+            &format!("{INFO_DIAG}\n{WARN_DIAG}"),
+            0,
+        );
+        assert_eq!(
+            r.outcome,
+            Outcome::Fail,
+            "Degraded must never promote a Fail"
+        );
+        assert!(
+            r.messages.iter().any(|m| m.contains("mcp_config.json")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// Many dropped subjects are truncated in the listing, but the COUNT stays
+    /// truthful — the same rule the findings list follows.
+    #[test]
+    fn many_diagnostics_are_truncated_but_the_count_is_not() {
+        let stderr = (0..14)
+            .map(|i| {
+                format!(
+                    r#"{{"record_type":"diagnostic","level":"warn","path":"/p/{i}","message":"unreadable"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let r = eval(&summary("complete", false, 148), &stderr, 0);
+        assert_eq!(r.outcome, Outcome::Degraded);
+        assert!(
+            r.messages.iter().any(|m| m.contains("could not read 14")),
+            "{:?}",
+            r.messages
+        );
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("and 4 more diagnostic")),
+            "truncation must be declared: {:?}",
+            r.messages
+        );
+    }
+
+    /// stderr that is not a diagnostic record is still output, and still reaches
+    /// the user. bumblebee's own fatal errors are bare text on this stream.
+    #[test]
+    fn non_record_stderr_lines_are_surfaced_verbatim_rather_than_dropped() {
+        let r = eval(
+            &summary("complete", false, 148),
+            "runtime: out of memory\n",
+            0,
+        );
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("runtime: out of memory")),
+            "unrecognised stderr must not be swallowed: {:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn diagnostics_parse_levels_paths_and_plain_lines_apart() {
+        let d = parse_diagnostics(&format!("{INFO_DIAG}\n{WARN_DIAG}\nnot a record\n\n"));
+        assert_eq!(d.entries.len(), 2);
+        assert_eq!(d.informational(), 1);
+        let problems = d.problems();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].level, "warn");
+        assert_eq!(
+            problems[0].path.as_deref(),
+            Some("/Users/p4gs/.gemini/config/mcp_config.json")
+        );
+        assert_eq!(d.plain, vec!["not a record".to_string()]);
+    }
+
+    /// A diagnostic with no `level` and no `message` must not panic or silently
+    /// vanish — an unknown level is not a safe level.
+    #[test]
+    fn a_diagnostic_missing_its_fields_is_treated_as_a_problem_not_as_noise() {
+        let d = parse_diagnostics(r#"{"record_type":"diagnostic"}"#);
+        assert_eq!(d.entries.len(), 1);
+        assert_eq!(d.entries[0].level, "unknown");
+        assert_eq!(d.entries[0].message, "(no message)");
+        assert_eq!(
+            d.problems().len(),
+            1,
+            "an unrecognised level must not be assumed benign"
         );
     }
 

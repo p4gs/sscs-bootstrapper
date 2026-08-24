@@ -203,7 +203,7 @@ sscsb verify bumblebee
 It reads only static files — no `npm ls`, no `pip show`, no source-file reads — and the
 binary is Go with a zero-dependency `go.mod`.
 
-**Three things worth knowing before you trust the output:**
+**Things worth knowing before you trust the output:**
 
 - **Findings do not change bumblebee's exit code.** A scan that matches a compromised
   package exits `0`, exactly like a clean one. `sscsb` parses the NDJSON record stream
@@ -218,6 +218,12 @@ binary is Go with a zero-dependency `go.mod`.
   `(ecosystem, name, version)`. A catalog written from the README is a gate that never
   fires — so `sscsb` refuses to count a wildcard-only entry as criteria and fails the
   control rather than reporting a clean scan that checked nothing.
+- **What the scan could NOT read is only ever said on stderr.** stdout carries findings
+  and the summary; `record_type=diagnostic` rows go to stderr, and a config bumblebee
+  cannot parse appears there at `warn` while the run still exits `0` with a `complete`
+  summary. `sscsb` reads that stream on every run — not just failed ones — so a clean
+  scan that dropped a subject reports `DEGRADED` naming the file it could not read,
+  rather than `PASS`. `--strict` gates on it.
 - **`profile = "project"` scopes the scan to the repository**, which for most repos means
   none of the MCP / extension / agent-skill roots are reached, and for a Rust repo means
   nothing is inventoried at all. If a scan inventories zero artifacts the control `FAIL`s
