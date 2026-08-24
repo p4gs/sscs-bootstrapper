@@ -1156,6 +1156,28 @@ mod tests {
         );
     }
 
+    /// A non-UTF-8 blob sitting at a `.yml` path in the workflow directory is
+    /// not a workflow sscsb read — so it is unverified, not protected.
+    #[test]
+    fn harden_runner_reports_a_workflow_it_could_not_read_as_text() {
+        let (_d, ctx) = repo();
+        std::fs::write(
+            ctx.root.join(".github/workflows/blob.yml"),
+            [0xff_u8, 0xfe, 0x00, 0x01],
+        )
+        .unwrap();
+        let result = verify_template_control(&ctx, "harden-runner");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.contains("blob.yml") && m.contains("unreadable as text")),
+            "{:?}",
+            result.messages
+        );
+    }
+
     /// A workflow sscsb cannot parse, or one that declares no jobs, proves
     /// nothing about harden-runner — and must not be reported as protected.
     #[test]

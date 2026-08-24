@@ -1677,6 +1677,46 @@ esac
         assert!(f.is_empty(), "not a checkout action: {f:?}");
     }
 
+    /// The checkout matcher reads the REPOSITORY name, so a `uses:` that names
+    /// no repository is not a checkout however it is spelled.
+    #[test]
+    fn the_checkout_matcher_needs_a_repository_not_just_a_word() {
+        let wf = "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    \
+                  runs-on: ubuntu-latest\n    steps:\n      \
+                  - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920\n      \
+                  - uses: checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n";
+        let f = audit_workflow("w.yml", wf, true).unwrap();
+        assert!(
+            f.is_empty(),
+            "a bare `checkout@sha` names no repository to check out from: {f:?}"
+        );
+    }
+
+    /// A job carrying BOTH `uses:` and `steps:` is not a reusable-workflow job
+    /// — and until GitHub rejects it, the steps are what would run. The
+    /// predecessor skipped any job with a `uses:` key outright, so adding one
+    /// line to a job removed it from the harden-runner check entirely.
+    #[test]
+    fn a_job_with_both_uses_and_steps_is_not_exempt_from_harden_runner() {
+        let wf = "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    \
+                  runs-on: ubuntu-latest\n    uses: some/reusable.yml@v1\n    steps:\n      \
+                  - run: curl evil.example\n";
+        let f = audit_workflow("w.yml", wf, true).unwrap();
+        assert!(
+            f.iter()
+                .any(|x| x.message.contains("job `b`") && x.message.contains("harden-runner")),
+            "a `uses:` key must not buy a job with steps an exemption: {f:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_composite_action_file_is_reported_as_empty() {
+        let f = audit_action_file("a.yml", "# nothing but a comment\n").unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].severity, Severity::Warn);
+        assert!(f[0].message.contains("empty action file"));
+    }
+
     /// M13(c): only `docs.first()` was ever audited, so everything after a
     /// `---` separator was reported as clean without being looked at.
     #[test]
