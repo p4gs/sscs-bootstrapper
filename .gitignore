@@ -8,5 +8,13 @@
 # actual policy, not build output.
 /.sscsb/out/
 
-# Agent worktrees from the coverage build-out.
-/.claude/
+# Agent worktrees from the coverage build-out. The shipped agent skill under
+# .claude/skills/ is deliberately re-included: it is part of the tool's
+# distributed surface, not a local artifact. (A bare `/.claude/` exclusion
+# cannot be negated — git will not re-include a file whose parent directory is
+# excluded — hence `/*` plus an explicit un-ignore.)
+/.claude/*
+!/.claude/skills/
+
+# Serena's per-project index and settings — local tool state, not policy.
+/.serena/
