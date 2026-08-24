@@ -53,7 +53,52 @@ pub const RISKY_ACTION_SUBSTITUTIONS: &[(&str, &str)] = &[
 /// The one sanctioned non-SHA pin: slsa-github-generator MUST be referenced by
 /// semver tag for slsa-verifier to validate the trusted builder ref
 /// (upstream README, slsa-verifier issue #12).
-const TAG_PIN_EXCEPTION_PREFIX: &str = "slsa-framework/slsa-github-generator";
+const TAG_PIN_EXCEPTION_REPO: &str = "slsa-framework/slsa-github-generator";
+
+/// Does this action path belong to the one repository the tag-pin exception
+/// names?
+///
+/// A `starts_with` prefix test does not answer that question: it also matches
+/// `slsa-framework/slsa-github-generator-anything`, a DIFFERENT repository
+/// under the same owner, which would have inherited a licence to use mutable
+/// refs from a rule written for exactly one builder. The exception ends at the
+/// repository boundary — the path is either the repo itself or a `/`-separated
+/// path inside it.
+fn is_tag_pin_exception(action: &str) -> bool {
+    action == TAG_PIN_EXCEPTION_REPO
+        || action
+            .strip_prefix(TAG_PIN_EXCEPTION_REPO)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Does this `uses:` reference an actions/checkout-shaped action?
+///
+/// The credential-persistence hazard belongs to the BEHAVIOUR, not to the
+/// `actions` org: a fork (`myorg/checkout`) or a re-publish
+/// (`myorg/checkout-action`, `myorg/action-checkout`) leaves the same
+/// GITHUB_TOKEN in `.git/config` for every later step to read. Matching the
+/// literal string `actions/checkout@` asked the question of one publisher and
+/// silently exempted all the others.
+///
+/// Deliberately narrow: the repository name, minus a conventional
+/// `action-`/`-action` decoration, must BE `checkout`. An action whose name
+/// merely contains the word is not one.
+fn is_checkout_action(uses: &str) -> bool {
+    let action = uses.split('@').next().unwrap_or(uses);
+    let Some(repo) = action.split('/').nth(1) else {
+        return false;
+    };
+    let lower = repo.to_ascii_lowercase();
+    let stem = lower.strip_prefix("action-").unwrap_or(&lower);
+    let stem = stem.strip_suffix("-action").unwrap_or(stem);
+    stem == "checkout"
+}
+
+/// A YAML document that holds nothing — what a trailing `---` separator
+/// produces. It is not a second workflow and owes no findings.
+fn is_blank_doc(doc: &Yaml) -> bool {
+    matches!(doc, Yaml::Null | Yaml::BadValue)
+}
 
 fn is_full_sha(s: &str) -> bool {
     s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
@@ -70,29 +115,64 @@ fn is_semver_tag(s: &str) -> bool {
             .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
-/// Audit one workflow document.
+/// Prefix each finding raised by one document of a multi-document file with
+/// which document it came from — otherwise the operator gets a finding they
+/// cannot locate in the file.
+fn locate(findings: &mut [Finding], index: usize, total: usize) {
+    if total < 2 {
+        return;
+    }
+    for f in findings.iter_mut() {
+        f.message = format!("document {}: {}", index + 1, f.message);
+    }
+}
+
+/// Audit one workflow file — EVERY YAML document in it.
+///
+/// A `---` separator used to end the audit: only `docs.first()` was ever
+/// examined, so any jobs, actions or permissions living below the separator
+/// were reported as clean without being looked at. Whether GitHub itself runs
+/// a second document is beside the point — sscsb must not call a file clean on
+/// the strength of the half it read.
 pub fn audit_workflow(file: &str, content: &str, extended: bool) -> Result<Vec<Finding>> {
     let docs =
         YamlLoader::load_from_str(content).with_context(|| format!("parsing YAML in {file}"))?;
-    let Some(doc) = docs.first() else {
+    let live: Vec<&Yaml> = docs.iter().filter(|d| !is_blank_doc(d)).collect();
+    if live.is_empty() {
         return Ok(vec![Finding::new(
             Severity::Warn,
             file,
             "empty workflow file".into(),
         )]);
-    };
+    }
     let mut findings = Vec::new();
+    if live.len() > 1 {
+        findings.push(Finding::new(
+            Severity::Warn,
+            file,
+            format!(
+                "file holds {} YAML documents — a GitHub Actions workflow file is a single \
+                 document, so at least one of these is not the workflow anyone thinks is \
+                 running; all of them were audited rather than assumed inert",
+                live.len()
+            ),
+        ));
+    }
+    for (i, doc) in live.iter().enumerate() {
+        let mut of_doc = Vec::new();
+        audit_permissions(file, doc, &mut of_doc);
+        audit_uses_refs(file, doc, &mut of_doc);
 
-    audit_permissions(file, doc, &mut findings);
-    audit_uses_refs(file, doc, &mut findings);
-
-    if extended {
-        audit_pull_request_target(file, doc, content, &mut findings);
-        audit_checkout_credentials(file, doc, &mut findings);
-        audit_secret_exposure(file, doc, &mut findings);
-        audit_risky_actions(file, doc, &mut findings);
-        audit_lockfile_exact(file, doc, &mut findings);
-        audit_harden_runner(file, doc, &mut findings);
+        if extended {
+            audit_pull_request_target(file, doc, content, &mut of_doc);
+            audit_checkout_credentials(file, doc, &mut of_doc);
+            audit_secret_exposure(file, doc, &mut of_doc);
+            audit_risky_actions(file, doc, &mut of_doc);
+            audit_lockfile_exact(file, doc, &mut of_doc);
+            audit_harden_runner(file, doc, &mut of_doc);
+        }
+        locate(&mut of_doc, i, live.len());
+        findings.extend(of_doc);
     }
     Ok(findings)
 }
@@ -157,7 +237,7 @@ fn check_uses_ref(file: &str, uses: &str, findings: &mut Vec<Finding>) {
     if is_full_sha(r) {
         return;
     }
-    if action.starts_with(TAG_PIN_EXCEPTION_PREFIX) && is_semver_tag(r) {
+    if is_tag_pin_exception(action) && is_semver_tag(r) {
         findings.push(Finding::new(
             Severity::Info,
             file,
@@ -195,22 +275,119 @@ fn composite_action_uses(doc: &Yaml) -> Vec<String> {
 pub fn audit_action_file(file: &str, content: &str) -> Result<Vec<Finding>> {
     let docs =
         YamlLoader::load_from_str(content).with_context(|| format!("parsing YAML in {file}"))?;
-    let Some(doc) = docs.first() else {
+    let live: Vec<&Yaml> = docs.iter().filter(|d| !is_blank_doc(d)).collect();
+    if live.is_empty() {
         return Ok(vec![Finding::new(
             Severity::Warn,
             file,
             "empty action file".into(),
         )]);
-    };
+    }
     let mut findings = Vec::new();
-    for uses in composite_action_uses(doc) {
-        check_uses_ref(file, &uses, &mut findings);
+    // Same reasoning as `audit_workflow`: a `---` is not the end of the file.
+    for (i, doc) in live.iter().enumerate() {
+        let mut of_doc = Vec::new();
+        for uses in composite_action_uses(doc) {
+            check_uses_ref(file, &uses, &mut of_doc);
+        }
+        locate(&mut of_doc, i, live.len());
+        findings.extend(of_doc);
     }
     Ok(findings)
 }
 
 fn permissions_is_write_all(perms: &Yaml) -> bool {
     perms.as_str() == Some("write-all")
+}
+
+/// The scopes a `permissions:` block grants at `write`, in declaration order.
+fn write_scopes(perms: &Yaml) -> Vec<String> {
+    let Some(hash) = perms.as_hash() else {
+        return Vec::new();
+    };
+    hash.iter()
+        .filter(|(_, level)| level.as_str() == Some("write"))
+        .filter_map(|(scope, _)| scope.as_str().map(str::to_string))
+        .collect()
+}
+
+/// How many scopes the GITHUB_TOKEN has, per GitHub's Actions documentation:
+/// actions, attestations, checks, contents, deployments, discussions,
+/// id-token, issues, models, packages, pages, pull-requests,
+/// repository-projects, security-events, statuses.
+const TOKEN_SCOPE_COUNT: usize = 15;
+
+/// At this many distinct write scopes, a grant has stopped describing a job
+/// and started describing a role.
+///
+/// The most privileged job sscsb itself ships is a release that pushes the
+/// release, publishes a package, mints an OIDC token and writes an attestation
+/// — four scopes, one coherent purpose. Nothing legitimate that could be named
+/// needs five, so five is where `write-all` has merely been spelled out. This
+/// threshold is deliberately ABOVE every real workflow rather than at the edge
+/// of one: a count low enough to catch `contents: write` would flag every
+/// release workflow in existence, which is noise, not least privilege.
+const WRITE_ALL_BY_ENUMERATION: usize = 5;
+
+/// The scope whose write grant reaches OUTSIDE the job's own build: `actions:
+/// write` can delete or replace another workflow run's artifacts and caches
+/// (the ClusterFuzzLite/Ultralytics cache-poisoning class) and cancel or
+/// re-run workflows.
+const CI_CONTROL_SCOPE: &str = "actions";
+
+/// Scopes that let a job ship something the world consumes.
+const PUBLISH_SCOPES: &[&str] = &[
+    "contents",
+    "packages",
+    "attestations",
+    "deployments",
+    "id-token",
+];
+
+/// What "least privilege" means beyond the literal string `write-all`.
+///
+/// Breadth cannot be judged by counting alone — a release job legitimately
+/// needs `contents: write` — so only two shapes are called out, both chosen to
+/// be silent on every workflow sscsb ships and on every ordinary one that
+/// could be named:
+///
+/// 1. Write on so many scopes that the grant IS `write-all`, enumerated.
+/// 2. The right to tamper with CI state (`actions: write`) held together with
+///    the right to publish — one compromised step can then poison the build
+///    AND ship the result, which neither half can do alone.
+fn audit_permission_breadth(file: &str, held_by: &str, perms: &Yaml, findings: &mut Vec<Finding>) {
+    let writes = write_scopes(perms);
+    if writes.len() >= WRITE_ALL_BY_ENUMERATION {
+        findings.push(Finding::new(
+            Severity::Error,
+            file,
+            format!(
+                "{held_by} grants write on {} of the GITHUB_TOKEN's {TOKEN_SCOPE_COUNT} scopes \
+                 ({}) — that is `write-all` spelled out; grant only the scopes the job uses",
+                writes.len(),
+                writes.join(", ")
+            ),
+        ));
+        return;
+    }
+    let publish: Vec<&String> = writes
+        .iter()
+        .filter(|s| PUBLISH_SCOPES.contains(&s.as_str()))
+        .collect();
+    if writes.iter().any(|s| s == CI_CONTROL_SCOPE) && !publish.is_empty() {
+        let with: Vec<&str> = publish.iter().map(|s| s.as_str()).collect();
+        findings.push(Finding::new(
+            Severity::Warn,
+            file,
+            format!(
+                "{held_by} holds `actions: write` alongside `{}` — `actions: write` can replace \
+                 another run's artifacts and caches, so one compromised step in this job can \
+                 poison the build AND publish the result; split the tampering right off into a \
+                 job that cannot publish",
+                with.join("`, `")
+            ),
+        ));
+    }
 }
 
 fn audit_permissions(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
@@ -223,17 +400,24 @@ fn audit_permissions(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
             "top-level `permissions: write-all` — grant specific least-privilege scopes".into(),
         ));
     }
+    if top_present {
+        audit_permission_breadth(file, "the top-level `permissions:` block", top, findings);
+    }
     let mut all_jobs_scoped = true;
+    let mut inheritors = Vec::new();
     for (name, job) in jobs(doc) {
         let jp = &job["permissions"];
         if jp.is_badvalue() {
             all_jobs_scoped = false;
+            inheritors.push(name.to_string());
         } else if permissions_is_write_all(jp) {
             findings.push(Finding::new(
                 Severity::Error,
                 file,
                 format!("job `{name}` uses `permissions: write-all`"),
             ));
+        } else {
+            audit_permission_breadth(file, &format!("job `{name}`"), jp, findings);
         }
     }
     if !top_present && !all_jobs_scoped {
@@ -243,6 +427,60 @@ fn audit_permissions(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
             "no `permissions:` block at workflow or job level — the default GITHUB_TOKEN grant \
              is too broad; add an explicit least-privilege block"
                 .into(),
+        ));
+    }
+    if top_present {
+        audit_top_level_write_reach(file, top, &inheritors, findings);
+    }
+}
+
+/// A write scope at the TOP level is granted to every job that does not
+/// override it — including the job that only runs the test suite, and
+/// including every job added to the file later. This is the placement half of
+/// least privilege (and what OpenSSF Scorecard's Token-Permissions check looks
+/// at): the same scope on the one job that needs it has a fraction of the
+/// blast radius.
+///
+/// The finding distinguishes a grant that is live from one that is latent,
+/// because those deserve different urgency and a tool that conflates them is
+/// the reason people stop reading its output.
+fn audit_top_level_write_reach(
+    file: &str,
+    top: &Yaml,
+    inheritors: &[String],
+    findings: &mut Vec<Finding>,
+) {
+    let writes = write_scopes(top);
+    if writes.is_empty() {
+        return;
+    }
+    let scopes = writes
+        .iter()
+        .map(|s| format!("{s}: write"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if inheritors.is_empty() {
+        findings.push(Finding::new(
+            Severity::Info,
+            file,
+            format!(
+                "top-level `{scopes}` is currently overridden by every job, but it stays the \
+                 default for the next job added — prefer a read-only top-level block"
+            ),
+        ));
+    } else {
+        let jobs = inheritors
+            .iter()
+            .map(|j| format!("`{j}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        findings.push(Finding::new(
+            Severity::Warn,
+            file,
+            format!(
+                "top-level `{scopes}` is inherited by job(s) {jobs}, which never asked for it — \
+                 move the grant down to the job that needs it and leave the top level read-only"
+            ),
         ));
     }
 }
@@ -285,9 +523,10 @@ fn audit_checkout_credentials(file: &str, doc: &Yaml, findings: &mut Vec<Finding
             let Some(uses) = step["uses"].as_str() else {
                 continue;
             };
-            if !uses.starts_with("actions/checkout@") {
+            if !is_checkout_action(uses) {
                 continue;
             }
+            let action = uses.split('@').next().unwrap_or(uses);
             let persist = &step["with"]["persist-credentials"];
             let disabled = persist.as_bool() == Some(false) || persist.as_str() == Some("false");
             if !disabled {
@@ -295,8 +534,9 @@ fn audit_checkout_credentials(file: &str, doc: &Yaml, findings: &mut Vec<Finding
                     Severity::Warn,
                     file,
                     format!(
-                        "job `{name}`: actions/checkout without `persist-credentials: false` — \
-                         the GITHUB_TOKEN stays on disk for later steps to exfiltrate"
+                        "job `{name}`: `{action}` checks out code without \
+                         `persist-credentials: false` — the GITHUB_TOKEN stays on disk for later \
+                         steps to exfiltrate"
                     ),
                 ));
             }
@@ -382,17 +622,63 @@ fn audit_lockfile_exact(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
     }
 }
 
-fn audit_harden_runner(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
-    for (name, job) in jobs(doc) {
-        // Reusable-workflow jobs have no steps of their own.
-        if job["uses"].as_str().is_some() {
-            continue;
+/// Whether ONE job runs under Harden-Runner.
+///
+/// Harden-Runner protects the job whose step list it heads — not the file it
+/// happens to appear in, and never a `#`-commented mention of itself. The
+/// question is therefore only answerable per job, off the parsed document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HardenRunner {
+    /// The job's first step is `step-security/harden-runner@…`.
+    Present,
+    /// The job delegates to a reusable workflow and has no steps of its own,
+    /// so no harden-runner step can be added here — hardening is the called
+    /// workflow's responsibility. Carries the `uses:` target.
+    Reusable(String),
+    /// The job runs its own steps without starting them under harden-runner.
+    Absent,
+}
+
+fn harden_runner_of(job: &Yaml) -> HardenRunner {
+    // A reusable-workflow job has no steps of its own to harden.
+    if let Some(uses) = job["uses"].as_str() {
+        if steps(job).is_empty() {
+            return HardenRunner::Reusable(uses.to_string());
         }
-        let first_uses = steps(job)
-            .first()
-            .and_then(|s| s["uses"].as_str())
-            .unwrap_or("");
-        if !first_uses.starts_with("step-security/harden-runner@") {
+    }
+    let first_uses = steps(job)
+        .first()
+        .and_then(|s| s["uses"].as_str())
+        .unwrap_or("");
+    if first_uses.starts_with("step-security/harden-runner@") {
+        HardenRunner::Present
+    } else {
+        HardenRunner::Absent
+    }
+}
+
+/// Per-job Harden-Runner status for one parsed workflow document.
+fn harden_runner_jobs(doc: &Yaml) -> Vec<(String, HardenRunner)> {
+    jobs(doc)
+        .into_iter()
+        .map(|(name, job)| (name.to_string(), harden_runner_of(job)))
+        .collect()
+}
+
+/// Per-job Harden-Runner status for a workflow file's raw text, across EVERY
+/// YAML document in it. Parsing is the point: a substring search over the text
+/// matches commented-out references and cannot tell one job from another.
+///
+/// An empty result means the file declares no jobs at all — which proves
+/// nothing about harden-runner, and callers must not read it as a pass.
+pub fn harden_runner_status(content: &str) -> Result<Vec<(String, HardenRunner)>> {
+    let docs = YamlLoader::load_from_str(content).context("parsing workflow YAML")?;
+    Ok(docs.iter().flat_map(harden_runner_jobs).collect())
+}
+
+fn audit_harden_runner(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
+    for (name, status) in harden_runner_jobs(doc) {
+        if status == HardenRunner::Absent {
             findings.push(Finding::new(
                 Severity::Warn,
                 file,
@@ -1194,6 +1480,283 @@ esac
             .messages
             .iter()
             .any(|x| x.contains("cannot self-approve")));
+    }
+
+    /// Wrap a job-level permissions block in a workflow that is otherwise
+    /// clean, so the only findings under test are the permissions ones.
+    fn job_perms(block: &str) -> String {
+        format!(
+            "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    \
+             runs-on: ubuntu-latest\n    permissions:\n{block}    steps:\n      - run: echo hi\n"
+        )
+    }
+
+    /// M12: "least privilege" was the literal string `write-all`. A job that
+    /// enumerates write on scope after scope is write-all with extra typing,
+    /// and it was not flagged at all.
+    #[test]
+    fn write_all_spelled_out_scope_by_scope_is_still_write_all() {
+        let wf = job_perms(
+            "      contents: write\n      packages: write\n      id-token: write\n      \
+             actions: write\n      issues: write\n",
+        );
+        let f = audit_workflow("w.yml", &wf, false).unwrap();
+        assert!(
+            f.iter().any(|x| x.severity == Severity::Error
+                && x.message.contains("job `b`")
+                && x.message.contains("write on 5")),
+            "an enumerated write-all must be the same finding as the literal one: {f:?}"
+        );
+    }
+
+    /// The guard on the rule above: the most privileged job sscsb itself ships
+    /// — a release that pushes the release, publishes a package, mints an OIDC
+    /// token and writes an attestation — must stay silent. A rule that fails
+    /// ordinary correct workflows is worse than the hole it closes.
+    #[test]
+    fn a_legitimate_release_grant_is_not_flagged() {
+        for block in [
+            // sscsb's own release.yml job.
+            "      contents: write\n      id-token: write\n      attestations: write\n",
+            // ...plus publishing a package: four scopes, still one coherent job.
+            "      contents: write\n      packages: write\n      id-token: write\n      \
+             attestations: write\n",
+            // A single write scope is what least privilege LOOKS like.
+            "      contents: write\n",
+            "      security-events: write\n",
+        ] {
+            let f = audit_workflow("w.yml", &job_perms(block), false).unwrap();
+            assert!(f.is_empty(), "no finding is owed for `{block}`: {f:?}");
+        }
+    }
+
+    /// M12: `actions: write` reaches outside the job's own build — it can
+    /// replace ANOTHER run's artifacts and caches. Combined with the right to
+    /// publish, one compromised step can poison the build and ship the result.
+    #[test]
+    fn ci_tampering_rights_combined_with_publishing_rights_are_flagged() {
+        let f = audit_workflow(
+            "w.yml",
+            &job_perms("      actions: write\n      contents: write\n"),
+            false,
+        )
+        .unwrap();
+        assert!(
+            f.iter().any(|x| x.severity == Severity::Warn
+                && x.message.contains("job `b`")
+                && x.message.contains("actions: write")),
+            "{f:?}"
+        );
+
+        // Narrowness: each half alone is a job someone legitimately runs.
+        for block in ["      actions: write\n", "      contents: write\n"] {
+            let f = audit_workflow("w.yml", &job_perms(block), false).unwrap();
+            assert!(f.is_empty(), "`{block}` alone owes no finding: {f:?}");
+        }
+    }
+
+    /// M12: a write scope at the TOP level is handed to every job in the file.
+    /// Which jobs actually inherit it is the difference between a live
+    /// over-grant and a latent one, so the finding says which it is.
+    #[test]
+    fn top_level_write_scopes_are_reported_by_who_inherits_them() {
+        // `test` inherits `contents: write` to run `cargo test`.
+        let wf = "on: push\npermissions:\n  contents: write\njobs:\n  \
+                  release:\n    runs-on: ubuntu-latest\n    permissions:\n      \
+                  contents: write\n    steps:\n      - run: gh release create\n  \
+                  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n";
+        let f = audit_workflow("w.yml", wf, false).unwrap();
+        assert!(
+            f.iter().any(|x| x.severity == Severity::Warn
+                && x.message.contains("contents: write")
+                && x.message.contains("`test`")),
+            "the inheriting job must be named: {f:?}"
+        );
+
+        // Every job overrides it: the grant is inert today, but it is still
+        // the default the next job added will get. Reported, not failed.
+        let wf = "on: push\npermissions:\n  contents: write\njobs:\n  \
+                  release:\n    runs-on: ubuntu-latest\n    permissions:\n      \
+                  contents: write\n    steps:\n      - run: gh release create\n";
+        let f = audit_workflow("w.yml", wf, false).unwrap();
+        assert!(
+            f.iter()
+                .any(|x| x.severity == Severity::Info
+                    && x.message.contains("overridden by every job")),
+            "{f:?}"
+        );
+
+        // A read-only top level is the shape being asked for.
+        let wf = "on: push\npermissions:\n  contents: read\njobs:\n  \
+                  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n";
+        assert!(audit_workflow("w.yml", wf, false).unwrap().is_empty());
+    }
+
+    /// M13(a): the tag-pin exception was a `starts_with` PREFIX test, so any
+    /// repository whose path merely begins with the sanctioned one inherited
+    /// permission to use a mutable ref. The exception belongs to exactly one
+    /// repository.
+    #[test]
+    fn tag_pin_exception_does_not_extend_to_lookalike_repositories() {
+        for lookalike in [
+            "slsa-framework/slsa-github-generator-evil/.github/workflows/generator_generic_slsa3.yml",
+            "slsa-framework/slsa-github-generator2",
+        ] {
+            let wf = format!(
+                "on: push\npermissions: {{}}\njobs:\n  p:\n    permissions:\n      \
+                 id-token: write\n    uses: {lookalike}@v2.1.0\n"
+            );
+            let f = audit_workflow("w.yml", &wf, false).unwrap();
+            assert!(
+                f.iter()
+                    .any(|x| x.severity == Severity::Error && x.message.contains("mutable ref")),
+                "`{lookalike}` is a different repository and must not inherit the tag-pin \
+                 exception: {f:?}"
+            );
+        }
+
+        // The genuine repository, and its reusable workflows, keep it.
+        for genuine in [
+            "slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml",
+            "slsa-framework/slsa-github-generator",
+        ] {
+            let wf = format!(
+                "on: push\npermissions: {{}}\njobs:\n  p:\n    permissions:\n      \
+                 id-token: write\n    uses: {genuine}@v2.1.0\n"
+            );
+            let f = audit_workflow("w.yml", &wf, false).unwrap();
+            assert!(
+                f.iter().all(|x| x.severity != Severity::Error),
+                "the sanctioned exception must survive: {f:?}"
+            );
+            assert!(f.iter().any(|x| x.message.contains("tag-pinned by design")));
+        }
+    }
+
+    /// M13(b): the credential-persistence check matched the literal string
+    /// `actions/checkout@`, so a fork or re-publish of the same action — which
+    /// leaves the same GITHUB_TOKEN on disk — was never asked the question.
+    #[test]
+    fn checkout_credential_check_covers_forks_and_republished_actions() {
+        for fork in [
+            "myorg/checkout",
+            "myorg/checkout-action",
+            "MyOrg/Checkout",
+            "myorg/action-checkout",
+        ] {
+            let wf = format!(
+                "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    \
+                 runs-on: ubuntu-latest\n    steps:\n      \
+                 - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920\n      \
+                 - uses: {fork}@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
+            );
+            let f = audit_workflow("w.yml", &wf, true).unwrap();
+            assert!(
+                f.iter()
+                    .any(|x| x.message.contains("persist-credentials") && x.message.contains(fork)),
+                "`{fork}` checks out code with the same token exposure: {f:?}"
+            );
+        }
+
+        // Setting it still silences the check, whoever publishes the action.
+        let wf = "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    \
+                  runs-on: ubuntu-latest\n    steps:\n      \
+                  - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920\n      \
+                  - uses: myorg/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n        \
+                  with:\n          persist-credentials: false\n";
+        let f = audit_workflow("w.yml", wf, true).unwrap();
+        assert!(f.is_empty(), "no finding is owed here: {f:?}");
+
+        // And an action that merely mentions checkout in a longer name is not
+        // a checkout — this rule must not invent findings.
+        let wf = "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    \
+                  runs-on: ubuntu-latest\n    steps:\n      \
+                  - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920\n      \
+                  - uses: myorg/checkout-secrets-to-disk@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n";
+        let f = audit_workflow("w.yml", wf, true).unwrap();
+        assert!(f.is_empty(), "not a checkout action: {f:?}");
+    }
+
+    /// The checkout matcher reads the REPOSITORY name, so a `uses:` that names
+    /// no repository is not a checkout however it is spelled.
+    #[test]
+    fn the_checkout_matcher_needs_a_repository_not_just_a_word() {
+        let wf = "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    \
+                  runs-on: ubuntu-latest\n    steps:\n      \
+                  - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920\n      \
+                  - uses: checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n";
+        let f = audit_workflow("w.yml", wf, true).unwrap();
+        assert!(
+            f.is_empty(),
+            "a bare `checkout@sha` names no repository to check out from: {f:?}"
+        );
+    }
+
+    /// A job carrying BOTH `uses:` and `steps:` is not a reusable-workflow job
+    /// — and until GitHub rejects it, the steps are what would run. The
+    /// predecessor skipped any job with a `uses:` key outright, so adding one
+    /// line to a job removed it from the harden-runner check entirely.
+    #[test]
+    fn a_job_with_both_uses_and_steps_is_not_exempt_from_harden_runner() {
+        let wf = "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    \
+                  runs-on: ubuntu-latest\n    uses: some/reusable.yml@v1\n    steps:\n      \
+                  - run: curl evil.example\n";
+        let f = audit_workflow("w.yml", wf, true).unwrap();
+        assert!(
+            f.iter()
+                .any(|x| x.message.contains("job `b`") && x.message.contains("harden-runner")),
+            "a `uses:` key must not buy a job with steps an exemption: {f:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_composite_action_file_is_reported_as_empty() {
+        let f = audit_action_file("a.yml", "# nothing but a comment\n").unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].severity, Severity::Warn);
+        assert!(f[0].message.contains("empty action file"));
+    }
+
+    /// M13(c): only `docs.first()` was ever audited, so everything after a
+    /// `---` separator was reported as clean without being looked at.
+    #[test]
+    fn every_yaml_document_in_a_workflow_file_is_audited() {
+        let wf = format!("{PINNED_OK}---\non: push\npermissions:\n  contents: read\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n");
+        let f = audit_workflow("w.yml", &wf, false).unwrap();
+        assert!(
+            f.iter().any(|x| x.severity == Severity::Error
+                && x.message.contains("mutable ref")
+                && x.message.contains("document 2")),
+            "the second document must be audited and located: {f:?}"
+        );
+        assert!(
+            f.iter()
+                .any(|x| x.severity == Severity::Warn && x.message.contains("2 YAML documents")),
+            "the reader must be told the file is multi-document: {f:?}"
+        );
+
+        // A trailing separator is an empty document, not a hidden workflow.
+        let f = audit_workflow("w.yml", &format!("{PINNED_OK}---\n"), true).unwrap();
+        assert!(f.is_empty(), "a trailing `---` owes no finding: {f:?}");
+
+        // A file that is nothing BUT a separator declares no workflow at all —
+        // it used to audit an empty document and report the file as clean.
+        let f = audit_workflow("w.yml", "---\n", false).unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].message.contains("empty workflow file"));
+    }
+
+    /// Composite action definitions hide the same way.
+    #[test]
+    fn every_yaml_document_in_a_composite_action_is_audited() {
+        let action = "name: setup\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n---\nname: shadow\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@v4\n";
+        let f = audit_action_file("a.yml", action).unwrap();
+        assert!(
+            f.iter().any(|x| x.severity == Severity::Error
+                && x.message.contains("mutable ref")
+                && x.message.contains("document 2")),
+            "{f:?}"
+        );
     }
 
     #[test]
