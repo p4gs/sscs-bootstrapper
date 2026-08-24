@@ -767,19 +767,37 @@ pub fn approval_warnings_for(qualified: &str, source: &DepSource, offline: bool)
         ));
     }
     if !offline {
-        match registry_exists(eco, name) {
-            RegistryStatus::NotFound => warnings.push(format!(
-                "`{qualified}` was NOT FOUND on its public registry — likely a hallucinated \
-                 (slopsquat) name; do not approve without verifying it is real"
-            )),
-            RegistryStatus::Unknown(e) => warnings.push(format!(
-                "`{qualified}` existence could not be confirmed ({e}) — verify manually before \
-                 approving (a registry outage must not launder an unverified package)"
-            )),
-            RegistryStatus::Exists => {}
-        }
+        warnings.extend(registry_problem(qualified, &registry_exists(eco, name)));
     }
     warnings
+}
+
+/// What one registry outcome MEANS — in one place, because the two callers used
+/// to disagree about it.
+///
+/// [`approval_warnings_for`] treated `Unknown` as a reason not to approve, while
+/// [`deps_check`] filed it as a *note*, left `problems` empty, and printed
+/// `deps check: clean` at exit 0. So a DNS failure, a proxy, a 503, or an
+/// offline laptop turned the anti-slopsquat control into a rubber stamp: every
+/// hallucinated name in the manifest reported clean, with the reason buried in
+/// a `note:` line nobody's CI reads.
+///
+/// An outage is not evidence of existence. `Unknown` is a failure to answer, and
+/// the only honest report of a failure to answer is that the check did not pass.
+/// `--offline` remains the way to decline the question deliberately.
+fn registry_problem(qualified: &str, status: &RegistryStatus) -> Option<String> {
+    match status {
+        RegistryStatus::Exists => None,
+        RegistryStatus::NotFound => Some(format!(
+            "{qualified}: NOT FOUND on its public registry — likely hallucinated \
+             (slopsquatting target) or private; do not approve without verification"
+        )),
+        RegistryStatus::Unknown(e) => Some(format!(
+            "{qualified}: registry check inconclusive ({e}) — existence was NOT confirmed, \
+             and a registry outage is not evidence that a package is real; verify manually, \
+             or pass --offline to decline the existence check on purpose"
+        )),
+    }
 }
 
 pub fn approve_package(ctx: &Ctx, qualified: &str) -> Result<()> {
@@ -1335,6 +1353,16 @@ pub fn verify_socket_control(ctx: &Ctx) -> VerifyResult {
 /// and a sibling-repo path dep (`../grc-controls/…`, an ordinary multi-repo
 /// layout) reported as a likely slopsquatting target at exit 1.
 pub fn deps_check(ctx: &Ctx, offline: bool) -> Result<(Vec<String>, Vec<String>)> {
+    deps_check_with(ctx, offline, registry_exists)
+}
+
+/// [`deps_check`] with the registry lookup injected, so the outage path can be
+/// exercised without an outage (and without a network call).
+fn deps_check_with(
+    ctx: &Ctx,
+    offline: bool,
+    resolve: impl Fn(Ecosystem, &str) -> RegistryStatus,
+) -> Result<(Vec<String>, Vec<String>)> {
     let mut problems = Vec::new();
     let mut notes = Vec::new();
     let new_deps = new_unapproved_deps(ctx)?;
@@ -1382,15 +1410,9 @@ pub fn deps_check(ctx: &Ctx, offline: bool) -> Result<(Vec<String>, Vec<String>)
             ));
         }
         if !offline {
-            match registry_exists(eco, name) {
-                RegistryStatus::Exists => notes.push(format!("{qualified}: exists on registry")),
-                RegistryStatus::NotFound => problems.push(format!(
-                    "{qualified}: NOT FOUND on its public registry — likely hallucinated \
-                     (slopsquatting target) or private; do not approve without verification"
-                )),
-                RegistryStatus::Unknown(e) => {
-                    notes.push(format!("{qualified}: registry check inconclusive ({e})"));
-                }
+            match registry_problem(qualified, &resolve(eco, name)) {
+                Some(problem) => problems.push(problem),
+                None => notes.push(format!("{qualified}: exists on registry")),
             }
         }
     }
@@ -2032,14 +2054,68 @@ mod tests {
     }
 
     #[test]
-    fn deps_check_online_leaves_a_registry_note_for_every_target_regardless_of_connectivity() {
+    fn deps_check_online_records_the_registry_outcome_for_every_target() {
         let (_d, ctx) = repo_ctx();
         write_file(&ctx, "Cargo.toml", "[dependencies]\nserde = \"1\"\n");
         let (problems, notes) = deps_check(&ctx, false).unwrap();
         assert!(!problems.iter().any(|p| p.contains("typosquat")));
+        // Online: `serde` exists → a note. Degraded: the lookup could not
+        // answer → a PROBLEM, never silence. Either way the outcome is on the
+        // record; what must never happen is neither.
         assert!(
-            !notes.is_empty(),
-            "the registry outcome for `serde` must always be recorded, online or degraded: {notes:?}"
+            notes.iter().any(|n| n.contains("cargo:serde"))
+                || problems.iter().any(|p| p.contains("cargo:serde")),
+            "the registry outcome for `serde` must always be recorded, online or \
+             degraded: problems={problems:?} notes={notes:?}"
+        );
+    }
+
+    /// M11: a registry outage used to report `deps check: clean` at exit 0.
+    ///
+    /// The two `registry_exists` callers disagreed about what `Unknown` means:
+    /// `approval_warnings_for` treated it as a reason not to approve, while
+    /// `deps_check` filed it as a *note*, left `problems` empty, and let the CLI
+    /// print `deps check: clean`. One blocked DNS lookup, one corporate proxy,
+    /// one crates.io 503, and the anti-slopsquat control passed every
+    /// hallucinated name in the manifest.
+    ///
+    /// The lookup is injected, so this proves the policy without a network call
+    /// and without waiting for a real outage.
+    #[test]
+    fn a_registry_outage_is_a_problem_not_a_clean_check() {
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\nsome-crate = \"1\"\n");
+        let outage = |_: Ecosystem, _: &str| RegistryStatus::Unknown("dns error".into());
+
+        let (problems, notes) = deps_check_with(&ctx, false, outage).unwrap();
+        assert!(
+            problems.iter().any(
+                |p| p.contains("cargo:some-crate") && p.contains("registry check inconclusive")
+            ),
+            "an unanswered existence check must fail the check, not annotate it: \
+             problems={problems:?} notes={notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|n| n.contains("some-crate")),
+            "an outage must not be filed as a passing note: {notes:?}"
+        );
+
+        // …and the two callers now agree, because they share one verdict.
+        let status = RegistryStatus::Unknown("dns error".into());
+        assert_eq!(
+            registry_problem("cargo:some-crate", &status),
+            problems.first().cloned(),
+            "`deps check` and `deps approve` must reach the same verdict"
+        );
+        assert!(registry_problem("cargo:serde", &RegistryStatus::Exists).is_none());
+        assert!(registry_problem("cargo:nope", &RegistryStatus::NotFound)
+            .is_some_and(|p| p.contains("NOT FOUND")));
+
+        // `--offline` remains the deliberate way to decline the question.
+        let (offline_problems, _) = deps_check_with(&ctx, true, outage).unwrap();
+        assert!(
+            offline_problems.is_empty(),
+            "--offline declines the existence check on purpose: {offline_problems:?}"
         );
     }
 

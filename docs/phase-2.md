@@ -137,8 +137,14 @@ sscsb deps list
 **Existence.** Every package is checked against its own public registry —
 crates.io, npm, PyPI, the Go module proxy, RubyGems. A package that is *not found*
 is reported as a likely hallucination or slopsquatting target, and must not be
-approved without verification. This is a network call; `--offline` skips it, and an
-inconclusive lookup is reported as inconclusive rather than assumed fine.
+approved without verification. This is a network call; `--offline` skips it.
+
+A lookup that cannot be *answered* — DNS failure, a proxy, a registry 503 — is a
+**problem**, not a note: `sscsb deps check` reports it and exits non-zero, and
+`sscsb deps approve` refuses without `--force`. An outage is not evidence that a
+package exists, and the alternative is a control that reports every hallucinated
+name in the manifest as clean the moment the network hiccups. `--offline` is how
+you decline the existence check deliberately; the heuristics still run.
 
 **Typosquat proximity.** A new package name within one edit of a popular package
 in the same ecosystem is flagged, with the name it shadows. The distance is
