@@ -210,11 +210,11 @@ pub fn install_all(ctx: &Ctx, cfg: &Config) -> Result<Vec<String>> {
     let branch = ctx.default_branch();
     let mut lines = Vec::new();
     for artifact in ARTIFACTS {
-        let def = crate::controls::control(artifact.control).expect("registry");
-        let enabled = cfg
-            .control_enabled(artifact.control)
-            .unwrap_or(def.default_enabled);
-        if !enabled {
+        // Every artifact must name a registered control; the lookup is the
+        // assertion, and `control_enabled_or_default` reads that same registry
+        // entry for the fallback rather than repeating its default here.
+        crate::controls::control(artifact.control).expect("registry");
+        if !cfg.control_enabled_or_default(artifact.control) {
             lines.push(format!(
                 "skip {} (control {} disabled)",
                 artifact.dest, artifact.control

@@ -600,7 +600,7 @@ fn cmd_scan(cwd: &std::path::Path, vex: Option<&std::path::Path>, grype: bool) -
         println!("  [{}] {} {} ({})", f.severity, f.id, f.package, f.source);
     }
     if grype {
-        let cfg_enabled = cfg.control_enabled("grype").unwrap_or(false);
+        let cfg_enabled = cfg.control_enabled_or_default("grype");
         if !cfg_enabled {
             println!("grype: control disabled — `sscsb enable grype` first");
         } else {

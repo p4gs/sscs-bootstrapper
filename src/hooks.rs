@@ -321,7 +321,7 @@ pub fn regenerate_allowed_signers(ctx: &Ctx, include_agents: bool) -> Result<()>
 
 /// Whether the (default-off) `agent-signing` control is enabled.
 pub fn agent_signing_enabled(cfg: &Config) -> bool {
-    cfg.control_enabled("agent-signing").unwrap_or(false)
+    cfg.control_enabled_or_default("agent-signing")
 }
 
 // ─────────────────────────────── Trailers ───────────────────────────────────
@@ -475,7 +475,7 @@ pub fn hook_pre_commit(ctx: &Ctx) -> Result<i32> {
     };
     let mut blocked = false;
 
-    if cfg.control_enabled("secrets").unwrap_or(true) {
+    if cfg.control_enabled_or_default("secrets") {
         match run_secret_scan_staged(ctx, cfg) {
             Ok(problems) if problems.is_empty() => {
                 eprintln!("sscsb: secrets — staged changes clean");
@@ -499,7 +499,7 @@ pub fn hook_pre_commit(ctx: &Ctx) -> Result<i32> {
         }
     }
 
-    if cfg.control_enabled("sast").unwrap_or(false)
+    if cfg.control_enabled_or_default("sast")
         && cfg.control_opt_bool("sast", "pre_commit").unwrap_or(false)
     {
         match crate::sast::scan_staged(ctx, cfg) {
@@ -682,13 +682,13 @@ pub fn hook_commit_msg(ctx: &Ctx, msg_file: &Path) -> Result<i32> {
     let trailers = parse_trailers(&message);
     let mut problems: Vec<String> = Vec::new();
 
-    if cfg.control_enabled("ai-trailers").unwrap_or(true) {
+    if cfg.control_enabled_or_default("ai-trailers") {
         problems.extend(validate_ai_trailers(&trailers));
     }
 
     let ai_assisted = trailers.get("AI-Assisted").map(String::as_str) == Some("true");
 
-    if ai_assisted && cfg.control_enabled("ai-dep-gate").unwrap_or(true) {
+    if ai_assisted && cfg.control_enabled_or_default("ai-dep-gate") {
         let staged = exec::git(
             &["diff", "--cached", "--name-only", "--diff-filter=ACMR"],
             &ctx.root,
@@ -723,7 +723,7 @@ pub fn hook_commit_msg(ctx: &Ctx, msg_file: &Path) -> Result<i32> {
         }
     }
 
-    if cfg.control_enabled("package-trust").unwrap_or(true) {
+    if cfg.control_enabled_or_default("package-trust") {
         match crate::deps::new_unapproved_deps(ctx) {
             Ok(new_deps) if !new_deps.is_empty() => {
                 for d in &new_deps {
@@ -835,11 +835,11 @@ pub fn hook_pre_push(ctx: &Ctx, _remote: &str, stdin: &str) -> Result<i32> {
         let branch = branch_of_ref(&u.remote_ref).unwrap_or("");
         let is_protected = protected.iter().any(|p| p == branch);
 
-        if is_protected && cfg.control_enabled("commit-signing").unwrap_or(true) {
+        if is_protected && cfg.control_enabled_or_default("commit-signing") {
             problems.extend(check_signing_for_range(ctx, cfg, u, branch)?);
         }
 
-        if cfg.control_enabled("secrets").unwrap_or(true)
+        if cfg.control_enabled_or_default("secrets")
             && cfg
                 .control_opt_bool("secrets", "pre_push_range_scan")
                 .unwrap_or(true)

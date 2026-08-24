@@ -523,7 +523,7 @@ impl VerifyResult {
 /// Verify one control. Central dispatch so `sscsb verify` and `sscsb report`
 /// share behavior; per-control logic lives in the phase modules.
 pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> VerifyResult {
-    if !cfg.control_enabled(def.id).unwrap_or(def.default_enabled) {
+    if !cfg.control_enabled_or_default(def.id) {
         return VerifyResult::new(
             def.id,
             Outcome::Disabled,
@@ -594,6 +594,149 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `.rs` file under `src/`, whitespace-collapsed so a rustfmt line
+    /// break cannot hide a call from a source scan.
+    ///
+    /// Source scanning is the only way to assert a *negative* about the code —
+    /// "no second copy of this default exists anywhere" — and that negative is
+    /// the whole anti-recurrence property here. Nothing weaker catches a default
+    /// re-typed into a call site three modules away.
+    fn collapsed_sources() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("src/ is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("source is readable");
+            let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            out.push((
+                path.file_name().unwrap().to_string_lossy().to_string(),
+                collapsed,
+            ));
+        }
+        assert!(
+            out.len() > 10,
+            "source scan found almost nothing — wrong dir?"
+        );
+        out
+    }
+
+    /// M27. The registry declared `sast` enabled by default while the pre-commit
+    /// hook read the same control's enabled state with a hard-coded `false`
+    /// fallback, so a config with no explicit `[controls.sast] enabled` key
+    /// reported the control ON in `status` and `verify` while the commit gate
+    /// silently skipped every commit. Every such literal was a second copy of the
+    /// registry that could disagree with it; `Config::control_enabled_or_default`
+    /// reads the registry, so no call site needs one. Ban them, and the class
+    /// cannot come back.
+    ///
+    /// (This comment deliberately describes the banned shape instead of quoting
+    /// it — a verbatim example here would trip the scanner on its own source.)
+    ///
+    /// A fallback derived FROM the registry (`unwrap_or(def.default_enabled)`) is
+    /// fine and is not what this matches.
+    #[test]
+    fn no_call_site_hard_codes_a_controls_enabled_default() {
+        let pattern = regex_lite_enabled_literal();
+        for (file, text) in collapsed_sources() {
+            if file == "config.rs" {
+                continue; // where the single registry-backed fallback lives
+            }
+            assert!(
+                !pattern(&text),
+                "{file} hard-codes an enabled-state default next to `control_enabled(` — \
+                 use `Config::control_enabled_or_default` so the registry stays the only \
+                 source of that value"
+            );
+        }
+    }
+
+    /// Hand-rolled scan for an enabled-state call followed by a boolean literal
+    /// fallback, so the test needs no regex dependency.
+    ///
+    /// The needles are BUILT rather than written out: a literal copy of the
+    /// pattern in this file would make the scanner match its own source and fail
+    /// on `controls.rs` forever, which would mean exempting the registry module
+    /// from its own rule.
+    fn regex_lite_enabled_literal() -> impl Fn(&str) -> bool {
+        let call = format!("control_{}(", "enabled");
+        let fallbacks = [
+            format!("unwrap_or({})", true),
+            format!("unwrap_or({})", false),
+        ];
+        move |text: &str| {
+            let mut rest = text;
+            while let Some(i) = rest.find(&call) {
+                let after = &rest[i + call.len()..];
+                if let Some(close) = after.find(')') {
+                    let tail = after[close + 1..].trim_start();
+                    let tail = tail.strip_prefix('.').map(str::trim_start).unwrap_or(tail);
+                    if fallbacks.iter().any(|f| tail.starts_with(f.as_str())) {
+                        return true;
+                    }
+                }
+                rest = &rest[i + call.len()..];
+            }
+            false
+        }
+    }
+
+    /// The same drift class one level down: a per-control OPTION whose code
+    /// fallback disagrees with the value `sscsb init` writes for it. Checked by
+    /// comparing the literal at the call site against the registry rather than
+    /// banning it, because an option's fallback has nowhere else to live.
+    ///
+    /// `[controls.sast] pre_commit = false` is deliberately false in BOTH places
+    /// and must stay that way — this asserts agreement, not a direction.
+    #[test]
+    fn every_hard_coded_option_default_agrees_with_the_registry() {
+        let mut checked = 0;
+        for (file, text) in collapsed_sources() {
+            for c in CONTROLS {
+                for (key, declared) in c.default_options {
+                    for (accessor, unwrap_form) in [
+                        ("control_opt_bool", "unwrap_or("),
+                        ("control_opt_str", "unwrap_or_else(|| \""),
+                    ] {
+                        let call = format!("{accessor}(\"{}\", \"{key}\")", c.id);
+                        let Some(i) = text.find(&call) else { continue };
+                        let tail = text[i + call.len()..].trim_start();
+                        let Some(tail) = tail.strip_prefix('.') else {
+                            continue;
+                        };
+                        let tail = tail.trim_start();
+                        let Some(rest) = tail.strip_prefix(unwrap_form) else {
+                            continue;
+                        };
+                        let literal: String = match accessor {
+                            "control_opt_bool" => {
+                                rest.chars().take_while(|ch| *ch != ')').collect()
+                            }
+                            _ => rest.chars().take_while(|ch| *ch != '"').collect(),
+                        };
+                        let expected = declared.trim_matches('"');
+                        assert_eq!(
+                            literal.trim(),
+                            expected,
+                            "{file}: fallback for [controls.{}] {key} disagrees with the \
+                             registry, so the control behaves differently depending on \
+                             whether the config key happens to be present",
+                            c.id
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 8,
+            "expected to check several option fallbacks, found {checked} — the scan \
+             stopped matching real call sites"
+        );
+    }
 
     #[test]
     fn registry_ids_unique_and_phases_valid() {
