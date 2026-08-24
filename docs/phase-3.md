@@ -151,24 +151,40 @@ free-plan repo.
 Provenance you never check is a file. The gate is the control:
 
 ```sh
+sscsb provenance inspect dist/multiple.intoto.jsonl   # subjects, builder, predicate
+
 sscsb provenance verify \
   --artifact dist/app-linux-amd64 \
   --provenance dist/multiple.intoto.jsonl \
   --source-uri github.com/OWNER/REPO \
-  --source-tag v1.0.0
-
-sscsb provenance inspect dist/multiple.intoto.jsonl   # subjects, builder, predicate
+  --source-tag v1.0.0 \
+  --builder-id https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.0.0
 ```
 
 `sscsb provenance verify` wraps **slsa-verifier**, which checks that the artifact's
-digest appears in the provenance, that the provenance was produced by a trusted
-builder, and that it came from the source repository and tag you specify. All three
-must hold. The installed release workflow runs this gate **before** promoting or
-publishing anything, so an artifact that cannot prove its origin does not ship.
+digest appears in the provenance, that the provenance was produced by the builder
+you pin, and that it came from the source repository (and tag) you specify. All of
+them must hold. The installed release workflow runs this gate **before** promoting
+or publishing anything, so an artifact that cannot prove its origin does not ship.
+
+**The builder must be pinned.** `--builder-id` is optional to slsa-verifier itself,
+and leaving it off makes the verdict "*some* builder slsa-verifier trusts produced
+this, for this source URI" — anyone who can get any trusted builder to run in that
+repository clears the gate. `sscsb` therefore refuses to run unpinned: pass
+`--builder-id`, or set `builder_id` once under `[controls.provenance-verify]` in
+`.sscsb/config.toml`. Look the value up with `sscsb provenance inspect` **once**,
+from a build you trust — never from the file you are currently verifying, which is
+the untrusted input.
+
+`--source-tag` stays optional, because verifying an artifact built from a branch, or
+before any tag exists, is legitimate. When you leave it off the verdict says so
+explicitly (`source tag NOT pinned`), rather than letting the word "verified" carry
+more weight than it earned.
 
 This path is tested against a real, externally-signed artifact — a real
-slsa-verifier binary release with its real provenance — and the test asserts both
-that a genuine artifact passes *and* that a tampered one is rejected. A verifier
+slsa-verifier binary release with its real provenance — and the test asserts that a
+genuine artifact passes, that a tampered one is rejected, and that the *same
+genuine* artifact is rejected when pinned to a different trusted builder. A verifier
 that says yes to everything is the failure mode worth testing for.
 
 ## Short-lived credentials (Octo STS)

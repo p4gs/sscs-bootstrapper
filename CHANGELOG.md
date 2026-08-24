@@ -150,6 +150,58 @@ versions.
   returned `0` — one appended line switched the gate off. It now fails closed,
   with `fail_open = true` as the single explicit opt-out, matching the
   secret-scan and SAST arms of the same hook.
+- **A file on `PATH` counted as an installed tool.** `find_in_path` accepted any
+  regular file and `detect` swallowed the version probe's failure, so a
+  three-line shell script nobody made executable, named `guacone`, took
+  `sscsb verify --strict guac` from exit 1 (DEGRADED) to exit 0 (PASS,
+  "guacone ? available"). Reproduced end to end. A candidate must now be
+  executable, and the probe must run, exit 0, and say something: a present but
+  broken install is not a working tool. This is the root of the class — every
+  orchestrated tool resolves through the same lookup, so cosign, slsa-verifier,
+  guacone, oras and witness are all covered by it. Unparseable versions are
+  still accepted (`sighthound` reports two components), because calling a
+  genuinely installed tool missing would be the opposite error; an *executable*
+  stub that prints anything still detects, and telling a real tool from an
+  impostor needs binary checksum pinning, which is a separate control. The
+  degrade message now distinguishes "not found on PATH" from "found at <path>
+  but its version probe did not succeed".
+- **`sscsb receipt create -- --raw` exited 101.** `git rev-parse` echoes an
+  unrecognised option back at exit 0 when `--verify` is absent, so the resolved
+  "sha" was `--raw` and the receipt filename's twelve-character slice ran off
+  the end of it. `--verify --end-of-options` (added the same day for an
+  unrelated injection fix) already stopped that particular input; the slice
+  itself is now behind a full-object-name check, because `is_object_name`
+  admits abbreviations from seven characters and any resolver answer between
+  seven and eleven still aborted the process. A CLI must not panic on its own
+  argument.
+- **A receipt's actual claim was never verified.** `receipt verify` recomputed
+  the patch digest and stopped. The AI trailers live in the commit *message*,
+  which `git show --format=` does not print, so the digest covers none of them:
+  a receipt whose `aiTool` disagreed with the commit it named verified at exit
+  0, and deleting the declaration outright — laundering AI-assisted work into
+  apparently unassisted work — was equally invisible. The commit's trailers are
+  now re-read and diffed field by field (`CLAIM MISMATCH`). Separately,
+  `receipt create --sign` wrote a cosign bundle that nothing ever read, so a
+  signed receipt and an unsigned one verified identically; any bundle beside a
+  receipt is now put to `cosign verify-blob` against an expected identity, from
+  `--identity` or the new `cosign_identity`/`cosign_issuer` options. A bundle
+  that is present but *unverifiable* — no identity, or no cosign — is an error,
+  not a footnote: "receipt verified" must not be printable next to a signature
+  nobody looked at.
+- **`provenance verify` pinned the source repository and nothing else.**
+  `--builder-id` is optional to slsa-verifier, so an unpinned run asserted only
+  that *some* builder slsa-verifier trusts produced the provenance for that
+  source URI — anyone able to get any trusted builder to run in the repository
+  cleared the gate. A trusted builder is now required, from `--builder-id` or
+  `builder_id` under `[controls.provenance-verify]`, and resolved before the
+  tool-availability check, because an unpinned builder is a policy gap whether
+  or not slsa-verifier is installed. Not defaulted: a default has to name one
+  generator, and one that is wrong for a repo narrows the gate silently or gets
+  copied without thought. `--source-tag` stays optional — branch builds are
+  legitimate — but the verdict now states `source tag NOT pinned` rather than
+  letting "verified" carry more weight than it earned. The shipped
+  `deploy-gate.yml` and `release-slsa.yml` workflows had the same gap and now
+  pass a `BUILDER_ID` tied to the generator they pin.
 
 ### Changed
 

@@ -730,12 +730,70 @@ mod tests {
         std::env::remove_var("DTRACK_API_KEY");
     }
 
+    /// Reported (M18): `guac` and `oras` PASSED on a three-line shell script
+    /// dropped onto PATH that was never made executable, flipping
+    /// `sscsb verify --strict` from exit 1 (DEGRADED) to exit 0 (PASS).
+    ///
+    /// The A/B is deliberately tight: the same file, same content, same name,
+    /// same PATH — only the execute bit changes between the two halves.
+    #[cfg(unix)]
+    #[test]
+    fn guac_and_oras_refuse_a_non_executable_decoy_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, ctx) = repo();
+
+        let dir = tempfile::tempdir().unwrap();
+        let decoys: Vec<std::path::PathBuf> = ["guacone", "oras"]
+            .iter()
+            .map(|name| {
+                let p = dir.path().join(name);
+                std::fs::write(&p, "#!/bin/sh\n# a note, not a binary\necho hi\n").unwrap();
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+                p
+            })
+            .collect();
+
+        let (g, o) = crate::testutil::with_decoy_dir_on_path(dir.path(), || {
+            (verify_guac_control(&ctx), verify_oras_control(&ctx))
+        });
+        assert_eq!(
+            g.outcome,
+            Outcome::Degraded,
+            "a non-executable text file named `guacone` must not satisfy the guac control: {:?}",
+            g.messages
+        );
+        assert_eq!(
+            o.outcome,
+            Outcome::Degraded,
+            "a non-executable text file named `oras` must not satisfy the oras control: {:?}",
+            o.messages
+        );
+
+        // Flip ONLY the execute bit: the same file, same name, same PATH — now
+        // something the OS will run, which answers its version probe. Both
+        // controls pass again, so the fix rejects un-runnable files rather than
+        // real installs.
+        for p in &decoys {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (g, o) = crate::testutil::with_decoy_dir_on_path(dir.path(), || {
+            (verify_guac_control(&ctx), verify_oras_control(&ctx))
+        });
+        assert_eq!(g.outcome, Outcome::Pass, "{:?}", g.messages);
+        assert_eq!(o.outcome, Outcome::Pass, "{:?}", o.messages);
+    }
+
     #[test]
     fn guac_ingest_requires_the_tool_and_something_to_ingest() {
         let (_d, ctx) = repo();
-        let err = guac_ingest(&ctx, None).unwrap_err();
+        // Reads guacone's NATURAL presence on PATH, so it must not run while a
+        // sibling test is masking or shimming PATH.
+        let (err, available) = crate::sast::tests::serialized(|| {
+            let err = guac_ingest(&ctx, None).unwrap_err();
+            (err, tools::is_available("guacone"))
+        });
         let msg = format!("{err:#}");
-        if tools::is_available("guacone") {
+        if available {
             // Tool present, but .sscsb/out does not exist yet.
             assert!(msg.contains("nothing to ingest"), "{msg}");
         } else {
@@ -750,8 +808,10 @@ mod tests {
     #[test]
     fn guac_verify_degrades_with_a_quickstart_hint_when_absent() {
         let (_d, ctx) = repo();
-        let r = verify_guac_control(&ctx);
-        if tools::is_available("guacone") {
+        let (r, available) = crate::sast::tests::serialized(|| {
+            (verify_guac_control(&ctx), tools::is_available("guacone"))
+        });
+        if available {
             assert_eq!(r.outcome, Outcome::Pass);
         } else {
             assert_eq!(r.outcome, Outcome::Degraded);
@@ -932,8 +992,10 @@ mod tests {
     #[test]
     fn oras_verify_reflects_tool_presence() {
         let (_d, ctx) = repo();
-        let r = verify_oras_control(&ctx);
-        if tools::is_available("oras") {
+        let (r, available) = crate::sast::tests::serialized(|| {
+            (verify_oras_control(&ctx), tools::is_available("oras"))
+        });
+        if available {
             assert_eq!(r.outcome, Outcome::Pass);
             assert!(r.messages.iter().any(|m| m.contains("sscsb oras push")));
         } else {

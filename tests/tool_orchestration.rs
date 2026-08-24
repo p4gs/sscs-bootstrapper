@@ -280,6 +280,11 @@ fn provenance_verify_passes_on_a_real_slsa_signed_artifact() {
                 "y",
                 "--source-uri",
                 "github.com/o/r",
+                // A trusted builder must be pinned before the tool is even
+                // consulted, so supply one to reach the tool-absence branch
+                // this half of the test is about.
+                "--builder-id",
+                "https://example.invalid/builder",
             ])
             .assert()
             .failure();
@@ -321,7 +326,75 @@ fn provenance_verify_passes_on_a_real_slsa_signed_artifact() {
         "subject digest expected: {stdout}"
     );
 
-    // 2. sscsb's gate wraps slsa-verifier and PASSES on the genuine pair.
+    // The builder this genuine release was actually built by, read out of the
+    // provenance the way an operator configures the pin once: from a build they
+    // trust. `inspect` prints it as "builder:   <id>".
+    let real_builder = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("builder:"))
+        .expect("inspect names the builder")
+        .trim()
+        .to_string();
+
+    // 2. sscsb's gate wraps slsa-verifier and PASSES on the genuine pair, with
+    //    the builder pinned to the one that really produced it.
+    let out = sscsb(repo)
+        .args([
+            "provenance",
+            "verify",
+            "--artifact",
+            artifact.to_str().unwrap(),
+            "--provenance",
+            provenance.to_str().unwrap(),
+            "--source-uri",
+            "github.com/slsa-framework/slsa-verifier",
+            "--source-tag",
+            "v2.7.1",
+            "--builder-id",
+            &real_builder,
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("PASSED"),
+        "slsa-verifier must pass: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("builder-id {real_builder}")),
+        "the verdict must say what it pinned: {stdout}"
+    );
+
+    // 2b. (M15) The pin has TEETH against real provenance: the same genuine,
+    //     untampered artifact and provenance, verified against a DIFFERENT
+    //     trusted builder, must be rejected. Without --builder-id this exact
+    //     invocation passed, which is the finding.
+    let out = sscsb(repo)
+        .args([
+            "provenance",
+            "verify",
+            "--artifact",
+            artifact.to_str().unwrap(),
+            "--provenance",
+            provenance.to_str().unwrap(),
+            "--source-uri",
+            "github.com/slsa-framework/slsa-verifier",
+            "--source-tag",
+            "v2.7.1",
+            "--builder-id",
+            "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/\
+             generator_container_slsa3.yml@refs/tags/v2.0.0",
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("FAILED") || stderr.to_lowercase().contains("builder"),
+        "provenance from another builder must be rejected: {stderr}"
+    );
+
+    // 2c. And an unpinned run is refused outright rather than verifying less
+    //     than it appears to.
     let out = sscsb(repo)
         .args([
             "provenance",
@@ -336,11 +409,11 @@ fn provenance_verify_passes_on_a_real_slsa_signed_artifact() {
             "v2.7.1",
         ])
         .assert()
-        .success();
-    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
     assert!(
-        stdout.contains("PASSED"),
-        "slsa-verifier must pass: {stdout}"
+        stderr.contains("no trusted builder is pinned"),
+        "an unpinned verify must be refused: {stderr}"
     );
 
     // 3. TAMPERED artifact must FAIL the gate (the gate has teeth).
@@ -359,6 +432,8 @@ fn provenance_verify_passes_on_a_real_slsa_signed_artifact() {
             "github.com/slsa-framework/slsa-verifier",
             "--source-tag",
             "v2.7.1",
+            "--builder-id",
+            &real_builder,
         ])
         .assert()
         .failure();

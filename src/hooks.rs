@@ -1530,6 +1530,26 @@ pub fn verify_hook_installed(ctx: &Ctx, control: &'static str) -> VerifyResult {
 mod tests {
     use super::*;
 
+    // `hook_pre_commit` and `hook_pre_push` shell out to whatever scanners are
+    // naturally on PATH — trufflehog, gitleaks, opengrep. PATH is
+    // process-global and the harness runs the whole crate's tests in ONE
+    // multi-threaded process, so these calls must not run while a sibling test
+    // is masking or shimming PATH: the scan asks `tools::is_available(x)` and
+    // then spawns `x`, and a PATH that changes in between turns a clean run
+    // into "failed to spawn `trufflehog`" and a passing assertion into a
+    // failing one. Observed intermittently across full-suite runs before these
+    // wrappers existed. This is the discipline `sast::tests` already documents
+    // for every test that depends on a tool-detection outcome, applied to the
+    // hook lane that had been missing it.
+
+    fn pre_commit(ctx: &Ctx) -> i32 {
+        crate::sast::tests::serialized(|| hook_pre_commit(ctx).unwrap())
+    }
+
+    fn pre_push(ctx: &Ctx, stdin: &str) -> i32 {
+        crate::sast::tests::serialized(|| hook_pre_push(ctx, "origin", stdin).unwrap())
+    }
+
     #[test]
     fn shims_are_posix_and_fail_closed() {
         for event in HOOK_EVENTS {
@@ -2313,7 +2333,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
     #[test]
     fn hook_pre_commit_without_config_allows_the_commit() {
         let (_d, ctx) = bare_repo();
-        assert_eq!(hook_pre_commit(&ctx).unwrap(), 0);
+        assert_eq!(pre_commit(&ctx), 0);
     }
 
     #[test]
@@ -2321,18 +2341,14 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let (_d, ctx) = test_repo();
         write_file(&ctx, "clean.md", "nothing to see here\n");
         stage(&ctx, "clean.md");
-        assert_eq!(hook_pre_commit(&ctx).unwrap(), 0, "clean stage must pass");
+        assert_eq!(pre_commit(&ctx), 0, "clean stage must pass");
 
         // Runtime-constructed token — never a real credential, and never
         // present in this repository's sources as a single string.
         let token = format!("ghp_{}{}", "A1b2C3d4E5f6G7h8I9j0", "K1l2M3n4O5p6Q7r8S9t0");
         write_file(&ctx, "leak.txt", &format!("github_token = \"{token}\"\n"));
         stage(&ctx, "leak.txt");
-        assert_eq!(
-            hook_pre_commit(&ctx).unwrap(),
-            1,
-            "planted secret must block the commit"
-        );
+        assert_eq!(pre_commit(&ctx), 1, "planted secret must block the commit");
     }
 
     #[test]
@@ -2348,7 +2364,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         write_file(&ctx, "a.txt", "a\n");
         stage(&ctx, "a.txt");
         assert_eq!(
-            hook_pre_commit(&ctx).unwrap(),
+            pre_commit(&ctx),
             1,
             "no scanner able to run must fail CLOSED by default"
         );
@@ -2368,7 +2384,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         write_file(&ctx, "a.txt", "a\n");
         stage(&ctx, "a.txt");
         assert_eq!(
-            hook_pre_commit(&ctx).unwrap(),
+            pre_commit(&ctx),
             0,
             "fail_open=true must let the commit through with only a warning"
         );
@@ -2419,7 +2435,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         std::fs::write(ctx.config_path(), cfg_text).unwrap();
         let ctx = Ctx::discover(&ctx.root).unwrap();
         assert_eq!(
-            hook_pre_commit(&ctx).unwrap(),
+            pre_commit(&ctx),
             0,
             "fail_open=true must let the commit through with only a warning"
         );
@@ -2599,7 +2615,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
     #[test]
     fn hook_pre_push_without_config_allows_the_push() {
         let (_d, ctx) = bare_repo();
-        assert_eq!(hook_pre_push(&ctx, "origin", "").unwrap(), 0);
+        assert_eq!(pre_push(&ctx, ""), 0);
     }
 
     #[test]
@@ -2612,16 +2628,16 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
 
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "unsigned commit on a protected branch must be blocked"
         );
 
         let stdin = format!("refs/heads/feature/x {local} refs/heads/feature/x {ZERO}\n");
-        assert_eq!(hook_pre_push(&ctx, "origin", &stdin).unwrap(), 0);
+        assert_eq!(pre_push(&ctx, &stdin), 0);
 
         let stdin = format!("(delete) {ZERO} refs/heads/main {ZERO}\n");
-        assert_eq!(hook_pre_push(&ctx, "origin", &stdin).unwrap(), 0);
+        assert_eq!(pre_push(&ctx, &stdin), 0);
     }
 
     #[test]
@@ -2641,7 +2657,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         // signing guard.
         let stdin = format!("refs/heads/feature/x {local} refs/heads/feature/x {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "a secret anywhere in the outgoing range must block the push"
         );
@@ -2813,7 +2829,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "merge with AI-declared parent lacking review evidence must block"
         );
@@ -2838,7 +2854,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         );
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
-        assert_eq!(hook_pre_push(&ctx, "origin", &stdin).unwrap(), 0);
+        assert_eq!(pre_push(&ctx, &stdin), 0);
 
         // Self-review: the committer authored the merged range, so naming
         // themselves as reviewer is refused even though they are a
@@ -2859,7 +2875,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "an author vouching for their own commits must be refused"
         );
@@ -2889,7 +2905,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             0,
             "the merge commit's own author must not be counted as a range author"
         );
@@ -3118,7 +3134,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "agent signature must never satisfy the human-only protected-branch gate"
         );
@@ -3140,7 +3156,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         );
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
-        assert_eq!(hook_pre_push(&ctx, "origin", &stdin).unwrap(), 1);
+        assert_eq!(pre_push(&ctx, &stdin), 1);
     }
 
     #[test]
@@ -3174,7 +3190,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "an attestation artifact must not turn an agent key into a valid protected-branch signer"
         );
@@ -3221,7 +3237,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "AI-history merge without review evidence must stay blocked with agent-signing on"
         );
@@ -3338,7 +3354,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
     #[test]
     fn hook_pre_commit_with_no_staged_files_is_a_no_op() {
         let (_d, ctx) = test_repo();
-        assert_eq!(hook_pre_commit(&ctx).unwrap(), 0);
+        assert_eq!(pre_commit(&ctx), 0);
     }
 
     #[test]
@@ -3352,7 +3368,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         write_file(&ctx, "leak.txt", &format!("github_token = \"{token}\"\n"));
         stage(&ctx, "leak.txt");
         assert_eq!(
-            hook_pre_commit(&ctx).unwrap(),
+            pre_commit(&ctx),
             0,
             "a disabled control must not run — that is the modularity contract"
         );
@@ -3373,7 +3389,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         );
         stage(&ctx, "install.sh");
         assert_eq!(
-            hook_pre_commit(&ctx).unwrap(),
+            pre_commit(&ctx),
             1,
             "an ERROR-severity SAST finding in the staged diff must block the commit"
         );
@@ -3427,7 +3443,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "a software (non-hardware-backed) key must be blocked when the policy requires hardware backing"
         );
@@ -3451,7 +3467,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         // than treating this as a brand-new branch.
         let stdin = format!("refs/heads/feature/x {second} refs/heads/feature/x {first}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             0,
             "clean incremental push must pass"
         );
