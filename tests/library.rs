@@ -671,8 +671,8 @@ fn scan_runs_configured_scanners_and_applies_vex() {
 
     let report = scan::run_scan(&ctx, cfg, None).unwrap();
     // Threshold gating is configurable and honored.
-    let breached_low = scan::breaches_threshold(&report, "low");
-    let breached_crit = scan::breaches_threshold(&report, "critical");
+    let breached_low = scan::breaches_threshold(&report, "low").unwrap();
+    let breached_crit = scan::breaches_threshold(&report, "critical").unwrap();
     assert!(
         !breached_crit || breached_low,
         "thresholds must be monotonic: anything that breaches `critical` must \

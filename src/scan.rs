@@ -13,11 +13,58 @@ use std::path::Path;
 
 pub const SEVERITIES: &[&str] = &["low", "medium", "high", "critical"];
 
-pub fn severity_rank(s: &str) -> usize {
+/// The rank of a severity label, weakest first — or `None` when the label is
+/// not a severity this scale recognises.
+///
+/// The `Option` is the whole point. This used to end in `.unwrap_or(0)`, so
+/// EVERY unrecognised string ranked below `low`: a finding whose severity we
+/// could not determine could not breach any threshold, and neither could a
+/// GHSA advisory rated `MODERATE`, because that is not the literal string
+/// `medium`. A severity we could not determine is not a low severity, and
+/// callers must decide what to do about it rather than inheriting a silent
+/// floor — see [`breaches_threshold`], which fails closed on `None`.
+///
+/// Vocabulary is normalised where two databases name the same rung
+/// differently: OSV/GHSA say `MODERATE` where this scale says `medium`.
+/// Everything else is compared case-insensitively after trimming, so a
+/// stray-whitespace `"HIGH "` in config is the threshold its author meant
+/// rather than a string that silently means something else.
+pub fn severity_rank(s: &str) -> Option<usize> {
+    let label = s.trim();
+    let label = if label.eq_ignore_ascii_case("moderate") {
+        "medium"
+    } else {
+        label
+    };
     SEVERITIES
         .iter()
-        .position(|x| x.eq_ignore_ascii_case(s))
-        .unwrap_or(0)
+        .position(|x| x.eq_ignore_ascii_case(label))
+}
+
+/// How many findings carry a severity no source could determine.
+///
+/// These are not low-severity findings; they are findings we cannot rank. The
+/// count is reported so the reader can see the size of the undetermined set
+/// rather than discovering it as an unexplained threshold breach.
+pub fn undetermined_severity_count(report: &ScanReport) -> usize {
+    report
+        .findings
+        .iter()
+        .filter(|f| severity_rank(&f.severity).is_none())
+        .count()
+}
+
+/// The note explaining an undetermined-severity set, or `None` when every
+/// finding could be ranked.
+fn undetermined_severity_note(report: &ScanReport) -> Option<String> {
+    let n = undetermined_severity_count(report);
+    (n > 0).then(|| {
+        format!(
+            "{n} finding(s) carry no severity this scan could determine — they breach \
+             every threshold rather than ranking below `low`. Waive one deliberately, \
+             and visibly, with a VEX statement (`sscsb vex create`)"
+        )
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +122,9 @@ pub fn run_scan(ctx: &Ctx, cfg: &Config, vex_path: Option<&Path>) -> Result<Scan
         let vex_text = std::fs::read_to_string(vex)
             .with_context(|| format!("reading VEX {}", vex.display()))?;
         apply_vex(&mut report, &vex_text)?;
+    }
+    if let Some(note) = undetermined_severity_note(&report) {
+        report.notes.push(note);
     }
     let _ = cfg;
     Ok(report)
@@ -241,11 +291,7 @@ pub fn parse_osv(stdout: &str) -> Result<Vec<VulnFinding>> {
                 .and_then(|x| x.as_array())
                 .unwrap_or(&Vec::new())
             {
-                let severity = vuln
-                    .pointer("/database_specific/severity")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("unknown")
-                    .to_lowercase();
+                let severity = osv_severity(vuln);
                 findings.push(VulnFinding {
                     id: vuln
                         .get("id")
@@ -261,6 +307,186 @@ pub fn parse_osv(stdout: &str) -> Result<Vec<VulnFinding>> {
         }
     }
     Ok(findings)
+}
+
+/// The severity of one OSV vulnerability record, recovered from whichever of
+/// the fields advisories ACTUALLY populate — `"unknown"` only when the record
+/// states no rating anywhere.
+///
+/// Reading `/database_specific/severity` alone was measurably not enough.
+/// Against a live `osv-scanner 2.4.0` run, RUSTSEC and PYSEC records do not
+/// carry that field at all (a RUSTSEC record's `database_specific` is
+/// `{"license": "CC0-1.0"}`), so they all landed as `unknown`. The ratings
+/// those records do carry live in two other places, both read here:
+///
+/// * the OSV `severity` array — `[{"type": "CVSS_V3", "score": "CVSS:3.1/…"}]`;
+/// * `affected[].database_specific.cvss`, where RUSTSEC repeats the vector.
+///
+/// When a record states a rating more than one way — GHSA carries both a
+/// `MODERATE` label and a CVSS vector — the HIGHEST determinable rating wins.
+/// A gate should not be argued down by the weaker of two ratings the same
+/// advisory asserts, and the rows disagree rarely and narrowly in practice.
+///
+/// Only CVSS v3.0/v3.1 vectors are scored. A v4.0 vector needs the v4
+/// macro-vector lookup tables, and guessing a band from a vector we cannot
+/// score would be inventing a rating; such a record stays undetermined, which
+/// now fails closed and visibly rather than passing as `low`. (In practice a
+/// v4-rated advisory is a modern GHSA one, which also carries the label read
+/// first.)
+fn osv_severity(vuln: &serde_json::Value) -> String {
+    let mut candidates: Vec<String> = Vec::new();
+
+    // The database's own label: GHSA says LOW / MODERATE / HIGH / CRITICAL.
+    if let Some(label) = vuln
+        .pointer("/database_specific/severity")
+        .and_then(|x| x.as_str())
+    {
+        candidates.push(label.to_string());
+    }
+    // The OSV `severity` array — CVSS vectors.
+    for entry in vuln
+        .get("severity")
+        .and_then(|x| x.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(sev) = entry
+            .get("score")
+            .and_then(|x| x.as_str())
+            .and_then(severity_from_cvss_vector)
+        {
+            candidates.push(sev.to_string());
+        }
+    }
+    // RUSTSEC repeats the vector per affected range.
+    for affected in vuln
+        .get("affected")
+        .and_then(|x| x.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(sev) = affected
+            .pointer("/database_specific/cvss")
+            .and_then(|x| x.as_str())
+            .and_then(severity_from_cvss_vector)
+        {
+            candidates.push(sev.to_string());
+        }
+    }
+
+    candidates
+        .iter()
+        .filter_map(|c| severity_rank(c))
+        .max()
+        .map_or_else(
+            || "unknown".to_string(),
+            |rank| SEVERITIES[rank].to_string(),
+        )
+}
+
+/// The severity band of a CVSS vector, via its base score. `None` for any
+/// vector we cannot score exactly — never a guess.
+fn severity_from_cvss_vector(vector: &str) -> Option<&'static str> {
+    let score = cvss_v3_base_score(vector)?;
+    // The CVSS v3 qualitative severity rating scale. 0.0 is "None" upstream;
+    // this scale has no rung below `low`, and the record did state a score, so
+    // it ranks `low` rather than counting as undetermined.
+    Some(match score {
+        s if s < 4.0 => "low",
+        s if s < 7.0 => "medium",
+        s if s < 9.0 => "high",
+        _ => "critical",
+    })
+}
+
+/// CVSS v3.0/v3.1 base score from a vector string, per the first.org
+/// specification. `None` when the string is not a v3 base vector or is missing
+/// a mandatory base metric — an incomplete vector is not a low score.
+fn cvss_v3_base_score(vector: &str) -> Option<f64> {
+    let (version, metrics) = vector.trim().split_once('/')?;
+    if version != "CVSS:3.1" && version != "CVSS:3.0" {
+        return None;
+    }
+    let pairs: Vec<(&str, &str)> = metrics
+        .split('/')
+        .filter_map(|p| p.split_once(':'))
+        .collect();
+    let get = |key: &str| {
+        pairs
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| *value)
+    };
+
+    let scope_changed = match get("S")? {
+        "U" => false,
+        "C" => true,
+        _ => return None,
+    };
+    let attack_vector = match get("AV")? {
+        "N" => 0.85,
+        "A" => 0.62,
+        "L" => 0.55,
+        "P" => 0.2,
+        _ => return None,
+    };
+    let attack_complexity = match get("AC")? {
+        "L" => 0.77,
+        "H" => 0.44,
+        _ => return None,
+    };
+    // Privileges Required is scored higher when the scope changes.
+    let privileges_required = match (get("PR")?, scope_changed) {
+        ("N", _) => 0.85,
+        ("L", false) => 0.62,
+        ("L", true) => 0.68,
+        ("H", false) => 0.27,
+        ("H", true) => 0.50,
+        _ => return None,
+    };
+    let user_interaction = match get("UI")? {
+        "N" => 0.85,
+        "R" => 0.62,
+        _ => return None,
+    };
+    let impact_weight = |metric: &str| match metric {
+        "H" => Some(0.56),
+        "L" => Some(0.22),
+        "N" => Some(0.0),
+        _ => None,
+    };
+    let confidentiality = impact_weight(get("C")?)?;
+    let integrity = impact_weight(get("I")?)?;
+    let availability = impact_weight(get("A")?)?;
+
+    let iss = 1.0 - ((1.0 - confidentiality) * (1.0 - integrity) * (1.0 - availability));
+    let impact = if scope_changed {
+        7.52 * (iss - 0.029) - 3.25 * (iss - 0.02f64).powi(15)
+    } else {
+        6.42 * iss
+    };
+    if impact <= 0.0 {
+        return Some(0.0);
+    }
+    let exploitability =
+        8.22 * attack_vector * attack_complexity * privileges_required * user_interaction;
+    let raw = if scope_changed {
+        1.08 * (impact + exploitability)
+    } else {
+        impact + exploitability
+    };
+    Some(cvss_roundup(raw.min(10.0)))
+}
+
+/// The CVSS v3.1 `Roundup` function: round up to one decimal place, defined
+/// on integers so floating-point representation cannot round 8.6 down to 8.5.
+fn cvss_roundup(x: f64) -> f64 {
+    let scaled = (x * 100_000.0).round() as i64;
+    if scaled % 10_000 == 0 {
+        scaled as f64 / 100_000.0
+    } else {
+        ((scaled as f64 / 10_000.0).floor() + 1.0) / 10.0
+    }
 }
 
 /// Apply an OpenVEX document: a finding is suppressed only when a
@@ -431,12 +657,35 @@ fn normalize_ecosystem(label: &str) -> String {
 }
 
 /// Does the report breach the configured severity threshold?
-pub fn breaches_threshold(report: &ScanReport, fail_on: &str) -> bool {
-    let threshold = severity_rank(fail_on);
-    report
+///
+/// Two things this refuses to do silently, both of which it used to:
+///
+/// 1. **Rank an undetermined severity below `low`.** A finding whose severity
+///    no source stated breaches EVERY threshold. We cannot show it is below
+///    the line, so it is above it; the alternative is a gate that a missing
+///    field can walk straight through. [`parse_osv`] recovers a real rating
+///    wherever the advisory carries one precisely so this set stays small,
+///    and a documented waiver is still available through VEX — visibly.
+/// 2. **Turn a typo'd threshold into the strictest setting.** `fail_on =
+///    "error"` used to rank 0, i.e. `low`, i.e. everything breaches: a
+///    misconfiguration that *looks* like it is working. A `fail_on` that is
+///    not a severity is a configuration error and says so.
+pub fn breaches_threshold(report: &ScanReport, fail_on: &str) -> Result<bool> {
+    let threshold = severity_rank(fail_on).with_context(|| {
+        format!(
+            "`fail_on` is not a severity: {fail_on:?} (valid: {}). \
+             Fix `[controls.vuln-scan] fail_on` in .sscsb/config.toml",
+            SEVERITIES.join(", ")
+        )
+    })?;
+    Ok(report
         .findings
         .iter()
-        .any(|f| severity_rank(&f.severity) >= threshold)
+        .any(|f| match severity_rank(&f.severity) {
+            Some(rank) => rank >= threshold,
+            // Undetermined: not provably below the line, so treated as above it.
+            None => true,
+        }))
 }
 
 pub fn verify_scan_control(ctx: &Ctx) -> VerifyResult {
@@ -473,10 +722,10 @@ mod tests {
             findings,
             ..Default::default()
         };
-        assert!(breaches_threshold(&report, "high"));
-        assert!(!breaches_threshold(&ScanReport::default(), "low"));
+        assert!(breaches_threshold(&report, "high").unwrap());
+        assert!(!breaches_threshold(&ScanReport::default(), "low").unwrap());
         // Raising the threshold to critical: the high finding no longer breaches.
-        assert!(!breaches_threshold(&report, "critical"));
+        assert!(!breaches_threshold(&report, "critical").unwrap());
     }
 
     #[test]
@@ -487,6 +736,9 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].id, "GHSA-xxxx");
         assert_eq!(findings[0].source, "osv-scanner");
+        // GHSA's MODERATE is this scale's `medium`, not an unrecognised
+        // string that ranks below `low`.
+        assert_eq!(findings[0].severity, "medium");
     }
 
     #[test]
@@ -515,7 +767,90 @@ mod tests {
     fn severity_ranks_are_ordered() {
         assert!(severity_rank("critical") > severity_rank("high"));
         assert!(severity_rank("high") > severity_rank("medium"));
-        assert_eq!(severity_rank("unknown-thing"), severity_rank("low"));
+        assert!(severity_rank("medium") > severity_rank("low"));
+    }
+
+    /// H6: `severity_rank` ended in `.unwrap_or(0)`, so every string that was
+    /// not one of the four labels ranked BELOW `low` — an unrateable advisory
+    /// and a GHSA `MODERATE` alike. Both halves are asserted here.
+    #[test]
+    fn an_undetermined_severity_is_not_a_low_severity() {
+        // Not a severity: no rank at all, rather than the weakest rank.
+        assert_eq!(severity_rank("unknown"), None);
+        assert_eq!(severity_rank("unknown-thing"), None);
+        assert_eq!(severity_rank(""), None);
+        // ...and it is strictly not `low`, which does have a rank.
+        assert!(severity_rank("low").is_some());
+
+        // A finding we cannot rank breaches every threshold, including the
+        // most permissive one, because nothing shows it is below the line.
+        let report = ScanReport {
+            findings: vec![VulnFinding {
+                id: "RUSTSEC-2024-0375".into(),
+                package: "atty".into(),
+                severity: "unknown".into(),
+                source: "osv-scanner",
+                ecosystem: Some("crates.io".into()),
+            }],
+            ..Default::default()
+        };
+        for threshold in SEVERITIES {
+            assert!(
+                breaches_threshold(&report, threshold).unwrap(),
+                "an undetermined severity must breach `{threshold}`"
+            );
+        }
+        // And it is counted and explained rather than merely gating.
+        assert_eq!(undetermined_severity_count(&report), 1);
+        let note = undetermined_severity_note(&report).expect("note");
+        assert!(
+            note.contains("1 finding(s)") && note.contains("VEX"),
+            "{note}"
+        );
+        assert_eq!(undetermined_severity_note(&ScanReport::default()), None);
+    }
+
+    /// H6: GHSA rates advisories `MODERATE`; the scale says `medium`. Before
+    /// normalisation that string was unrecognised, so every GitHub-rated
+    /// moderate advisory ranked below `low` and could not breach `medium`.
+    #[test]
+    fn ghsa_moderate_ranks_as_medium() {
+        assert_eq!(severity_rank("MODERATE"), severity_rank("medium"));
+        let report = ScanReport {
+            findings: vec![VulnFinding {
+                id: "GHSA-wcg3-cvx6-7396".into(),
+                package: "time".into(),
+                severity: "moderate".into(),
+                source: "osv-scanner",
+                ecosystem: Some("crates.io".into()),
+            }],
+            ..Default::default()
+        };
+        assert!(breaches_threshold(&report, "medium").unwrap());
+        assert!(breaches_threshold(&report, "low").unwrap());
+        // It is a real rating, so it does NOT breach a higher threshold —
+        // this is a recovered severity, not a fail-closed unknown.
+        assert!(!breaches_threshold(&report, "high").unwrap());
+    }
+
+    /// H6, inverse hazard: a typo'd threshold used to rank 0 — the STRICTEST
+    /// setting — so a misconfigured gate looked like a working one.
+    #[test]
+    fn a_fail_on_that_is_not_a_severity_is_an_error_not_the_strictest_setting() {
+        let report = ScanReport {
+            findings: parse_trivy(TRIVY_SAMPLE).unwrap(),
+            ..Default::default()
+        };
+        for typo in ["none", "error", "HIGH!", "", "criticalish"] {
+            let err = breaches_threshold(&report, typo).unwrap_err().to_string();
+            assert!(
+                err.contains("not a severity") && err.contains("low, medium, high, critical"),
+                "a {typo:?} threshold must name the valid values: {err}"
+            );
+        }
+        // Case and stray whitespace are the author's intent, not a typo.
+        assert!(breaches_threshold(&report, "HIGH ").unwrap());
+        assert!(!breaches_threshold(&report, " Critical").unwrap());
     }
 
     #[test]
@@ -595,6 +930,112 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].id, "GHSA-unrated");
         assert_eq!(findings[0].severity, "unknown");
+        // ...and "unknown" is not a rank, so it cannot slip under a gate.
+        assert_eq!(severity_rank(&findings[0].severity), None);
+    }
+
+    /// H6: RUSTSEC and PYSEC records carry no `/database_specific/severity` —
+    /// reading only that field rated 13 of 25 findings `unknown` in a live
+    /// `osv-scanner 2.4.0` run. These are the record shapes those databases
+    /// actually emit, captured from that run.
+    #[test]
+    fn parse_osv_recovers_severity_from_the_fields_advisories_actually_populate() {
+        // RUSTSEC-2021-0003 (smallvec): no database_specific.severity; the
+        // rating lives in the OSV `severity` array as a CVSS vector. 9.8.
+        let rustsec_vector = r#"{"results":[{"packages":[{"package":{"name":"smallvec","ecosystem":"crates.io"},
+            "vulnerabilities":[{"id":"RUSTSEC-2021-0003","database_specific":{"license":"CC0-1.0"},
+             "severity":[{"score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H","type":"CVSS_V3"}]}]}]}]}"#;
+        let findings = parse_osv(rustsec_vector).unwrap();
+        assert_eq!(findings[0].severity, "critical", "{:?}", findings[0]);
+
+        // RUSTSEC-2020-0071 (time): the same vector, in the other place
+        // RUSTSEC puts it — affected[].database_specific.cvss. 6.2.
+        let rustsec_affected = r#"{"results":[{"packages":[{"package":{"name":"time","ecosystem":"crates.io"},
+            "vulnerabilities":[{"id":"RUSTSEC-2020-0071","database_specific":{"license":"CC0-1.0"},
+             "affected":[{"database_specific":{"cvss":"CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+             "informational":null}}]}]}]}]}"#;
+        let findings = parse_osv(rustsec_affected).unwrap();
+        assert_eq!(findings[0].severity, "medium", "{:?}", findings[0]);
+
+        // GHSA states a label AND a vector. The label is normalised onto this
+        // scale, and where the two disagree the higher rating wins — a gate is
+        // not argued down by the weaker of two ratings one record asserts.
+        let ghsa = r#"{"results":[{"packages":[{"package":{"name":"smallvec","ecosystem":"crates.io"},
+            "vulnerabilities":[{"id":"GHSA-43w2-9j62-hq99",
+             "database_specific":{"severity":"MODERATE","github_reviewed":true},
+             "severity":[{"score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H","type":"CVSS_V3"}]}]}]}]}"#;
+        let findings = parse_osv(ghsa).unwrap();
+        assert_eq!(findings[0].severity, "critical", "{:?}", findings[0]);
+
+        // A label with no vector is still recovered, canonicalised.
+        let label_only = r#"{"results":[{"packages":[{"package":{"name":"atty"},
+            "vulnerabilities":[{"id":"GHSA-g98v-hv3f-hcfr","database_specific":{"severity":"MODERATE"}}]}]}]}"#;
+        assert_eq!(parse_osv(label_only).unwrap()[0].severity, "medium");
+
+        // A vector we cannot score exactly is NOT guessed at: the v4
+        // macro-vector tables are not implemented, so this stays undetermined
+        // (which fails closed) rather than being invented as some band.
+        let v4_only = r#"{"results":[{"packages":[{"package":{"name":"foo"},
+            "vulnerabilities":[{"id":"GHSA-v4","severity":[{"score":"CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N","type":"CVSS_V4"}]}]}]}]}"#;
+        assert_eq!(parse_osv(v4_only).unwrap()[0].severity, "unknown");
+    }
+
+    /// The base-score arithmetic, checked against published CVSS values —
+    /// a recovered severity is only worth having if the score is right.
+    #[test]
+    fn cvss_v3_base_scores_match_the_published_values() {
+        let score = |v: &str| cvss_v3_base_score(v).expect("scorable vector");
+        // RUSTSEC-2021-0003 / CVE-2021-25900, rated 9.8 by NVD and GHSA.
+        assert_eq!(score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"), 9.8);
+        // CVE-2020-26235 (time), 6.2 — GHSA's MODERATE.
+        assert_eq!(score("CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"), 6.2);
+        // Log4Shell, the canonical scope-changed 10.0.
+        assert_eq!(score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"), 10.0);
+        // Heartbleed's v3 vector, 7.5.
+        assert_eq!(score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"), 7.5);
+        // Scope-changed with partial impact: 6.4 (exercises the 1.08 factor).
+        assert_eq!(score("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:L/I:L/A:N"), 6.4);
+        // Low band, and the v3.0 prefix is accepted too.
+        assert_eq!(score("CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:N/A:N"), 3.1);
+        // No impact at all scores 0.0 — the impact<=0 branch.
+        assert_eq!(score("CVSS:3.0/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:N"), 0.0);
+
+        // Bands, including the 0.0 "None" case which has no lower rung here.
+        assert_eq!(
+            severity_from_cvss_vector("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+            Some("critical")
+        );
+        assert_eq!(
+            severity_from_cvss_vector("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"),
+            Some("high")
+        );
+        assert_eq!(
+            severity_from_cvss_vector("CVSS:3.0/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:N"),
+            Some("low")
+        );
+
+        // Nothing we cannot score exactly is guessed at.
+        for unscorable in [
+            "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+            "CVSS:2.0/AV:N/AC:L/Au:N/C:P/I:P/A:P",
+            "AV:N/AC:L/Au:N/C:P/I:P/A:P",
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H", // missing mandatory A
+            "CVSS:3.1/AV:X/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", // bogus metric value
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:X/C:H/I:H/A:H", // bogus scope
+            "CVSS:3.1/AV:N/AC:X/PR:N/UI:N/S:U/C:H/I:H/A:H", // bogus complexity
+            "CVSS:3.1/AV:N/AC:L/PR:X/UI:N/S:U/C:H/I:H/A:H", // bogus privileges
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:X/S:U/C:H/I:H/A:H", // bogus interaction
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:X/I:H/A:H", // bogus impact
+            "not a vector",
+            "",
+        ] {
+            assert_eq!(
+                cvss_v3_base_score(unscorable),
+                None,
+                "must not invent a score for {unscorable:?}"
+            );
+            assert_eq!(severity_from_cvss_vector(unscorable), None);
+        }
     }
 
     #[test]
@@ -871,8 +1312,8 @@ mod tests {
         }
         // Threshold gating stays monotonic with severity regardless of what
         // the real scanners returned.
-        let breached_low = breaches_threshold(&report, "low");
-        let breached_crit = breaches_threshold(&report, "critical");
+        let breached_low = breaches_threshold(&report, "low").unwrap();
+        let breached_crit = breaches_threshold(&report, "critical").unwrap();
         assert!(
             !breached_crit || breached_low,
             "anything that breaches `critical` must also breach `low`"

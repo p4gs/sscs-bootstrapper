@@ -10,6 +10,31 @@ versions.
 
 ### Fixed
 
+- **A severity we could not determine ranked below `low`, so real advisories
+  could not breach the gate.** `severity_rank` ended in `.unwrap_or(0)`: every
+  string that was not one of `low|medium|high|critical` ranked *beneath the
+  weakest severity*, and therefore could not breach any threshold. Three
+  consequences, all measured against live tools:
+  - `parse_osv` read severity only from `/database_specific/severity`, a field
+    RUSTSEC and PYSEC records do not carry — 13 of 25 findings in an
+    `osv-scanner 2.4.0` run landed as `unknown` and could not breach
+    `fail_on = "high"`. Severity is now recovered from the fields those records
+    *do* populate: the OSV `severity` array's CVSS vectors (scored with the
+    CVSS v3.0/v3.1 base-score formula) and `affected[].database_specific.cvss`.
+    Where a record states a rating more than one way, the highest wins.
+  - GHSA's `MODERATE` ranked 0 because it is not the literal string `medium`.
+    The two vocabularies are now bridged.
+  - What remains genuinely unrated breaches *every* threshold rather than
+    passing as `low`, and is reported as a note with its count. The way to
+    waive one is a VEX statement — visibly, like every other suppression.
+  A CVSS v4.0 vector is left undetermined rather than guessed at; scoring it
+  needs the v4 macro-vector tables, and inventing a band is how a gate starts
+  lying.
+- **A typo'd `fail_on` silently became the strictest setting.** `fail_on =
+  "error"` ranked 0, i.e. `low`, i.e. everything breaches — a broken gate that
+  looks like a working one. A `fail_on` that is not a severity is now an error
+  naming the valid values. Case and stray whitespace (`"HIGH "`) are still
+  accepted as the threshold their author meant.
 - **Five controls reported `PASS` for checks that never ran.** `sscsb`'s value
   rests on a green `verify --strict` meaning the named controls actually work,
   and `--strict` only escalates `DEGRADED` — so a false `PASS` sailed straight

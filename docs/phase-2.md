@@ -59,6 +59,26 @@ enabled = true
 fail_on = "high"      # critical | high | medium | low
 ```
 
+A `fail_on` that is not one of those four is a configuration error, not a
+default. It used to rank below `low` — which meant `fail_on = "error"` gated on
+*everything*, a misconfigured threshold wearing the appearance of a strict one.
+
+**A severity we could not determine is not a low severity.** Advisory databases
+disagree about where they put a rating: GHSA states a label (`MODERATE`, which
+is this scale's `medium`), while RUSTSEC and PYSEC records carry no label at all
+and state a CVSS vector instead — in the OSV `severity` array, or under
+`affected[].database_specific.cvss`. `sscsb` reads all of them and scores v3
+vectors, because a finding that reads `unknown` cannot be gated on, and reading
+one field only left 13 of 25 findings in a real `osv-scanner` run unrateable.
+What is still genuinely unrated after that breaches **every** threshold and is
+reported with its count. The way to stand one down is a VEX statement, which
+says so out loud:
+
+```sh
+sscsb vex create --vuln RUSTSEC-2024-0375 --product pkg:cargo/atty \
+  --status not_affected --justification vulnerable_code_not_present
+```
+
 ## Package trust — the AI-era control
 
 A model will confidently tell you to install a package that does not exist. If an
