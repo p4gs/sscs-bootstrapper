@@ -300,6 +300,96 @@ fn permissions_is_write_all(perms: &Yaml) -> bool {
     perms.as_str() == Some("write-all")
 }
 
+/// The scopes a `permissions:` block grants at `write`, in declaration order.
+fn write_scopes(perms: &Yaml) -> Vec<String> {
+    let Some(hash) = perms.as_hash() else {
+        return Vec::new();
+    };
+    hash.iter()
+        .filter(|(_, level)| level.as_str() == Some("write"))
+        .filter_map(|(scope, _)| scope.as_str().map(str::to_string))
+        .collect()
+}
+
+/// How many scopes the GITHUB_TOKEN has, per GitHub's Actions documentation:
+/// actions, attestations, checks, contents, deployments, discussions,
+/// id-token, issues, models, packages, pages, pull-requests,
+/// repository-projects, security-events, statuses.
+const TOKEN_SCOPE_COUNT: usize = 15;
+
+/// At this many distinct write scopes, a grant has stopped describing a job
+/// and started describing a role.
+///
+/// The most privileged job sscsb itself ships is a release that pushes the
+/// release, publishes a package, mints an OIDC token and writes an attestation
+/// — four scopes, one coherent purpose. Nothing legitimate that could be named
+/// needs five, so five is where `write-all` has merely been spelled out. This
+/// threshold is deliberately ABOVE every real workflow rather than at the edge
+/// of one: a count low enough to catch `contents: write` would flag every
+/// release workflow in existence, which is noise, not least privilege.
+const WRITE_ALL_BY_ENUMERATION: usize = 5;
+
+/// The scope whose write grant reaches OUTSIDE the job's own build: `actions:
+/// write` can delete or replace another workflow run's artifacts and caches
+/// (the ClusterFuzzLite/Ultralytics cache-poisoning class) and cancel or
+/// re-run workflows.
+const CI_CONTROL_SCOPE: &str = "actions";
+
+/// Scopes that let a job ship something the world consumes.
+const PUBLISH_SCOPES: &[&str] = &[
+    "contents",
+    "packages",
+    "attestations",
+    "deployments",
+    "id-token",
+];
+
+/// What "least privilege" means beyond the literal string `write-all`.
+///
+/// Breadth cannot be judged by counting alone — a release job legitimately
+/// needs `contents: write` — so only two shapes are called out, both chosen to
+/// be silent on every workflow sscsb ships and on every ordinary one that
+/// could be named:
+///
+/// 1. Write on so many scopes that the grant IS `write-all`, enumerated.
+/// 2. The right to tamper with CI state (`actions: write`) held together with
+///    the right to publish — one compromised step can then poison the build
+///    AND ship the result, which neither half can do alone.
+fn audit_permission_breadth(file: &str, held_by: &str, perms: &Yaml, findings: &mut Vec<Finding>) {
+    let writes = write_scopes(perms);
+    if writes.len() >= WRITE_ALL_BY_ENUMERATION {
+        findings.push(Finding::new(
+            Severity::Error,
+            file,
+            format!(
+                "{held_by} grants write on {} of the GITHUB_TOKEN's {TOKEN_SCOPE_COUNT} scopes \
+                 ({}) — that is `write-all` spelled out; grant only the scopes the job uses",
+                writes.len(),
+                writes.join(", ")
+            ),
+        ));
+        return;
+    }
+    let publish: Vec<&String> = writes
+        .iter()
+        .filter(|s| PUBLISH_SCOPES.contains(&s.as_str()))
+        .collect();
+    if writes.iter().any(|s| s == CI_CONTROL_SCOPE) && !publish.is_empty() {
+        let with: Vec<&str> = publish.iter().map(|s| s.as_str()).collect();
+        findings.push(Finding::new(
+            Severity::Warn,
+            file,
+            format!(
+                "{held_by} holds `actions: write` alongside `{}` — `actions: write` can replace \
+                 another run's artifacts and caches, so one compromised step in this job can \
+                 poison the build AND publish the result; split the tampering right off into a \
+                 job that cannot publish",
+                with.join("`, `")
+            ),
+        ));
+    }
+}
+
 fn audit_permissions(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
     let top = &doc["permissions"];
     let top_present = !top.is_badvalue();
@@ -310,17 +400,24 @@ fn audit_permissions(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
             "top-level `permissions: write-all` — grant specific least-privilege scopes".into(),
         ));
     }
+    if top_present {
+        audit_permission_breadth(file, "the top-level `permissions:` block", top, findings);
+    }
     let mut all_jobs_scoped = true;
+    let mut inheritors = Vec::new();
     for (name, job) in jobs(doc) {
         let jp = &job["permissions"];
         if jp.is_badvalue() {
             all_jobs_scoped = false;
+            inheritors.push(name.to_string());
         } else if permissions_is_write_all(jp) {
             findings.push(Finding::new(
                 Severity::Error,
                 file,
                 format!("job `{name}` uses `permissions: write-all`"),
             ));
+        } else {
+            audit_permission_breadth(file, &format!("job `{name}`"), jp, findings);
         }
     }
     if !top_present && !all_jobs_scoped {
@@ -330,6 +427,60 @@ fn audit_permissions(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
             "no `permissions:` block at workflow or job level — the default GITHUB_TOKEN grant \
              is too broad; add an explicit least-privilege block"
                 .into(),
+        ));
+    }
+    if top_present {
+        audit_top_level_write_reach(file, top, &inheritors, findings);
+    }
+}
+
+/// A write scope at the TOP level is granted to every job that does not
+/// override it — including the job that only runs the test suite, and
+/// including every job added to the file later. This is the placement half of
+/// least privilege (and what OpenSSF Scorecard's Token-Permissions check looks
+/// at): the same scope on the one job that needs it has a fraction of the
+/// blast radius.
+///
+/// The finding distinguishes a grant that is live from one that is latent,
+/// because those deserve different urgency and a tool that conflates them is
+/// the reason people stop reading its output.
+fn audit_top_level_write_reach(
+    file: &str,
+    top: &Yaml,
+    inheritors: &[String],
+    findings: &mut Vec<Finding>,
+) {
+    let writes = write_scopes(top);
+    if writes.is_empty() {
+        return;
+    }
+    let scopes = writes
+        .iter()
+        .map(|s| format!("{s}: write"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if inheritors.is_empty() {
+        findings.push(Finding::new(
+            Severity::Info,
+            file,
+            format!(
+                "top-level `{scopes}` is currently overridden by every job, but it stays the \
+                 default for the next job added — prefer a read-only top-level block"
+            ),
+        ));
+    } else {
+        let jobs = inheritors
+            .iter()
+            .map(|j| format!("`{j}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        findings.push(Finding::new(
+            Severity::Warn,
+            file,
+            format!(
+                "top-level `{scopes}` is inherited by job(s) {jobs}, which never asked for it — \
+                 move the grant down to the job that needs it and leave the top level read-only"
+            ),
         ));
     }
 }
@@ -1329,6 +1480,116 @@ esac
             .messages
             .iter()
             .any(|x| x.contains("cannot self-approve")));
+    }
+
+    /// Wrap a job-level permissions block in a workflow that is otherwise
+    /// clean, so the only findings under test are the permissions ones.
+    fn job_perms(block: &str) -> String {
+        format!(
+            "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    \
+             runs-on: ubuntu-latest\n    permissions:\n{block}    steps:\n      - run: echo hi\n"
+        )
+    }
+
+    /// M12: "least privilege" was the literal string `write-all`. A job that
+    /// enumerates write on scope after scope is write-all with extra typing,
+    /// and it was not flagged at all.
+    #[test]
+    fn write_all_spelled_out_scope_by_scope_is_still_write_all() {
+        let wf = job_perms(
+            "      contents: write\n      packages: write\n      id-token: write\n      \
+             actions: write\n      issues: write\n",
+        );
+        let f = audit_workflow("w.yml", &wf, false).unwrap();
+        assert!(
+            f.iter().any(|x| x.severity == Severity::Error
+                && x.message.contains("job `b`")
+                && x.message.contains("write on 5")),
+            "an enumerated write-all must be the same finding as the literal one: {f:?}"
+        );
+    }
+
+    /// The guard on the rule above: the most privileged job sscsb itself ships
+    /// — a release that pushes the release, publishes a package, mints an OIDC
+    /// token and writes an attestation — must stay silent. A rule that fails
+    /// ordinary correct workflows is worse than the hole it closes.
+    #[test]
+    fn a_legitimate_release_grant_is_not_flagged() {
+        for block in [
+            // sscsb's own release.yml job.
+            "      contents: write\n      id-token: write\n      attestations: write\n",
+            // ...plus publishing a package: four scopes, still one coherent job.
+            "      contents: write\n      packages: write\n      id-token: write\n      \
+             attestations: write\n",
+            // A single write scope is what least privilege LOOKS like.
+            "      contents: write\n",
+            "      security-events: write\n",
+        ] {
+            let f = audit_workflow("w.yml", &job_perms(block), false).unwrap();
+            assert!(f.is_empty(), "no finding is owed for `{block}`: {f:?}");
+        }
+    }
+
+    /// M12: `actions: write` reaches outside the job's own build — it can
+    /// replace ANOTHER run's artifacts and caches. Combined with the right to
+    /// publish, one compromised step can poison the build and ship the result.
+    #[test]
+    fn ci_tampering_rights_combined_with_publishing_rights_are_flagged() {
+        let f = audit_workflow(
+            "w.yml",
+            &job_perms("      actions: write\n      contents: write\n"),
+            false,
+        )
+        .unwrap();
+        assert!(
+            f.iter().any(|x| x.severity == Severity::Warn
+                && x.message.contains("job `b`")
+                && x.message.contains("actions: write")),
+            "{f:?}"
+        );
+
+        // Narrowness: each half alone is a job someone legitimately runs.
+        for block in ["      actions: write\n", "      contents: write\n"] {
+            let f = audit_workflow("w.yml", &job_perms(block), false).unwrap();
+            assert!(f.is_empty(), "`{block}` alone owes no finding: {f:?}");
+        }
+    }
+
+    /// M12: a write scope at the TOP level is handed to every job in the file.
+    /// Which jobs actually inherit it is the difference between a live
+    /// over-grant and a latent one, so the finding says which it is.
+    #[test]
+    fn top_level_write_scopes_are_reported_by_who_inherits_them() {
+        // `test` inherits `contents: write` to run `cargo test`.
+        let wf = "on: push\npermissions:\n  contents: write\njobs:\n  \
+                  release:\n    runs-on: ubuntu-latest\n    permissions:\n      \
+                  contents: write\n    steps:\n      - run: gh release create\n  \
+                  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n";
+        let f = audit_workflow("w.yml", wf, false).unwrap();
+        assert!(
+            f.iter().any(|x| x.severity == Severity::Warn
+                && x.message.contains("contents: write")
+                && x.message.contains("`test`")),
+            "the inheriting job must be named: {f:?}"
+        );
+
+        // Every job overrides it: the grant is inert today, but it is still
+        // the default the next job added will get. Reported, not failed.
+        let wf = "on: push\npermissions:\n  contents: write\njobs:\n  \
+                  release:\n    runs-on: ubuntu-latest\n    permissions:\n      \
+                  contents: write\n    steps:\n      - run: gh release create\n";
+        let f = audit_workflow("w.yml", wf, false).unwrap();
+        assert!(
+            f.iter()
+                .any(|x| x.severity == Severity::Info
+                    && x.message.contains("overridden by every job")),
+            "{f:?}"
+        );
+
+        // A read-only top level is the shape being asked for.
+        let wf = "on: push\npermissions:\n  contents: read\njobs:\n  \
+                  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n";
+        assert!(audit_workflow("w.yml", wf, false).unwrap().is_empty());
     }
 
     /// M13(a): the tag-pin exception was a `starts_with` PREFIX test, so any
