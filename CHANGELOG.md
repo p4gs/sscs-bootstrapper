@@ -10,6 +10,18 @@ versions.
 
 ### Fixed
 
+- **Every staged binary file was corrupted before it was scanned.**
+  `stage_to_tempdir` materialises each staged blob by running `git show
+  :<file>` and writing the result out, and the process-execution layer decoded
+  that stdout with `String::from_utf8_lossy` — which replaces every byte
+  sequence that is not valid UTF-8 with U+FFFD, three bytes of `EF BF BD`.
+  Measured: a 264-byte staged PNG arrived in the scan directory as 522 bytes,
+  and a staged, valid zip failed its own CRC — the reported "zipfile corrupt"
+  symptom. This cost twice over: the secret scanners and the pre-commit SAST
+  scanner both read bytes that were never in the repository, and so did
+  anything else that opened that directory. Staged blobs are now carried as
+  bytes end to end, through a new `exec::run_bytes`/`RawOutput` path that
+  exists precisely to keep file content out of the lossy `String` channel.
 - **A file committed to the repository silently muted the scanners.** Trivy
   reads `trivy.yaml` and `.trivyignore` from the directory it scans;
   OSV-Scanner reads `osv-scanner.toml` from the tree. None of it is asked

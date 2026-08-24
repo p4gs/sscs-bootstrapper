@@ -440,6 +440,12 @@ fn staged_submodules(ctx: &Ctx) -> Result<std::collections::HashSet<String>> {
 ///
 /// Shared by the secret scanner and the pre-commit SAST scanner so both get the
 /// same fail-closed, quote-safe materialization.
+///
+/// The blob is carried as BYTES end to end. `CmdOutput.stdout` is
+/// `from_utf8_lossy`, so routing a staged PNG, zip, or any other non-UTF-8 file
+/// through it would rewrite every invalid sequence as U+FFFD before the
+/// scanners ever saw it: the scan would read the wrong bytes, and anything
+/// downstream reading this directory would too.
 pub fn stage_to_tempdir(ctx: &Ctx) -> Result<(tempfile::TempDir, Vec<String>)> {
     let dir = tempfile::tempdir()?;
     let files = staged_paths(ctx)?;
@@ -447,7 +453,7 @@ pub fn stage_to_tempdir(ctx: &Ctx) -> Result<(tempfile::TempDir, Vec<String>)> {
     for file in &files {
         // `--` guards against a path that begins with a dash, and the raw path
         // is passed as a single argument (never shell-interpolated).
-        let out = exec::git_raw(&["show", &format!(":{file}")], &ctx.root)?;
+        let out = exec::git_bytes(&["show", &format!(":{file}")], &ctx.root)?;
         if !out.success() {
             if submodules.contains(file) {
                 continue; // gitlink: no blob to scan, correctly skipped
@@ -463,7 +469,7 @@ pub fn stage_to_tempdir(ctx: &Ctx) -> Result<(tempfile::TempDir, Vec<String>)> {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&dest, out.stdout.as_bytes())?;
+        std::fs::write(&dest, &out.stdout)?;
     }
     Ok((dir, files))
 }
@@ -1593,6 +1599,132 @@ not-json-noise
         assert!(paths.iter().any(|p| p == "café.txt"), "{paths:?}");
         assert!(paths.iter().any(|p| p == "plain.txt"));
         assert!(!paths.iter().any(|p| p.contains('\\')));
+    }
+
+    /// CRC-32/IEEE, so the test can build (and then validate) a REAL archive
+    /// rather than trust a hand-waved one. Bit-reversed polynomial 0xEDB88320.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// A real ZIP archive holding one STORED (uncompressed) entry, assembled
+    /// here at runtime — no binary fixture lives in this tree.
+    fn zip_with_stored_entry(name: &str, payload: &[u8]) -> Vec<u8> {
+        let crc = crc32(payload);
+        let size = payload.len() as u32;
+        let n = name.len() as u16;
+        let mut z = Vec::new();
+        // Local file header.
+        z.extend(b"PK\x03\x04");
+        z.extend(20u16.to_le_bytes()); // version needed
+        z.extend(0u16.to_le_bytes()); // flags
+        z.extend(0u16.to_le_bytes()); // method: stored
+        z.extend(0u16.to_le_bytes()); // mod time
+        z.extend(0u16.to_le_bytes()); // mod date
+        z.extend(crc.to_le_bytes());
+        z.extend(size.to_le_bytes()); // compressed size
+        z.extend(size.to_le_bytes()); // uncompressed size
+        z.extend(n.to_le_bytes());
+        z.extend(0u16.to_le_bytes()); // extra len
+        z.extend(name.as_bytes());
+        z.extend(payload);
+        // Central directory.
+        let cd_offset = z.len() as u32;
+        z.extend(b"PK\x01\x02");
+        z.extend(20u16.to_le_bytes()); // version made by
+        z.extend(20u16.to_le_bytes()); // version needed
+        z.extend(0u16.to_le_bytes()); // flags
+        z.extend(0u16.to_le_bytes()); // method
+        z.extend(0u16.to_le_bytes()); // mod time
+        z.extend(0u16.to_le_bytes()); // mod date
+        z.extend(crc.to_le_bytes());
+        z.extend(size.to_le_bytes());
+        z.extend(size.to_le_bytes());
+        z.extend(n.to_le_bytes());
+        z.extend(0u16.to_le_bytes()); // extra len
+        z.extend(0u16.to_le_bytes()); // comment len
+        z.extend(0u16.to_le_bytes()); // disk number start
+        z.extend(0u16.to_le_bytes()); // internal attrs
+        z.extend(0u32.to_le_bytes()); // external attrs
+        z.extend(0u32.to_le_bytes()); // local header offset
+        z.extend(name.as_bytes());
+        let cd_size = z.len() as u32 - cd_offset;
+        // End of central directory.
+        z.extend(b"PK\x05\x06");
+        z.extend(0u16.to_le_bytes()); // this disk
+        z.extend(0u16.to_le_bytes()); // disk with cd
+        z.extend(1u16.to_le_bytes()); // entries this disk
+        z.extend(1u16.to_le_bytes()); // entries total
+        z.extend(cd_size.to_le_bytes());
+        z.extend(cd_offset.to_le_bytes());
+        z.extend(0u16.to_le_bytes()); // comment len
+        z
+    }
+
+    /// M2: `stage_to_tempdir` materialised `git show`'s stdout after it had
+    /// been through `String::from_utf8_lossy`, so every staged non-UTF-8 file
+    /// was rewritten — each invalid byte becoming U+FFFD (`EF BF BD`), which
+    /// changes the content AND the length. The scanners then read the wrong
+    /// bytes, and so does anything else that opens this directory. Reported
+    /// symptom: a staged, valid zip comes out "zipfile corrupt".
+    #[test]
+    fn a_staged_binary_file_is_materialised_byte_for_byte() {
+        let (_d, ctx) = tmp_repo();
+
+        // Every one of the 256 byte values, behind a real PNG signature: the
+        // maximal non-UTF-8 stress, built at runtime.
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend((0u8..=255).rev());
+        assert!(
+            String::from_utf8(png.clone()).is_err(),
+            "fixture must actually be non-UTF-8, or it proves nothing"
+        );
+        let zip = zip_with_stored_entry("payload.bin", &(0u8..=255).collect::<Vec<u8>>());
+
+        std::fs::write(ctx.root.join("image.png"), &png).unwrap();
+        std::fs::write(ctx.root.join("archive.zip"), &zip).unwrap();
+        crate::exec::git(&["add", "image.png", "archive.zip"], &ctx.root).unwrap();
+
+        let (dir, files) = stage_to_tempdir(&ctx).unwrap();
+        assert_eq!(files.len(), 2, "{files:?}");
+
+        let got_png = std::fs::read(dir.path().join("image.png")).unwrap();
+        assert_eq!(
+            got_png.len(),
+            png.len(),
+            "lossy decoding also RESIZES the file: {} bytes staged, {} materialised",
+            png.len(),
+            got_png.len()
+        );
+        assert_eq!(got_png, png, "staged PNG must be materialised verbatim");
+
+        let got_zip = std::fs::read(dir.path().join("archive.zip")).unwrap();
+        assert_eq!(got_zip, zip, "staged zip must be materialised verbatim");
+
+        // …and the materialised archive is still a VALID zip: read its own
+        // stored CRC back and check it against the payload that survived.
+        assert_eq!(&got_zip[0..4], b"PK\x03\x04", "local file header signature");
+        let stored_crc = u32::from_le_bytes(got_zip[14..18].try_into().unwrap());
+        let name_len = u16::from_le_bytes(got_zip[26..28].try_into().unwrap()) as usize;
+        let size = u32::from_le_bytes(got_zip[22..26].try_into().unwrap()) as usize;
+        let start = 30 + name_len;
+        let payload = &got_zip[start..start + size];
+        assert_eq!(
+            crc32(payload),
+            stored_crc,
+            "materialised zip fails its own CRC — this is the `zipfile corrupt` symptom"
+        );
     }
 
     #[test]
