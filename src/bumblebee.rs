@@ -42,9 +42,9 @@
 //!    schema_version …`), so the parser keeps unrecognised lines rather than
 //!    dropping them.
 //!
-//! ## Three ways a bumblebee run can be empty, none of which mean "clean"
+//! ## Four ways a bumblebee run can be empty, none of which mean "clean"
 //!
-//! Every one of these produces zero findings and, in two cases, exit 0 and a
+//! Every one of these produces zero findings and, in three cases, exit 0 and a
 //! well-formed summary. Each is refused explicitly rather than passed:
 //!
 //! - **No criteria.** The catalog is an empty directory, has `entries: []`, or
@@ -54,12 +54,19 @@
 //!   "project"` does to a repository with no npm/pypi/go/gem/composer manifests,
 //!   which includes every Rust repository. `package_records_emitted +
 //!   package_records_suppressed == 0` is the signal.
+//! - **No subjects OF THE RIGHT CLASS.** `inventoried` is a single aggregate, so
+//!   a machine whose only populated root is the Homebrew Cellar clears the guard
+//!   above with 16,912 receipts while every class this control exists for — MCP
+//!   configs, editor extensions, browser extensions, agent skills — went
+//!   unexamined. `--findings-only` suppresses the per-package records, so the
+//!   summary's `roots[].kind` list is the only per-class signal there is.
 //! - **No completion.** The run timed out or ended with a non-`complete`
 //!   `status`. A summary record alone is not proof of a finished scan; the
 //!   summary's own `status` and `timed_out` fields are.
 //!
 //! A scanner that reports clean without having scanned is worse than no scanner,
-//! so `Outcome::Pass` requires criteria, subjects, and completion together.
+//! so `Outcome::Pass` requires criteria, subjects of the classes this control is
+//! for, and completion together.
 
 use crate::config::Config;
 use crate::context::Ctx;
@@ -101,6 +108,18 @@ pub struct ScanRecords {
     ///
     /// Zero means the scan matched the catalog against nothing at all.
     pub inventoried: u64,
+    /// The `kind` of every root the scan actually reached, deduplicated in
+    /// first-seen order — `mcp_config_root`, `editor_extension_root`,
+    /// `browser_extension_root`, `agent_skill_root`, `homebrew_root`,
+    /// `user_package_root`, or `project_root`.
+    ///
+    /// This is the ONLY per-class signal bumblebee emits. Under `--findings-only`
+    /// package records are suppressed rather than printed, so nothing in the
+    /// stream says which ecosystem the inventory came from, and the summary's own
+    /// `counts` are aggregates. `inventoried` is therefore one number that 16,912
+    /// Homebrew receipts satisfy on their own — which is why a guard built on it
+    /// alone cannot tell "scanned the endpoint" from "counted the Cellar".
+    pub root_kinds: Vec<String>,
     /// Lines in the parsed stream that were not valid JSON. bumblebee writes its
     /// diagnostics to **stderr**, not into this stream, so a malformed line here
     /// is genuinely unexpected rather than routine — it is counted and surfaced.
@@ -148,6 +167,17 @@ pub fn parse_records(ndjson: &str) -> ScanRecords {
                 out.status = status;
                 let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
                 out.inventoried = n("package_records_emitted") + n("package_records_suppressed");
+                for kind in v
+                    .get("roots")
+                    .and_then(|x| x.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r.get("kind").and_then(|k| k.as_str()))
+                {
+                    if !out.root_kinds.iter().any(|k| k == kind) {
+                        out.root_kinds.push(kind.to_string());
+                    }
+                }
             }
             _ => {}
         }
@@ -576,6 +606,30 @@ pub fn plan_scan(
     })
 }
 
+/// The root classes this control exists for — the surface nothing else in the
+/// registry looks at. Keys are bumblebee's own `roots[].kind` values, read off a
+/// real v0.1.2 `baseline` summary; values are what to call them in a report.
+///
+/// Deliberately excludes `homebrew_root`, `user_package_root` and `project_root`:
+/// those are package inventories, which `vuln-scan`, `package-trust` and the SBOM
+/// controls already cover from the repository side. A scan that reached only
+/// those has not looked at the endpoint.
+const ENDPOINT_ROOT_KINDS: &[(&str, &str)] = &[
+    ("mcp_config_root", "MCP server configs"),
+    ("editor_extension_root", "editor extensions"),
+    ("browser_extension_root", "browser extensions"),
+    ("agent_skill_root", "agent skills"),
+];
+
+/// Which of the endpoint classes did this scan actually reach?
+fn endpoint_classes_reached(root_kinds: &[String]) -> Vec<&'static str> {
+    ENDPOINT_ROOT_KINDS
+        .iter()
+        .filter(|(kind, _)| root_kinds.iter().any(|k| k == kind))
+        .map(|(_, label)| *label)
+        .collect()
+}
+
 /// Turn a finished bumblebee invocation into an outcome.
 ///
 /// Split out from `verify_bumblebee_control` deliberately: every decision that
@@ -681,11 +735,59 @@ fn evaluate_records(
     }
 
     if records.exposures.is_empty() {
+        // The class-aware half of the "did this scan actually look?" question.
+        // `inventoried` is one aggregate number, so a machine whose only populated
+        // root was the Homebrew Cellar satisfied the zero-subject guard above and
+        // then reported a clean ENDPOINT — having never opened an MCP config, an
+        // editor or browser extension, or an agent skill. Those four classes are
+        // the entire reason this control exists; nothing else in the registry
+        // looks at them, so a clean verdict that never reached one of them is
+        // claiming more than it checked.
+        let reached = endpoint_classes_reached(&records.root_kinds);
         let mut messages = vec![format!(
             "bumblebee {version}: {} artifact(s) inventoried, no known-compromised packages found \
              (profile {prof}, catalog {catalog})",
             records.inventoried
         )];
+        let outcome = if reached.is_empty() {
+            let missing: Vec<&str> = ENDPOINT_ROOT_KINDS.iter().map(|(_, l)| *l).collect();
+            messages.push(format!(
+                "scan reached no {} — nothing was established about the artifact classes this \
+                 control exists to check; the inventory above is packages only",
+                missing.join(", ")
+            ));
+            messages.push(format!(
+                "roots reached: {}",
+                if records.root_kinds.is_empty() {
+                    "none reported".to_string()
+                } else {
+                    records.root_kinds.join(", ")
+                }
+            ));
+            if prof == "project" {
+                // Fixable from config, so it degrades rather than merely
+                // informing: `--strict` should catch a control pointed at the
+                // wrong surface.
+                messages.push(
+                    "profile `project` scopes the scan to this repository, where none of those \
+                     roots live — set profile = \"baseline\" in [controls.bumblebee]"
+                        .into(),
+                );
+                Outcome::Degraded
+            } else {
+                // Nothing to fix: this endpoint genuinely has none of those roots.
+                // Say so plainly instead of failing a build over it.
+                messages.push(
+                    "none of those roots are present on this endpoint, so this run verified \
+                     installed packages only"
+                        .into(),
+                );
+                Outcome::Info
+            }
+        } else {
+            messages.push(format!("endpoint classes covered: {}", reached.join(", ")));
+            Outcome::Pass
+        };
         if let Some(c) = &coerced {
             messages.push(format!(
                 "note: unrecognised profile `{c}` was treated as `{prof}`"
@@ -697,7 +799,7 @@ fn evaluate_records(
                 records.unparsable_lines
             ));
         }
-        return VerifyResult::new(CONTROL, Outcome::Pass, messages);
+        return VerifyResult::new(CONTROL, outcome, messages);
     }
 
     let mut messages = vec![format!(
@@ -790,9 +892,21 @@ mod tests {
         }
     }
 
+    /// The root set a real `baseline` run reports on a developer machine, so the
+    /// default fixture is a scan that actually reached the endpoint classes.
+    const ENDPOINT_ROOTS: &str = r#"[{"path":"/h/.claude","kind":"mcp_config_root"},{"path":"/h/.vscode/extensions","kind":"editor_extension_root"},{"path":"/h/Library/.../Extensions","kind":"browser_extension_root"},{"path":"/h/.agents","kind":"agent_skill_root"},{"path":"/opt/homebrew/Cellar","kind":"homebrew_root"}]"#;
+    /// What a machine with nothing but Homebrew reports — the M20 case.
+    const HOMEBREW_ONLY_ROOTS: &str = r#"[{"path":"/opt/homebrew/Cellar","kind":"homebrew_root"},{"path":"/h/go","kind":"user_package_root"}]"#;
+    /// What `--profile project --root <repo>` reports, verbatim from a real run.
+    const PROJECT_ROOTS: &str = r#"[{"path":"/repo","kind":"project_root"}]"#;
+
     fn summary(status: &str, timed_out: bool, inventoried: u64) -> String {
+        summary_with_roots(status, timed_out, inventoried, ENDPOINT_ROOTS)
+    }
+
+    fn summary_with_roots(status: &str, timed_out: bool, inventoried: u64, roots: &str) -> String {
         format!(
-            r#"{{"record_type":"scan_summary","status":"{status}","timed_out":{timed_out},"package_records_emitted":0,"package_records_suppressed":{inventoried}}}"#
+            r#"{{"record_type":"scan_summary","status":"{status}","timed_out":{timed_out},"package_records_emitted":0,"package_records_suppressed":{inventoried},"roots":{roots}}}"#
         )
     }
 
@@ -1009,6 +1123,142 @@ mod tests {
             r.messages[0].contains("148"),
             "a pass must say how much it looked at: {:?}",
             r.messages
+        );
+    }
+
+    // ── M20: the inventory guard must be per-class, not one aggregate number ──
+
+    /// The finding. 16,912 Homebrew receipts satisfied "did the scan look at
+    /// anything?" while every class this control exists for went unopened, and
+    /// the report said the ENDPOINT was clean.
+    #[test]
+    fn a_homebrew_only_scan_is_not_a_clean_endpoint() {
+        let r = evaluate_scan(
+            "0.1.2",
+            "baseline",
+            "catalog.json",
+            None,
+            &out(
+                &summary_with_roots("complete", false, 16912, HOMEBREW_ONLY_ROOTS),
+                "",
+                0,
+            ),
+        );
+        assert_ne!(
+            r.outcome,
+            Outcome::Pass,
+            "a single populated class must not satisfy a guard meant to prove the scan \
+             looked at the endpoint: {:?}",
+            r.messages
+        );
+        assert_eq!(r.outcome, Outcome::Info);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("MCP server configs") && m.contains("agent skills")),
+            "the unexamined classes must be named: {:?}",
+            r.messages
+        );
+        assert!(
+            r.messages.iter().any(|m| m.contains("homebrew_root")),
+            "what WAS reached must be named too: {:?}",
+            r.messages
+        );
+    }
+
+    /// Same blindness, the version a user can fix: `project` cannot reach those
+    /// roots by construction, so it degrades and names the config change. An npm
+    /// repo inventories plenty under `project` and sailed past the aggregate
+    /// guard.
+    #[test]
+    fn a_project_scoped_scan_degrades_and_points_at_the_profile() {
+        let r = evaluate_scan(
+            "0.1.2",
+            "project",
+            "catalog.json",
+            None,
+            &out(
+                &summary_with_roots("complete", false, 431, PROJECT_ROOTS),
+                "",
+                0,
+            ),
+        );
+        assert_eq!(
+            r.outcome,
+            Outcome::Degraded,
+            "a control pointed at the wrong surface is fixable, so --strict should see it: {:?}",
+            r.messages
+        );
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("profile = \"baseline\"")),
+            "must name the fix: {:?}",
+            r.messages
+        );
+    }
+
+    /// The other direction: reaching even one endpoint class is a real endpoint
+    /// scan, and it passes — with the covered classes stated, so the verdict is
+    /// no longer a class-blind number.
+    #[test]
+    fn a_scan_that_reached_endpoint_roots_passes_and_names_the_classes_covered() {
+        let r = eval(&summary("complete", false, 148), "", 0);
+        assert_eq!(r.outcome, Outcome::Pass);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("endpoint classes covered") && m.contains("MCP server configs")),
+            "a pass must say WHICH classes it covered: {:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn one_endpoint_class_is_enough_to_be_an_endpoint_scan() {
+        let only_skills = r#"[{"path":"/h/.agents","kind":"agent_skill_root"},{"path":"/opt/homebrew/Cellar","kind":"homebrew_root"}]"#;
+        let r = evaluate_scan(
+            "0.1.2",
+            "baseline",
+            "catalog.json",
+            None,
+            &out(
+                &summary_with_roots("complete", false, 9, only_skills),
+                "",
+                0,
+            ),
+        );
+        assert_eq!(r.outcome, Outcome::Pass, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("endpoint classes covered: agent skills")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// A summary with no `roots` at all is not evidence of coverage either.
+    #[test]
+    fn a_summary_with_no_roots_array_is_not_a_covered_endpoint() {
+        let no_roots = r#"{"record_type":"scan_summary","status":"complete","timed_out":false,"package_records_suppressed":50}"#;
+        let r = eval(no_roots, "", 0);
+        assert_ne!(r.outcome, Outcome::Pass, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("none reported")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn root_kinds_are_parsed_and_deduplicated_in_first_seen_order() {
+        let dup = r#"{"record_type":"scan_summary","status":"complete","timed_out":false,"package_records_suppressed":1,"roots":[{"path":"/a","kind":"mcp_config_root"},{"path":"/b","kind":"mcp_config_root"},{"path":"/c","kind":"homebrew_root"}]}"#;
+        let r = parse_records(dup);
+        assert_eq!(r.root_kinds, vec!["mcp_config_root", "homebrew_root"]);
+        assert_eq!(
+            endpoint_classes_reached(&r.root_kinds),
+            vec!["MCP server configs"]
         );
     }
 

@@ -228,6 +228,15 @@ binary is Go with a zero-dependency `go.mod`.
   none of the MCP / extension / agent-skill roots are reached, and for a Rust repo means
   nothing is inventoried at all. If a scan inventories zero artifacts the control `FAIL`s
   rather than calling the endpoint clean. The default is `baseline` for that reason.
+- **"It inventoried something" is not the same as "it inventoried the endpoint."** The
+  artifact count is one aggregate number, and a machine whose only populated root is the
+  Homebrew Cellar can clear it with thousands of receipts while no MCP config, editor or
+  browser extension, or agent skill was ever opened — the four classes this control
+  exists for. `sscsb` reads the summary's `roots[].kind` list, reports which of those
+  classes a clean run actually covered, and refuses to call a run that reached none of
+  them a `PASS`: `DEGRADED` under `profile = "project"` (fixable — point it at
+  `baseline`), `INFO` under `baseline` (this endpoint simply has none of those roots, so
+  the run verified installed packages only).
 
 `sscsb` ships **no** catalog. A stale threat feed that reports clean is worse than no
 feed, so the catalog is yours to point at — upstream publishes them under `threat_intel/`.
