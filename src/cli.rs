@@ -688,11 +688,15 @@ fn cmd_deps(cwd: &std::path::Path, action: DepsAction) -> Result<ExitCode> {
             // bless a typosquat/hallucinated name. Clean packages are approved;
             // suspect ones are reported and SKIPPED for a deliberate
             // `sscsb deps approve <pkg> --force`.
-            let current = deps::current_deps(&ctx)?;
+            // Source-aware: a `path`/`git` dependency's name is not what
+            // resolves its code, so validating it against the public registry
+            // would hand back an unrelated same-named package as its verdict.
+            let current = deps::current_dep_specs(&ctx)?;
             let mut approved = 0usize;
             let mut skipped = Vec::new();
-            for pkg in current {
-                let warnings = deps::approval_warnings(&pkg, offline);
+            for (eco, spec) in current {
+                let pkg = format!("{}:{}", eco.label(), spec.name);
+                let warnings = deps::approval_warnings_for(&pkg, &spec.source, offline);
                 if warnings.is_empty() {
                     deps::approve_package(&ctx, &pkg)?;
                     approved += 1;

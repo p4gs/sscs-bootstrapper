@@ -68,15 +68,17 @@ impl Ecosystem {
     }
 }
 
-/// Extract direct dependency names from a manifest's content.
+/// Extract dependency names from a manifest's content.
+///
+/// Derived from [`parse_dep_specs`] rather than implemented twice. There used
+/// to be a second family of per-ecosystem name parsers here, and the two
+/// families drifted: whichever one a caller happened to use decided which
+/// declaration sections were visible. One parser, one answer.
 pub fn parse_deps(eco: Ecosystem, content: &str) -> BTreeSet<String> {
-    match eco {
-        Ecosystem::Cargo => parse_cargo(content),
-        Ecosystem::Npm => parse_npm(content),
-        Ecosystem::PyPi => parse_python(content),
-        Ecosystem::Go => parse_go(content),
-        Ecosystem::RubyGems => parse_gemfile(content),
-    }
+    parse_dep_specs(eco, content)
+        .into_iter()
+        .map(|s| s.name)
+        .collect()
 }
 
 /// Where a dependency's code actually comes from. Registry is the trusted,
@@ -91,8 +93,13 @@ pub enum DepSource {
     /// npm `"a": "npm:b@1"` — `a` resolves to a DIFFERENT package `b`.
     Alias(String),
     Url(String),
-    /// A cargo alternate registry (`registry = "…"`), or a go `replace` target.
+    /// A cargo alternate registry (`registry = "…"`), a cargo
+    /// `[patch]`/`[replace]` override, or a go `replace` target.
     Other(String),
+    /// A pip index/link directive (`--extra-index-url`, `--find-links`, …).
+    /// Not a package at all: it re-points where EVERY name in the file may
+    /// resolve from, which is a trust decision the gate has to see.
+    Index(String),
 }
 
 impl DepSource {
@@ -104,6 +111,7 @@ impl DepSource {
             DepSource::Alias(t) => format!("alias:{t}"),
             DepSource::Url(u) => format!("url:{u}"),
             DepSource::Other(o) => format!("other:{o}"),
+            DepSource::Index(u) => format!("index:{u}"),
         }
     }
     fn describe(&self) -> Option<String> {
@@ -114,7 +122,29 @@ impl DepSource {
             DepSource::Alias(t) => Some(format!("npm alias to `{t}`")),
             DepSource::Url(u) => Some(format!("url source {u}")),
             DepSource::Other(o) => Some(format!("non-default source {o}")),
+            DepSource::Index(u) => Some(format!(
+                "alternate package index {u} — it re-points where every dependency \
+                 in this file may resolve from"
+            )),
         }
+    }
+
+    /// Whether this dependency's NAME is what resolves its code on the public
+    /// registry — i.e. whether asking the registry about the name says anything
+    /// true about what will actually be built.
+    ///
+    /// For a `path`, `git`, `url`, alternate-registry or index-directive
+    /// source it does not: the code comes from disk, a URL, or somebody else's
+    /// index, and a public package that happens to share the name is an
+    /// unrelated package. Resolving those anyway is a name/source confusion in
+    /// the very tool that exists to catch name/source confusion — it reported
+    /// an in-repo crate as validated on a collision, and an ordinary
+    /// sibling-repo path dep as a slopsquatting target.
+    ///
+    /// An npm alias IS resolvable: `"a": "npm:b@1"` installs the real registry
+    /// package `b`, and `b` is the name whose existence matters.
+    pub fn is_registry_resolvable(&self) -> bool {
+        matches!(self, DepSource::Registry | DepSource::Alias(_))
     }
 }
 
@@ -183,13 +213,42 @@ pub fn parse_dep_specs(eco: Ecosystem, content: &str) -> BTreeSet<DepSpec> {
     }
 }
 
+/// The three dependency-table names cargo accepts, both at the top level and
+/// under every `[target.<cfg>]` key.
+const CARGO_DEP_KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+/// `package = "real-name"` renames take precedence: the crate that is actually
+/// fetched and compiled is the one whose trust matters.
+fn cargo_real_name(key: &str, val: &toml::Value) -> String {
+    val.as_table()
+        .and_then(|t| t.get("package"))
+        .and_then(|p| p.as_str())
+        .unwrap_or(key)
+        .to_string()
+}
+
+fn cargo_dep_source(val: &toml::Value) -> DepSource {
+    let Some(t) = val.as_table() else {
+        return DepSource::Registry; // `name = "1.0"`
+    };
+    if let Some(u) = t.get("git").and_then(|v| v.as_str()) {
+        DepSource::Git(u.to_string())
+    } else if let Some(p) = t.get("path").and_then(|v| v.as_str()) {
+        DepSource::Path(p.to_string())
+    } else if let Some(r) = t.get("registry").and_then(|v| v.as_str()) {
+        DepSource::Other(format!("registry {r}"))
+    } else {
+        DepSource::Registry // `name = { version = "1" }`
+    }
+}
+
 fn cargo_specs(content: &str) -> BTreeSet<DepSpec> {
     let mut out = BTreeSet::new();
     let Ok(table) = content.parse::<toml::Table>() else {
         return out;
     };
     let mut sections: Vec<&toml::Table> = Vec::new();
-    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+    for key in CARGO_DEP_KINDS {
         if let Some(t) = table.get(key).and_then(|v| v.as_table()) {
             sections.push(t);
         }
@@ -202,31 +261,77 @@ fn cargo_specs(content: &str) -> BTreeSet<DepSpec> {
     {
         sections.push(ws);
     }
-    for s in sections {
-        for (name, val) in s {
-            let real = val
-                .as_table()
-                .and_then(|t| t.get("package"))
-                .and_then(|p| p.as_str())
-                .unwrap_or(name)
-                .to_string();
-            let source = match val.as_table() {
-                None => DepSource::Registry, // `name = "1.0"`
-                Some(t) if t.get("git").and_then(|v| v.as_str()).is_some() => {
-                    DepSource::Git(t["git"].as_str().unwrap().to_string())
-                }
-                Some(t) if t.get("path").and_then(|v| v.as_str()).is_some() => {
-                    DepSource::Path(t["path"].as_str().unwrap().to_string())
-                }
-                Some(t) if t.get("registry").and_then(|v| v.as_str()).is_some() => {
-                    DepSource::Other(format!("registry {}", t["registry"].as_str().unwrap()))
-                }
-                Some(_) => DepSource::Registry, // `name = { version = "1" }`
+    // `[target.'cfg(unix)'.dependencies]` and friends. Platform-conditional
+    // dependencies are ordinary dependencies that happen to build on one
+    // platform; reading only the unconditional tables meant a dependency added
+    // here was never a "new package" at all — a one-line bypass of the gate.
+    if let Some(targets) = table.get("target").and_then(|v| v.as_table()) {
+        for spec in targets.values() {
+            let Some(spec) = spec.as_table() else {
+                continue;
             };
-            out.insert(DepSpec { name: real, source });
+            for key in CARGO_DEP_KINDS {
+                if let Some(t) = spec.get(key).and_then(|v| v.as_table()) {
+                    sections.push(t);
+                }
+            }
         }
     }
+    for s in sections {
+        for (name, val) in s {
+            out.insert(DepSpec {
+                name: cargo_real_name(name, val),
+                source: cargo_dep_source(val),
+            });
+        }
+    }
+    cargo_override_specs(&table, &mut out);
     out
+}
+
+/// `[patch.<registry>]` and the deprecated `[replace]` are the nastiest members
+/// of this class: the NAME stays whatever it already was — very possibly an
+/// already-approved, entirely reputable name — while the CODE behind it is
+/// replaced wholesale by a git checkout, a local directory, or another
+/// registry. A name-keyed diff sees nothing change, which is exactly the
+/// dependency-substitution shape this gate exists to catch.
+fn cargo_override_specs(table: &toml::Table, out: &mut BTreeSet<DepSpec>) {
+    if let Some(patch) = table.get("patch").and_then(|v| v.as_table()) {
+        for entries in patch.values() {
+            let Some(entries) = entries.as_table() else {
+                continue;
+            };
+            for (name, val) in entries {
+                out.insert(DepSpec {
+                    name: cargo_real_name(name, val),
+                    source: cargo_override_source(val),
+                });
+            }
+        }
+    }
+    if let Some(replace) = table.get("replace").and_then(|v| v.as_table()) {
+        for (spec_key, val) in replace {
+            // `[replace]` keys are `name:semver`, e.g. `"serde:1.0.0"`.
+            let name = spec_key
+                .rsplit_once(':')
+                .map_or(spec_key.as_str(), |(n, _)| n);
+            out.insert(DepSpec {
+                name: name.to_string(),
+                source: cargo_override_source(val),
+            });
+        }
+    }
+}
+
+/// An override must never classify as `Registry`: that would give it the same
+/// trust key as the ordinary declaration it overrides, and the whole point is
+/// that it is NOT the same code. Anything cargo will accept here that is not
+/// git/path/alternate-registry still gets a distinct, visible source.
+fn cargo_override_source(val: &toml::Value) -> DepSource {
+    match cargo_dep_source(val) {
+        DepSource::Registry => DepSource::Other("cargo [patch]/[replace] override".into()),
+        other => other,
+    }
 }
 
 fn npm_specs(content: &str) -> BTreeSet<DepSpec> {
@@ -260,51 +365,195 @@ fn npm_specs(content: &str) -> BTreeSet<DepSpec> {
     out
 }
 
-fn python_specs(content: &str) -> BTreeSet<DepSpec> {
-    // PEP 508 direct references (`pkg @ git+https://…`) are the source-swap
-    // vector; a plain `pkg==1.2` is registry-sourced.
-    let classify = |req: &str| -> Option<DepSpec> {
-        let name = python_req_name(req)?;
-        let source = if let Some((_, rhs)) = req.split_once('@') {
-            let rhs = rhs.trim();
-            if rhs.starts_with("git") {
-                DepSource::Git(rhs.to_string())
-            } else if rhs.contains("://") {
-                DepSource::Url(rhs.to_string())
-            } else {
-                DepSource::Registry
-            }
+/// PEP 508 direct references (`pkg @ git+https://…`) are the source-swap
+/// vector; a plain `pkg==1.2` is registry-sourced.
+fn python_requirement_spec(req: &str) -> Option<DepSpec> {
+    let name = python_req_name(req)?;
+    let source = if let Some((_, rhs)) = req.split_once('@') {
+        let rhs = rhs.trim();
+        if rhs.starts_with("git") {
+            DepSource::Git(rhs.to_string())
+        } else if rhs.contains("://") {
+            DepSource::Url(rhs.to_string())
         } else {
             DepSource::Registry
-        };
-        Some(DepSpec { name, source })
+        }
+    } else {
+        DepSource::Registry
     };
+    Some(DepSpec { name, source })
+}
+
+fn python_specs(content: &str) -> BTreeSet<DepSpec> {
     let mut out = BTreeSet::new();
     if let Ok(table) = content.parse::<toml::Table>() {
-        if let Some(deps) = table
-            .get("project")
-            .and_then(|p| p.as_table())
-            .and_then(|p| p.get("dependencies"))
-            .and_then(|d| d.as_array())
-        {
-            for d in deps {
-                if let Some(spec) = d.as_str().and_then(classify) {
-                    out.insert(spec);
-                }
-            }
+        pyproject_specs(&table, &mut out);
+        if !out.is_empty() {
             return out;
         }
     }
     for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('-') {
-            continue;
+        requirements_line_spec(line, &mut out);
+    }
+    out
+}
+
+/// Every place PEP 621 / PEP 735 let a pyproject.toml declare installable code.
+///
+/// Reading only `[project].dependencies` left two whole sections invisible:
+/// `[project.optional-dependencies]` (extras — `pip install pkg[dev]` installs
+/// them, and CI almost always does) and `[dependency-groups]` (PEP 735, where
+/// modern tooling puts dev dependencies).
+fn pyproject_specs(table: &toml::Table, out: &mut BTreeSet<DepSpec>) {
+    let project = table.get("project").and_then(|p| p.as_table());
+    if let Some(arr) = project
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|d| d.as_array())
+    {
+        push_python_reqs(arr, out);
+    }
+    if let Some(extras) = project
+        .and_then(|p| p.get("optional-dependencies"))
+        .and_then(|d| d.as_table())
+    {
+        for list in extras.values() {
+            if let Some(arr) = list.as_array() {
+                push_python_reqs(arr, out);
+            }
         }
-        if let Some(spec) = classify(line) {
+    }
+    if let Some(groups) = table.get("dependency-groups").and_then(|d| d.as_table()) {
+        for list in groups.values() {
+            // A group entry may be `{ include-group = "other" }`; those are not
+            // requirement strings and `as_str` skips them.
+            if let Some(arr) = list.as_array() {
+                push_python_reqs(arr, out);
+            }
+        }
+    }
+}
+
+fn push_python_reqs(arr: &[toml::Value], out: &mut BTreeSet<DepSpec>) {
+    for d in arr {
+        if let Some(spec) = d.as_str().and_then(python_requirement_spec) {
             out.insert(spec);
         }
     }
-    out
+}
+
+/// One requirements.txt line.
+///
+/// `line.starts_with('-')` used to skip every option line wholesale, which
+/// discarded two real trust decisions: `-e git+https://…` installs from an
+/// arbitrary VCS URL, and `--extra-index-url` / `--find-links` re-point where
+/// every OTHER name in the file may resolve from. Options that genuinely carry
+/// no dependency (`-r`, `-c`, `--hash`, `--no-binary`, …) are still skipped.
+fn requirements_line_spec(line: &str, out: &mut BTreeSet<DepSpec>) {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return;
+    }
+    // pip's inline comment is a `#` preceded by whitespace — a bare `#` is a
+    // URL fragment (`…#egg=name`) and must survive.
+    let line = match line.find(" #") {
+        Some(i) => line[..i].trim_end(),
+        None => line,
+    };
+    if line.is_empty() {
+        return;
+    }
+    // Split at the first separator so `-e X`, `--index-url=X` and a bare
+    // `pkg==1` all decompose the same way.
+    let (opt, rest) = match line.split_once(['=', ' ', '\t']) {
+        Some((o, r)) => (o, r.trim()),
+        None => (line, ""),
+    };
+    match opt {
+        "-e" | "--editable" => {
+            if let Some(spec) = python_direct_reference(rest) {
+                out.insert(spec);
+            }
+            return;
+        }
+        "-i" | "--index-url" | "--extra-index-url" | "-f" | "--find-links" => {
+            if !rest.is_empty() {
+                out.insert(DepSpec {
+                    name: rest.to_string(),
+                    source: DepSource::Index(rest.to_string()),
+                });
+            }
+            return;
+        }
+        // -r/-c includes, --hash, --no-binary, --require-hashes, …
+        _ if opt.starts_with('-') => return,
+        _ => {}
+    }
+    // A bare direct reference: `https://host/x.whl`, `git+ssh://…`, `./pkg`.
+    // These used to collapse to the name `https` (or `.`), which made every
+    // such line ONE interchangeable trust unit — swap the URL, keep the key.
+    if let Some(spec) = python_direct_reference_if_bare(line) {
+        out.insert(spec);
+        return;
+    }
+    if let Some(spec) = python_requirement_spec(line) {
+        out.insert(spec);
+    }
+}
+
+fn python_direct_reference_if_bare(line: &str) -> Option<DepSpec> {
+    let is_url = match line.split_once("://") {
+        Some((scheme, _)) => {
+            !scheme.is_empty()
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '.' || c == '-')
+        }
+        None => ["git+", "hg+", "svn+", "bzr+"]
+            .iter()
+            .any(|p| line.starts_with(p)),
+    };
+    let is_path = line == "."
+        || line == ".."
+        || line.starts_with("./")
+        || line.starts_with("../")
+        || line.starts_with('/');
+    if is_url || is_path {
+        python_direct_reference(line)
+    } else {
+        None
+    }
+}
+
+/// A `-e`/bare direct reference. The trust unit is the URL or path itself —
+/// two different URLs are two different dependencies even when neither names a
+/// package — unless a `#egg=NAME` fragment names one.
+fn python_direct_reference(target: &str) -> Option<DepSpec> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let name = target
+        .rsplit_once("#egg=")
+        .map(|(_, egg)| {
+            egg.split(['&', '#'])
+                .next()
+                .unwrap_or(egg)
+                .trim()
+                .to_string()
+        })
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| target.to_string());
+    let source = if ["git+", "hg+", "svn+", "bzr+", "git:", "git@"]
+        .iter()
+        .any(|p| target.starts_with(p))
+    {
+        DepSource::Git(target.to_string())
+    } else if target.contains("://") {
+        DepSource::Url(target.to_string())
+    } else {
+        DepSource::Path(target.to_string())
+    };
+    Some(DepSpec { name, source })
 }
 
 fn go_specs(content: &str) -> BTreeSet<DepSpec> {
@@ -378,89 +627,17 @@ fn extract_ruby_value(s: &str) -> String {
         .collect()
 }
 
-fn parse_cargo(content: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let Ok(table) = content.parse::<toml::Table>() else {
-        return out;
-    };
-    let mut sections: Vec<&toml::Table> = Vec::new();
-    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
-        if let Some(t) = table.get(key).and_then(|v| v.as_table()) {
-            sections.push(t);
-        }
-    }
-    if let Some(ws) = table
-        .get("workspace")
-        .and_then(|v| v.as_table())
-        .and_then(|w| w.get("dependencies"))
-        .and_then(|v| v.as_table())
-    {
-        sections.push(ws);
-    }
-    for s in sections {
-        for (name, val) in s {
-            // `package = "real-name"` renames take precedence.
-            let real = val
-                .as_table()
-                .and_then(|t| t.get("package"))
-                .and_then(|p| p.as_str())
-                .unwrap_or(name);
-            out.insert(real.to_string());
-        }
-    }
-    out
-}
-
-fn parse_npm(content: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(content) else {
-        return out;
-    };
-    for key in ["dependencies", "devDependencies", "optionalDependencies"] {
-        if let Some(map) = v.get(key).and_then(|d| d.as_object()) {
-            out.extend(map.keys().cloned());
-        }
-    }
-    out
-}
-
-fn parse_python(content: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    // pyproject.toml
-    if let Ok(table) = content.parse::<toml::Table>() {
-        if let Some(deps) = table
-            .get("project")
-            .and_then(|p| p.as_table())
-            .and_then(|p| p.get("dependencies"))
-            .and_then(|d| d.as_array())
-        {
-            for d in deps {
-                if let Some(s) = d.as_str() {
-                    if let Some(name) = python_req_name(s) {
-                        out.insert(name);
-                    }
-                }
-            }
-            return out;
-        }
-    }
-    // requirements.txt
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('-') {
-            continue;
-        }
-        if let Some(name) = python_req_name(line) {
-            out.insert(name);
-        }
-    }
-    out
-}
-
+/// A requirement's package name.
+///
+/// `is_alphanumeric` rather than `is_ascii_alphanumeric` deliberately: a name
+/// carrying a non-ASCII homoglyph (Cyrillic `г` for Latin `r`) used to stop the
+/// scan on its first character, yield an empty name, and drop the entire line —
+/// so the gate never saw the dependency at all. Surfacing the name is what
+/// turns a silent blind spot into something the existence check can reject.
 fn python_req_name(req: &str) -> Option<String> {
     let name: String = req
         .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
         .collect();
     if name.is_empty() {
         None
@@ -490,26 +667,17 @@ fn parse_go(content: &str) -> BTreeSet<String> {
             continue;
         };
         if let Some(module) = candidate.split_whitespace().next() {
-            if module.contains('/') && !candidate.contains("// indirect") {
+            // NOTE: `// indirect` is deliberately NOT a filter. It is a comment
+            // the go toolchain writes as bookkeeping; it is not a trust
+            // boundary, and `go build` will happily compile a module whose
+            // require line carries it. Skipping those lines meant appending
+            // eight characters to a require made a dependency invisible to this
+            // gate. The cost is that a `go get` which pulls new transitive
+            // modules now needs them approved too — which is the honest answer,
+            // since that is new code entering the build; `sscsb deps baseline`
+            // blesses a whole manifest at once.
+            if module.contains('/') {
                 out.insert(module.to_string());
-            }
-        }
-    }
-    out
-}
-
-fn parse_gemfile(content: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("gem ") {
-            let rest = rest.trim_start_matches(['\'', '"']);
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                .collect();
-            if !name.is_empty() {
-                out.insert(name);
             }
         }
     }
@@ -568,6 +736,20 @@ pub fn load_approved(ctx: &Ctx) -> Result<BTreeSet<String>> {
 /// so a typosquat or a hallucinated (registry-absent) name cannot be blessed
 /// without a human seeing the warning and overriding on purpose.
 pub fn approval_warnings(qualified: &str, offline: bool) -> Vec<String> {
+    // A hand-typed `sscsb deps approve <pkg>` names a package to resolve from
+    // the registry; that is exactly the Registry case.
+    approval_warnings_for(qualified, &DepSource::Registry, offline)
+}
+
+/// [`approval_warnings`] for a dependency whose declared source is known.
+///
+/// Both warnings here interrogate the NAME — is it one edit from a popular
+/// package, does it exist on the public registry — and both are meaningless
+/// when the name is not what resolves the code. A `path`/`git`/`url` dependency
+/// gets neither, because a public package sharing its name is an unrelated
+/// package; those sources are flagged on their own terms by
+/// [`new_unapproved_deps`], which does not care about the baseline at all.
+pub fn approval_warnings_for(qualified: &str, source: &DepSource, offline: bool) -> Vec<String> {
     let mut warnings = Vec::new();
     let Some((label, name)) = qualified.split_once(':') else {
         return warnings;
@@ -575,6 +757,9 @@ pub fn approval_warnings(qualified: &str, offline: bool) -> Vec<String> {
     let Some(eco) = Ecosystem::from_label(label) else {
         return warnings;
     };
+    if !source.is_registry_resolvable() {
+        return warnings;
+    }
     if let Some(shadowed) = typosquat_suspect(eco, name) {
         warnings.push(format!(
             "`{qualified}` is one edit from popular package `{shadowed}` — possible \
@@ -633,8 +818,33 @@ pub fn approve_package(ctx: &Ctx, qualified: &str) -> Result<()> {
     Ok(())
 }
 
-/// Current direct deps across all manifests in the repo root (qualified
-/// `eco:name`).
+/// Current deps across all manifests in the repo root, each keeping the source
+/// it was declared with.
+///
+/// The source is the half [`current_deps`] throws away, and throwing it away is
+/// what let `deps check` ask the public registry about a `path` dependency.
+/// A `BTreeSet`, so the same dependency declared in two manifests of one
+/// ecosystem (requirements.txt and pyproject.toml both naming `requests`) is
+/// one target, not two registry lookups.
+pub fn current_dep_specs(ctx: &Ctx) -> Result<BTreeSet<(Ecosystem, DepSpec)>> {
+    let mut out = BTreeSet::new();
+    for mf in MANIFEST_FILES {
+        let path = ctx.root.join(mf);
+        if !path.is_file() {
+            continue;
+        }
+        let eco = Ecosystem::of_manifest(mf).expect("manifest list");
+        let content = std::fs::read_to_string(&path)?;
+        for spec in parse_dep_specs(eco, &content) {
+            out.insert((eco, spec));
+        }
+    }
+    Ok(out)
+}
+
+/// Current dependency NAMES across all manifests in the repo root (qualified
+/// `eco:name`). Anything that has to know where the code comes from must use
+/// [`current_dep_specs`] instead.
 pub fn current_deps(ctx: &Ctx) -> Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
     for mf in MANIFEST_FILES {
@@ -675,6 +885,15 @@ pub enum NewDepReason {
 pub struct NewDep {
     pub qualified: String,
     pub reason: NewDepReason,
+    /// Where this dependency's code comes from. `None` only for
+    /// [`NewDepReason::UnparseableManifest`], where `qualified` is a file path
+    /// rather than a package and there is no source to speak of.
+    ///
+    /// Callers that validate a package by NAME — registry existence, typosquat
+    /// distance — must consult this first: those questions are only meaningful
+    /// when the name is what resolves the code. See
+    /// [`DepSource::is_registry_resolvable`].
+    pub source: Option<DepSource>,
 }
 
 impl NewDep {
@@ -707,7 +926,19 @@ impl NewDep {
 /// (repo-relative path) resolves to a location INSIDE the repo — the repo's own
 /// code, already reviewed here (e.g. a cargo-fuzz project's `path = ".."`).
 /// Absolute paths, or `..` components that escape above the repo root, are false.
-fn path_resolves_within_repo(manifest: &str, rel: &str) -> bool {
+///
+/// Two checks, in order, because neither alone is enough:
+///
+/// 1. A lexical component walk. This is the only answer available for a path
+///    that is not on disk yet (a staged manifest may name a directory that
+///    arrives in a later commit), and it is the one that must fail closed.
+/// 2. If the path DOES exist, `canonicalize` on both sides, which resolves
+///    symlinks. Without this the walk was purely textual, so `path =
+///    "link/pkg"` where `link` is a symlink pointing out of the repo counted as
+///    the repo's own reviewed code and was exempted from the gate. The doc
+///    comment above claimed "resolves to a location INSIDE the repo"; before
+///    this it only claimed to *spell* one.
+fn path_resolves_within_repo(root: &std::path::Path, manifest: &str, rel: &str) -> bool {
     use std::path::{Component, Path};
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
@@ -716,8 +947,9 @@ fn path_resolves_within_repo(manifest: &str, rel: &str) -> bool {
     let manifest_dir = Path::new(manifest)
         .parent()
         .unwrap_or_else(|| Path::new(""));
+    let joined = manifest_dir.join(rel_path);
     let mut depth: i32 = 0;
-    for c in manifest_dir.join(rel_path).components() {
+    for c in joined.components() {
         match c {
             Component::ParentDir => {
                 depth -= 1;
@@ -730,7 +962,12 @@ fn path_resolves_within_repo(manifest: &str, rel: &str) -> bool {
             Component::RootDir | Component::Prefix(_) => return false,
         }
     }
-    true
+    // Physical check. If either side cannot be canonicalized the path is not
+    // on disk to be followed, so the lexical answer stands.
+    match (root.join(&joined).canonicalize(), root.canonicalize()) {
+        (Ok(target), Ok(root)) => target.starts_with(root),
+        _ => true,
+    }
 }
 
 /// STAGED dependency changes that need a fresh trust decision. Source-aware: a
@@ -772,6 +1009,7 @@ pub fn new_unapproved_deps(ctx: &Ctx) -> Result<Vec<NewDep>> {
             out.push(NewDep {
                 qualified: file.to_string(),
                 reason: NewDepReason::UnparseableManifest(detail),
+                source: None,
             });
             continue;
         }
@@ -791,7 +1029,7 @@ pub fn new_unapproved_deps(ctx: &Ctx) -> Result<Vec<NewDep>> {
                 // external unvetted code. Exempt them. Out-of-tree paths and
                 // git/url/alias sources still need explicit review.
                 if let DepSource::Path(p) = &spec.source {
-                    if path_resolves_within_repo(file, p) {
+                    if path_resolves_within_repo(&ctx.root, file, p) {
                         continue;
                     }
                 }
@@ -799,11 +1037,13 @@ pub fn new_unapproved_deps(ctx: &Ctx) -> Result<Vec<NewDep>> {
                 out.push(NewDep {
                     qualified,
                     reason: NewDepReason::NonRegistrySource(desc),
+                    source: Some(spec.source.clone()),
                 });
             } else if !approved.contains(&qualified) {
                 out.push(NewDep {
                     qualified,
                     reason: NewDepReason::NotInBaseline,
+                    source: Some(spec.source.clone()),
                 });
             }
         }
@@ -1084,17 +1324,33 @@ pub fn verify_socket_control(ctx: &Ctx) -> VerifyResult {
 }
 
 /// `sscsb deps check`: validate current (or staged-new) packages.
+///
+/// Every check below asks a question ABOUT A NAME — is it one edit from a
+/// popular package, does the public registry have it — so every check first has
+/// to know whether the name is what resolves the code. It did not: targets were
+/// built from name-only lists, the source was discarded, and a `path`
+/// dependency was resolved against crates.io like any other. That got both
+/// answers wrong in the same run — an in-repo crate reported as "exists on
+/// registry" on nothing but a name collision with an unrelated public crate,
+/// and a sibling-repo path dep (`../grc-controls/…`, an ordinary multi-repo
+/// layout) reported as a likely slopsquatting target at exit 1.
 pub fn deps_check(ctx: &Ctx, offline: bool) -> Result<(Vec<String>, Vec<String>)> {
     let mut problems = Vec::new();
     let mut notes = Vec::new();
-    let new_pkgs = unapproved_new_packages(ctx)?;
-    let targets: Vec<String> = if new_pkgs.is_empty() {
-        current_deps(ctx)?.into_iter().collect()
+    let new_deps = new_unapproved_deps(ctx)?;
+    let targets: Vec<(String, Option<DepSource>)> = if new_deps.is_empty() {
+        current_dep_specs(ctx)?
+            .into_iter()
+            .map(|(eco, spec)| (format!("{}:{}", eco.label(), spec.name), Some(spec.source)))
+            .collect()
     } else {
-        notes.push(format!("checking {} staged new package(s)", new_pkgs.len()));
-        new_pkgs
+        notes.push(format!("checking {} staged new package(s)", new_deps.len()));
+        new_deps
+            .into_iter()
+            .map(|d| (d.qualified, d.source))
+            .collect()
     };
-    for qualified in &targets {
+    for (qualified, source) in &targets {
         let Some((eco_label, name)) = qualified.split_once(':') else {
             continue;
         };
@@ -1106,6 +1362,19 @@ pub fn deps_check(ctx: &Ctx, offline: bool) -> Result<(Vec<String>, Vec<String>)
             "rubygems" => Ecosystem::RubyGems,
             _ => continue,
         };
+        // Not registry-resolvable → the name answers nothing. Say so and move
+        // on; the commit gate flags these on their own terms (a non-registry
+        // source needs review whatever the baseline says), so staying silent
+        // here loses no coverage — it only stops inventing a verdict.
+        if let Some(source) = source.as_ref().filter(|s| !s.is_registry_resolvable()) {
+            if let Some(desc) = source.describe() {
+                notes.push(format!(
+                    "{qualified}: {desc} — not resolved by name against the public \
+                     {eco_label} registry, because the name is not what resolves it"
+                ));
+            }
+            continue;
+        }
         if let Some(shadowed) = typosquat_suspect(eco, name) {
             problems.push(format!(
                 "{qualified}: name is one edit away from popular package `{shadowed}` — \
@@ -1141,7 +1410,8 @@ mod tests {
 
     #[test]
     fn cargo_parsing_includes_rename_and_workspace() {
-        let deps = parse_cargo(
+        let deps = parse_deps(
+            Ecosystem::Cargo,
             "[dependencies]\nserde = \"1\"\nfancy = { package = \"real-crate\", version = \"1\" }\n\
              [dev-dependencies]\ntempfile = \"3\"\n[workspace.dependencies]\nanyhow = \"1\"\n",
         );
@@ -1154,20 +1424,36 @@ mod tests {
 
     #[test]
     fn npm_python_go_gemfile_parsing() {
-        let npm = parse_npm(r#"{"dependencies":{"react":"18"},"devDependencies":{"jest":"29"}}"#);
+        let npm = parse_deps(
+            Ecosystem::Npm,
+            r#"{"dependencies":{"react":"18"},"devDependencies":{"jest":"29"}}"#,
+        );
         assert!(npm.contains("react") && npm.contains("jest"));
 
-        let py = parse_python("requests==2.31.0\n# comment\nflask>=2\n");
+        let py = parse_deps(Ecosystem::PyPi, "requests==2.31.0\n# comment\nflask>=2\n");
         assert!(py.contains("requests") && py.contains("flask"));
 
-        let pyproject = parse_python("[project]\nname = \"x\"\ndependencies = [\"pydantic>=2\"]\n");
+        let pyproject = parse_deps(
+            Ecosystem::PyPi,
+            "[project]\nname = \"x\"\ndependencies = [\"pydantic>=2\"]\n",
+        );
         assert!(pyproject.contains("pydantic"));
 
         let go = parse_go("module m\n\nrequire (\n\tgithub.com/pkg/errors v0.9.1\n\tgolang.org/x/sys v0.1.0 // indirect\n)\n");
         assert!(go.contains("github.com/pkg/errors"));
-        assert!(!go.iter().any(|d| d.contains("x/sys")), "indirect excluded");
+        // `// indirect` used to exclude the line. It is a toolchain comment, not
+        // a trust boundary — appending it to a require was a one-line way to
+        // hide a module from this gate — so an indirect require is now visible
+        // like any other.
+        assert!(
+            go.contains("golang.org/x/sys"),
+            "an `// indirect` require is still a module in the build: {go:?}"
+        );
 
-        let gems = parse_gemfile("source 'https://rubygems.org'\ngem 'rails', '~> 7'\n");
+        let gems = parse_deps(
+            Ecosystem::RubyGems,
+            "source 'https://rubygems.org'\ngem 'rails', '~> 7'\n",
+        );
         assert!(gems.contains("rails"));
     }
 
@@ -1305,11 +1591,13 @@ mod tests {
         let baseline = NewDep {
             qualified: "cargo:x".into(),
             reason: NewDepReason::NotInBaseline,
+            source: Some(DepSource::Registry),
         };
         assert!(baseline.explain().contains("approved baseline"));
         let source = NewDep {
             qualified: "cargo:serde".into(),
             reason: NewDepReason::NonRegistrySource("git source u".into()),
+            source: Some(DepSource::Git("u".into())),
         };
         assert!(source.explain().contains("non-registry source"));
     }
@@ -1424,7 +1712,7 @@ mod tests {
 
     #[test]
     fn parse_cargo_on_unparseable_toml_yields_an_empty_set_not_a_panic() {
-        assert!(parse_cargo("this is { not valid toml").is_empty());
+        assert!(parse_deps(Ecosystem::Cargo, "this is { not valid toml").is_empty());
     }
 
     // ───────────────────────── python parsing edge cases ─────────────────────
@@ -1433,8 +1721,10 @@ mod tests {
     fn parse_python_pyproject_skips_non_string_and_unnameable_array_entries() {
         // TOML 1.0 arrays may be heterogeneous; a stray integer and an empty
         // string must be skipped rather than corrupting the result.
-        let deps =
-            parse_python("[project]\nname = \"x\"\ndependencies = [123, \"\", \"pydantic>=2\"]\n");
+        let deps = parse_deps(
+            Ecosystem::PyPi,
+            "[project]\nname = \"x\"\ndependencies = [123, \"\", \"pydantic>=2\"]\n",
+        );
         assert_eq!(deps, BTreeSet::from(["pydantic".to_string()]));
     }
 
@@ -1449,7 +1739,10 @@ mod tests {
         // Poetry-style `[tool.poetry.dependencies]` manifests hit this same
         // path and deserve first-class parsing instead of this accidental
         // fallback).
-        let deps = parse_python("[project]\nname = \"mypkg\"\nversion = \"0.1.0\"\n");
+        let deps = parse_deps(
+            Ecosystem::PyPi,
+            "[project]\nname = \"mypkg\"\nversion = \"0.1.0\"\n",
+        );
         assert_eq!(
             deps,
             BTreeSet::from(["name".to_string(), "version".to_string()])
@@ -1458,8 +1751,16 @@ mod tests {
 
     #[test]
     fn parse_python_requirements_txt_skips_directives_blanks_and_unnameable_lines() {
-        let deps = parse_python("# a comment\n-e .\n\n==1.0\nrequests\n");
-        assert_eq!(deps, BTreeSet::from(["requests".to_string()]));
+        // `-e .` is no longer skipped: an editable install IS a dependency, and
+        // `-e` was the same option prefix that hid `-e git+https://…`. A local
+        // editable path is recorded as a path source, which the commit gate
+        // exempts when it stays inside the repo — so nothing new blocks — while
+        // `==1.0` (no name) and comments are still dropped.
+        let deps = parse_deps(Ecosystem::PyPi, "# a comment\n-e .\n\n==1.0\nrequests\n");
+        assert_eq!(
+            deps,
+            BTreeSet::from([".".to_string(), "requests".to_string()])
+        );
     }
 
     // ───────────────────────── Ctx-backed deps surface ────────────────────────
@@ -1857,14 +2158,353 @@ mod tests {
 
     #[test]
     fn path_within_repo_exempts_intree_but_not_escapes() {
+        // None of these exist on disk, so only the lexical walk can answer —
+        // which is the case the physical check must leave alone.
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
         // in-tree (own code) — exempt
-        assert!(path_resolves_within_repo("fuzz/Cargo.toml", "..")); // → repo root
-        assert!(path_resolves_within_repo("fuzz/Cargo.toml", "../src"));
-        assert!(path_resolves_within_repo("Cargo.toml", "."));
-        assert!(path_resolves_within_repo("a/b/Cargo.toml", "../.."));
+        assert!(path_resolves_within_repo(root, "fuzz/Cargo.toml", "..")); // → repo root
+        assert!(path_resolves_within_repo(root, "fuzz/Cargo.toml", "../src"));
+        assert!(path_resolves_within_repo(root, "Cargo.toml", "."));
+        assert!(path_resolves_within_repo(root, "a/b/Cargo.toml", "../.."));
         // escapes the repo — still flagged
-        assert!(!path_resolves_within_repo("fuzz/Cargo.toml", "../.."));
-        assert!(!path_resolves_within_repo("Cargo.toml", ".."));
-        assert!(!path_resolves_within_repo("fuzz/Cargo.toml", "/etc/passwd"));
+        assert!(!path_resolves_within_repo(root, "fuzz/Cargo.toml", "../.."));
+        assert!(!path_resolves_within_repo(root, "Cargo.toml", ".."));
+        assert!(!path_resolves_within_repo(
+            root,
+            "fuzz/Cargo.toml",
+            "/etc/passwd"
+        ));
+    }
+
+    /// The physical half of the same predicate. A lexical walk can only tell
+    /// you how a path is SPELLED; `link/pkg` spells an in-tree location while
+    /// resolving anywhere the symlink points.
+    #[cfg(unix)]
+    #[test]
+    fn path_within_repo_follows_symlinks_before_deciding() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("pkg")).unwrap();
+        std::fs::create_dir_all(root.path().join("real")).unwrap();
+        symlink(outside.path(), root.path().join("link")).unwrap();
+
+        assert!(
+            !path_resolves_within_repo(root.path(), "Cargo.toml", "link/pkg"),
+            "a symlink out of the repo is not the repo's own reviewed code"
+        );
+        // A real in-tree directory still resolves in-tree.
+        assert!(path_resolves_within_repo(root.path(), "Cargo.toml", "real"));
+    }
+
+    // ───────── H7: declaration classes that must not be invisible ─────────
+    //
+    // Each of these is a way to put code into the build that the trust gate
+    // never looked at. They are regressions, not features: every one of them
+    // passed at exit 0 before the parsers below learned to read the section.
+
+    /// `[target.'cfg(unix)'.dependencies]` is a real, buildable dependency
+    /// table. Reading only the three unconditional tables meant a
+    /// platform-gated dependency was never a "new package" at all.
+    #[test]
+    fn cargo_target_specific_sections_are_not_invisible() {
+        let specs = cargo_specs(
+            "[dependencies]\n\
+             serde = \"1\"\n\
+             [target.'cfg(unix)'.dependencies]\n\
+             unixdep = \"1\"\n\
+             [target.\"cfg(windows)\".dev-dependencies]\n\
+             windep = \"1\"\n\
+             [target.'cfg(target_os = \"macos\")'.build-dependencies]\n\
+             macdep = \"1\"\n\
+             [target.'cfg(unix)'.dependencies.gitdep]\n\
+             git = \"https://evil.example/repo\"\n",
+        );
+        let names: BTreeSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains("unixdep"), "{specs:?}");
+        assert!(names.contains("windep"), "{specs:?}");
+        assert!(names.contains("macdep"), "{specs:?}");
+        assert!(
+            matches!(source_of(&specs, "gitdep"), DepSource::Git(_)),
+            "a target-gated git source must still classify as git: {specs:?}"
+        );
+        // The name-only view must agree — it feeds the baseline.
+        assert!(parse_deps(
+            Ecosystem::Cargo,
+            "[target.'cfg(unix)'.dependencies]\nunixdep = \"1\"\n"
+        )
+        .contains("unixdep"));
+    }
+
+    /// `[patch.crates-io]` is the nastiest of the class: the NAME stays the
+    /// already-approved one while the CODE is replaced wholesale by an
+    /// attacker-controlled git checkout. A name-keyed diff sees nothing.
+    /// `[replace]` is the deprecated spelling of the same swap.
+    #[test]
+    fn cargo_patch_and_replace_repoint_a_trusted_name_to_an_untrusted_source() {
+        let specs = cargo_specs(
+            "[dependencies]\n\
+             serde = \"1\"\n\
+             [patch.crates-io]\n\
+             serde = { git = \"https://evil.example/serde\" }\n",
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name == "serde" && matches!(s.source, DepSource::Git(_))),
+            "a [patch.crates-io] git override must be a distinct trust unit: {specs:?}"
+        );
+
+        let replaced = cargo_specs(
+            "[dependencies]\nserde = \"1\"\n\
+             [replace]\n\"serde:1.0.0\" = { git = \"https://evil.example/serde\" }\n",
+        );
+        assert!(
+            replaced
+                .iter()
+                .any(|s| s.name == "serde" && matches!(s.source, DepSource::Git(_))),
+            "[replace] must be read too: {replaced:?}"
+        );
+    }
+
+    /// `[project.optional-dependencies]` (PEP 621 extras) and
+    /// `[dependency-groups]` (PEP 735) install real code. The parser returned
+    /// early on `[project].dependencies` and never looked at either.
+    #[test]
+    fn pyproject_optional_dependencies_and_dependency_groups_are_parsed() {
+        let specs = python_specs(
+            "[project]\nname = \"x\"\ndependencies = [\"requests==2.31.0\"]\n\
+             [project.optional-dependencies]\n\
+             dev = [\"evil-extra==1.0\"]\n\
+             docs = [\"sphinx\"]\n",
+        );
+        let names: BTreeSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains("requests"), "{specs:?}");
+        assert!(names.contains("evil-extra"), "{specs:?}");
+        assert!(names.contains("sphinx"), "{specs:?}");
+
+        let groups = python_specs(
+            "[project]\nname = \"x\"\ndependencies = []\n\
+             [dependency-groups]\ntest = [\"evil-group @ git+https://evil.example/x\"]\n",
+        );
+        assert!(
+            groups
+                .iter()
+                .any(|s| s.name == "evil-group" && matches!(s.source, DepSource::Git(_))),
+            "PEP 735 dependency groups must be read, with their sources: {groups:?}"
+        );
+    }
+
+    /// `// indirect` is a comment. `go build` does not treat it as a trust
+    /// boundary and neither may this gate: appending it to a `require` line
+    /// hid the module completely.
+    #[test]
+    fn go_indirect_comment_cannot_hide_a_required_module() {
+        let deps = parse_go(
+            "module m\n\nrequire (\n\tevil.example/pkg v1.0.0 // indirect\n)\n\
+             require evil.example/two v1.0.0 // indirect\n",
+        );
+        assert!(deps.contains("evil.example/pkg"), "{deps:?}");
+        assert!(deps.contains("evil.example/two"), "{deps:?}");
+    }
+
+    /// requirements.txt option lines were skipped wholesale by
+    /// `line.starts_with('-')`. `-e git+…` installs from an arbitrary VCS URL
+    /// and `--extra-index-url` re-points resolution for EVERY package in the
+    /// file — both are trust decisions, not formatting.
+    #[test]
+    fn requirements_editable_and_index_directives_are_parsed_not_skipped() {
+        let specs = python_specs(
+            "requests==2.31.0  # pinned by security\n\
+             -e git+https://evil.example/x#egg=evil-editable\n\
+             --extra-index-url https://evil.example/simple\n\
+             https://evil.example/wheels/first.whl\n\
+             -r shared/base.txt\n\
+             --require-hashes\n",
+        );
+        // An inline comment is stripped, but the `#` of a `#egg=` fragment (no
+        // preceding space) is not — that one names the package.
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name == "requests" && s.source == DepSource::Registry),
+            "{specs:?}"
+        );
+        // Options that carry no dependency are still skipped.
+        assert!(
+            specs.iter().all(|s| !s.name.contains("base.txt")),
+            "a -r include names no package of its own: {specs:?}"
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name == "evil-editable" && matches!(s.source, DepSource::Git(_))),
+            "-e git+… must be a git-sourced dependency: {specs:?}"
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name.contains("evil.example/simple") && s.source != DepSource::Registry),
+            "--extra-index-url must be visible as a non-registry source: {specs:?}"
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name.contains("evil.example/wheels/first.whl")),
+            "a bare direct-reference URL must not collapse to the name `https`: {specs:?}"
+        );
+        assert!(
+            specs.iter().all(|s| s.name != "https"),
+            "every URL line collapsing to `https` made them one interchangeable \
+             trust unit: {specs:?}"
+        );
+    }
+
+    /// A name outside ASCII was dropped on the floor — `python_req_name`
+    /// returned `None` and the whole line vanished from the gate's view. Whether
+    /// such a name can resolve anywhere is a separate question; a manifest line
+    /// the gate cannot see is a blind spot either way.
+    #[test]
+    fn a_non_ascii_package_name_is_surfaced_not_silently_dropped() {
+        // Cyrillic 'г' (U+0433) in place of Latin 'r'.
+        let specs = python_specs("\u{0433}equests==2.31.0\n");
+        assert_eq!(
+            specs.len(),
+            1,
+            "a homoglyph name must still be a visible dependency: {specs:?}"
+        );
+        assert_eq!(specs.iter().next().unwrap().name, "\u{0433}equests");
+    }
+
+    /// The gate itself, not just the parser: both bypasses have to change the
+    /// staged-vs-HEAD verdict.
+    #[test]
+    fn the_commit_gate_sees_target_specific_and_patched_cargo_dependencies() {
+        // (a) a platform-gated new dependency
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\nserde = \"1\"\n");
+        stage(&ctx, "Cargo.toml");
+        exec::git_raw(&["commit", "-m", "base", "--no-verify"], &ctx.root).unwrap();
+        write_file(
+            &ctx,
+            "Cargo.toml",
+            "[dependencies]\nserde = \"1\"\n[target.'cfg(unix)'.dependencies]\nsneaky = \"1\"\n",
+        );
+        stage(&ctx, "Cargo.toml");
+        let flagged = new_unapproved_deps(&ctx).unwrap();
+        assert!(
+            flagged.iter().any(|d| d.qualified == "cargo:sneaky"),
+            "a target-gated new dependency must reach the gate: {flagged:?}"
+        );
+
+        // (b) an APPROVED name whose code is swapped by [patch.crates-io]
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\nserde = \"1\"\n");
+        stage(&ctx, "Cargo.toml");
+        exec::git_raw(&["commit", "-m", "base", "--no-verify"], &ctx.root).unwrap();
+        approve_package(&ctx, "cargo:serde").unwrap();
+        assert!(unapproved_new_packages(&ctx).unwrap().is_empty());
+
+        write_file(
+            &ctx,
+            "Cargo.toml",
+            "[dependencies]\nserde = \"1\"\n\
+             [patch.crates-io]\nserde = { git = \"https://evil.example/serde\" }\n",
+        );
+        stage(&ctx, "Cargo.toml");
+        let flagged = new_unapproved_deps(&ctx).unwrap();
+        assert!(
+            flagged.iter().any(|d| d.qualified == "cargo:serde"
+                && matches!(d.reason, NewDepReason::NonRegistrySource(_))),
+            "patching an approved crate to a git URL must be flagged: {flagged:?}"
+        );
+    }
+    // ─────────── R1: `deps check` must consult the source, not the name ───────
+
+    /// A `path` dependency's code comes from disk, never from the public
+    /// registry. Resolving its NAME there answered a question nobody asked and
+    /// got both possible answers wrong: an in-repo crate was reported as
+    /// "exists on registry" purely on a name collision with an unrelated public
+    /// crate, and a perfectly ordinary sibling-repo path dep was reported as a
+    /// slopsquatting target at exit 1.
+    ///
+    /// Note the `offline = false` argument: post-fix this test makes no network
+    /// call at all, because a non-registry source is never resolved by name.
+    /// Pre-fix it did, and every arm of that match — Exists, NotFound, Unknown —
+    /// pushed one of the strings asserted absent below, so the test fails
+    /// regardless of connectivity.
+    #[test]
+    fn deps_check_never_resolves_a_non_registry_dependency_by_name_on_the_public_registry() {
+        let (_d, ctx) = repo_ctx();
+        write_file(
+            &ctx,
+            "Cargo.toml",
+            "[dependencies]\n\
+             serde = { path = \"vendor/serde\" }\n\
+             sibling-crate = { path = \"../outside/sibling-crate\" }\n",
+        );
+        let (problems, notes) = deps_check(&ctx, false).unwrap();
+
+        assert!(
+            !notes.iter().any(|n| n.contains("exists on registry")),
+            "a path dependency must never be VALIDATED by a same-named public \
+             crate: {notes:?}"
+        );
+        assert!(
+            !problems.iter().any(|p| p.contains("NOT FOUND")),
+            "a sibling-repo path dependency is a normal multi-repo layout, not a \
+             slopsquatting target: {problems:?}"
+        );
+        assert!(
+            !notes
+                .iter()
+                .any(|n| n.contains("registry check inconclusive")),
+            "no registry lookup should have been attempted at all: {notes:?}"
+        );
+        assert!(
+            problems.is_empty(),
+            "a repo whose only deps are path deps must exit clean: {problems:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("sibling-crate"))
+                && notes.iter().any(|n| n.contains("path source")),
+            "the user still has to be told WHY the name was not checked: {notes:?}"
+        );
+    }
+
+    /// `path_resolves_within_repo` walked path components lexically with no
+    /// `canonicalize`, so `path = "link/pkg"` where `link` is a symlink out of
+    /// the repo counted as the repo's own reviewed code and was exempted.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_dependency_through_a_symlink_that_escapes_the_repo_is_not_exempt() {
+        use std::os::unix::fs::symlink;
+        let (_d, ctx) = repo_ctx();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("pkg")).unwrap();
+        std::fs::write(
+            outside.path().join("pkg/Cargo.toml"),
+            "[package]\nname = \"pkg\"\n",
+        )
+        .unwrap();
+        symlink(outside.path(), ctx.root.join("link")).unwrap();
+
+        write_file(&ctx, "Cargo.toml", "[package]\nname = \"root\"\n");
+        stage(&ctx, "Cargo.toml");
+        exec::git_raw(&["commit", "-m", "base", "--no-verify"], &ctx.root).unwrap();
+
+        write_file(
+            &ctx,
+            "Cargo.toml",
+            "[package]\nname = \"root\"\n[dependencies]\npkg = { path = \"link/pkg\" }\n",
+        );
+        stage(&ctx, "Cargo.toml");
+        let flagged = new_unapproved_deps(&ctx).unwrap();
+        assert!(
+            flagged.iter().any(|d| d.qualified == "cargo:pkg"
+                && matches!(d.reason, NewDepReason::NonRegistrySource(_))),
+            "a path that only LOOKS in-tree must not be exempted: {flagged:?}"
+        );
     }
 }
