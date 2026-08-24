@@ -157,6 +157,9 @@ Two more docs cover the parts people get wrong:
 - **[docs/example-walkthrough.md](docs/example-walkthrough.md)** — a complete
   bootstrap on a fresh repo, with the real terminal output, including the hooks
   actually blocking a planted secret and an unsigned protected-branch commit.
+- **[docs/qa-corpus-2026-08.md](docs/qa-corpus-2026-08.md)** — what happened
+  when `sscsb` was run against twenty other repositories across two orgs, what
+  that surfaced, and what the fixes measurably changed.
 
 ## Controls
 
