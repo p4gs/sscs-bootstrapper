@@ -222,22 +222,87 @@ fn count_catalog_entries(path: &std::path::Path) -> std::io::Result<usize> {
     }
 }
 
+/// The registry's declared default for `[controls.bumblebee] profile` — the
+/// value `sscsb init` actually writes into `.sscsb/config.toml`.
+///
+/// Read from the registry rather than repeated as a literal because a hard-coded
+/// second copy is exactly how the two drifted apart: the registry said
+/// `"baseline"` while the code fell back to `"project"`, so the same control
+/// scanned two different things depending on whether the config key happened to
+/// be present. One source, one default.
+///
+/// The match arm is not redundant with `trim_matches`: it keeps an unrecognised
+/// registry value from becoming a profile bumblebee would reject, and preserves
+/// the never-widen rule below as the failure mode.
+fn registry_default_profile() -> &'static str {
+    crate::controls::control(CONTROL)
+        .and_then(|d| d.default_options.iter().find(|(k, _)| *k == "profile"))
+        .map(|(_, v)| v.trim_matches('"'))
+        .and_then(|v| match v {
+            "baseline" => Some("baseline"),
+            "project" => Some("project"),
+            _ => None,
+        })
+        .unwrap_or("project")
+}
+
 /// Scan profile, validated against what v0.1.2 actually accepts.
 ///
 /// `deep` is deliberately NOT reachable from config: it requires explicit
 /// `--root` paths and is the mode that walks `$HOME`. Scanning a developer's
 /// entire home directory is a decision for the developer at a shell prompt, not
 /// something a repository bootstrapper turns on from a config file it generated.
-/// Anything unrecognised — including an attempt to name `deep` — falls back to
-/// the repo-scoped profile, so config can never widen the blast radius.
+/// Anything *named* but unrecognised — including an attempt to name `deep` —
+/// narrows to the repo-scoped profile, so config can never widen the blast
+/// radius.
+///
+/// An ABSENT (or blank) option is not an unrecognised one: nobody chose
+/// anything, so the registry default applies — the same value the generated
+/// config carries. Conflating the two is what made the default disagree with
+/// itself.
 ///
 /// Takes the raw option rather than a `Config` so the allow-list is testable
 /// without materialising a config file.
 fn profile_from(opt: Option<&str>) -> &'static str {
     match opt.map(str::trim) {
+        None | Some("") => registry_default_profile(),
         Some("baseline") => "baseline",
         _ => "project",
     }
+}
+
+/// No catalog means no exposure criteria, which means no gate is possible.
+/// Report that plainly as Info: an inventory with nothing to match against is
+/// useful context, but it is not a passing security control and must not be
+/// dressed up as one.
+///
+/// Pure, so the hint it prints is testable without a `bumblebee` on PATH — the
+/// hint named the wrong profile for as long as nothing could check it.
+fn no_catalog_result(version: &str) -> VerifyResult {
+    VerifyResult::new(
+        CONTROL,
+        Outcome::Info,
+        vec![
+            format!("bumblebee {version} available; no exposure catalog configured"),
+            // `sscsb init` will not backfill options into a config that already
+            // exists, and `sscsb enable` writes only `enabled`. So a user who
+            // turns this control on may have no `catalog` key to edit — spell
+            // the whole block out rather than naming a key that isn't there.
+            //
+            // The profile printed here is read from the registry, not typed in:
+            // this hint used to say `project`, the opposite of what the generated
+            // config says and of what this control needs.
+            format!(
+                "add to .sscsb/config.toml:  [controls.bumblebee]  profile = \"{}\"  \
+                 catalog = \"path/to/catalog.json\"",
+                registry_default_profile()
+            ),
+            "catalogs must use schema_version \"0.1.0\" and exact versions \
+             (wildcards do not match in v0.1.2) — upstream publishes them under threat_intel/"
+                .into(),
+            "inventory-only: nothing to match against, so no exposure gate is applied".into(),
+        ],
+    )
 }
 
 pub fn verify_bumblebee_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
@@ -260,29 +325,8 @@ pub fn verify_bumblebee_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
         .trim()
         .to_string();
 
-    // No catalog means no exposure criteria, which means no gate is possible.
-    // Report that plainly as Info: an inventory with nothing to match against is
-    // useful context, but it is not a passing security control and must not be
-    // dressed up as one.
     if catalog.is_empty() {
-        return VerifyResult::new(
-            CONTROL,
-            Outcome::Info,
-            vec![
-                format!("bumblebee {version} available; no exposure catalog configured"),
-                // `sscsb init` will not backfill options into a config that already
-                // exists, and `sscsb enable` writes only `enabled`. So a user who
-                // turns this control on may have no `catalog` key to edit — spell
-                // the whole block out rather than naming a key that isn't there.
-                "add to .sscsb/config.toml:  [controls.bumblebee]  profile = \"project\"  \
-                 catalog = \"path/to/catalog.json\""
-                    .into(),
-                "catalogs must use schema_version \"0.1.0\" and exact versions \
-                 (wildcards do not match in v0.1.2) — upstream publishes them under threat_intel/"
-                    .into(),
-                "inventory-only: nothing to match against, so no exposure gate is applied".into(),
-            ],
-        );
+        return no_catalog_result(&version);
     }
 
     match plan_scan(
@@ -1077,12 +1121,11 @@ mod tests {
     }
 
     #[test]
-    fn profile_defaults_to_project_and_deep_is_unreachable() {
-        assert_eq!(profile_from(None), "project");
-        // Anything that is not an explicit `baseline` — including an attempt to
+    fn an_unrecognised_profile_never_widens_the_scan() {
+        // Anything NAMED but not an explicit `baseline` — including an attempt to
         // select the $HOME-walking `deep` mode — resolves to the repo-scoped
         // profile. Config cannot escalate scan scope beyond the repository.
-        for attempted in ["deep", "DEEP", "", "nonsense", "  deep  "] {
+        for attempted in ["deep", "DEEP", "nonsense", "  deep  "] {
             assert_eq!(
                 profile_from(Some(attempted)),
                 "project",
@@ -1091,5 +1134,57 @@ mod tests {
         }
         assert_eq!(profile_from(Some("baseline")), "baseline");
         assert_eq!(profile_from(Some("  baseline  ")), "baseline");
+        assert_eq!(profile_from(Some("project")), "project");
+    }
+
+    /// The registry literal, unquoted — the value `sscsb init` writes into
+    /// `.sscsb/config.toml` for `[controls.bumblebee] profile`.
+    fn registry_profile_literal() -> &'static str {
+        crate::controls::control(CONTROL)
+            .expect("bumblebee is in the registry")
+            .default_options
+            .iter()
+            .find(|(k, _)| *k == "profile")
+            .map(|(_, v)| v.trim_matches('"'))
+            .expect("bumblebee declares a default profile")
+    }
+
+    /// M25. The registry said `"baseline"` and the code fell back to `"project"`,
+    /// so the SAME control scanned a different surface depending on whether the
+    /// config key happened to be present — a hand-written or trimmed config got
+    /// the repo-scoped scan while a generated one got the endpoint scan. An
+    /// absent key must mean the registry default, not a second opinion.
+    #[test]
+    fn the_runtime_profile_default_is_the_registry_default() {
+        assert_eq!(
+            profile_from(None),
+            registry_profile_literal(),
+            "the fallback used when `profile` is absent must equal the value the \
+             generated config carries"
+        );
+        assert_eq!(
+            profile_from(Some("")),
+            registry_profile_literal(),
+            "a blank value is nobody choosing anything, not an unrecognised choice"
+        );
+    }
+
+    /// M25, second half: the Info hint printed when no catalog is configured told
+    /// the user to set the profile the module's own doc says inventories nothing
+    /// on a Rust repo — advice that produced the zero-subject FAIL below.
+    #[test]
+    fn the_no_catalog_hint_names_the_registry_default_profile() {
+        let r = no_catalog_result("0.1.2");
+        assert_eq!(r.outcome, Outcome::Info);
+        let hint = r
+            .messages
+            .iter()
+            .find(|m| m.contains("[controls.bumblebee]"))
+            .expect("the hint must spell out the config block");
+        assert!(
+            hint.contains(&format!("profile = \"{}\"", registry_profile_literal())),
+            "the hint must not tell the user to set a different profile than the \
+             registry default: {hint}"
+        );
     }
 }
