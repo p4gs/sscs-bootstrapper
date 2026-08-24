@@ -1005,8 +1005,8 @@ pub fn approve_package(ctx: &Ctx, qualified: &str) -> Result<()> {
     Ok(())
 }
 
-/// Current deps across all manifests in the repo root, each keeping the source
-/// it was declared with.
+/// Current deps across every manifest in the repo — nested ones included — each
+/// keeping the source it was declared with.
 ///
 /// The source is the half [`current_deps`] throws away, and throwing it away is
 /// what let `deps check` ask the public registry about a `path` dependency.
@@ -1015,13 +1015,12 @@ pub fn approve_package(ctx: &Ctx, qualified: &str) -> Result<()> {
 /// one target, not two registry lookups.
 pub fn current_dep_specs(ctx: &Ctx) -> Result<BTreeSet<(Ecosystem, DepSpec)>> {
     let mut out = BTreeSet::new();
-    for mf in MANIFEST_FILES {
-        let path = ctx.root.join(mf);
-        if !path.is_file() {
+    for file in manifest_paths(ctx)? {
+        let Some(eco) = Ecosystem::of_manifest(&file) else {
             continue;
-        }
-        let eco = Ecosystem::of_manifest(mf).expect("manifest list");
-        let content = std::fs::read_to_string(&path)?;
+        };
+        let content = std::fs::read_to_string(ctx.root.join(&file))
+            .with_context(|| format!("reading manifest {file}"))?;
         for spec in parse_dep_specs(eco, &content) {
             out.insert((eco, spec));
         }
@@ -1029,23 +1028,53 @@ pub fn current_dep_specs(ctx: &Ctx) -> Result<BTreeSet<(Ecosystem, DepSpec)>> {
     Ok(out)
 }
 
-/// Current dependency NAMES across all manifests in the repo root (qualified
-/// `eco:name`). Anything that has to know where the code comes from must use
-/// [`current_dep_specs`] instead.
-pub fn current_deps(ctx: &Ctx) -> Result<BTreeSet<String>> {
-    let mut out = BTreeSet::new();
-    for mf in MANIFEST_FILES {
-        let path = ctx.root.join(mf);
-        if !path.is_file() {
-            continue;
-        }
-        let eco = Ecosystem::of_manifest(mf).expect("manifest list");
-        let content = std::fs::read_to_string(&path)?;
-        for dep in parse_deps(eco, &content) {
-            out.insert(format!("{}:{dep}", eco.label()));
+/// Every dependency manifest in the repo, repo-relative — not only the ones at
+/// the root.
+///
+/// The root-only read was half of a disagreement with the commit gate, which
+/// matches a staged file by BASENAME *anywhere* in the tree. `sscsb deps
+/// baseline` blessed the root manifest, never saw `sub/package.json`, and the
+/// gate then blocked the commit on a dependency from it that `baseline` had no
+/// way to approve — leaving `sscsb deps approve`, one package at a time, as the
+/// only route out. Monorepos are the common case, not the exotic one.
+///
+/// The search universe is deliberately **git's**, not the filesystem's. The gate
+/// can only ever see a path git is tracking or staging, so `git ls-files` — which
+/// lists the INDEX, and therefore staged-new files too — is exactly the set that
+/// can reach it. It also excludes, for free and by the repo's own rules, every
+/// directory a filesystem walk would have to exclude by hand: `node_modules/`,
+/// `target/`, `.venv/`, vendored trees. Baselining those would approve thousands
+/// of packages nobody is committing.
+///
+/// Root manifests are unioned in unconditionally, so a repo whose first commit
+/// has not happened yet still baselines exactly as it did before.
+fn manifest_paths(ctx: &Ctx) -> Result<BTreeSet<String>> {
+    let mut out: BTreeSet<String> = MANIFEST_FILES
+        .iter()
+        .filter(|mf| ctx.root.join(mf).is_file())
+        .map(|mf| (*mf).to_string())
+        .collect();
+    let tracked = exec::git(&["ls-files", "-z"], &ctx.root)?;
+    for file in tracked.split('\0') {
+        if !file.is_empty() && is_dependency_manifest(file) && ctx.root.join(file).is_file() {
+            out.insert(file.to_string());
         }
     }
     Ok(out)
+}
+
+/// Current dependency NAMES across every manifest in the repo (qualified
+/// `eco:name`). Anything that has to know where the code comes from must use
+/// [`current_dep_specs`] instead.
+///
+/// Derived from `current_dep_specs` rather than walking the manifests a second
+/// time: the two used to be separate loops, and a separate loop is how the two
+/// views drift into disagreeing about which manifests exist.
+pub fn current_deps(ctx: &Ctx) -> Result<BTreeSet<String>> {
+    Ok(current_dep_specs(ctx)?
+        .into_iter()
+        .map(|(eco, spec)| format!("{}:{}", eco.label(), spec.name))
+        .collect())
 }
 
 /// Why a staged dependency needs a fresh trust decision.
@@ -2303,6 +2332,93 @@ mod tests {
                 .any(|d| d.starts_with("pypi:") || d.starts_with("go:")),
             "no requirements.txt/go.mod present: {deps:?}"
         );
+    }
+
+    /// M9: `deps check` and `deps baseline` only ever read ROOT manifests, while
+    /// the commit gate matches a staged file by BASENAME anywhere in the tree.
+    ///
+    /// The disagreement had teeth. `sscsb deps baseline` blessed `Cargo.toml`,
+    /// never saw `sub/package.json`, and the gate then blocked the commit on a
+    /// dependency from it that `baseline` had no way to approve — leaving
+    /// `sscsb deps approve`, one package at a time, as the only route. This
+    /// repo's own `.sscsb/policy/packages.toml` carries the scar: `libfuzzer-sys`
+    /// and `sscsb` are in it because `fuzz/Cargo.toml` had to be hand-approved.
+    ///
+    /// The invariant is the whole finding: everything the gate can block must be
+    /// something the baseline can bless.
+    #[test]
+    fn baseline_sees_every_manifest_the_commit_gate_can_block_on() {
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\nserde = \"1\"\n");
+        write_file(
+            &ctx,
+            "sub/package.json",
+            r#"{"dependencies":{"left-pad":"1"}}"#,
+        );
+        write_file(&ctx, "services/api/requirements.txt", "flask>=2\n");
+        write_file(
+            &ctx,
+            "tools/go.mod",
+            "module m\n\nrequire example.com/x v1.0.0\n",
+        );
+        stage(&ctx, ".");
+
+        let gated = unapproved_new_packages(&ctx).unwrap();
+        assert!(
+            gated.contains(&"npm:left-pad".to_string()),
+            "the gate matches a manifest basename anywhere: {gated:?}"
+        );
+
+        let current = current_deps(&ctx).unwrap();
+        for pkg in &gated {
+            assert!(
+                current.contains(pkg),
+                "the gate blocks `{pkg}` but `deps baseline` cannot see it, so it \
+                 cannot be blessed in bulk — only one `deps approve` at a time. \
+                 baseline sees: {current:?}"
+            );
+        }
+        assert!(current.contains("cargo:serde"), "{current:?}");
+        assert!(current.contains("npm:left-pad"), "{current:?}");
+        assert!(current.contains("pypi:flask"), "{current:?}");
+        assert!(current.contains("go:example.com/x"), "{current:?}");
+
+        // `deps baseline` itself runs on the source-aware view; it must agree.
+        let specs = current_dep_specs(&ctx).unwrap();
+        let qualified: BTreeSet<String> = specs
+            .iter()
+            .map(|(eco, s)| format!("{}:{}", eco.label(), s.name))
+            .collect();
+        assert_eq!(qualified, current, "the two views must not drift apart");
+    }
+
+    /// The widened search stays inside git's universe. A manifest under a
+    /// gitignored directory — `node_modules/`, `target/`, a vendored tree — can
+    /// never reach the commit gate, so baselining it would approve thousands of
+    /// packages nobody is committing.
+    #[test]
+    fn baseline_ignores_manifests_git_does_not_track() {
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, ".gitignore", "node_modules/\n");
+        write_file(&ctx, "Cargo.toml", "[dependencies]\nserde = \"1\"\n");
+        write_file(
+            &ctx,
+            "node_modules/leftpad/package.json",
+            r#"{"dependencies":{"transitive-junk":"1"}}"#,
+        );
+        stage(&ctx, ".");
+
+        let current = current_deps(&ctx).unwrap();
+        assert!(current.contains("cargo:serde"));
+        assert!(
+            !current.contains("npm:transitive-junk"),
+            "a gitignored manifest can never reach the gate, so it must not \
+             reach the baseline either: {current:?}"
+        );
+        // …and the gate agrees, which is the point.
+        assert!(!unapproved_new_packages(&ctx)
+            .unwrap()
+            .contains(&"npm:transitive-junk".to_string()));
     }
 
     /// A manifest that is present but unreadable must fail the gate closed.

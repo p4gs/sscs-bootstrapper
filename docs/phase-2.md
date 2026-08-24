@@ -166,6 +166,13 @@ that fails to compile. Only that shape is exempt: `boto` still shadows `boto3`
 in length), and every one of these names still goes through the existence check,
 which is the arm that actually knows whether a name is real.
 
+**Where manifests are looked for.** Everywhere git tracks one, not just the repo
+root — `sub/package.json` and `services/api/requirements.txt` count. The commit
+gate has always matched a staged manifest by filename anywhere in the tree, so
+anything it can block on is something `sscsb deps baseline` can bless in bulk.
+The search is git's index, not a filesystem walk, so `node_modules/`, `target/`
+and anything else your `.gitignore` covers stays out of the baseline.
+
 **What counts as a declaration.** `pyproject.toml` is read as TOML, never scanned
 line by line, and every section that installs code is read: PEP 621 `[project]`
 and its extras, PEP 735 `[dependency-groups]`, **Poetry**
