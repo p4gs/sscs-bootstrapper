@@ -6,6 +6,7 @@
 
 use crate::exec;
 use crate::platform::Platform;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ToolSpec {
@@ -225,23 +226,39 @@ pub fn spec(id: &str) -> Option<&'static ToolSpec> {
     TOOLS.iter().find(|t| t.id == id)
 }
 
-/// Detect a tool: locate on PATH and capture its reported version.
+/// Detect a tool: locate an EXECUTABLE on PATH and make it answer its own
+/// version probe.
+///
+/// Both halves are load-bearing. A present-but-broken tool is not a working
+/// tool: this used to swallow the probe's failure and report `Found` anyway, so
+/// anything that merely occupied the name satisfied the control. Together with
+/// `find_in_path`'s executable check, a three-line text file named `guacone`
+/// no longer flips `sscsb verify --strict guac` from exit 1 to exit 0.
+///
+/// The probe must RUN, exit 0, and say something. It is deliberately not
+/// required to yield a *parseable* version — `ToolStatus::Found.version` is an
+/// `Option` because registry entries such as `sighthound` report two-component
+/// versions that `extract_version` cannot parse, and declaring a genuinely
+/// installed tool missing over that would be a false positive.
+///
+/// Residual, stated plainly: an *executable* stub that prints anything and
+/// exits 0 still detects. Distinguishing a real tool from a convincing
+/// impostor needs checksum or signature pinning of the binary itself, which is
+/// a separate control, not a detection tweak.
 pub fn detect(spec: &ToolSpec) -> ToolStatus {
-    match exec::find_in_path(spec.bin) {
-        None => ToolStatus::Missing,
-        Some(path) => {
-            let version = exec::run(spec.bin, spec.version_args, None)
-                .ok()
-                .filter(|o| o.success())
-                .and_then(|o| {
-                    let combined = format!("{} {}", o.stdout, o.stderr);
-                    extract_version(&combined)
-                });
-            ToolStatus::Found {
-                path: path.display().to_string(),
-                version,
-            }
-        }
+    let Some(path) = exec::find_in_path(spec.bin) else {
+        return ToolStatus::Missing;
+    };
+    let Ok(out) = exec::run(spec.bin, spec.version_args, None) else {
+        return ToolStatus::Missing; // on PATH but unspawnable
+    };
+    let combined = format!("{} {}", out.stdout, out.stderr);
+    if !out.success() || combined.trim().is_empty() {
+        return ToolStatus::Missing;
+    }
+    ToolStatus::Found {
+        path: path.display().to_string(),
+        version: extract_version(&combined),
     }
 }
 
@@ -253,21 +270,44 @@ pub fn is_available(id: &str) -> bool {
 pub fn degrade_message(id: &str, platform: Platform) -> String {
     match spec(id) {
         None => format!("unknown tool `{id}`"),
-        Some(s) => {
-            let install = match (platform, s.brew) {
-                (Platform::MacOs, Some(f)) => format!("brew install {f}"),
-                (Platform::Linux | Platform::Wsl, Some(f)) => {
-                    format!("brew install {f} (Linuxbrew) or see {}", s.install_note)
-                }
-                _ => s.install_note.to_string(),
-            };
-            format!(
-                "{id} not found on PATH — this control cannot run its underlying tool. \
-                 Pinned known-good version: {v}. Install: {install} ({home})",
-                v = s.pinned_version,
-                home = s.homepage
-            )
+        // `detect` reports Missing for two distinct situations, and telling an
+        // operator "not found on PATH" about a binary sitting right there on
+        // their PATH is a lie that costs them an hour. Ask PATH again so the
+        // message matches the reason.
+        Some(s) => unusable_message(s, platform, exec::find_in_path(s.bin).as_deref()),
+    }
+}
+
+/// The body of [`degrade_message`], with the PATH answer passed in rather than
+/// looked up, so both branches are testable without touching the process
+/// environment.
+fn unusable_message(s: &ToolSpec, platform: Platform, found_at: Option<&Path>) -> String {
+    let install = match (platform, s.brew) {
+        (Platform::MacOs, Some(f)) => format!("brew install {f}"),
+        (Platform::Linux | Platform::Wsl, Some(f)) => {
+            format!("brew install {f} (Linuxbrew) or see {}", s.install_note)
         }
+        _ => s.install_note.to_string(),
+    };
+    match found_at {
+        Some(p) => format!(
+            "{id} found at {path} but `{bin} {probe}` did not succeed — present, not working, \
+             so this control cannot run it. Pinned known-good version: {v}. \
+             Repair or reinstall: {install} ({home})",
+            id = s.id,
+            path = p.display(),
+            bin = s.bin,
+            probe = s.version_args.join(" "),
+            v = s.pinned_version,
+            home = s.homepage
+        ),
+        None => format!(
+            "{id} not found on PATH — this control cannot run its underlying tool. \
+             Pinned known-good version: {v}. Install: {install} ({home})",
+            id = s.id,
+            v = s.pinned_version,
+            home = s.homepage
+        ),
     }
 }
 
@@ -351,6 +391,137 @@ mod tests {
             install_note: "",
         };
         assert!(matches!(detect(&absent), ToolStatus::Missing));
+    }
+
+    /// Write `script` as an executable file called `name` inside `dir`.
+    #[cfg(unix)]
+    fn shim(dir: &std::path::Path, name: &str, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A spec whose `bin` name cannot collide with anything on a real machine,
+    /// so the decoy is always the only candidate and the fixture never has to
+    /// hide a genuine install from the rest of the (threaded) suite.
+    fn decoy_spec() -> ToolSpec {
+        ToolSpec {
+            id: "probe-decoy",
+            bin: "sscsb-probe-decoy",
+            pinned_version: "1.0.0",
+            version_args: &["version"],
+            homepage: "https://example.invalid/decoy",
+            brew: None,
+            install_note: "not a real tool",
+        }
+    }
+
+    /// A binary that cannot answer its own version probe is not a working
+    /// tool. `Found` used to be returned regardless of what the probe did —
+    /// which, together with `find_in_path` accepting any regular file, is what
+    /// let a three-line text file named `guacone` satisfy a control.
+    #[cfg(unix)]
+    #[test]
+    fn detect_refuses_a_decoy_that_is_not_executable_or_cannot_answer_its_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::testutil::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // Prepend only — nothing on the real PATH is hidden, so a
+        // concurrently-running test can still find and spawn its own tools.
+        let _path = crate::testutil::PathPrepend::new(dir.path());
+        let decoy = dir.path().join("sscsb-probe-decoy");
+
+        // The reported shape: a three-line shell script nobody chmod'd.
+        std::fs::write(
+            &decoy,
+            "#!/bin/sh\n# three lines, never chmod +x\necho hi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let status = detect(&decoy_spec());
+        assert!(
+            matches!(status, ToolStatus::Missing),
+            "a non-executable text file must not detect as an installed tool: {status:?}"
+        );
+
+        // Half-installed: on PATH, executable, exits non-zero.
+        shim(
+            dir.path(),
+            "sscsb-probe-decoy",
+            "#!/bin/sh\necho 'missing shared library' 1>&2\nexit 1\n",
+        );
+        let broken = detect(&decoy_spec());
+        assert!(
+            matches!(broken, ToolStatus::Missing),
+            "a tool whose version probe fails must not report as available: {broken:?}"
+        );
+
+        // A silent stub that exits 0 without saying anything is not a tool
+        // either — every real version command prints something.
+        shim(dir.path(), "sscsb-probe-decoy", "#!/bin/sh\nexit 0\n");
+        let silent = detect(&decoy_spec());
+        assert!(
+            matches!(silent, ToolStatus::Missing),
+            "a silent stub must not report as available: {silent:?}"
+        );
+
+        // And the working case still detects, with its version parsed — the
+        // guard must not become a false negative for a real install.
+        shim(
+            dir.path(),
+            "sscsb-probe-decoy",
+            "#!/bin/sh\necho 'decoy version 1.2.3'\n",
+        );
+        match detect(&decoy_spec()) {
+            ToolStatus::Found { version, path } => {
+                assert_eq!(version.as_deref(), Some("1.2.3"));
+                assert!(path.ends_with("sscsb-probe-decoy"), "{path}");
+            }
+            ToolStatus::Missing => panic!("a working tool must still be detected"),
+        }
+
+        // A tool that answers but with an unparseable version is still FOUND —
+        // `sighthound` reports a two-component version, and calling that
+        // missing would be a false positive.
+        shim(
+            dir.path(),
+            "sscsb-probe-decoy",
+            "#!/bin/sh\necho 'decoy 1.0'\n",
+        );
+        match detect(&decoy_spec()) {
+            ToolStatus::Found { version, .. } => assert_eq!(version, None),
+            ToolStatus::Missing => panic!("an unparseable version is not an absent tool"),
+        }
+    }
+
+    /// Telling an operator a binary is "not found on PATH" when it is sitting
+    /// right there costs them an hour. The two reasons `detect` reports
+    /// Missing must read differently — asserted on the pure body so the test
+    /// never touches the process environment.
+    #[test]
+    fn unusable_message_distinguishes_absent_from_present_but_broken() {
+        let guacone = spec("guacone").unwrap();
+
+        let absent = unusable_message(guacone, Platform::MacOs, None);
+        assert!(absent.contains("guacone not found on PATH"), "{absent}");
+        assert!(absent.contains("1.1.0"), "{absent}");
+
+        let broken = unusable_message(
+            guacone,
+            Platform::MacOs,
+            Some(std::path::Path::new("/usr/local/bin/guacone")),
+        );
+        assert!(
+            broken.contains("found at /usr/local/bin/guacone"),
+            "{broken}"
+        );
+        assert!(broken.contains("present, not working"), "{broken}");
+        assert!(
+            broken.contains("guacone version"),
+            "names the probe: {broken}"
+        );
+        assert!(broken.contains("1.1.0"), "still names the pin: {broken}");
     }
 
     #[test]

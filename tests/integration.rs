@@ -891,9 +891,20 @@ impl FakeMachine {
     }
 
     /// Replace the fake `gh` this machine puts on PATH.
+    ///
+    /// Every shim answers `--version` first, whatever the caller's script does
+    /// with the API endpoints, because a real `gh` does — even one that is not
+    /// authenticated. Tool detection reads exactly that probe, so a shim that
+    /// failed it would be modelling a BROKEN `gh` rather than the API answers
+    /// the test is actually about.
     fn set_gh(&self, script: &str) {
+        let (shebang, rest) = script.split_once('\n').unwrap_or(("#!/bin/sh", script));
+        let script = format!(
+            "{shebang}\nif [ \"$1\" = \"--version\" ]; then \
+             echo 'gh version 2.96.0 (test shim)'; exit 0; fi\n{rest}"
+        );
         let path = self.dir.path().join("bin/gh");
-        std::fs::write(&path, script).unwrap();
+        std::fs::write(&path, &script).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
