@@ -558,6 +558,7 @@ mod tests {
     fn out(stdout: &str, stderr: &str, status: i32) -> exec::CmdOutput {
         exec::CmdOutput {
             status,
+            signal: None,
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
         }

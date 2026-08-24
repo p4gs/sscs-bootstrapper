@@ -10,6 +10,18 @@ versions.
 
 ### Fixed
 
+- **A SAST scanner that was killed reported a clean scan.** `run_sast` gated
+  the Semgrep engine on `exit status > 1`. A process killed by a signal — the
+  OOM killer, a CI timeout's SIGKILL, a segfault — has no exit code at all,
+  and the execution layer recorded that as `-1`, which is not greater than 1.
+  So an abnormal death ranked *below both success codes*: whatever the scanner
+  had managed to print was parsed, and a scanner killed after emitting
+  `{"results":[]}` reported zero findings, cleanly. `CmdOutput` now carries the
+  terminating signal alongside the code, `exit_code()` returns `None` when
+  there was no exit, and both engines accept only the exit codes their
+  contracts document (OpenGrep 0; Semgrep 0 or 1). Everything else — including
+  no exit at all — is a failed scan, and the diagnostic names the signal
+  instead of printing a fabricated exit code.
 - **Every staged binary file was corrupted before it was scanned.**
   `stage_to_tempdir` materialises each staged blob by running `git show
   :<file>` and writing the result out, and the process-execution layer decoded

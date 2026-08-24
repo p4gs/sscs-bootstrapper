@@ -81,12 +81,12 @@ pub fn run_sast(ctx: &Ctx, cfg: &Config, target: &Path) -> Result<Vec<SastFindin
             args.extend(excludes.iter().map(String::as_str));
             args.push(&target_arg);
             let out = exec::run("opengrep", &args, Some(&ctx.root))?;
-            if out.status != 0 {
+            if !out.success() {
                 // opengrep reports rule-parse errors on stdout with an empty
                 // stderr, so surface both or the failure is unactionable.
                 anyhow::bail!(
-                    "opengrep failed (exit {}): {}",
-                    out.status,
+                    "opengrep failed ({}): {}",
+                    out.termination(),
                     diagnostic(&out.stderr, &out.stdout)
                 );
             }
@@ -112,11 +112,14 @@ pub fn run_sast(ctx: &Ctx, cfg: &Config, target: &Path) -> Result<Vec<SastFindin
             args.extend(excludes.iter().map(String::as_str));
             args.push(&target_arg);
             let out = exec::run("semgrep", &args, Some(&ctx.root))?;
-            // semgrep: 0 = clean, 1 = findings, 2+ = error.
-            if out.status > 1 {
+            // semgrep: 0 = clean, 1 = findings. EVERYTHING else is a failed
+            // scan — including no exit code at all, which is what an OOM kill
+            // or a timeout's SIGKILL leaves behind. Gating on `status > 1`
+            // ranked that below both success codes and read it as clean.
+            if !matches!(out.exit_code(), Some(0 | 1)) {
                 anyhow::bail!(
-                    "semgrep failed (exit {}): {}",
-                    out.status,
+                    "semgrep failed ({}): {}",
+                    out.termination(),
                     diagnostic(&out.stderr, &out.stdout)
                 );
             }
@@ -522,6 +525,67 @@ pub(crate) mod tests {
 
         let err = with_only_git_on_path(|| run_sast(&ctx, cfg, &ctx.root)).unwrap_err();
         assert!(format!("{err:#}").contains("semgrep not found"));
+    }
+
+    /// Point a bootstrapped repo's `controls.sast.engine` at `engine`.
+    fn repo_with_engine(engine: &str) -> (tempfile::TempDir, Ctx) {
+        let (dir, ctx) = repo();
+        let cfg_path = ctx.config_path();
+        let text = std::fs::read_to_string(&cfg_path)
+            .unwrap()
+            .replace("engine = \"opengrep\"", &format!("engine = \"{engine}\""));
+        std::fs::write(&cfg_path, text).unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        (dir, ctx)
+    }
+
+    /// M5: the semgrep arm gated on `out.status > 1`. A process killed by a
+    /// signal has NO exit code — `exec` records the -1 sentinel — and -1 is not
+    /// greater than 1, so an OOM-killed or timed-out scanner fell through to
+    /// the parser and whatever it had managed to print was read as the result.
+    /// A scanner that printed `{"results":[]}` and was then killed therefore
+    /// reported a clean scan.
+    #[test]
+    fn a_signal_killed_scanner_is_a_failed_scan_not_a_clean_one() {
+        let (_d, ctx) = repo_with_engine("semgrep");
+        let cfg = ctx.require_config().unwrap();
+        // Prints a plausible clean result, then dies the way the OOM killer or
+        // a CI timeout kills it — after some output, never having exited.
+        let script = "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then echo \"1.169.0\"; exit 0; fi\n\
+             printf '{\"results\":[],\"errors\":[]}'\n\
+             kill -9 $$\n";
+        let err = with_fake_tool("semgrep", script, || run_sast(&ctx, cfg, &ctx.root))
+            .expect_err("a killed scanner must not report a clean scan");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("semgrep failed"), "{msg}");
+        assert!(
+            msg.contains("killed by signal 9"),
+            "the diagnostic must name how it died, not print a fake exit code: {msg}"
+        );
+    }
+
+    /// The other half of the same gate: semgrep's two DOCUMENTED codes still
+    /// mean what they mean, so tightening it did not turn findings into errors.
+    #[test]
+    fn semgrep_exit_one_still_means_findings_not_failure() {
+        let (_d, ctx) = repo_with_engine("semgrep");
+        let cfg = ctx.require_config().unwrap();
+        let script = "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then echo \"1.169.0\"; exit 0; fi\n\
+             printf '{\"results\":[{\"check_id\":\"x\",\"path\":\"a.sh\",\"start\":{\"line\":1},\
+             \"extra\":{\"severity\":\"ERROR\",\"message\":\"m\"}}],\"errors\":[]}'\n\
+             exit 1\n";
+        let findings =
+            with_fake_tool("semgrep", script, || run_sast(&ctx, cfg, &ctx.root)).unwrap();
+        assert_eq!(findings.len(), 1, "exit 1 is `findings`, not an error");
+
+        let clean = "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then echo \"1.169.0\"; exit 0; fi\n\
+             printf '{\"results\":[],\"errors\":[]}'\n\
+             exit 0\n";
+        let findings = with_fake_tool("semgrep", clean, || run_sast(&ctx, cfg, &ctx.root)).unwrap();
+        assert!(findings.is_empty());
     }
 
     #[test]
