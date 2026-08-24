@@ -1015,10 +1015,7 @@ pub fn approve_package(ctx: &Ctx, qualified: &str) -> Result<()> {
 /// one target, not two registry lookups.
 pub fn current_dep_specs(ctx: &Ctx) -> Result<BTreeSet<(Ecosystem, DepSpec)>> {
     let mut out = BTreeSet::new();
-    for file in manifest_paths(ctx)? {
-        let Some(eco) = Ecosystem::of_manifest(&file) else {
-            continue;
-        };
+    for (eco, file) in manifest_paths(ctx)? {
         let content = std::fs::read_to_string(ctx.root.join(&file))
             .with_context(|| format!("reading manifest {file}"))?;
         for spec in parse_dep_specs(eco, &content) {
@@ -1048,16 +1045,20 @@ pub fn current_dep_specs(ctx: &Ctx) -> Result<BTreeSet<(Ecosystem, DepSpec)>> {
 ///
 /// Root manifests are unioned in unconditionally, so a repo whose first commit
 /// has not happened yet still baselines exactly as it did before.
-fn manifest_paths(ctx: &Ctx) -> Result<BTreeSet<String>> {
-    let mut out: BTreeSet<String> = MANIFEST_FILES
+fn manifest_paths(ctx: &Ctx) -> Result<BTreeSet<(Ecosystem, String)>> {
+    let mut out: BTreeSet<(Ecosystem, String)> = MANIFEST_FILES
         .iter()
         .filter(|mf| ctx.root.join(mf).is_file())
-        .map(|mf| (*mf).to_string())
+        .filter_map(|mf| Ecosystem::of_manifest(mf).map(|eco| (eco, (*mf).to_string())))
         .collect();
     let tracked = exec::git(&["ls-files", "-z"], &ctx.root)?;
-    for file in tracked.split('\0') {
-        if !file.is_empty() && is_dependency_manifest(file) && ctx.root.join(file).is_file() {
-            out.insert(file.to_string());
+    for file in tracked.split('\0').filter(|f| !f.is_empty()) {
+        // `of_manifest` is the same table `is_dependency_manifest` consults, so
+        // asking it directly both filters and classifies in one step.
+        if let Some(eco) = Ecosystem::of_manifest(file) {
+            if ctx.root.join(file).is_file() {
+                out.insert((eco, file.to_string()));
+            }
         }
     }
     Ok(out)
@@ -2187,6 +2188,28 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "backport" && matches!(s.source, DepSource::Git(_))),
             "the git alternative must be its own trust unit: {specs:?}"
+        );
+    }
+
+    /// TOML permits shapes these sections do not — a scalar where a table
+    /// belongs. A hand-broken (or deliberately shaped) manifest must not take
+    /// the dependencies declared beside it down with it, because a section the
+    /// gate silently drops is a section an attacker can hide a package in.
+    #[test]
+    fn malformed_tool_sections_do_not_swallow_the_dependencies_beside_them() {
+        let deps = parse_deps(
+            Ecosystem::PyPi,
+            "[project]\ndependencies = [\"requests\"]\n\
+             [tool.hatch.envs]\ndefault = \"not-a-table\"\n\
+             [tool.pdm]\ndev-dependencies = \"not-a-table\"\n\
+             [tool.uv]\ndev-dependencies = \"not-an-array\"\n\
+             [tool.poetry.dependencies]\nflask = \"^2\"\n",
+        );
+        assert!(deps.contains("requests"), "{deps:?}");
+        assert!(deps.contains("flask"), "{deps:?}");
+        assert!(
+            !deps.contains("default") && !deps.contains("dev-dependencies"),
+            "a malformed section names no package: {deps:?}"
         );
     }
 
