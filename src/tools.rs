@@ -560,6 +560,11 @@ mod tests {
         // For every real tool id, is_available must agree with an
         // independent detect() call — it is a thin, correct wrapper, not a
         // guess, regardless of which tools happen to be installed here.
+        //
+        // The two calls read the NATURAL PATH, twice, so they must not be
+        // interleaved with a sibling test that masks or shims it: a tool that
+        // vanishes between them looks like a wrapper bug and is not one.
+        let _lock = crate::testutil::env_lock();
         for t in TOOLS {
             let expected = matches!(detect(t), ToolStatus::Found { .. });
             assert_eq!(is_available(t.id), expected, "mismatch for tool {}", t.id);

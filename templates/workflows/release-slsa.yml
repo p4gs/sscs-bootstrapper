@@ -78,9 +78,15 @@ jobs:
       # `${{ }}` interpolation into the script body — the same rule sscsb enforces
       # on your workflows. Verification also fails EXPLICITLY when there is nothing
       # to verify: an empty dist/ must never read as "everything passed".
+      # --builder-id is OPTIONAL to slsa-verifier, and omitting it makes the
+      # verdict "some builder slsa-verifier trusts produced this, for this
+      # source URI" rather than "the builder this workflow actually uses".
+      # BUILDER_ID must track the generator pinned in the `provenance` job
+      # above — change one, change the other.
       - name: Verify provenance for every artifact
         env:
           PROVENANCE: ${{ needs.provenance.outputs.provenance-name }}
+          BUILDER_ID: https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.1.0
         run: |
           set -uo pipefail
           shopt -s nullglob
@@ -93,5 +99,6 @@ jobs:
             slsa-verifier verify-artifact "$f" \
               --provenance-path "$PROVENANCE" \
               --source-uri "github.com/${GITHUB_REPOSITORY}" \
-              --source-tag "${GITHUB_REF_NAME}"
+              --source-tag "${GITHUB_REF_NAME}" \
+              --builder-id "$BUILDER_ID"
           done

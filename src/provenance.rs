@@ -20,11 +20,52 @@ pub struct ProvenanceArgs<'a> {
     pub provenance: &'a Path,
     pub source_uri: &'a str,
     pub source_tag: Option<&'a str>,
+    /// The builder whose provenance this repo trusts. Falls back to
+    /// `[controls.provenance-verify] builder_id`; one of the two must be set.
+    pub builder_id: Option<&'a str>,
 }
 
 /// Verify an artifact's SLSA provenance with slsa-verifier. Returns the tool's
 /// stdout on success.
+///
+/// Reported (M15): this pinned the source repository and nothing else.
+/// `--builder-id` is optional to slsa-verifier ("[optional] the unique builder
+/// ID who created the provenance", 2.7.1), and leaving it off means the
+/// verdict is "some builder slsa-verifier trusts produced this, for this
+/// source URI" — not "the builder our release pipeline actually uses". Anyone
+/// who can get any trusted builder to run in that repository clears the gate.
+///
+/// Required, not defaulted. Defaulting would have to name one generator, and a
+/// default that is wrong for a repo either narrows the gate silently or gets
+/// copied without thought, which is the same failure with extra steps. Required
+/// is affordable here because the error names both places it can be set and
+/// because `sscsb provenance inspect` already prints the builder from a
+/// provenance file — read it ONCE, from a build you trust, when configuring;
+/// never off the file you are currently verifying, which is the untrusted input.
+///
+/// The builder is resolved BEFORE the tool-availability check on purpose: an
+/// unset trust anchor is a policy gap, and it should be reported as one whether
+/// or not slsa-verifier happens to be installed on this machine.
 pub fn verify_artifact(ctx: &Ctx, args: &ProvenanceArgs) -> Result<String> {
+    let builder_id = args
+        .builder_id
+        .map(str::to_string)
+        .or_else(|| {
+            ctx.config
+                .as_ref()
+                .and_then(|c| c.control_opt_str("provenance-verify", "builder_id"))
+                .filter(|s| !s.trim().is_empty())
+        })
+        .context(
+            "no trusted builder is pinned, so `verified` would only mean `some builder \
+             slsa-verifier trusts built this` — pass `--builder-id <id>` or set builder_id \
+             under [controls.provenance-verify] in .sscsb/config.toml. The id is the \
+             workflow your releases are actually built by (e.g. \
+             https://github.com/slsa-framework/slsa-github-generator/.github/workflows/\
+             generator_generic_slsa3.yml@refs/tags/vX.Y.Z); `sscsb provenance inspect \
+             <provenance>` prints the builder from a file, which is how to look it up ONCE \
+             from a build you trust — not off the file you are verifying",
+        )?;
     if !tools::is_available("slsa-verifier") {
         anyhow::bail!("{}", tools::degrade_message("slsa-verifier", ctx.platform));
     }
@@ -37,6 +78,8 @@ pub fn verify_artifact(ctx: &Ctx, args: &ProvenanceArgs) -> Result<String> {
         &provenance,
         "--source-uri",
         args.source_uri,
+        "--builder-id",
+        &builder_id,
     ];
     if let Some(tag) = args.source_tag {
         argv.push("--source-tag");
@@ -51,7 +94,21 @@ pub fn verify_artifact(ctx: &Ctx, args: &ProvenanceArgs) -> Result<String> {
             out.stderr
         );
     }
-    Ok(format!("{}{}", out.stdout, out.stderr))
+    // Say what was pinned. `--source-tag` stays optional — verifying an
+    // artifact built from a branch, or before any tag exists, is legitimate and
+    // slsa-verifier treats it as optional too — but an unpinned tag means
+    // provenance from ANY ref of that repository satisfies this check, and a
+    // reader of the output must not have to guess which of the two they got.
+    let tag = match args.source_tag {
+        Some(tag) => format!("source tag {tag}"),
+        None => "source tag NOT pinned (any ref of this repository satisfies it; \
+                 pass --source-tag for a release artifact)"
+            .to_string(),
+    };
+    Ok(format!(
+        "{}{}\npinned: source-uri {}, builder-id {builder_id}, {tag}",
+        out.stdout, out.stderr, args.source_uri
+    ))
 }
 
 // ─────────────────────────── DSSE / in-toto ─────────────────────────────────
@@ -505,9 +562,23 @@ pub fn verify_provenance_control(ctx: &Ctx) -> VerifyResult {
     }
     messages.push(
         "gate: `sscsb provenance verify --artifact <f> --provenance <f>.intoto.jsonl \
-         --source-uri github.com/<owner>/<repo> [--source-tag vX.Y.Z]`"
+         --source-uri github.com/<owner>/<repo> --builder-id <trusted builder> \
+         [--source-tag vX.Y.Z]`"
             .into(),
     );
+    let pinned = ctx
+        .config
+        .as_ref()
+        .and_then(|c| c.control_opt_str("provenance-verify", "builder_id"))
+        .filter(|s| !s.trim().is_empty());
+    match pinned {
+        Some(id) => messages.push(format!("trusted builder pinned in config: {id}")),
+        None => messages.push(
+            "no builder_id pinned under [controls.provenance-verify] — `provenance verify` \
+             will require --builder-id on the command line rather than trusting any builder"
+                .into(),
+        ),
+    }
     let deploy_gate = ctx
         .root
         .join(".github")
@@ -684,6 +755,164 @@ mod tests {
 
     // ─────────────────────────── slsa-verifier wrapper ───────────────────────
 
+    const TEST_BUILDER: &str = "https://github.com/slsa-framework/slsa-github-generator\
+                                /.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.0.0";
+
+    /// Reported (M15): `provenance verify` pinned the source repository and
+    /// nothing else. `--builder-id` is optional to slsa-verifier, so an
+    /// unpinned run only asserts "SOME builder slsa-verifier trusts produced
+    /// this, for this source URI" — anyone able to get any trusted builder to
+    /// run in that repository clears the gate.
+    ///
+    /// Required rather than defaulted: a default would have to name one
+    /// generator, and a default that is wrong for a repo either narrows the
+    /// gate silently or gets copied without thought. The trust anchor is also
+    /// resolved BEFORE the tool-availability check, because an unpinned builder
+    /// is a policy gap whether or not slsa-verifier is installed here.
+    #[test]
+    fn verify_artifact_refuses_to_run_without_a_pinned_builder() {
+        let (_d, ctx) = repo();
+        let artifact = ctx.root.join("artifact.txt");
+        let provenance = ctx.root.join("prov.intoto.jsonl");
+        std::fs::write(&artifact, b"hello\n").unwrap();
+        std::fs::write(&provenance, b"{}\n").unwrap();
+
+        let err = verify_artifact(
+            &ctx,
+            &ProvenanceArgs {
+                artifact: &artifact,
+                provenance: &provenance,
+                source_uri: "github.com/o/r",
+                source_tag: Some("v1.0.0"),
+                builder_id: None,
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no trusted builder is pinned"), "{msg}");
+        assert!(msg.contains("--builder-id"), "names the flag: {msg}");
+        assert!(msg.contains("[controls.provenance-verify]"), "{msg}");
+    }
+
+    /// The pin actually reaches slsa-verifier, and the verdict says what was
+    /// pinned — including, loudly, when the source TAG was not. `--source-tag`
+    /// stays optional (verifying a branch build is legitimate, and
+    /// slsa-verifier treats it as optional), but an unpinned tag means any ref
+    /// of that repository satisfies the check, and a reader must not have to
+    /// guess which of the two they were handed.
+    #[test]
+    fn verify_artifact_passes_the_pinned_builder_and_reports_what_it_pinned() {
+        let (_d, ctx) = repo();
+        let artifact = ctx.root.join("artifact.txt");
+        let provenance = ctx.root.join("prov.intoto.jsonl");
+        std::fs::write(&artifact, b"hello\n").unwrap();
+        std::fs::write(&provenance, b"{}\n").unwrap();
+
+        // A slsa-verifier that reports the argv it was handed.
+        let script = "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'slsa-verifier 2.7.1'; \
+                      exit 0; fi\necho \"ARGV: $*\"\nexit 0\n";
+
+        let tagged = with_fake_tool("slsa-verifier", script, || {
+            verify_artifact(
+                &ctx,
+                &ProvenanceArgs {
+                    artifact: &artifact,
+                    provenance: &provenance,
+                    source_uri: "github.com/o/r",
+                    source_tag: Some("v1.2.3"),
+                    builder_id: Some(TEST_BUILDER),
+                },
+            )
+        })
+        .unwrap();
+        assert!(
+            tagged.contains(&format!("--builder-id {TEST_BUILDER}")),
+            "the builder pin must reach slsa-verifier: {tagged}"
+        );
+        assert!(tagged.contains("--source-tag v1.2.3"), "{tagged}");
+        assert!(tagged.contains("source tag v1.2.3"), "{tagged}");
+
+        let untagged = with_fake_tool("slsa-verifier", script, || {
+            verify_artifact(
+                &ctx,
+                &ProvenanceArgs {
+                    artifact: &artifact,
+                    provenance: &provenance,
+                    source_uri: "github.com/o/r",
+                    source_tag: None,
+                    builder_id: Some(TEST_BUILDER),
+                },
+            )
+        })
+        .unwrap();
+        assert!(
+            untagged.contains("source tag NOT pinned"),
+            "an unpinned tag must be stated, not left to inference: {untagged}"
+        );
+        let argv = untagged
+            .lines()
+            .find(|l| l.starts_with("ARGV:"))
+            .expect("the shim echoes its argv");
+        assert!(
+            !argv.contains("--source-tag"),
+            "no tag was asked for, so none may be invented: {argv}"
+        );
+    }
+
+    /// A repo pins its builder once, in config, and every later verify uses it.
+    #[test]
+    fn verify_artifact_takes_the_builder_pin_from_config_when_no_flag_is_given() {
+        let (_d, ctx) = repo();
+        let artifact = ctx.root.join("artifact.txt");
+        let provenance = ctx.root.join("prov.intoto.jsonl");
+        std::fs::write(&artifact, b"hello\n").unwrap();
+        std::fs::write(&provenance, b"{}\n").unwrap();
+
+        let cfg_path = ctx.config_path();
+        let text = std::fs::read_to_string(&cfg_path).unwrap().replace(
+            "builder_id = \"\"",
+            &format!("builder_id = \"{TEST_BUILDER}\""),
+        );
+        assert!(
+            text.contains(TEST_BUILDER),
+            "the generated [controls.provenance-verify] block changed shape — fix this test"
+        );
+        std::fs::write(&cfg_path, text).unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+
+        let script = "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'slsa-verifier 2.7.1'; \
+                      exit 0; fi\necho \"ARGV: $*\"\nexit 0\n";
+        let out = with_fake_tool("slsa-verifier", script, || {
+            verify_artifact(
+                &ctx,
+                &ProvenanceArgs {
+                    artifact: &artifact,
+                    provenance: &provenance,
+                    source_uri: "github.com/o/r",
+                    source_tag: None,
+                    builder_id: None,
+                },
+            )
+        })
+        .unwrap();
+        assert!(
+            out.contains(&format!("--builder-id {TEST_BUILDER}")),
+            "{out}"
+        );
+
+        // …and the control verifier reports the pin, so `sscsb verify` shows
+        // whether this repo has a trust anchor at all.
+        let result = serialized(|| verify_provenance_control(&ctx));
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.contains("trusted builder pinned in config")),
+            "{:?}",
+            result.messages
+        );
+    }
+
     #[test]
     fn verify_artifact_degrades_when_slsa_verifier_missing_and_fails_loudly_when_present() {
         let (_d, ctx) = repo();
@@ -696,6 +925,7 @@ mod tests {
             provenance: &provenance,
             source_uri: "github.com/o/r",
             source_tag: None,
+            builder_id: Some(TEST_BUILDER),
         };
         let err = with_only_git_on_path(|| verify_artifact(&ctx, &args)).unwrap_err();
         assert!(format!("{err:#}").contains("slsa-verifier not found"));
@@ -707,6 +937,7 @@ mod tests {
             provenance: &provenance,
             source_uri: "github.com/o/r",
             source_tag: Some("v1.0.0"),
+            builder_id: Some(TEST_BUILDER),
         };
         let err = serialized(|| verify_artifact(&ctx, &args_tagged)).unwrap_err();
         let msg = format!("{err:#}");

@@ -279,7 +279,12 @@ pub const CONTROLS: &[ControlDef] = &[
         summary: "slsa-verifier + cosign verification required before promote/deploy/publish",
         default_enabled: true,
         tools: &["slsa-verifier", "cosign"],
-        default_options: &[],
+        // The builder whose provenance this repo trusts, e.g.
+        // "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/\
+        // generator_generic_slsa3.yml@refs/tags/v2.0.0". Empty means unset, and
+        // `sscsb provenance verify` refuses to run unpinned — see
+        // `provenance::verify_artifact`.
+        default_options: &[("builder_id", "\"\"")],
     },
     ControlDef {
         id: "release-immutability",

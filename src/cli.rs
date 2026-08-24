@@ -290,6 +290,11 @@ enum ProvenanceAction {
         source_uri: String,
         #[arg(long)]
         source_tag: Option<String>,
+        /// Trusted builder id (default: builder_id under
+        /// [controls.provenance-verify]). One of the two is required — an
+        /// unpinned builder makes "verified" mean far less than it looks.
+        #[arg(long)]
+        builder_id: Option<String>,
     },
     /// Inspect a DSSE/in-toto provenance file (subjects, builder)
     Inspect { file: PathBuf },
@@ -774,6 +779,7 @@ fn cmd_provenance(cwd: &std::path::Path, action: ProvenanceAction) -> Result<Exi
             provenance: prov,
             source_uri,
             source_tag,
+            builder_id,
         } => {
             let output = provenance::verify_artifact(
                 &ctx,
@@ -782,6 +788,7 @@ fn cmd_provenance(cwd: &std::path::Path, action: ProvenanceAction) -> Result<Exi
                     provenance: &prov,
                     source_uri: &source_uri,
                     source_tag: source_tag.as_deref(),
+                    builder_id: builder_id.as_deref(),
                 },
             )?;
             println!("{output}");
