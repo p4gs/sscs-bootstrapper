@@ -859,8 +859,10 @@ fn cvss_roundup(x: f64) -> f64 {
 /// an ecosystem, they must agree — `pkg:cargo/openssl` must not suppress an
 /// OS-package `openssl` finding for the same CVE (same-name collisions across
 /// ecosystems are routine in a single Trivy filesystem scan). Each
-/// suppression row names the product id and status that matched, so any
-/// remaining over-breadth is visible in the report rather than silent.
+/// suppression row names the product id and status that matched AND the
+/// ecosystem of the finding it removed, so any remaining over-breadth — a
+/// bare-name product id matching in several ecosystems at once — is visible
+/// in the report rather than silent.
 pub fn apply_vex(report: &mut ScanReport, vex_text: &str) -> Result<()> {
     let v: serde_json::Value = serde_json::from_str(vex_text).context("VEX is not valid JSON")?;
     anyhow::ensure!(
@@ -903,8 +905,17 @@ pub fn apply_vex(report: &mut ScanReport, vex_text: &str) -> Result<()> {
             .find(|(id, product, _)| *id == f.id && vex_product_matches(product, f))
         {
             Some((_, product, status)) => {
+                // The ecosystem is part of WHICH finding was waived, not
+                // decoration. A product id that is a bare name declares no
+                // ecosystem, so it matches by name in every ecosystem at
+                // once; without this, those suppressions printed as identical
+                // rows and their reach could not be read off the report.
+                let eco = match &f.ecosystem {
+                    Some(eco) => format!(" [{eco}]"),
+                    None => String::new(),
+                };
                 suppressed.push(format!(
-                    "{} ({}) — VEX {status} for {product}",
+                    "{} ({}{eco}) — VEX {status} for {product}",
                     f.id, f.package
                 ));
                 false
@@ -943,10 +954,19 @@ fn vex_product_ids(stmt: &serde_json::Value) -> Vec<String> {
 /// ecosystem agreement when both sides declare one. The gate is what stops a
 /// `pkg:cargo/openssl` statement from suppressing an OS-package `openssl`
 /// finding: purl `type` and scanner ecosystem are normalised through
-/// [`normalize_ecosystem`] and must be equal. When either side is unknown
-/// (secrets, misconfigs, older report shapes, non-purl product ids) matching
-/// falls back to name granularity — we cannot tighten on information that
-/// does not exist, and the suppression row keeps the residue visible.
+/// [`normalize_ecosystem`] and must be equal. Normalisation is load-bearing,
+/// not cosmetic: the canonical purl and the label a scanner emits for the
+/// same registry are usually different strings.
+///
+/// When either side is unknown (secrets, misconfigs, older report shapes,
+/// non-purl product ids) matching falls back to name granularity. This is
+/// deliberate, and it is not a hole in the ecosystem gate: a bare product id
+/// is a namespace-free assertion, so there is no ecosystem for it to cross.
+/// Requiring one would not tighten the gate — it would turn every bare-name
+/// statement into a silent no-op, which is the failure this module exists to
+/// prevent. The residue is bounded to statements whose author wrote no
+/// namespace, and [`apply_vex`] states the ecosystem of each finding it
+/// suppressed so the reach of such a statement is readable in the report.
 ///
 /// Maven is additionally matched in its conventional `group:artifact` colon
 /// form, since scanners commonly emit GAV notation while purls use a slash.
@@ -990,16 +1010,46 @@ fn purl_parts(purl: &str) -> Option<(String, String)> {
 /// `crates.io` (OSV) and `cargo` (purl, Trivy) compare equal. Unknown labels
 /// pass through lowercased — two unknowns still have to agree with each
 /// other, which is strictly safer than ignoring them.
+///
+/// The three vocabularies disagree systematically, not occasionally:
+///
+/// * a **purl** names the ecosystem by its REGISTRY (`pypi`, `npm`, `gem`);
+/// * **OSV** names it by the registry too, but spells it its own way
+///   (`crates.io`, `Packagist`, `RubyGems`);
+/// * **Trivy** names it by the MANIFEST it read the dependency out of, so one
+///   registry answers to several labels.
+///
+/// That last row is the one that bites, because the manifest labels are the
+/// ones a real scan emits and the registry label is the one `sscsb vex create`
+/// writes. Measured on trivy 0.72.0, one fixture tree per file:
+/// `requirements.txt` → `pip`, `poetry.lock` → `poetry`, `Pipfile.lock` →
+/// `pipenv`, `yarn.lock` → `yarn`, `pnpm-lock.yaml` → `pnpm`, `go.mod` →
+/// `gomod`, `Gemfile.lock` → `bundler`, `*.deps.json` → `dotnet-core`,
+/// `pom.xml` → `pom`, `package-lock.json` → `npm`, `Cargo.lock` → `cargo`,
+/// `composer.lock` → `composer`, `packages.lock.json` → `nuget`. Without the
+/// aliases below, the canonical `pkg:pypi/…` matched no Python finding Trivy
+/// can produce — a waiver that suppressed nothing and said nothing.
+///
+/// Aliasing only ever loosens the gate, so every entry has to be a genuine
+/// identity: these map manifests onto the single registry they resolve
+/// against, never two registries onto each other.
 fn normalize_ecosystem(label: &str) -> String {
     let l = label.to_ascii_lowercase();
     match l.as_str() {
         "crates.io" => "cargo".into(),
-        "go" => "golang".into(),
+        "go" | "gomod" | "gobinary" => "golang".into(),
         // Trivy reports Java findings under archive/build-file types; their
         // coordinates are Maven GAV, purl type "maven".
         "jar" | "pom" | "gradle" | "gradle-lockfile" | "sbt" => "maven".into(),
+        // Python: one registry (PyPI), one manifest label per tool.
+        "pip" | "poetry" | "pipenv" | "uv" | "python-pkg" => "pypi".into(),
+        // JavaScript: alternative clients, all resolving against the npm
+        // registry.
+        "yarn" | "pnpm" | "bun" | "node-pkg" => "npm".into(),
         "packagist" => "composer".into(),
-        "rubygems" => "gem".into(),
+        "rubygems" | "bundler" | "gemspec" => "gem".into(),
+        "dotnet-core" => "nuget".into(),
+        "conda-pkg" => "conda".into(),
         "debian" | "ubuntu" => "deb".into(),
         "alpine" => "apk".into(),
         "redhat" | "centos" | "rocky" | "alma" | "almalinux" | "fedora" | "oracle" | "amazon"
@@ -1564,6 +1614,127 @@ mod tests {
              "status":"not_affected","justification":"vulnerable_code_not_present"}]}"#;
         apply_vex(&mut report, vex).unwrap();
         assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    /// M3(b): a purl names an ecosystem by its REGISTRY (`pypi`, `npm`,
+    /// `golang`, `gem`, `nuget`); Trivy names it by the MANIFEST it read the
+    /// dependency out of. Measured on trivy 0.72.0 against one fixture tree:
+    /// `requirements.txt` → `pip`, `poetry.lock` → `poetry`, `Pipfile.lock` →
+    /// `pipenv`, `yarn.lock` → `yarn`, `pnpm-lock.yaml` → `pnpm`, `go.mod` →
+    /// `gomod`, `Gemfile.lock` → `bundler`, `*.deps.json` → `dotnet-core`.
+    ///
+    /// Every one of those disagrees with the canonical purl `sscsb vex create`
+    /// writes, so the ecosystem gate rejected the match and the waiver
+    /// suppressed nothing — the exact silent no-op VEX exists to avoid. The
+    /// canonical `pkg:pypi/...` form was inert against every Python finding
+    /// Trivy can produce.
+    #[test]
+    fn vex_canonical_purl_matches_the_manifest_named_ecosystems_scanners_emit() {
+        let waiver = |purl_type: &str, package: &str| {
+            format!(
+                r#"{{"@context":"https://openvex.dev/ns/v0.2.0","statements":[
+                {{"vulnerability":{{"name":"CVE-2024-0001"}},
+                 "products":[{{"@id":"pkg:{purl_type}/{package}"}}],
+                 "status":"not_affected","justification":"vulnerable_code_not_present"}}]}}"#
+            )
+        };
+        // (canonical purl type, package, the label a scanner actually emits)
+        let bridged = [
+            ("pypi", "requests", "pip"),
+            ("pypi", "requests", "poetry"),
+            ("pypi", "requests", "pipenv"),
+            ("pypi", "requests", "PyPI"), // OSV's own spelling, cased
+            ("npm", "lodash", "yarn"),
+            ("npm", "lodash", "pnpm"),
+            ("golang", "github.com/gin-gonic/gin", "gomod"),
+            ("gem", "rack", "bundler"),
+            ("nuget", "Newtonsoft.Json", "dotnet-core"),
+        ];
+        for (purl_type, package, ecosystem) in bridged {
+            let mut report = ScanReport {
+                findings: vec![eco_finding("CVE-2024-0001", package, ecosystem)],
+                ..Default::default()
+            };
+            apply_vex(&mut report, &waiver(purl_type, package)).unwrap();
+            assert!(
+                report.findings.is_empty(),
+                "pkg:{purl_type}/{package} must waive the same package reported \
+                 under the scanner's `{ecosystem}` label, not silently miss it"
+            );
+        }
+
+        // The gate is bridged, not dropped: a Python waiver still may not
+        // reach a same-named package from any other registry.
+        for foreign in ["debian", "alpine", "npm", "cargo", "gomod"] {
+            let mut report = ScanReport {
+                findings: vec![eco_finding("CVE-2024-0001", "requests", foreign)],
+                ..Default::default()
+            };
+            apply_vex(&mut report, &waiver("pypi", "requests")).unwrap();
+            assert_eq!(
+                report.findings.len(),
+                1,
+                "a pypi waiver must not reach a `{foreign}` package of the same name"
+            );
+        }
+    }
+
+    /// M3(a), REBUTTED — the bare-name fallback is the design, not a defect.
+    ///
+    /// A product id that is a bare name declares no ecosystem, so there is no
+    /// ecosystem for it to cross. Refusing the match would not tighten the
+    /// gate; it would turn every bare-name statement into a silent no-op —
+    /// the failure mode this module exists to prevent, and the one that
+    /// pushes an operator into disabling the control outright.
+    ///
+    /// What the design does owe is legibility, since it rests on the claim
+    /// that "the suppression row keeps the residue visible". It did not:
+    /// findings of the same name in different ecosystems produced textually
+    /// IDENTICAL rows, so a reader could not see how far a name-only waiver
+    /// reached. Each row now states the ecosystem it hit.
+    #[test]
+    fn vex_bare_product_name_matches_by_name_alone_and_each_row_names_its_ecosystem() {
+        let mut report = ScanReport {
+            findings: vec![
+                eco_finding("CVE-2024-0001", "openssl", "cargo"),
+                eco_finding("CVE-2024-0001", "openssl", "debian"),
+                finding("CVE-2024-0001", "openssl"),
+            ],
+            ..Default::default()
+        };
+        let vex = r#"{"@context":"https://openvex.dev/ns/v0.2.0","statements":[
+            {"vulnerability":{"name":"CVE-2024-0001"},"products":["openssl"],
+             "status":"not_affected","justification":"vulnerable_code_not_present"}]}"#;
+        apply_vex(&mut report, vex).unwrap();
+
+        // Deliberate: a namespace-free assertion matches by name, everywhere.
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(report.suppressed.len(), 3);
+
+        // ...and its breadth is readable — three suppressions are three
+        // distinct facts on the page, not one fact printed three times.
+        assert!(
+            report.suppressed[0].contains("[cargo]"),
+            "{}",
+            report.suppressed[0]
+        );
+        assert!(
+            report.suppressed[1].contains("[debian]"),
+            "{}",
+            report.suppressed[1]
+        );
+        assert!(
+            !report.suppressed[2].contains('['),
+            "a finding with no ecosystem must not be given one: {}",
+            report.suppressed[2]
+        );
+        let distinct: std::collections::HashSet<&String> = report.suppressed.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "a name-only waiver's reach must not read as one repeated row: {:?}",
+            report.suppressed
+        );
     }
 
     #[test]
