@@ -731,6 +731,17 @@ pub fn hook_commit_msg(ctx: &Ctx, msg_file: &Path) -> Result<i32> {
                     // Enforce the anti-slopsquat heuristic HERE, not only in the
                     // advisory `deps check`: a new package one edit from a popular
                     // name is called out at the gate that actually blocks.
+                    //
+                    // Only where the name is what resolves the code, though. A
+                    // path/git dependency named one edit from `serde` fetches
+                    // nothing from crates.io, and `d.explain()` has already said
+                    // the real thing about it — that its source needs review.
+                    if d.source
+                        .as_ref()
+                        .is_some_and(|s| !s.is_registry_resolvable())
+                    {
+                        continue;
+                    }
                     if let Some((eco_label, name)) = d.qualified.split_once(':') {
                         if let Some(eco) = crate::deps::Ecosystem::from_label(eco_label) {
                             if let Some(shadowed) = crate::deps::typosquat_suspect(eco, name) {

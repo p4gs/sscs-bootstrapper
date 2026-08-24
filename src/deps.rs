@@ -128,6 +128,24 @@ impl DepSource {
             )),
         }
     }
+
+    /// Whether this dependency's NAME is what resolves its code on the public
+    /// registry — i.e. whether asking the registry about the name says anything
+    /// true about what will actually be built.
+    ///
+    /// For a `path`, `git`, `url`, alternate-registry or index-directive
+    /// source it does not: the code comes from disk, a URL, or somebody else's
+    /// index, and a public package that happens to share the name is an
+    /// unrelated package. Resolving those anyway is a name/source confusion in
+    /// the very tool that exists to catch name/source confusion — it reported
+    /// an in-repo crate as validated on a collision, and an ordinary
+    /// sibling-repo path dep as a slopsquatting target.
+    ///
+    /// An npm alias IS resolvable: `"a": "npm:b@1"` installs the real registry
+    /// package `b`, and `b` is the name whose existence matters.
+    pub fn is_registry_resolvable(&self) -> bool {
+        matches!(self, DepSource::Registry | DepSource::Alias(_))
+    }
 }
 
 /// A dependency as a (name, source) pair — the real trust unit. Two entries are
@@ -709,6 +727,20 @@ pub fn load_approved(ctx: &Ctx) -> Result<BTreeSet<String>> {
 /// so a typosquat or a hallucinated (registry-absent) name cannot be blessed
 /// without a human seeing the warning and overriding on purpose.
 pub fn approval_warnings(qualified: &str, offline: bool) -> Vec<String> {
+    // A hand-typed `sscsb deps approve <pkg>` names a package to resolve from
+    // the registry; that is exactly the Registry case.
+    approval_warnings_for(qualified, &DepSource::Registry, offline)
+}
+
+/// [`approval_warnings`] for a dependency whose declared source is known.
+///
+/// Both warnings here interrogate the NAME — is it one edit from a popular
+/// package, does it exist on the public registry — and both are meaningless
+/// when the name is not what resolves the code. A `path`/`git`/`url` dependency
+/// gets neither, because a public package sharing its name is an unrelated
+/// package; those sources are flagged on their own terms by
+/// [`new_unapproved_deps`], which does not care about the baseline at all.
+pub fn approval_warnings_for(qualified: &str, source: &DepSource, offline: bool) -> Vec<String> {
     let mut warnings = Vec::new();
     let Some((label, name)) = qualified.split_once(':') else {
         return warnings;
@@ -716,6 +748,9 @@ pub fn approval_warnings(qualified: &str, offline: bool) -> Vec<String> {
     let Some(eco) = Ecosystem::from_label(label) else {
         return warnings;
     };
+    if !source.is_registry_resolvable() {
+        return warnings;
+    }
     if let Some(shadowed) = typosquat_suspect(eco, name) {
         warnings.push(format!(
             "`{qualified}` is one edit from popular package `{shadowed}` — possible \
@@ -774,8 +809,30 @@ pub fn approve_package(ctx: &Ctx, qualified: &str) -> Result<()> {
     Ok(())
 }
 
-/// Current direct deps across all manifests in the repo root (qualified
-/// `eco:name`).
+/// Current deps across all manifests in the repo root, each keeping the source
+/// it was declared with.
+///
+/// The source is the half [`current_deps`] throws away, and throwing it away is
+/// what let `deps check` ask the public registry about a `path` dependency.
+pub fn current_dep_specs(ctx: &Ctx) -> Result<Vec<(Ecosystem, DepSpec)>> {
+    let mut out = Vec::new();
+    for mf in MANIFEST_FILES {
+        let path = ctx.root.join(mf);
+        if !path.is_file() {
+            continue;
+        }
+        let eco = Ecosystem::of_manifest(mf).expect("manifest list");
+        let content = std::fs::read_to_string(&path)?;
+        for spec in parse_dep_specs(eco, &content) {
+            out.push((eco, spec));
+        }
+    }
+    Ok(out)
+}
+
+/// Current dependency NAMES across all manifests in the repo root (qualified
+/// `eco:name`). Anything that has to know where the code comes from must use
+/// [`current_dep_specs`] instead.
 pub fn current_deps(ctx: &Ctx) -> Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
     for mf in MANIFEST_FILES {
@@ -816,6 +873,15 @@ pub enum NewDepReason {
 pub struct NewDep {
     pub qualified: String,
     pub reason: NewDepReason,
+    /// Where this dependency's code comes from. `None` only for
+    /// [`NewDepReason::UnparseableManifest`], where `qualified` is a file path
+    /// rather than a package and there is no source to speak of.
+    ///
+    /// Callers that validate a package by NAME — registry existence, typosquat
+    /// distance — must consult this first: those questions are only meaningful
+    /// when the name is what resolves the code. See
+    /// [`DepSource::is_registry_resolvable`].
+    pub source: Option<DepSource>,
 }
 
 impl NewDep {
@@ -848,7 +914,19 @@ impl NewDep {
 /// (repo-relative path) resolves to a location INSIDE the repo — the repo's own
 /// code, already reviewed here (e.g. a cargo-fuzz project's `path = ".."`).
 /// Absolute paths, or `..` components that escape above the repo root, are false.
-fn path_resolves_within_repo(manifest: &str, rel: &str) -> bool {
+///
+/// Two checks, in order, because neither alone is enough:
+///
+/// 1. A lexical component walk. This is the only answer available for a path
+///    that is not on disk yet (a staged manifest may name a directory that
+///    arrives in a later commit), and it is the one that must fail closed.
+/// 2. If the path DOES exist, `canonicalize` on both sides, which resolves
+///    symlinks. Without this the walk was purely textual, so `path =
+///    "link/pkg"` where `link` is a symlink pointing out of the repo counted as
+///    the repo's own reviewed code and was exempted from the gate. The doc
+///    comment above claimed "resolves to a location INSIDE the repo"; before
+///    this it only claimed to *spell* one.
+fn path_resolves_within_repo(root: &std::path::Path, manifest: &str, rel: &str) -> bool {
     use std::path::{Component, Path};
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
@@ -857,8 +935,9 @@ fn path_resolves_within_repo(manifest: &str, rel: &str) -> bool {
     let manifest_dir = Path::new(manifest)
         .parent()
         .unwrap_or_else(|| Path::new(""));
+    let joined = manifest_dir.join(rel_path);
     let mut depth: i32 = 0;
-    for c in manifest_dir.join(rel_path).components() {
+    for c in joined.components() {
         match c {
             Component::ParentDir => {
                 depth -= 1;
@@ -871,7 +950,12 @@ fn path_resolves_within_repo(manifest: &str, rel: &str) -> bool {
             Component::RootDir | Component::Prefix(_) => return false,
         }
     }
-    true
+    // Physical check. If either side cannot be canonicalized the path is not
+    // on disk to be followed, so the lexical answer stands.
+    match (root.join(&joined).canonicalize(), root.canonicalize()) {
+        (Ok(target), Ok(root)) => target.starts_with(root),
+        _ => true,
+    }
 }
 
 /// STAGED dependency changes that need a fresh trust decision. Source-aware: a
@@ -913,6 +997,7 @@ pub fn new_unapproved_deps(ctx: &Ctx) -> Result<Vec<NewDep>> {
             out.push(NewDep {
                 qualified: file.to_string(),
                 reason: NewDepReason::UnparseableManifest(detail),
+                source: None,
             });
             continue;
         }
@@ -932,7 +1017,7 @@ pub fn new_unapproved_deps(ctx: &Ctx) -> Result<Vec<NewDep>> {
                 // external unvetted code. Exempt them. Out-of-tree paths and
                 // git/url/alias sources still need explicit review.
                 if let DepSource::Path(p) = &spec.source {
-                    if path_resolves_within_repo(file, p) {
+                    if path_resolves_within_repo(&ctx.root, file, p) {
                         continue;
                     }
                 }
@@ -940,11 +1025,13 @@ pub fn new_unapproved_deps(ctx: &Ctx) -> Result<Vec<NewDep>> {
                 out.push(NewDep {
                     qualified,
                     reason: NewDepReason::NonRegistrySource(desc),
+                    source: Some(spec.source.clone()),
                 });
             } else if !approved.contains(&qualified) {
                 out.push(NewDep {
                     qualified,
                     reason: NewDepReason::NotInBaseline,
+                    source: Some(spec.source.clone()),
                 });
             }
         }
@@ -1225,17 +1312,33 @@ pub fn verify_socket_control(ctx: &Ctx) -> VerifyResult {
 }
 
 /// `sscsb deps check`: validate current (or staged-new) packages.
+///
+/// Every check below asks a question ABOUT A NAME — is it one edit from a
+/// popular package, does the public registry have it — so every check first has
+/// to know whether the name is what resolves the code. It did not: targets were
+/// built from name-only lists, the source was discarded, and a `path`
+/// dependency was resolved against crates.io like any other. That got both
+/// answers wrong in the same run — an in-repo crate reported as "exists on
+/// registry" on nothing but a name collision with an unrelated public crate,
+/// and a sibling-repo path dep (`../grc-controls/…`, an ordinary multi-repo
+/// layout) reported as a likely slopsquatting target at exit 1.
 pub fn deps_check(ctx: &Ctx, offline: bool) -> Result<(Vec<String>, Vec<String>)> {
     let mut problems = Vec::new();
     let mut notes = Vec::new();
-    let new_pkgs = unapproved_new_packages(ctx)?;
-    let targets: Vec<String> = if new_pkgs.is_empty() {
-        current_deps(ctx)?.into_iter().collect()
+    let new_deps = new_unapproved_deps(ctx)?;
+    let targets: Vec<(String, Option<DepSource>)> = if new_deps.is_empty() {
+        current_dep_specs(ctx)?
+            .into_iter()
+            .map(|(eco, spec)| (format!("{}:{}", eco.label(), spec.name), Some(spec.source)))
+            .collect()
     } else {
-        notes.push(format!("checking {} staged new package(s)", new_pkgs.len()));
-        new_pkgs
+        notes.push(format!("checking {} staged new package(s)", new_deps.len()));
+        new_deps
+            .into_iter()
+            .map(|d| (d.qualified, d.source))
+            .collect()
     };
-    for qualified in &targets {
+    for (qualified, source) in &targets {
         let Some((eco_label, name)) = qualified.split_once(':') else {
             continue;
         };
@@ -1247,6 +1350,19 @@ pub fn deps_check(ctx: &Ctx, offline: bool) -> Result<(Vec<String>, Vec<String>)
             "rubygems" => Ecosystem::RubyGems,
             _ => continue,
         };
+        // Not registry-resolvable → the name answers nothing. Say so and move
+        // on; the commit gate flags these on their own terms (a non-registry
+        // source needs review whatever the baseline says), so staying silent
+        // here loses no coverage — it only stops inventing a verdict.
+        if let Some(source) = source.as_ref().filter(|s| !s.is_registry_resolvable()) {
+            if let Some(desc) = source.describe() {
+                notes.push(format!(
+                    "{qualified}: {desc} — not resolved by name against the public \
+                     {eco_label} registry, because the name is not what resolves it"
+                ));
+            }
+            continue;
+        }
         if let Some(shadowed) = typosquat_suspect(eco, name) {
             problems.push(format!(
                 "{qualified}: name is one edit away from popular package `{shadowed}` — \
@@ -1463,11 +1579,13 @@ mod tests {
         let baseline = NewDep {
             qualified: "cargo:x".into(),
             reason: NewDepReason::NotInBaseline,
+            source: Some(DepSource::Registry),
         };
         assert!(baseline.explain().contains("approved baseline"));
         let source = NewDep {
             qualified: "cargo:serde".into(),
             reason: NewDepReason::NonRegistrySource("git source u".into()),
+            source: Some(DepSource::Git("u".into())),
         };
         assert!(source.explain().contains("non-registry source"));
     }
@@ -2028,15 +2146,44 @@ mod tests {
 
     #[test]
     fn path_within_repo_exempts_intree_but_not_escapes() {
+        // None of these exist on disk, so only the lexical walk can answer —
+        // which is the case the physical check must leave alone.
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
         // in-tree (own code) — exempt
-        assert!(path_resolves_within_repo("fuzz/Cargo.toml", "..")); // → repo root
-        assert!(path_resolves_within_repo("fuzz/Cargo.toml", "../src"));
-        assert!(path_resolves_within_repo("Cargo.toml", "."));
-        assert!(path_resolves_within_repo("a/b/Cargo.toml", "../.."));
+        assert!(path_resolves_within_repo(root, "fuzz/Cargo.toml", "..")); // → repo root
+        assert!(path_resolves_within_repo(root, "fuzz/Cargo.toml", "../src"));
+        assert!(path_resolves_within_repo(root, "Cargo.toml", "."));
+        assert!(path_resolves_within_repo(root, "a/b/Cargo.toml", "../.."));
         // escapes the repo — still flagged
-        assert!(!path_resolves_within_repo("fuzz/Cargo.toml", "../.."));
-        assert!(!path_resolves_within_repo("Cargo.toml", ".."));
-        assert!(!path_resolves_within_repo("fuzz/Cargo.toml", "/etc/passwd"));
+        assert!(!path_resolves_within_repo(root, "fuzz/Cargo.toml", "../.."));
+        assert!(!path_resolves_within_repo(root, "Cargo.toml", ".."));
+        assert!(!path_resolves_within_repo(
+            root,
+            "fuzz/Cargo.toml",
+            "/etc/passwd"
+        ));
+    }
+
+    /// The physical half of the same predicate. A lexical walk can only tell
+    /// you how a path is SPELLED; `link/pkg` spells an in-tree location while
+    /// resolving anywhere the symlink points.
+    #[cfg(unix)]
+    #[test]
+    fn path_within_repo_follows_symlinks_before_deciding() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("pkg")).unwrap();
+        std::fs::create_dir_all(root.path().join("real")).unwrap();
+        symlink(outside.path(), root.path().join("link")).unwrap();
+
+        assert!(
+            !path_resolves_within_repo(root.path(), "Cargo.toml", "link/pkg"),
+            "a symlink out of the repo is not the repo's own reviewed code"
+        );
+        // A real in-tree directory still resolves in-tree.
+        assert!(path_resolves_within_repo(root.path(), "Cargo.toml", "real"));
     }
 
     // ───────── H7: declaration classes that must not be invisible ─────────
@@ -2244,6 +2391,93 @@ mod tests {
             flagged.iter().any(|d| d.qualified == "cargo:serde"
                 && matches!(d.reason, NewDepReason::NonRegistrySource(_))),
             "patching an approved crate to a git URL must be flagged: {flagged:?}"
+        );
+    }
+    // ─────────── R1: `deps check` must consult the source, not the name ───────
+
+    /// A `path` dependency's code comes from disk, never from the public
+    /// registry. Resolving its NAME there answered a question nobody asked and
+    /// got both possible answers wrong: an in-repo crate was reported as
+    /// "exists on registry" purely on a name collision with an unrelated public
+    /// crate, and a perfectly ordinary sibling-repo path dep was reported as a
+    /// slopsquatting target at exit 1.
+    ///
+    /// Note the `offline = false` argument: post-fix this test makes no network
+    /// call at all, because a non-registry source is never resolved by name.
+    /// Pre-fix it did, and every arm of that match — Exists, NotFound, Unknown —
+    /// pushed one of the strings asserted absent below, so the test fails
+    /// regardless of connectivity.
+    #[test]
+    fn deps_check_never_resolves_a_non_registry_dependency_by_name_on_the_public_registry() {
+        let (_d, ctx) = repo_ctx();
+        write_file(
+            &ctx,
+            "Cargo.toml",
+            "[dependencies]\n\
+             serde = { path = \"vendor/serde\" }\n\
+             sibling-crate = { path = \"../outside/sibling-crate\" }\n",
+        );
+        let (problems, notes) = deps_check(&ctx, false).unwrap();
+
+        assert!(
+            !notes.iter().any(|n| n.contains("exists on registry")),
+            "a path dependency must never be VALIDATED by a same-named public \
+             crate: {notes:?}"
+        );
+        assert!(
+            !problems.iter().any(|p| p.contains("NOT FOUND")),
+            "a sibling-repo path dependency is a normal multi-repo layout, not a \
+             slopsquatting target: {problems:?}"
+        );
+        assert!(
+            !notes
+                .iter()
+                .any(|n| n.contains("registry check inconclusive")),
+            "no registry lookup should have been attempted at all: {notes:?}"
+        );
+        assert!(
+            problems.is_empty(),
+            "a repo whose only deps are path deps must exit clean: {problems:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("sibling-crate"))
+                && notes.iter().any(|n| n.contains("path source")),
+            "the user still has to be told WHY the name was not checked: {notes:?}"
+        );
+    }
+
+    /// `path_resolves_within_repo` walked path components lexically with no
+    /// `canonicalize`, so `path = "link/pkg"` where `link` is a symlink out of
+    /// the repo counted as the repo's own reviewed code and was exempted.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_dependency_through_a_symlink_that_escapes_the_repo_is_not_exempt() {
+        use std::os::unix::fs::symlink;
+        let (_d, ctx) = repo_ctx();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("pkg")).unwrap();
+        std::fs::write(
+            outside.path().join("pkg/Cargo.toml"),
+            "[package]\nname = \"pkg\"\n",
+        )
+        .unwrap();
+        symlink(outside.path(), ctx.root.join("link")).unwrap();
+
+        write_file(&ctx, "Cargo.toml", "[package]\nname = \"root\"\n");
+        stage(&ctx, "Cargo.toml");
+        exec::git_raw(&["commit", "-m", "base", "--no-verify"], &ctx.root).unwrap();
+
+        write_file(
+            &ctx,
+            "Cargo.toml",
+            "[package]\nname = \"root\"\n[dependencies]\npkg = { path = \"link/pkg\" }\n",
+        );
+        stage(&ctx, "Cargo.toml");
+        let flagged = new_unapproved_deps(&ctx).unwrap();
+        assert!(
+            flagged.iter().any(|d| d.qualified == "cargo:pkg"
+                && matches!(d.reason, NewDepReason::NonRegistrySource(_))),
+            "a path that only LOOKS in-tree must not be exempted: {flagged:?}"
         );
     }
 }
