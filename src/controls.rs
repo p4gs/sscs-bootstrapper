@@ -468,6 +468,30 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// The weaker of two outcomes. A control is only as strong as its weakest
+    /// piece of evidence, so a shared prerequisite that could not be verified
+    /// (hook integrity, say) must drag the control's own verdict down rather
+    /// than being reported alongside a cheerful PASS.
+    ///
+    /// `Disabled` is never folded — a disabled control short-circuits before
+    /// any evidence is gathered — so it sits at the strong end by convention.
+    pub fn weakest(self, other: Outcome) -> Outcome {
+        fn rank(o: &Outcome) -> u8 {
+            match o {
+                Outcome::Fail => 0,
+                Outcome::Degraded => 1,
+                Outcome::Info => 2,
+                Outcome::Pass => 3,
+                Outcome::Disabled => 4,
+            }
+        }
+        if rank(&other) < rank(&self) {
+            other
+        } else {
+            self
+        }
+    }
+
     pub fn symbol(&self) -> &'static str {
         match self {
             Outcome::Pass => "PASS",

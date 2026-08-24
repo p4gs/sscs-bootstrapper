@@ -11,6 +11,7 @@ use sscsb::context::Ctx;
 use sscsb::controls::{self, Outcome};
 use sscsb::{
     audit, compliance, deps, exec, hooks, init, observability, provenance, sast, sbom, scan,
+    signers,
 };
 use std::path::Path;
 
@@ -56,7 +57,17 @@ fn tool(bin: &str) -> bool {
 #[test]
 fn install_hooks_writes_executable_posix_shims_and_sets_hookspath() {
     let (_d, ctx) = repo();
-    assert!(hooks::hooks_installed(&ctx));
+    // A freshly bootstrapped repo must reach the STRONGEST state the integrity
+    // check can report — shims present, executable, and byte-identical to the
+    // generated ones. Anything weaker means `sscsb init` just shipped a shim
+    // sscsb cannot vouch for.
+    let integrity = hooks::hook_integrity(&ctx);
+    assert_eq!(
+        integrity.outcome,
+        Outcome::Pass,
+        "freshly installed hooks must verify clean: {:?}",
+        integrity.messages
+    );
     for event in hooks::HOOK_EVENTS {
         let path = ctx.sscsb_dir().join("hooks").join(event);
         let content = std::fs::read_to_string(&path).unwrap();
@@ -76,6 +87,82 @@ fn install_hooks_writes_executable_posix_shims_and_sets_hookspath() {
     let signers_cfg = exec::git(&["config", "gpg.ssh.allowedSignersFile"], &ctx.root).unwrap();
     assert!(signers_cfg.ends_with(".sscsb/policy/allowed_signers"));
     assert!(Path::new(&signers_cfg).is_file());
+}
+
+/// Overwrite every shim with `#!/bin/sh\nexit 0`. The files still exist, are
+/// still executable, and `core.hooksPath` still points at them — and they
+/// enforce nothing: with this exact setup a planted `AKIAIOSFODNN7EXAMPLE`
+/// committed cleanly while `sscsb verify --strict` reported
+/// `[PASS] secrets / commit-signing / ai-trailers / ai-dep-gate /
+/// package-trust`. Presence-only checking is what made that possible. (H8)
+#[test]
+fn neutered_hook_shims_fail_every_hook_gated_control() {
+    let (_d, ctx) = repo();
+    let cfg = ctx.require_config().unwrap();
+    for event in hooks::HOOK_EVENTS {
+        let path = ctx.sscsb_dir().join("hooks").join(event);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    for r in [
+        hooks::verify_secrets_control(&ctx, cfg),
+        hooks::verify_signing_control(&ctx, cfg),
+        hooks::verify_hook_installed(&ctx, "ai-trailers"),
+        hooks::verify_hook_installed(&ctx, "ai-dep-gate"),
+        deps::verify_package_trust(&ctx, cfg),
+        signers::verify_agent_signing_control(&ctx, cfg),
+    ] {
+        assert_eq!(
+            r.outcome,
+            Outcome::Fail,
+            "`{}` reported {:?} on shims that run nothing: {:?}",
+            r.control,
+            r.outcome,
+            r.messages
+        );
+    }
+}
+
+/// The other half of the H8 contract, and the more important one: a correctly
+/// installed hook set must NOT start failing. A false FAIL on every user's
+/// repo would be worse than the bug being fixed.
+#[test]
+fn a_correctly_installed_hook_set_keeps_every_hook_gated_control_off_fail() {
+    let (_d, ctx) = repo();
+    let cfg = ctx.require_config().unwrap();
+    for r in [
+        hooks::verify_secrets_control(&ctx, cfg),
+        hooks::verify_signing_control(&ctx, cfg),
+        hooks::verify_hook_installed(&ctx, "ai-trailers"),
+        hooks::verify_hook_installed(&ctx, "ai-dep-gate"),
+        deps::verify_package_trust(&ctx, cfg),
+        signers::verify_agent_signing_control(&ctx, cfg),
+    ] {
+        assert_ne!(
+            r.outcome,
+            Outcome::Fail,
+            "`{}` must not fail on a freshly bootstrapped repo: {:?}",
+            r.control,
+            r.messages
+        );
+        assert!(
+            !r.messages.iter().any(|m| m.contains("never invokes")
+                || m.contains("differs from the shim")
+                || m.contains("is not executable")),
+            "`{}` reported hook damage on a clean install: {:?}",
+            r.control,
+            r.messages
+        );
+    }
+    // The controls whose ONLY prerequisite is the hook set must be fully green.
+    assert_eq!(
+        hooks::verify_hook_installed(&ctx, "ai-trailers").outcome,
+        Outcome::Pass
+    );
 }
 
 // ───────────────────────── hook engine: pre-commit ──────────────────────────
