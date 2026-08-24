@@ -1396,9 +1396,23 @@ mod tests {
     /// host `/etc/gitconfig` or an agent harness's injected identity cannot
     /// leak in: the fixture is hermetic by construction, not by invocation.
     struct FakeMachine {
+        // FIELD ORDER IS LOAD-BEARING. Fields drop in declaration order, and
+        // `EnvGuard` points GIT_CONFIG_GLOBAL at a file inside `dir`. With `dir`
+        // declared first it was deleted BEFORE the env was restored, so for the
+        // width of that window GIT_CONFIG_GLOBAL named a path that no longer
+        // existed. Env is process-global and these tests run on threads, so any
+        // concurrently-running test that shelled out to git in that window died
+        // with `fatal: unknown error occurred while reading the configuration
+        // files` — which reads like a bug in whichever test caught it rather
+        // than a teardown race here. Observed in CI on
+        // `signers::tests::verify_policy_changes_*`, which touches no
+        // environment of its own and holds no lock.
+        //
+        // Now `_env` restores first, then `dir` is deleted, and `_lock` releases
+        // last so no lock-taking test can observe either transition.
+        _env: EnvGuard,
         dir: tempfile::TempDir,
         gitconfig: PathBuf,
-        _env: EnvGuard,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
