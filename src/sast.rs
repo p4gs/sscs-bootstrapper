@@ -16,6 +16,32 @@ pub fn engine(cfg: &Config) -> String {
         .unwrap_or_else(|| "opengrep".to_string())
 }
 
+/// The engines `run_sast` can actually drive.
+///
+/// One list, consulted by both the runner and the verifier: an engine either
+/// works everywhere or is rejected everywhere. Splitting that knowledge is how
+/// `sscsb verify` came to report PASS for a configuration `sscsb sast` refuses.
+pub const SUPPORTED_ENGINES: &[&str] = &["opengrep", "semgrep"];
+
+/// The tool registry entry for a SUPPORTED engine, or `None`.
+///
+/// Deliberately not `tools::spec(engine)`: the registry holds every tool sscsb
+/// orchestrates, and being in it says nothing about being a SAST engine
+/// sscsb can run.
+fn engine_spec(engine: &str) -> Option<&'static tools::ToolSpec> {
+    SUPPORTED_ENGINES
+        .contains(&engine)
+        .then(|| tools::spec(engine))
+        .flatten()
+}
+
+fn unknown_engine(engine: &str) -> String {
+    format!(
+        "unknown sast engine `{engine}` — use {}",
+        SUPPORTED_ENGINES.join(" or ")
+    )
+}
+
 fn rules_dir(cfg: &Config) -> String {
     cfg.control_opt_str("sast", "rules")
         .unwrap_or_else(|| ".sscsb/rules".to_string())
@@ -180,7 +206,7 @@ pub fn run_sast(ctx: &Ctx, cfg: &Config, target: &Path) -> Result<SastScan> {
             }
             parse_semgrep_output(&out.stdout)
         }
-        other => anyhow::bail!("unknown sast engine `{other}` — use opengrep or semgrep"),
+        other => anyhow::bail!("{}", unknown_engine(other)),
     }
 }
 
@@ -343,9 +369,18 @@ pub fn verify_sast_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     } else {
         messages.push("local ruleset missing — run `sscsb init` to install .sscsb/rules".into());
     }
-    match tools::detect(
-        tools::spec(engine.as_str()).unwrap_or_else(|| tools::spec("opengrep").expect("registry")),
-    ) {
+    // `verify` must answer for the engine that is CONFIGURED, and for no other.
+    // Detection used to fall back to the opengrep spec for any name it did not
+    // recognise — and the tool registry holds every tool sscsb orchestrates, so
+    // `engine = "trivy"` detected a real, installed trivy and reported PASS,
+    // printing trivy's version under the SAST control, while `sscsb sast`
+    // refused to run at all. A control whose command errors is not a passing
+    // control, and a version belonging to another tool is not evidence for it.
+    let Some(spec) = engine_spec(&engine) else {
+        messages.push(unknown_engine(&engine));
+        return VerifyResult::new("sast", Outcome::Fail, messages);
+    };
+    match tools::detect(spec) {
         tools::ToolStatus::Found { version, .. } => {
             messages.push(format!(
                 "{engine}: {}",
@@ -993,6 +1028,53 @@ pub(crate) mod tests {
             .messages
             .iter()
             .any(|m| m.contains("opengrep not found")));
+    }
+
+    /// M7: `verify` detected the configured engine by falling back to the
+    /// opengrep spec for any name it did not recognise. The tool registry holds
+    /// every tool sscsb orchestrates, so `engine = "trivy"` found a real,
+    /// installed trivy: `verify` reported PASS — and printed trivy's version
+    /// under the SAST control — for a configuration `sscsb sast` refuses to run.
+    #[test]
+    fn verify_sast_rejects_an_engine_run_sast_would_refuse() {
+        for bogus in ["trivy", "bogus-engine"] {
+            let (_d, ctx) = repo_with_engine(bogus);
+            let cfg = ctx.require_config().unwrap();
+
+            // The runner refuses it…
+            let err = run_sast(&ctx, cfg, &ctx.root).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("unknown sast engine"),
+                "{err:#}"
+            );
+
+            // …so the verifier must not report the control as working.
+            let result = serialized(|| verify_sast_control(&ctx, cfg));
+            assert_eq!(
+                result.outcome,
+                Outcome::Fail,
+                "engine `{bogus}`: {:?}",
+                result.messages
+            );
+            assert!(
+                result
+                    .messages
+                    .iter()
+                    .any(|m| m.contains("unknown sast engine") && m.contains(bogus)),
+                "the verdict must name the bad engine and the valid ones: {:?}",
+                result.messages
+            );
+            // And it must not have printed some other tool's version as if it
+            // were this control's evidence.
+            assert!(
+                !result
+                    .messages
+                    .iter()
+                    .any(|m| m.starts_with(&format!("{bogus}:"))),
+                "no version line for an engine we cannot run: {:?}",
+                result.messages
+            );
+        }
     }
 
     #[test]

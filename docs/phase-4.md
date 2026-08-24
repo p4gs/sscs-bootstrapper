@@ -55,6 +55,13 @@ governs it, exactly as it governs a scanner that could not run at all. A
 whole-tree `sscsb sast` reports the same thing as a `note:` naming each part of
 the tree the run does not cover, without changing the exit code.
 
+`engine` takes `opengrep` or `semgrep`, and nothing else. Anything else is a
+configuration error that `sscsb verify` reports as a **FAIL** — not a pass on
+some other tool's behalf. `sscsb` orchestrates a registry of tools, so a name
+like `trivy` resolves to a real, installed binary; detecting it would say
+nothing about whether the SAST control works, and `sscsb sast` would refuse to
+run it.
+
 A detail that cost real debugging time and is worth writing down: **OpenGrep exits
 0 even when it finds things** (you need `--error` to change that), and it prints
 rule-parse errors to **stdout** with an empty stderr. So `sscsb` gates on the parsed

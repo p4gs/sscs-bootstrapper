@@ -10,6 +10,15 @@ versions.
 
 ### Fixed
 
+- **`sscsb verify` reported PASS for a SAST engine `sscsb sast` refuses to
+  run.** The verifier detected the configured engine by falling back to the
+  OpenGrep tool spec for any name it did not recognise — and the tool registry
+  holds every tool `sscsb` orchestrates, so `[controls.sast] engine = "trivy"`
+  found a real, installed Trivy and reported the control as passing, printing
+  `trivy: 0.74.0` as its evidence, while `sscsb sast` errored with `unknown sast
+  engine`. The supported engines are now one list consulted by both the runner
+  and the verifier, and an engine outside it is a **FAIL** naming the valid
+  choices, with no version line borrowed from another tool.
 - **SAST severity handling lost findings three ways.** All three ended with the
   gate saying "clean" about something it had not cleared:
   - the results JSON's `errors` array was dropped entirely. Both engines report
