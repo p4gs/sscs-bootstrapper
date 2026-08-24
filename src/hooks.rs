@@ -321,7 +321,7 @@ pub fn regenerate_allowed_signers(ctx: &Ctx, include_agents: bool) -> Result<()>
 
 /// Whether the (default-off) `agent-signing` control is enabled.
 pub fn agent_signing_enabled(cfg: &Config) -> bool {
-    cfg.control_enabled("agent-signing").unwrap_or(false)
+    cfg.control_enabled_or_default("agent-signing")
 }
 
 // ─────────────────────────────── Trailers ───────────────────────────────────
@@ -481,7 +481,7 @@ pub fn hook_pre_commit(ctx: &Ctx) -> Result<i32> {
     };
     let mut blocked = false;
 
-    if cfg.control_enabled("secrets").unwrap_or(true) {
+    if cfg.control_enabled_or_default("secrets") {
         match run_secret_scan_staged(ctx, cfg) {
             Ok(problems) if problems.is_empty() => {
                 eprintln!("sscsb: secrets — staged changes clean");
@@ -505,7 +505,7 @@ pub fn hook_pre_commit(ctx: &Ctx) -> Result<i32> {
         }
     }
 
-    if cfg.control_enabled("sast").unwrap_or(false)
+    if cfg.control_enabled_or_default("sast")
         && cfg.control_opt_bool("sast", "pre_commit").unwrap_or(false)
     {
         match crate::sast::scan_staged(ctx, cfg) {
@@ -699,6 +699,52 @@ pub fn parse_gitleaks_findings(stdout: &str) -> Vec<String> {
 
 // ─────────────────────────────── commit-msg ─────────────────────────────────
 
+/// The name-proximity annotation the commit gate adds ON TOP of
+/// [`crate::deps::NewDep::explain`], for a new dependency it is already
+/// blocking.
+///
+/// Extracted from the loop and RETURNED rather than printed because two
+/// independent conditions suppress it, and neither was testable while it lived
+/// inline behind an `eprintln!`:
+///
+/// 1. **Correctness, unconditional.** A `path`/`git`/`url` dependency named one
+///    edit from `serde` fetches nothing from crates.io, so the heuristic is
+///    asking about a name that does not resolve the code. `explain()` has
+///    already said the true thing — that its source needs review. No
+///    configuration re-enables this; it is not a check the user elected to run.
+/// 2. **Policy, configurable.** `typosquat_check = false` switches the heuristic
+///    off. The commit gate is the THIRD place it runs, after `deps check` and
+///    approval, and a toggle reaching only the advisory two is the exact defect
+///    the key was fixed to close: the user turns it off because their dependency
+///    is legitimately one edit from a popular name, and it still blocks their
+///    commit.
+///
+/// Suppressing the annotation never lets the PACKAGE through: `explain()` is
+/// pushed unconditionally by the caller and still blocks the commit. Only the
+/// proximity note is withheld.
+fn typosquat_annotation(
+    d: &crate::deps::NewDep,
+    checks: crate::deps::TrustChecks,
+) -> Option<String> {
+    if d.source
+        .as_ref()
+        .is_some_and(|s| !s.is_registry_resolvable())
+    {
+        return None;
+    }
+    if !checks.typosquat {
+        return None;
+    }
+    let (eco_label, name) = d.qualified.split_once(':')?;
+    let eco = crate::deps::Ecosystem::from_label(eco_label)?;
+    let shadowed = crate::deps::typosquat_suspect(eco, name)?;
+    Some(format!(
+        "`{}` is one edit from popular package `{shadowed}` — likely \
+         typosquat/slopsquat; verify before approving",
+        d.qualified
+    ))
+}
+
 pub fn hook_commit_msg(ctx: &Ctx, msg_file: &Path) -> Result<i32> {
     let Some(cfg) = ctx.config.as_ref() else {
         return Ok(0);
@@ -708,13 +754,13 @@ pub fn hook_commit_msg(ctx: &Ctx, msg_file: &Path) -> Result<i32> {
     let trailers = parse_trailers(&message);
     let mut problems: Vec<String> = Vec::new();
 
-    if cfg.control_enabled("ai-trailers").unwrap_or(true) {
+    if cfg.control_enabled_or_default("ai-trailers") {
         problems.extend(validate_ai_trailers(&trailers));
     }
 
     let ai_assisted = trailers.get("AI-Assisted").map(String::as_str) == Some("true");
 
-    if ai_assisted && cfg.control_enabled("ai-dep-gate").unwrap_or(true) {
+    if ai_assisted && cfg.control_enabled_or_default("ai-dep-gate") {
         let staged = exec::git(
             &["diff", "--cached", "--name-only", "--diff-filter=ACMR"],
             &ctx.root,
@@ -749,36 +795,23 @@ pub fn hook_commit_msg(ctx: &Ctx, msg_file: &Path) -> Result<i32> {
         }
     }
 
-    if cfg.control_enabled("package-trust").unwrap_or(true) {
+    if cfg.control_enabled_or_default("package-trust") {
+        // The commit gate is the THIRD place the typosquat heuristic runs, after
+        // `deps check` and approval. A toggle that reaches only the advisory two
+        // is the defect it was written to fix: the user switched the heuristic
+        // off because their dependency is legitimately one edit from a popular
+        // name, and it still blocks their commit — the config contradicting
+        // itself at the one gate that actually stops work.
+        //
+        // The package itself is NOT let through by this: `d.explain()` above
+        // still reports it as a new unapproved dependency and still blocks. Only
+        // the name-proximity annotation is suppressed.
+        let checks = crate::deps::TrustChecks::from_config(Some(cfg));
         match crate::deps::new_unapproved_deps(ctx) {
             Ok(new_deps) if !new_deps.is_empty() => {
                 for d in &new_deps {
                     problems.push(d.explain());
-                    // Enforce the anti-slopsquat heuristic HERE, not only in the
-                    // advisory `deps check`: a new package one edit from a popular
-                    // name is called out at the gate that actually blocks.
-                    //
-                    // Only where the name is what resolves the code, though. A
-                    // path/git dependency named one edit from `serde` fetches
-                    // nothing from crates.io, and `d.explain()` has already said
-                    // the real thing about it — that its source needs review.
-                    if d.source
-                        .as_ref()
-                        .is_some_and(|s| !s.is_registry_resolvable())
-                    {
-                        continue;
-                    }
-                    if let Some((eco_label, name)) = d.qualified.split_once(':') {
-                        if let Some(eco) = crate::deps::Ecosystem::from_label(eco_label) {
-                            if let Some(shadowed) = crate::deps::typosquat_suspect(eco, name) {
-                                problems.push(format!(
-                                    "`{}` is one edit from popular package `{shadowed}` — likely \
-                                     typosquat/slopsquat; verify before approving",
-                                    d.qualified
-                                ));
-                            }
-                        }
-                    }
+                    problems.extend(typosquat_annotation(d, checks));
                 }
             }
             Ok(_) => {}
@@ -861,11 +894,11 @@ pub fn hook_pre_push(ctx: &Ctx, _remote: &str, stdin: &str) -> Result<i32> {
         let branch = branch_of_ref(&u.remote_ref).unwrap_or("");
         let is_protected = protected.iter().any(|p| p == branch);
 
-        if is_protected && cfg.control_enabled("commit-signing").unwrap_or(true) {
+        if is_protected && cfg.control_enabled_or_default("commit-signing") {
             problems.extend(check_signing_for_range(ctx, cfg, u, branch)?);
         }
 
-        if cfg.control_enabled("secrets").unwrap_or(true)
+        if cfg.control_enabled_or_default("secrets")
             && cfg
                 .control_opt_bool("secrets", "pre_push_range_scan")
                 .unwrap_or(true)
@@ -3392,6 +3425,95 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
             pre_commit(&ctx),
             1,
             "an ERROR-severity SAST finding in the staged diff must block the commit"
+        );
+    }
+
+    // ── the commit gate's typosquat annotation: two independent suppressors ──
+
+    fn new_dep(qualified: &str, source: Option<crate::deps::DepSource>) -> crate::deps::NewDep {
+        crate::deps::NewDep {
+            qualified: qualified.to_string(),
+            reason: crate::deps::NewDepReason::NotInBaseline,
+            source,
+        }
+    }
+
+    /// Baseline: with a registry source and the heuristic on, the gate that
+    /// actually blocks still names the shadowed package.
+    #[test]
+    fn the_commit_gate_still_names_a_typosquat_on_a_registry_dependency() {
+        let annotation = typosquat_annotation(
+            &new_dep("cargo:tokoi", Some(crate::deps::DepSource::Registry)),
+            crate::deps::TrustChecks::default(),
+        );
+        assert!(
+            annotation.is_some_and(|a| a.contains("tokio")),
+            "the enforcing gate must keep calling out a registry-sourced typosquat"
+        );
+    }
+
+    /// R1's property at the commit gate, asserted with the config fully
+    /// PERMISSIVE: a path dependency's name is not what resolves it, and no
+    /// `TrustChecks` value may re-enable resolving it by name.
+    #[test]
+    fn a_path_dependency_is_never_called_a_typosquat_even_with_every_check_on() {
+        let annotation = typosquat_annotation(
+            &new_dep(
+                "cargo:tokoi",
+                Some(crate::deps::DepSource::Path("../outside/tokoi".into())),
+            ),
+            crate::deps::TrustChecks::default(),
+        );
+        assert_eq!(
+            annotation, None,
+            "a public package sharing a path dependency's name is an unrelated \
+             package; the source guard is correctness, not policy"
+        );
+    }
+
+    /// M21's property at the commit gate — the third place the heuristic runs.
+    /// A toggle that reaches only `deps check` and approval leaves the config
+    /// contradicting itself at the one gate that stops work.
+    #[test]
+    fn typosquat_check_false_reaches_the_commit_gate_too() {
+        let off = crate::deps::TrustChecks {
+            registry: true,
+            typosquat: false,
+        };
+        assert_eq!(
+            typosquat_annotation(
+                &new_dep("cargo:tokoi", Some(crate::deps::DepSource::Registry)),
+                off
+            ),
+            None,
+            "the key must switch the heuristic off everywhere it runs, or it is \
+             the inert key it was fixed for"
+        );
+    }
+
+    /// ...and suppressing the ANNOTATION must never let the PACKAGE through.
+    /// `explain()` is pushed unconditionally by the caller, so the commit is
+    /// still blocked; only the proximity note is withheld.
+    #[test]
+    fn suppressing_the_annotation_does_not_unblock_the_dependency() {
+        let (_d, ctx) = test_repo();
+        let cfg_text = std::fs::read_to_string(ctx.config_path()).unwrap();
+        assert!(
+            cfg_text.contains("typosquat_check = true"),
+            "the generated config is expected to carry the key already"
+        );
+        std::fs::write(
+            ctx.config_path(),
+            cfg_text.replace("typosquat_check = true", "typosquat_check = false"),
+        )
+        .unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\ntokoi = \"1\"\n");
+        stage(&ctx, "Cargo.toml");
+        assert_eq!(
+            commit_msg(&ctx, "chore: add a dep\n"),
+            1,
+            "a new unapproved dependency is still blocked with the heuristic off"
         );
     }
 

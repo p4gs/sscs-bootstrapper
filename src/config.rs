@@ -225,6 +225,23 @@ impl Config {
         self.control_table(id)?.get("enabled")?.as_bool()
     }
 
+    /// Whether a control is enabled, falling back to the registry's own
+    /// `default_enabled` when config does not say.
+    ///
+    /// The fallback lives here, once, rather than at each call site. Every caller
+    /// that wrote its own `.unwrap_or(<literal>)` was a second copy of the
+    /// registry that could disagree with it — and one did: the pre-commit hook
+    /// assumed `sast` was OFF while the registry, `sscsb status` and `sscsb
+    /// verify` all reported it ON, so a config without an explicit
+    /// `[controls.sast] enabled` key showed the control installed while the gate
+    /// silently skipped every commit.
+    ///
+    /// An id that is not in the registry is not enabled: there is nothing to run.
+    pub fn control_enabled_or_default(&self, id: &str) -> bool {
+        self.control_enabled(id)
+            .unwrap_or_else(|| crate::controls::control(id).is_some_and(|d| d.default_enabled))
+    }
+
     pub fn control_opt_bool(&self, id: &str, key: &str) -> Option<bool> {
         self.control_table(id)?.get(key)?.as_bool()
     }
@@ -664,6 +681,53 @@ mod tests {
             Some(90)
         );
         assert_eq!(cfg.control_opt_int("agent-signing", "absent_key"), None);
+    }
+
+    /// M27. A config that declares no control sections at all must resolve every
+    /// control to the registry's own default — that is what the pre-commit hook
+    /// now reads, instead of a literal typed at the call site. `sast` is named
+    /// explicitly because it is the one that disagreed: the hook treated it as
+    /// off while `status` and `verify` both reported it on.
+    #[test]
+    fn control_enabled_or_default_resolves_every_control_from_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let sscsb = dir.path().join(".sscsb");
+        std::fs::create_dir_all(&sscsb).unwrap();
+        std::fs::write(sscsb.join("config.toml"), "[general]\nfail_open = false\n").unwrap();
+        let cfg = Config::load(dir.path()).unwrap().unwrap();
+        for c in CONTROLS {
+            assert_eq!(
+                cfg.control_enabled_or_default(c.id),
+                c.default_enabled,
+                "{} resolved against a config that says nothing must equal its registry default",
+                c.id
+            );
+        }
+        assert!(
+            cfg.control_enabled_or_default("sast"),
+            "sast is enabled by default in the registry; every reader must agree"
+        );
+        assert!(
+            !cfg.control_enabled_or_default("not-a-control"),
+            "an id with no registry entry has nothing to run"
+        );
+    }
+
+    /// An explicit setting still wins over the registry — the fallback is a
+    /// fallback, not an override.
+    #[test]
+    fn an_explicit_enabled_key_still_beats_the_registry_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let sscsb = dir.path().join(".sscsb");
+        std::fs::create_dir_all(&sscsb).unwrap();
+        std::fs::write(
+            sscsb.join("config.toml"),
+            "[controls.sast]\nenabled = false\n[controls.grype]\nenabled = true\n",
+        )
+        .unwrap();
+        let cfg = Config::load(dir.path()).unwrap().unwrap();
+        assert!(!cfg.control_enabled_or_default("sast"));
+        assert!(cfg.control_enabled_or_default("grype"));
     }
 
     #[test]

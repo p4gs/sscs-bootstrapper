@@ -19,8 +19,12 @@
 //!
 //! Everything here is probe → converge (programmatic) → guide (numbered steps
 //! for what technically cannot be automated) → verify. v1 implements the
-//! macOS + Secretive + Claude Code stack behind generalization seams
-//! (`human_backend` / `agent` config options).
+//! macOS + Secretive + Claude Code stack. Generalizing it — other enclave
+//! backends, other agents — is real work in `SigningPaths` and `Environment`,
+//! not a config key: `agent` and `human_backend` were emitted into
+//! `.sscsb/config.toml` for exactly that purpose and read by nothing, so setting
+//! them changed nothing and said nothing. They were removed rather than left
+//! advertising configurability that does not exist.
 
 use crate::config::Config;
 use crate::context::Ctx;

@@ -182,6 +182,36 @@ dependencies, and `[[tool.poetry.source]]`), PDM, uv and Hatch. Poetry's
 source, so repointing a Poetry dependency is a fresh trust decision rather than
 an unchanged name.
 
+Both checks are individually switchable, and the switches are real — they gate
+every place the check runs, not just the sentence `sscsb verify` prints about them:
+
+```toml
+[controls.package-trust]
+enabled = true
+registry_check = true    # false: no public existence lookup (private/air-gapped registries)
+typosquat_check = true   # false: no edit-distance heuristic (a name legitimately close to a popular one)
+```
+
+"Every place" is three: `sscsb deps check`, the warnings printed when you approve
+a package, and the **commit-msg gate that actually blocks**. A toggle reaching
+only the advisory two would be the defect these keys were fixed for — you switch
+the heuristic off because your dependency is legitimately one edit from a popular
+name, and it still stops your commit.
+
+Switching an annotation off never switches the *gate* off: a new unapproved
+dependency is still blocked, it is simply no longer also described as a possible
+typosquat. And neither key can re-enable resolving a `path`/`git`/`url`
+dependency by name — that is a correctness rule, not a policy setting. A public
+package sharing a path dependency's name is an unrelated package, and no
+configuration should be able to bring that confusion back.
+
+Turning either off is reported by `sscsb verify` as an `INFO`, naming the check
+that is not running — a control working with half its checks off must not read the
+same as one working whole. `sscsb deps check` says the same thing in its own
+output, once per run, for the same reason it explains why a path dependency was
+not resolved: a check that did not run has to say so, or "checked and found
+nothing" and "never checked" are the same silence.
+
 **Human approval.** New packages introduced by a **staged** manifest change are
 compared against the previous revision and against your approved baseline. Anything
 new and unapproved blocks the commit — and if the commit is AI-assisted, it needs
@@ -237,7 +267,7 @@ sscsb verify bumblebee
 It reads only static files — no `npm ls`, no `pip show`, no source-file reads — and the
 binary is Go with a zero-dependency `go.mod`.
 
-**Three things worth knowing before you trust the output:**
+**Things worth knowing before you trust the output:**
 
 - **Findings do not change bumblebee's exit code.** A scan that matches a compromised
   package exits `0`, exactly like a clean one. `sscsb` parses the NDJSON record stream
@@ -252,10 +282,25 @@ binary is Go with a zero-dependency `go.mod`.
   `(ecosystem, name, version)`. A catalog written from the README is a gate that never
   fires — so `sscsb` refuses to count a wildcard-only entry as criteria and fails the
   control rather than reporting a clean scan that checked nothing.
+- **What the scan could NOT read is only ever said on stderr.** stdout carries findings
+  and the summary; `record_type=diagnostic` rows go to stderr, and a config bumblebee
+  cannot parse appears there at `warn` while the run still exits `0` with a `complete`
+  summary. `sscsb` reads that stream on every run — not just failed ones — so a clean
+  scan that dropped a subject reports `DEGRADED` naming the file it could not read,
+  rather than `PASS`. `--strict` gates on it.
 - **`profile = "project"` scopes the scan to the repository**, which for most repos means
   none of the MCP / extension / agent-skill roots are reached, and for a Rust repo means
   nothing is inventoried at all. If a scan inventories zero artifacts the control `FAIL`s
   rather than calling the endpoint clean. The default is `baseline` for that reason.
+- **"It inventoried something" is not the same as "it inventoried the endpoint."** The
+  artifact count is one aggregate number, and a machine whose only populated root is the
+  Homebrew Cellar can clear it with thousands of receipts while no MCP config, editor or
+  browser extension, or agent skill was ever opened — the four classes this control
+  exists for. `sscsb` reads the summary's `roots[].kind` list, reports which of those
+  classes a clean run actually covered, and refuses to call a run that reached none of
+  them a `PASS`: `DEGRADED` under `profile = "project"` (fixable — point it at
+  `baseline`), `INFO` under `baseline` (this endpoint simply has none of those roots, so
+  the run verified installed packages only).
 
 `sscsb` ships **no** catalog. A stale threat feed that reports clean is worse than no
 feed, so the catalog is yours to point at — upstream publishes them under `threat_intel/`.
