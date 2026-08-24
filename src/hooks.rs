@@ -171,7 +171,21 @@ pub fn parse_signers(text: &str) -> Result<Vec<Signer>> {
     // twice — especially across classes — is the exact shape that would let an
     // `ai` entry ride in on a `human` principal, so it is a hard parse error
     // (ISC-A2), matched case-insensitively so casing can't smuggle a duplicate.
+    //
+    // Deduping the PRINCIPAL alone was not sufficient, and the gap was
+    // exploitable end to end. Git resolves `%GS` — the principal the
+    // protected-branch gate matches on — to the FIRST line in `allowed_signers`
+    // whose key verifies the signature. Register ONE key twice, once under a
+    // `human` principal and once under an `ai` principal, and an agent's
+    // signature resolves to the human and passes the gate. With `agent-signing`
+    // off (the default) it is worse: the `ai` line is never emitted at all, so
+    // only the human twin exists and the bypass does not even depend on
+    // ordering.
+    //
+    // Key material is an identity too. A key belongs to exactly one signer, or
+    // the class gate means nothing.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (i, item) in items.iter().enumerate() {
         let t = item
             .as_table()
@@ -186,6 +200,39 @@ pub fn parse_signers(text: &str) -> Result<Vec<Signer>> {
                 "signer `{principal}` is listed more than once — each principal must map to a \
                  single signer/class (humans, CI, and AI never share an identity)"
             );
+        }
+        // Compare the key's TYPE and BASE64 BODY, ignoring the trailing comment:
+        // `ssh-ed25519 AAAA… alice@host` and `ssh-ed25519 AAAA… bot@ci` are the
+        // same key wearing two names, which is precisely the attack.
+        for (field, raw) in [
+            (
+                "ssh_public_key",
+                t.get("ssh_public_key").and_then(|v| v.as_str()),
+            ),
+            (
+                "gpg_fingerprint",
+                t.get("gpg_fingerprint").and_then(|v| v.as_str()),
+            ),
+        ] {
+            let Some(raw) = raw else { continue };
+            let fingerprint = if field == "ssh_public_key" {
+                let mut parts = raw.split_whitespace();
+                match (parts.next(), parts.next()) {
+                    (Some(kind), Some(body)) => format!("{kind} {body}"),
+                    _ => raw.trim().to_string(),
+                }
+            } else {
+                // GPG fingerprints are case- and space-insensitive in practice.
+                raw.replace(char::is_whitespace, "").to_ascii_lowercase()
+            };
+            if let Some(other) = seen_keys.insert(fingerprint, principal.clone()) {
+                anyhow::bail!(
+                    "signer `{principal}` reuses the {field} already registered to `{other}` — \
+                     one key must map to exactly one signer. Sharing key material across \
+                     principals defeats the class gate: git resolves a signature to the FIRST \
+                     matching principal, so an agent's signature would verify as the human's."
+                );
+            }
         }
         let class = match t.get("class").and_then(|v| v.as_str()) {
             Some("human") => SignerClass::Human,
@@ -1642,6 +1689,87 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let signers = load_signers(&path).unwrap();
         assert_eq!(signers.len(), 1);
         assert_eq!(signers[0].principal, "human@example.com");
+    }
+
+    #[test]
+    /// One key, two principals, two classes — the shape that defeated the
+    /// protected-branch class gate entirely.
+    ///
+    /// Git resolves `%GS` to the FIRST principal in `allowed_signers` whose key
+    /// verifies the signature, so an agent signing with a key also registered
+    /// under a `human` principal resolved to the human and passed. With
+    /// `agent-signing` off (the default) the `ai` line is never emitted at all,
+    /// so only the human twin existed and the bypass did not even depend on
+    /// ordering. Reproduced end to end against the real binary before this
+    /// guard: the push succeeded and `git log -1 --format='%G? %GS'` printed
+    /// `G human@example.com` for a commit authored and committed by the agent.
+    #[test]
+    fn parse_signers_rejects_one_key_registered_under_two_principals() {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISHARED";
+        let toml = format!(
+            "[[signer]]\nprincipal = \"human@example.com\"\nclass = \"human\"\n\
+             ssh_public_key = \"{key} human@example.com\"\n\n\
+             [[signer]]\nprincipal = \"agent@ci.example.com\"\nclass = \"ai\"\n\
+             ssh_public_key = \"{key} agent@ci.example.com\"\n"
+        );
+        let err = parse_signers(&toml)
+            .expect_err("one key under two principals must be a hard parse error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reuses the ssh_public_key"),
+            "error must name the reuse, got: {msg}"
+        );
+        assert!(
+            msg.contains("human@example.com"),
+            "error must name the principal already holding the key, got: {msg}"
+        );
+    }
+
+    /// The trailing comment is not part of the key. Two entries differing only
+    /// there are the same key wearing two names, which is the disguised form of
+    /// the same attack.
+    #[test]
+    fn parse_signers_compares_key_material_not_the_trailing_comment() {
+        let body = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDISGUISED";
+        let toml = format!(
+            "[[signer]]\nprincipal = \"human@example.com\"\nclass = \"human\"\n\
+             ssh_public_key = \"{body} laptop\"\n\n\
+             [[signer]]\nprincipal = \"agent@ci.example.com\"\nclass = \"ai\"\n\
+             ssh_public_key = \"{body} totally-different-comment\"\n"
+        );
+        assert!(
+            parse_signers(&toml).is_err(),
+            "a differing comment must not disguise shared key material"
+        );
+
+        // Same guard for GPG, which is case- and whitespace-insensitive.
+        let gpg = "[[signer]]\nprincipal = \"a@example.com\"\nclass = \"human\"\n\
+                   gpg_fingerprint = \"ABCD 1234 ABCD 1234\"\n\n\
+                   [[signer]]\nprincipal = \"b@example.com\"\nclass = \"ai\"\n\
+                   gpg_fingerprint = \"abcd1234abcd1234\"\n";
+        assert!(
+            parse_signers(gpg).is_err(),
+            "GPG fingerprints must compare case- and space-insensitively"
+        );
+    }
+
+    /// The guard must not break the legitimate configuration it protects: a
+    /// human and an agent with genuinely distinct keys is the intended setup.
+    #[test]
+    fn parse_signers_admits_distinct_keys_across_classes() {
+        let toml = "[[signer]]\nprincipal = \"human@example.com\"\nclass = \"human\"\n\
+                    ssh_public_key = \"ssh-ed25519 AAAAHUMANKEY human@example.com\"\n\n\
+                    [[signer]]\nprincipal = \"agent@ci.example.com\"\nclass = \"ai\"\n\
+                    ssh_public_key = \"ssh-ed25519 AAAAAGENTKEY agent@ci.example.com\"\n";
+        let signers = parse_signers(toml).expect("distinct keys are the intended configuration");
+        assert_eq!(signers.len(), 2);
+        assert_eq!(signers[0].class, SignerClass::Human);
+        assert_eq!(signers[1].class, SignerClass::Ai);
+
+        // A signer with no key material at all must not collide with another.
+        let keyless = "[[signer]]\nprincipal = \"a@example.com\"\nclass = \"human\"\n\n\
+                       [[signer]]\nprincipal = \"b@example.com\"\nclass = \"ci\"\n";
+        assert_eq!(parse_signers(keyless).unwrap().len(), 2);
     }
 
     #[test]
