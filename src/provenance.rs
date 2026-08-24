@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::context::Ctx;
 use crate::controls::{Outcome, VerifyResult};
 use crate::exec;
+use crate::exec::is_object_name;
 use crate::tools;
 use anyhow::{Context as _, Result};
 use base64::Engine as _;
@@ -201,7 +202,19 @@ pub const RECEIPT_PREDICATE_TYPE: &str =
 /// Create an in-toto-style AI provenance receipt for a commit: binds the
 /// commit id + a sha256 of its full patch to the declared AI tool/model/role.
 pub fn create_receipt(ctx: &Ctx, commit: &str, out_dir: &Path) -> Result<std::path::PathBuf> {
-    let sha = exec::git(&["rev-parse", commit], &ctx.root)?;
+    // `commit` is a CLI argument, so a revision *expression* (`HEAD~2`, a tag, a
+    // branch) is legitimate and must keep working; the strict shape guard is
+    // applied to the resolved sha, and to receipt-supplied names in
+    // `verify_receipt`. `--end-of-options` is what stops git reading a
+    // leading-dash value as a flag.
+    let sha = exec::git(
+        &["rev-parse", "--verify", "--end-of-options", commit],
+        &ctx.root,
+    )?;
+    anyhow::ensure!(
+        is_object_name(&sha),
+        "rev-parse resolved {commit:?} to {sha:?}, which is not a git object name"
+    );
     let patch = exec::git(&["show", "--format=", "--no-color", &sha], &ctx.root)?;
     let patch_digest = hex::encode(Sha256::digest(patch.as_bytes()));
     let body = exec::git(&["log", "-1", "--format=%B", &sha], &ctx.root)?;
@@ -242,11 +255,28 @@ pub fn verify_receipt(ctx: &Ctx, receipt_path: &Path) -> Result<String> {
         .pointer("/subject/0/digest/gitCommit")
         .and_then(|c| c.as_str())
         .context("receipt missing gitCommit digest")?;
+    // The receipt is the thing under suspicion, so its object name is untrusted
+    // input. Reject anything that is not a bare hex object name BEFORE it can
+    // reach git's argument parser.
+    anyhow::ensure!(
+        is_object_name(commit),
+        "receipt gitCommit {commit:?} is not a git object name (expected 7-64 lowercase hex) \
+         — refusing to pass it to git"
+    );
     let claimed = v
         .pointer("/subject/0/digest/sha256")
         .and_then(|c| c.as_str())
         .context("receipt missing sha256 digest")?;
-    let patch = exec::git(&["show", "--format=", "--no-color", commit], &ctx.root)?;
+    let patch = exec::git(
+        &[
+            "show",
+            "--format=",
+            "--no-color",
+            "--end-of-options",
+            commit,
+        ],
+        &ctx.root,
+    )?;
     let actual = hex::encode(Sha256::digest(patch.as_bytes()));
     anyhow::ensure!(
         actual == claimed,
@@ -592,6 +622,84 @@ mod tests {
         .unwrap();
         let err = verify_receipt(&ctx, &other).unwrap_err();
         assert!(format!("{err:#}").contains("not an sscsb AI provenance receipt"));
+    }
+
+    /// A receipt's `gitCommit` is untrusted input — it is the thing under
+    /// suspicion. Before this guard, git accepted it as an OPTION: `-s`
+    /// suppressed the diff so a receipt claiming sha256("") "verified", and
+    /// `--output=<path>` additionally wrote the diff over an arbitrary file
+    /// while leaving stdout empty, so the same forged digest matched. Both
+    /// reproduced at exit 0 against the real binary before the fix.
+    #[test]
+    fn forged_receipt_naming_a_git_option_is_refused_and_writes_nothing() {
+        let (_d, ctx) = repo();
+        write(&ctx, "a.txt", "a\n");
+        commit_all(&ctx, "feat: real commit");
+        let out_dir = ctx.sscsb_dir().join("out").join("receipts");
+        let receipt = create_receipt(&ctx, "HEAD", &out_dir).unwrap();
+        let genuine = std::fs::read_to_string(&receipt).unwrap();
+
+        // sha256 of the empty string — what git prints when the diff is
+        // suppressed or redirected away from stdout.
+        const EMPTY_SHA256: &str =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        let victim = ctx.root.join("victim.txt");
+        std::fs::write(&victim, "ORIGINAL CONTENT\n").unwrap();
+
+        for payload in ["-s".to_string(), format!("--output={}", victim.display())] {
+            let mut doc: serde_json::Value = serde_json::from_str(&genuine).unwrap();
+            doc["subject"][0]["digest"]["gitCommit"] = serde_json::json!(payload);
+            doc["subject"][0]["digest"]["sha256"] = serde_json::json!(EMPTY_SHA256);
+            let forged = ctx.root.join("forged.json");
+            std::fs::write(&forged, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+            let err = verify_receipt(&ctx, &forged)
+                .expect_err("a receipt whose gitCommit is a git option must not verify");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("is not a git object name"),
+                "expected the shape guard to reject {payload:?}, got: {msg}"
+            );
+        }
+
+        // The arbitrary-write half: the victim file must be untouched.
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "ORIGINAL CONTENT\n",
+            "verifying a forged receipt must never write to a file on disk"
+        );
+    }
+
+    /// The guard must reject option-shaped names without rejecting the real
+    /// ones: a genuine receipt still verifies, and `create_receipt` still
+    /// accepts revision *expressions*, which are legitimate on the CLI.
+    #[test]
+    fn object_name_guard_admits_real_receipts_and_revision_expressions() {
+        let (_d, ctx) = repo();
+        write(&ctx, "a.txt", "a\n");
+        commit_all(&ctx, "feat: first");
+        write(&ctx, "b.txt", "b\n");
+        commit_all(&ctx, "feat: second");
+        let out_dir = ctx.sscsb_dir().join("out").join("receipts");
+
+        for rev in ["HEAD", "HEAD~1", "main"] {
+            let receipt = create_receipt(&ctx, rev, &out_dir)
+                .unwrap_or_else(|e| panic!("revision expression {rev:?} must still work: {e:#}"));
+            let ok = verify_receipt(&ctx, &receipt).unwrap();
+            assert!(
+                ok.contains("receipt verified"),
+                "{rev} receipt should verify"
+            );
+        }
+
+        assert!(is_object_name("1234567"));
+        assert!(is_object_name(&"a".repeat(40)));
+        assert!(!is_object_name("-s"));
+        assert!(!is_object_name("--output=/tmp/x"));
+        assert!(!is_object_name("HEAD"));
+        assert!(!is_object_name("123456")); // too short to be an abbreviation
+        assert!(!is_object_name("DEADBEEF1")); // uppercase is not git's output form
     }
 
     #[test]

@@ -61,6 +61,33 @@ pub fn run_with_stdin(
     })
 }
 
+/// True for a bare git object name: 7-64 lowercase hex characters.
+///
+/// Argument arrays stop the *shell* reinterpreting a value; they do not stop
+/// **git** reading one as an option. `git show`, `git log`, and `git rev-list`
+/// all inherit git's diff options including `--output=<file>`, so a value like
+/// `--output=/etc/thing` becomes a file write, and `-s` suppresses output
+/// entirely so a caller comparing digests sees `sha256("")`. Both reproduced
+/// against git 2.50.1.
+///
+/// Two defences, used together because they suit different call shapes:
+///
+/// - `--end-of-options` before the revision, where the revision is the LAST
+///   argument. Deliberately **not** `--`: after `--`, git treats arguments as
+///   PATHSPECS, so `git show --format= -- <sha>` exits 0 with EMPTY output,
+///   turning a digest comparison into a universal forgery — strictly worse
+///   than the bug it would be fixing.
+/// - This guard, where trailing flags must follow the revision (`rev-list
+///   <sha> --not --remotes`) and `--end-of-options` would swallow them.
+///
+/// Values built with a fixed non-option prefix (`:{file}`, `HEAD:{file}`) are
+/// safe by construction and need neither.
+pub fn is_object_name(s: &str) -> bool {
+    (7..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
 /// Locate an executable on PATH (adds `.exe` on Windows).
 pub fn find_in_path(bin: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
