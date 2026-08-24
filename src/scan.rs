@@ -386,8 +386,65 @@ fn run_trivy(ctx: &Ctx, report: &mut ScanReport) -> Result<()> {
 /// (a `severity` allowlist, `skip-dirs`, disabled scanners) filters findings
 /// before they are ever findings, and Trivy reports nothing at all for it —
 /// measured on 0.72.0. That gap is why [`scanner_config_notes`] exists.
+/// The top-level keys that identify a document as a Trivy report.
+///
+/// `Results` alone is NOT a sufficient marker: measured on trivy 0.72.0, a
+/// scan of a finding-free tree emits the envelope with no `Results` key at
+/// all (`SchemaVersion`, `Trivy`, `ReportID`, `CreatedAt`, `ArtifactName`,
+/// `ArtifactType`). Keying the check on `Results` would have turned every
+/// clean scan into an error.
+const TRIVY_REPORT_MARKERS: &[&str] = &["Results", "SchemaVersion", "ArtifactName", "ArtifactType"];
+
+/// The top-level key that identifies a document as an OSV-Scanner report.
+///
+/// Measured on osv-scanner 2.4.0, a clean scan over a real lockfile emits
+/// `{"results":[],…}` — present and empty — so requiring it costs a clean
+/// scan nothing. A package-free tree exits 128 with empty stdout, which
+/// [`run_osv`] handles before any parsing happens.
+const OSV_REPORT_MARKERS: &[&str] = &["results"];
+
+/// Parse a scanner's stdout as that scanner's report, refusing a document
+/// that is valid JSON but is not that report.
+///
+/// The asymmetry this closes: non-JSON was rejected loudly, while `{}`, `[]`,
+/// or any unrelated JSON document parsed happily into zero findings — no
+/// error, no note. The report then read "0 findings" and the gate exited 0.
+/// A scanner that returned something unexpected is exactly when you want to
+/// be told, so an unreadable document is an error rather than a clean bill of
+/// health. A document lacking any recognisable marker is not clean; it is
+/// output nobody parsed.
+///
+/// Two ways a document fails, both named: no recognisable top-level marker,
+/// or a marker present whose findings container is not a list. The marker set
+/// is deliberately liberal — any one key is enough — so a future field rename
+/// costs an error message rather than every clean scan.
+fn scanner_report(
+    stdout: &str,
+    tool: &str,
+    markers: &[&str],
+    container: &str,
+) -> Result<serde_json::Value> {
+    let v: serde_json::Value =
+        serde_json::from_str(stdout).with_context(|| format!("{tool} output not JSON"))?;
+    anyhow::ensure!(
+        markers.iter().any(|k| v.get(k).is_some()),
+        "{tool} output is JSON, but not in {tool}'s report shape: none of {} at the top level. \
+         A document this cannot read is not a clean scan — reading it as zero findings would \
+         pass the gate on output nobody parsed",
+        markers.join(", ")
+    );
+    if let Some(found) = v.get(container) {
+        anyhow::ensure!(
+            found.is_array() || found.is_null(),
+            "{tool} output is JSON, but not in {tool}'s report shape: `{container}` is present \
+             and is not a list of results. A document this cannot read is not a clean scan"
+        );
+    }
+    Ok(v)
+}
+
 pub fn parse_trivy_suppressions(stdout: &str) -> Result<Vec<String>> {
-    let v: serde_json::Value = serde_json::from_str(stdout).context("trivy output not JSON")?;
+    let v = scanner_report(stdout, "trivy", TRIVY_REPORT_MARKERS, "Results")?;
     let mut rows = Vec::new();
     for result in v
         .get("Results")
@@ -445,7 +502,7 @@ pub fn parse_trivy_suppressions(stdout: &str) -> Result<Vec<String>> {
 }
 
 pub fn parse_trivy(stdout: &str) -> Result<Vec<VulnFinding>> {
-    let v: serde_json::Value = serde_json::from_str(stdout).context("trivy output not JSON")?;
+    let v = scanner_report(stdout, "trivy", TRIVY_REPORT_MARKERS, "Results")?;
     let mut findings = Vec::new();
     for result in v
         .get("Results")
@@ -616,8 +673,7 @@ fn osv_filter_report(stderr: &str) -> (Vec<String>, Vec<String>) {
 }
 
 pub fn parse_osv(stdout: &str) -> Result<Vec<VulnFinding>> {
-    let v: serde_json::Value =
-        serde_json::from_str(stdout).context("osv-scanner output not JSON")?;
+    let v = scanner_report(stdout, "osv-scanner", OSV_REPORT_MARKERS, "results")?;
     let mut findings = Vec::new();
     for result in v
         .get("results")
@@ -1271,6 +1327,110 @@ mod tests {
     fn parse_osv_rejects_non_json_output() {
         let err = parse_osv("this is not json").unwrap_err();
         assert!(format!("{err:#}").contains("not JSON"));
+    }
+
+    /// M4: non-JSON failed loudly while wrong-shaped JSON failed silently,
+    /// which is backwards. `{}`, `[]`, and any unrelated document all read as
+    /// zero findings — no error, no note — so a scanner that returned
+    /// something unexpected reported a clean repository and exited 0. A
+    /// document with no recognisable marker is not clean; it is unreadable.
+    #[test]
+    fn parse_trivy_rejects_json_that_is_not_a_trivy_report() {
+        for wrong_shape in [
+            "{}",
+            "[]",
+            "null",
+            "42",
+            r#""a string""#,
+            r#"{"results":[]}"#, // OSV's envelope, handed to the wrong parser
+            r#"{"error":"failed to download vulnerability DB"}"#,
+            r#"[{"Results":[]}]"#, // the right key at the wrong nesting
+            r#"{"SchemaVersion":2,"Results":"broken"}"#, // envelope, unreadable body
+        ] {
+            let Err(err) = parse_trivy(wrong_shape) else {
+                panic!("{wrong_shape} must not read as a clean scan");
+            };
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not in trivy's report shape"),
+                "{wrong_shape} must be named unreadable, not counted as zero findings: {msg}"
+            );
+            // The same document through the suppression channel, which reads
+            // the same stdout and had the same silent-empty behaviour.
+            assert!(
+                parse_trivy_suppressions(wrong_shape).is_err(),
+                "{wrong_shape} must not read as zero suppressions either"
+            );
+        }
+    }
+
+    /// The other half of M4: a genuinely clean scan must still read clean and
+    /// gate green. This is the exact envelope `trivy fs --format json`
+    /// emitted for a finding-free tree on 0.72.0 — note it carries NO
+    /// `Results` key at all, so keying the shape check on `Results` would
+    /// have turned every clean scan into an error.
+    #[test]
+    fn parse_trivy_accepts_the_resultless_envelope_a_clean_scan_emits() {
+        const CLEAN: &str = r#"{"SchemaVersion":2,"Trivy":{"Version":"0.72.0"},
+            "ReportID":"01a03580-c434-7ad9-a00b-bc960132a8b2",
+            "CreatedAt":"2026-08-24T16:40:26.420713-04:00",
+            "ArtifactName":".","ArtifactType":"filesystem"}"#;
+        let findings = parse_trivy(CLEAN).expect("a clean scan is readable");
+        assert!(findings.is_empty());
+        assert!(parse_trivy_suppressions(CLEAN).unwrap().is_empty());
+        let report = ScanReport {
+            findings,
+            ..Default::default()
+        };
+        assert!(
+            !breaches_threshold(&report, "low").unwrap(),
+            "a clean scan must still pass the strictest threshold"
+        );
+        // An explicitly empty result list is equally clean.
+        assert!(parse_trivy(r#"{"SchemaVersion":2,"Results":[]}"#)
+            .unwrap()
+            .is_empty());
+        assert!(parse_trivy(r#"{"SchemaVersion":2,"Results":null}"#)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// M4, OSV half: `results` is the marker. Measured on osv-scanner 2.4.0,
+    /// a clean scan over a real lockfile emits `{"results":[],...}` — the key
+    /// is present — so requiring it costs no clean scan anything.
+    #[test]
+    fn parse_osv_rejects_json_that_is_not_an_osv_report() {
+        for wrong_shape in [
+            "{}",
+            "[]",
+            "null",
+            "42",
+            r#"{"Results":[]}"#, // Trivy's envelope, handed to the wrong parser
+            r#"{"error":"unsupported lockfile"}"#,
+            r#"[{"results":[]}]"#,
+            r#"{"results":"none"}"#, // marker present, body unreadable
+        ] {
+            let Err(err) = parse_osv(wrong_shape) else {
+                panic!("{wrong_shape} must not read as a clean scan");
+            };
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not in osv-scanner's report shape"),
+                "{wrong_shape} must be named unreadable, not counted as zero findings: {msg}"
+            );
+        }
+    }
+
+    /// The false-positive guard for the OSV half: the exact envelope
+    /// osv-scanner 2.4.0 emitted for a clean scan of a real `Cargo.lock`.
+    #[test]
+    fn parse_osv_accepts_the_empty_results_envelope_a_clean_scan_emits() {
+        const CLEAN: &str = r#"{"results":[],"experimental_config":{"licenses":
+            {"summary":false,"allowlist":null}}}"#;
+        assert!(parse_osv(CLEAN)
+            .expect("a clean scan is readable")
+            .is_empty());
+        assert!(parse_osv(r#"{"results":null}"#).unwrap().is_empty());
     }
 
     // A realistic multi-target Trivy report: one target with a dependency
