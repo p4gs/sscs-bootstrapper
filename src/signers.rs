@@ -1250,8 +1250,11 @@ mod tests {
         assert!(parsed[0].hardware_backed);
     }
 
-    /// Serializes the PATH-mutating fake-gh test (mirrors audit.rs).
-    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serializes the PATH-mutating fake-gh test against every other test in
+    /// the crate that fixtures a process-global (PATH, HOME, GIT_CONFIG_*) —
+    /// this is the one crate-wide lock, not a private one that would only
+    /// serialize this module against itself.
+    use crate::testutil::PATH_LOCK;
 
     struct PathPrepend {
         original: Option<std::ffi::OsString>,

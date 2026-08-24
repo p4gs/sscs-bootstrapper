@@ -248,7 +248,6 @@ pub fn verify_sighthound_control(ctx: &Ctx) -> VerifyResult {
 pub(crate) mod tests {
     use super::*;
     use crate::init;
-    use std::sync::Mutex;
 
     // ───────────────────── shared cross-file test fixtures ──────────────────
     //
@@ -263,7 +262,12 @@ pub(crate) mod tests {
     // sighthound serializes on `PATH_MUTEX` — including tests that rely on a
     // tool's *natural* presence/absence and never mutate PATH themselves,
     // via `serialized`.
-    pub(crate) static PATH_MUTEX: Mutex<()> = Mutex::new(());
+    //
+    // `PATH_MUTEX` IS `testutil::PATH_LOCK`: PATH is not the only process-global
+    // the suite fixtures (HOME and GIT_CONFIG_* are too, for the signing
+    // lanes), and a per-module lock only serializes that module against itself.
+    // One lock for all of it, or the modules race each other.
+    pub(crate) use crate::testutil::PATH_LOCK as PATH_MUTEX;
 
     struct PathGuard(Option<std::ffi::OsString>);
     impl Drop for PathGuard {

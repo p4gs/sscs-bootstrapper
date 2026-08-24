@@ -1379,9 +1379,141 @@ pub fn verify_signing_model_control(ctx: &Ctx, _cfg: &Config) -> VerifyResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{env_lock, fake_gh, EnvGuard, PathPrepend};
 
     fn fixture_home(dir: &Path) -> SigningPaths {
         SigningPaths::from_home(dir)
+    }
+
+    /// A throwaway *machine*: an isolated `HOME` and an isolated git **global**
+    /// config, so the human-lane probes and converge steps run against fixture
+    /// state instead of the developer's real `~/.gitconfig`.
+    ///
+    /// `git config --global` honours `GIT_CONFIG_GLOBAL` for both reads and
+    /// writes, which is what makes [`git_global`] / [`git_set_global`] — and
+    /// therefore the whole human lane — testable without touching the real
+    /// machine. `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_COUNT` are pinned too so a
+    /// host `/etc/gitconfig` or an agent harness's injected identity cannot
+    /// leak in: the fixture is hermetic by construction, not by invocation.
+    struct FakeMachine {
+        dir: tempfile::TempDir,
+        gitconfig: PathBuf,
+        _env: EnvGuard,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl FakeMachine {
+        fn new() -> Self {
+            let lock = env_lock();
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".ssh")).unwrap();
+            let gitconfig = dir.path().join("gitconfig");
+            std::fs::write(&gitconfig, "").unwrap();
+
+            // A deterministic, offline `gh`. The lane probes shell out to it,
+            // and a developer machine with a real authenticated gh would
+            // otherwise make these tests hit the live GitHub API.
+            let bin = dir.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let gh = bin.join("gh");
+            std::fs::write(
+                &gh,
+                "#!/bin/sh\ncase \"$2\" in\n  user) echo '{\"two_factor_authentication\": true}' ;;\n  \
+                 repos/*) printf 'human@example.invalid\\ttrue\\tvalid\\n' ;;\n  *) exit 1 ;;\nesac\n",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let path = format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+
+            let env = EnvGuard::new(&[
+                ("HOME", Some(dir.path().to_str().unwrap())),
+                ("GIT_CONFIG_GLOBAL", Some(gitconfig.to_str().unwrap())),
+                ("GIT_CONFIG_SYSTEM", Some("/dev/null")),
+                ("GIT_CONFIG_COUNT", Some("0")),
+                ("PATH", Some(&path)),
+            ]);
+            FakeMachine {
+                dir,
+                gitconfig,
+                _env: env,
+                _lock: lock,
+            }
+        }
+
+        fn home(&self) -> &Path {
+            self.dir.path()
+        }
+
+        /// `git config --global <key> <value>` against the fixture config.
+        fn set(&self, key: &str, value: &str) {
+            let out = exec::run("git", &["config", "--global", key, value], None).unwrap();
+            assert!(out.success(), "fixture `git config {key}`: {}", out.stderr);
+        }
+
+        /// Paths for this machine with the Secretive backend deliberately
+        /// absent, so the enclave-detection branch is pinned rather than
+        /// inherited from whatever the host developer happens to have installed.
+        fn paths(&self) -> SigningPaths {
+            SigningPaths {
+                home: self.home().to_path_buf(),
+                agent_settings: self.home().join(".claude/settings.json"),
+                secretive_socket: self.home().join("absent/socket.ssh"),
+                secretive_app: self.home().join("absent/Secretive.app"),
+            }
+        }
+
+        /// Create a file under the fixture home, returning its path.
+        fn touch(&self, rel: &str, content: &str) -> PathBuf {
+            let path = self.home().join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, content).unwrap();
+            path
+        }
+
+        /// The inputs a human brings to the lane before `setup` runs: a signing
+        /// key on disk, an allowed_signers file, and a git identity.
+        fn with_human_identity(&self) -> PathBuf {
+            let key = self.touch(".ssh/git_signing_key.pub", "ssh-ed25519 AAAAC3Nz human\n");
+            self.touch(
+                ".ssh/allowed_signers",
+                "me@example.invalid ssh-ed25519 AAAAC3Nz\n",
+            );
+            self.set("user.signingkey", key.to_str().unwrap());
+            self.set("user.email", "me@example.invalid");
+            self.set("user.name", "Human Example");
+            key
+        }
+    }
+
+    /// A `Ctx` over a scratch directory — enough for the repo-side probes.
+    fn scratch_ctx(root: &Path) -> Ctx {
+        Ctx {
+            root: root.to_path_buf(),
+            platform: crate::platform::Platform::detect(),
+            config: None,
+        }
+    }
+
+    /// A loaded default `Config`. The signing-model control derives everything
+    /// from probes and ignores config, but the control signature takes one.
+    fn scratch_config(root: &Path) -> crate::config::Config {
+        std::fs::create_dir_all(root.join(".sscsb")).unwrap();
+        std::fs::write(
+            root.join(".sscsb/config.toml"),
+            crate::config::default_config_toml(None),
+        )
+        .unwrap();
+        crate::config::Config::load(root).unwrap().unwrap()
     }
 
     #[test]
@@ -1679,5 +1811,533 @@ mod tests {
         };
         let st = probe_cloud_claude(&ctx);
         assert_eq!(st.state, EnvState::Configured);
+    }
+
+    // ───────────────────── E1: the human's local lane ───────────────────────
+
+    #[test]
+    fn human_probe_names_every_gap_on_a_fresh_machine() {
+        // What a developer sees the first time they run `sscsb signing status`
+        // on a laptop that has never been configured: each gap named with the
+        // remedy, not a bare "not configured".
+        let m = FakeMachine::new();
+        let st = probe_human_local(&m.paths());
+
+        assert_eq!(st.state, EnvState::Partial);
+        assert_eq!(st.state.symbol(), "PARTIAL");
+        let all = st.details.join("\n");
+        assert!(all.contains("gpg.format is unset"), "{all}");
+        assert!(all.contains("user.signingkey unset"), "{all}");
+        assert!(all.contains("commit.gpgsign not enabled"), "{all}");
+        assert!(all.contains("allowedSignersFile unset or missing"), "{all}");
+        assert!(all.contains("`git sign` alias missing"), "{all}");
+        // The alias gap must explain the footgun it prevents, not just name it.
+        assert!(all.contains("signs as the AGENT"), "{all}");
+    }
+
+    #[test]
+    fn human_probe_is_configured_once_every_requirement_is_wired() {
+        let m = FakeMachine::new();
+        let key = m.with_human_identity();
+        m.set("gpg.format", "ssh");
+        m.set("commit.gpgsign", "true");
+        m.set(
+            "gpg.ssh.allowedSignersFile",
+            m.home().join(".ssh/allowed_signers").to_str().unwrap(),
+        );
+        m.set("alias.sign", "!git -c commit.gpgsign=true commit");
+
+        let st = probe_human_local(&m.paths());
+        assert_eq!(st.state, EnvState::Configured, "{:?}", st.details);
+        assert_eq!(st.state.symbol(), "CONFIGURED");
+        let all = st.details.join("\n");
+        assert!(all.contains(key.to_str().unwrap()), "{all}");
+        assert!(all.contains("`git sign` alias present"), "{all}");
+    }
+
+    #[test]
+    fn human_probe_distinguishes_a_deleted_signing_key_from_an_unset_one() {
+        // A key path that no longer resolves (rotated machine, restored backup)
+        // is a different problem from never having configured one, and the
+        // report must say which — the remedies differ.
+        let m = FakeMachine::new();
+        m.set(
+            "user.signingkey",
+            m.home().join(".ssh/gone.pub").to_str().unwrap(),
+        );
+
+        let details = probe_human_local(&m.paths()).details.join("\n");
+        assert!(
+            details.contains("points at missing file"),
+            "a dangling key path must be reported as dangling: {details}"
+        );
+        assert!(!details.contains("user.signingkey unset"), "{details}");
+    }
+
+    #[test]
+    fn human_probe_reports_the_three_distinct_secretive_backend_states() {
+        // Backend presence is informative, never a gap (other backends are
+        // legal) — but "installed yet never launched" is the common trap and
+        // must read differently from "not installed".
+        let m = FakeMachine::new();
+        let socket = m.touch("socket.ssh", "");
+        let app = m.touch("Secretive.app", "");
+
+        let mut with_socket = m.paths();
+        with_socket.secretive_socket = socket;
+        assert!(probe_human_local(&with_socket)
+            .details
+            .iter()
+            .any(|d| d.contains("Secretive agent socket present")));
+
+        let mut app_only = m.paths();
+        app_only.secretive_app = app;
+        assert!(probe_human_local(&app_only)
+            .details
+            .iter()
+            .any(|d| d.contains("launch it once")));
+
+        assert!(probe_human_local(&m.paths())
+            .details
+            .iter()
+            .any(|d| d.contains("Secretive not detected")));
+    }
+
+    #[test]
+    fn setup_human_local_converges_the_machine_and_the_probe_then_agrees() {
+        // The feature's core promise: one `setup` turns a partially-configured
+        // lane into a configured one, and the writes are real `git config
+        // --global` state, not a printed intention.
+        let m = FakeMachine::new();
+        m.with_human_identity();
+        assert_eq!(probe_human_local(&m.paths()).state, EnvState::Partial);
+
+        let r = setup_human_local(&m.paths(), true).unwrap();
+        assert!(r.refused.is_none());
+
+        // Real machine state, read back through git itself.
+        assert_eq!(git_global("gpg.format").as_deref(), Some("ssh"));
+        assert_eq!(git_global("commit.gpgsign").as_deref(), Some("true"));
+        assert_eq!(
+            git_global("gpg.ssh.allowedsignersfile").as_deref(),
+            m.home().join(".ssh/allowed_signers").to_str()
+        );
+        // The alias must pin the human key via -c, which outranks the
+        // GIT_CONFIG_* env an agent session injects.
+        let alias = git_global("alias.sign").expect("alias.sign written");
+        assert!(alias.starts_with("!git "), "{alias}");
+        assert!(
+            alias.contains("-c user.email='me@example.invalid'"),
+            "{alias}"
+        );
+        assert!(alias.contains("-c commit.gpgsign=true"), "{alias}");
+        assert!(alias.ends_with(" commit"), "{alias}");
+
+        // Registering the human key on the forge is a browser step, so it is
+        // always surfaced as guidance rather than silently skipped.
+        assert!(r
+            .guided
+            .iter()
+            .any(|g| g.title.contains("Register your human key")));
+
+        assert_eq!(
+            probe_human_local(&m.paths()).state,
+            EnvState::Configured,
+            "setup must leave the lane in the state status reports as configured"
+        );
+    }
+
+    #[test]
+    fn setup_human_local_is_idempotent_on_a_converged_machine() {
+        // Re-running setup (the documented "fix a gap, then re-run" loop) must
+        // not churn already-correct config.
+        let m = FakeMachine::new();
+        m.with_human_identity();
+        setup_human_local(&m.paths(), true).unwrap();
+
+        let again = setup_human_local(&m.paths(), true).unwrap();
+        assert!(
+            again.changed.is_empty(),
+            "second run rewrote config: {:?}",
+            again.changed
+        );
+        for expected in [
+            "gpg.format already ssh",
+            "commit.gpgsign already true",
+            "allowedSignersFile already set",
+            "`git sign` alias already present",
+        ] {
+            assert!(
+                again.already.iter().any(|a| a.contains(expected)),
+                "missing `{expected}` in {:?}",
+                again.already
+            );
+        }
+    }
+
+    #[test]
+    fn setup_human_local_dry_run_previews_without_writing_git_config() {
+        let m = FakeMachine::new();
+        m.with_human_identity();
+        let before = std::fs::read_to_string(&m.gitconfig).unwrap();
+
+        let r = setup_human_local(&m.paths(), false).unwrap();
+
+        assert!(!r.changed.is_empty(), "dry-run must still preview the work");
+        assert_eq!(
+            std::fs::read_to_string(&m.gitconfig).unwrap(),
+            before,
+            "dry-run mutated the global git config"
+        );
+        assert!(git_global("gpg.format").is_none());
+        assert!(git_global("alias.sign").is_none());
+    }
+
+    #[test]
+    fn setup_human_local_guides_key_creation_instead_of_a_dangling_alias() {
+        // With no user.signingkey there is nothing for the alias to pin, so
+        // setup must ask for the key rather than write a broken alias.
+        let m = FakeMachine::new();
+        let r = setup_human_local(&m.paths(), true).unwrap();
+
+        assert!(
+            r.guided
+                .iter()
+                .any(|g| g.title.contains("Create your human signing key")),
+            "{:?}",
+            r.guided.iter().map(|g| &g.title).collect::<Vec<_>>()
+        );
+        assert!(
+            git_global("alias.sign").is_none(),
+            "alias must not be written without a key to pin"
+        );
+        // The enclave-key birth happens in a native app; it can only be guided.
+        assert!(r
+            .guided
+            .iter()
+            .any(|g| g.title.contains("hardware-backed signing key in Secretive")));
+    }
+
+    // ─────────────────── E4: forge web (gh-probed MFA state) ────────────────
+
+    /// Run `probe_github_web` with a fake `gh` whose `api user` prints `body`.
+    fn probe_web_with_gh(body: &str, exit: i32) -> EnvStatus {
+        let _lock = env_lock();
+        let script = format!("#!/bin/sh\ncat <<'EOF'\n{body}\nEOF\nexit {exit}\n");
+        let bin = fake_gh(&script);
+        let _path = PathPrepend::new(bin.path());
+        let tmp = tempfile::tempdir().unwrap();
+        probe_github_web(&scratch_ctx(tmp.path()))
+    }
+
+    #[test]
+    fn github_web_probe_reports_account_mfa_state_and_never_claims_more() {
+        // MFA is the only API-visible property of this lane; the probe must
+        // report it *and* say plainly that the rest needs attestation.
+        let on = probe_web_with_gh(r#"{"two_factor_authentication": true}"#, 0);
+        assert_eq!(on.state, EnvState::Partial);
+        assert!(on.details.iter().any(|d| d.contains("account MFA enabled")));
+        assert!(on
+            .details
+            .iter()
+            .any(|d| d.contains("no read API") || d.contains("attest")));
+
+        let off = probe_web_with_gh(r#"{"two_factor_authentication": false}"#, 0);
+        assert!(off
+            .details
+            .iter()
+            .any(|d| d.contains("account MFA DISABLED")));
+
+        // A token without `read:user` omits the field entirely — that is a
+        // scope problem, and the fix must be named.
+        let scopeless = probe_web_with_gh(r#"{"login": "someone"}"#, 0);
+        assert!(scopeless
+            .details
+            .iter()
+            .any(|d| d.contains("gh auth refresh -s read:user")));
+    }
+
+    #[test]
+    fn github_web_probe_is_unknown_when_gh_cannot_answer() {
+        let failed = probe_web_with_gh("not authenticated", 1);
+        assert!(
+            matches!(&failed.state, EnvState::Unknown(r) if r.contains("not authenticated")),
+            "{:?}",
+            failed.state
+        );
+        assert_eq!(failed.state.symbol(), "UNKNOWN");
+    }
+
+    #[test]
+    fn github_web_probe_degrades_with_install_guidance_when_gh_is_absent() {
+        let _lock = env_lock();
+        let empty = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::new(&[("PATH", Some(empty.path().to_str().unwrap()))]);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let st = probe_github_web(&scratch_ctx(tmp.path()));
+        assert!(
+            matches!(&st.state, EnvState::Unknown(r) if r.contains("gh not found on PATH")),
+            "{:?}",
+            st.state
+        );
+    }
+
+    // ──────────────── verify: report card + history classification ──────────
+
+    #[test]
+    fn verify_control_fails_only_on_identity_blur_not_on_absence() {
+        // The house rule this control encodes: an unconfigured lane is a to-do
+        // (Degraded), the agent wearing the human's identity is a breach (Fail).
+        let m = FakeMachine::new();
+        m.with_human_identity();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = scratch_ctx(tmp.path());
+        let cfg = scratch_config(tmp.path());
+
+        let clean = verify_signing_model_control(&ctx, &cfg);
+        assert_eq!(clean.outcome, Outcome::Degraded, "{:?}", clean.messages);
+
+        // Now hand the agent the human's own email.
+        let settings = serde_json::json!({
+            "env": {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "user.email",
+                "GIT_CONFIG_VALUE_0": "me@example.invalid",
+            }
+        });
+        m.touch(".claude/settings.json", &settings.to_string());
+
+        let blurred = verify_signing_model_control(&ctx, &cfg);
+        assert_eq!(blurred.outcome, Outcome::Fail, "{:?}", blurred.messages);
+        assert!(blurred
+            .messages
+            .iter()
+            .any(|msg| msg.contains("IDENTITY BLUR")));
+    }
+
+    #[test]
+    fn verify_control_degrades_with_a_named_reason_when_home_is_unavailable() {
+        // A daemon/CI context with no HOME cannot locate user config; the
+        // control must degrade with the reason rather than panic.
+        let _lock = env_lock();
+        let _env = EnvGuard::new(&[("HOME", None)]);
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = scratch_config(tmp.path());
+
+        assert!(SigningPaths::real().is_err());
+        let r = verify_signing_model_control(&scratch_ctx(tmp.path()), &cfg);
+        assert_eq!(r.outcome, Outcome::Degraded);
+        assert!(
+            r.messages.iter().any(|m| m.contains("HOME is not set")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn recent_commits_are_labelled_against_the_model_not_just_echoed() {
+        // `signing verify`'s history section exists to say what each state
+        // MEANS: unknown_key is expected for the agent, unsigned is expected
+        // only for cloud drafts, verified is expected for the human lanes.
+        let _lock = env_lock();
+        let (_dir, ctx) = crate::testutil::repo_with_gh_repo("p4gs/sscs-bootstrapper", "main");
+        let rows = [
+            "human@example.invalid\ttrue\tvalid",
+            "agent@example.invalid\tfalse\tunknown_key",
+            "bot@example.invalid\tfalse\tunsigned",
+            "odd@example.invalid\tfalse\texpired_key",
+            "malformed-row-without-tabs",
+        ]
+        .join("\n");
+        let bin = fake_gh(&format!("#!/bin/sh\ncat <<'EOF'\n{rows}\nEOF\n"));
+        let _path = PathPrepend::new(bin.path());
+
+        let lines = classify_recent_commits(&ctx).unwrap();
+        assert_eq!(
+            lines.len(),
+            4,
+            "the malformed row must be skipped: {lines:?}"
+        );
+        assert!(lines[0].contains("verified (human key or web-flow"));
+        assert!(lines[1].contains("expected for the agent lane"));
+        assert!(lines[2].contains("a FAILURE elsewhere"));
+        assert!(lines[3].contains("other"));
+    }
+
+    #[test]
+    fn recent_commit_classification_is_skipped_rather_than_failed_without_gh() {
+        let _lock = env_lock();
+        let (_dir, ctx) = crate::testutil::repo_with_gh_repo("p4gs/sscs-bootstrapper", "main");
+        let empty = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::new(&[("PATH", Some(empty.path().to_str().unwrap()))]);
+
+        assert!(classify_recent_commits(&ctx).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recent_commit_classification_needs_a_repo_slug() {
+        // No configured repo and no origin remote → nothing to classify, and
+        // that is a skip, not an error.
+        let _lock = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        crate::exec::git(&["init", "-b", "main"], tmp.path()).unwrap();
+        assert!(classify_recent_commits(&scratch_ctx(tmp.path()))
+            .unwrap()
+            .is_empty());
+    }
+
+    // ───────────────────────── E3: cloud attribution ────────────────────────
+
+    #[test]
+    fn setup_cloud_claude_adds_attribution_without_disturbing_repo_settings() {
+        // Only repo-level .claude/settings.json syncs to cloud containers, so
+        // that is where the attribution block must land — next to whatever the
+        // repo already configures there.
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = scratch_ctx(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        std::fs::write(
+            tmp.path().join(".claude/settings.json"),
+            r#"{"permissions":{"deny":["Bash(rm:*)"]}}"#,
+        )
+        .unwrap();
+
+        let r = setup_cloud_claude(&ctx, true).unwrap();
+        assert!(r.changed.iter().any(|c| c.contains("wrote attribution")));
+
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["attribution"]["sessionUrl"], true);
+        assert_eq!(
+            v["permissions"]["deny"][0], "Bash(rm:*)",
+            "pre-existing repo settings must survive"
+        );
+        assert_eq!(probe_cloud_claude(&ctx).state, EnvState::Configured);
+
+        // Idempotent: a second run recognises its own work.
+        let again = setup_cloud_claude(&ctx, true).unwrap();
+        assert!(again.changed.is_empty());
+        assert!(again.already.iter().any(|a| a.contains("already has an")));
+        // The App authorization is a browser step and is always guided.
+        assert!(again
+            .guided
+            .iter()
+            .any(|g| g.title.contains("Authorize the Claude GitHub App")));
+    }
+
+    #[test]
+    fn setup_cloud_claude_dry_run_creates_no_repo_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = scratch_ctx(tmp.path());
+        let r = setup_cloud_claude(&ctx, false).unwrap();
+
+        assert!(r.changed.iter().any(|c| c.contains("[dry-run]")));
+        assert!(!tmp.path().join(".claude/settings.json").exists());
+    }
+
+    #[test]
+    fn setup_cloud_claude_refuses_to_clobber_malformed_repo_settings() {
+        // Better to stop with a pointed message than to overwrite a file the
+        // user hand-edited into invalid JSON.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        std::fs::write(tmp.path().join(".claude/settings.json"), "{not json").unwrap();
+
+        let err = setup_cloud_claude(&scratch_ctx(tmp.path()), true).unwrap_err();
+        assert!(format!("{err:#}").contains("not valid JSON"));
+    }
+
+    // ─────────────────── E4/E5: guided lanes + attestations ─────────────────
+
+    #[test]
+    fn guided_lane_reports_carry_the_numbered_steps_for_each_web_only_lane() {
+        let m = FakeMachine::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = scratch_ctx(tmp.path());
+        let _ = &m; // the report resolves SigningPaths::real() → fixture HOME
+
+        let web = guided_lane_report(&ctx, Environment::GithubWeb);
+        let titles: Vec<&str> = web.guided.iter().map(|g| g.title.as_str()).collect();
+        assert!(titles.iter().any(|t| t.contains("phishing-resistant MFA")));
+        assert!(titles.iter().any(|t| t.contains("vigilant mode")));
+
+        let cs = guided_lane_report(&ctx, Environment::Codespaces);
+        assert!(cs
+            .guided
+            .iter()
+            .any(|g| g.title.contains("Codespaces GPG verification")));
+        // The trusted-repo scoping is the whole point of the step.
+        assert!(cs.guided[0]
+            .actions
+            .iter()
+            .any(|a| a.contains("never 'all repositories'")));
+
+        // Local lanes have no guided-lane content of their own.
+        assert!(guided_lane_report(&ctx, Environment::HumanLocal)
+            .guided
+            .is_empty());
+    }
+
+    #[test]
+    fn attested_lane_stays_pending_until_every_key_is_confirmed() {
+        // github-web needs BOTH vigilant mode and phishing-resistant MFA; one
+        // of two must not read as done.
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = scratch_ctx(tmp.path());
+        let path = signing_model_policy_path(&ctx);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[github-web]\nvigilant_mode = \"2026-01-01\"\n").unwrap();
+
+        let policy = read_signing_policy(&ctx);
+        let lane = policy.get("github-web").and_then(|v| v.as_table()).unwrap();
+        assert!(lane.contains_key("vigilant_mode"));
+        assert!(!lane.contains_key("phishing_resistant_mfa"));
+        assert_eq!(lane_attestation_keys(Environment::GithubWeb).len(), 2);
+    }
+
+    #[test]
+    fn unreadable_or_malformed_policy_reads_as_no_attestations() {
+        // A corrupt policy file must not crash `signing verify`; it means
+        // "nothing attested", which the report already knows how to say.
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = scratch_ctx(tmp.path());
+        assert!(read_signing_policy(&ctx).is_empty(), "absent file");
+
+        let path = signing_model_policy_path(&ctx);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "this is not = valid = toml [[[").unwrap();
+        assert!(read_signing_policy(&ctx).is_empty(), "malformed file");
+    }
+
+    #[test]
+    fn the_policy_template_documents_exactly_the_lanes_that_take_attestations() {
+        // The commented template is the user's only discovery surface for these
+        // keys; it must not drift from what the code actually reads.
+        for env in Environment::ALL {
+            for key in lane_attestation_keys(env) {
+                assert!(
+                    SIGNING_MODEL_TEMPLATE.contains(key),
+                    "template omits `{key}` for lane `{}`",
+                    env.id()
+                );
+            }
+        }
+        assert!(SIGNING_MODEL_TEMPLATE.contains("[github-web]"));
+        assert!(SIGNING_MODEL_TEMPLATE.contains("[codespaces]"));
+        assert!(SIGNING_MODEL_TEMPLATE.contains("[cloud-claude]"));
+    }
+
+    // ───────────────────────── merge-block hardening ────────────────────────
+
+    #[test]
+    fn merge_git_config_env_rejects_a_non_object_env_block() {
+        // A hand-edited settings.json with a scalar `env` must be refused, not
+        // silently replaced — this file is the agent's whole configuration.
+        let err =
+            merge_git_config_env(r#"{"env": "oops"}"#, &[("user.email", "a@b.c")]).unwrap_err();
+        assert!(format!("{err:#}").contains("`env` is not a JSON object"));
     }
 }

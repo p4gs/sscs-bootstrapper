@@ -5,8 +5,51 @@
 
 use crate::context::Ctx;
 
-/// Serializes tests that temporarily prepend a fake `gh` onto PATH.
+/// Serializes every test that mutates process-global environment state — a
+/// prepended fake `gh` on PATH, a fixture HOME, a fixture `GIT_CONFIG_GLOBAL`.
+/// `setenv` is not thread-safe and the test harness is multi-threaded, so ALL
+/// such tests share this one lock, not one lock per variable.
 pub static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`PATH_LOCK`], ignoring poisoning from an unrelated failing test (the
+/// guarded data is `()`, so a poisoned lock carries no corrupt state — without
+/// this a single panicking test cascades into spurious failures everywhere).
+pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// RAII guard for process-global environment variables: sets each name to the
+/// given value (or removes it when `None`), restoring every previous value on
+/// drop, even on panic. Callers MUST hold [`env_lock`] for the guard's
+/// lifetime — see the note on [`PATH_LOCK`].
+pub struct EnvGuard {
+    saved: Vec<(String, Option<std::ffi::OsString>)>,
+}
+
+impl EnvGuard {
+    pub fn new(vars: &[(&str, Option<&str>)]) -> Self {
+        let mut saved = Vec::with_capacity(vars.len());
+        for (key, value) in vars {
+            saved.push(((*key).to_string(), std::env::var_os(key)));
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        EnvGuard { saved }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.drain(..) {
+            match value {
+                Some(v) => std::env::set_var(&key, v),
+                None => std::env::remove_var(&key),
+            }
+        }
+    }
+}
 
 /// RAII guard: prepend `dir` to PATH, restore on drop (even on panic).
 pub struct PathPrepend {
