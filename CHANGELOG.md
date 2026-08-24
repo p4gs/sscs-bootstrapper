@@ -10,6 +10,16 @@ versions.
 
 ### Fixed
 
+- **The pre-commit SAST gate could not be made to hold.** Its arm degraded open
+  unconditionally — a missing engine, or a mistyped `[controls.sast] engine`
+  name, printed a notice and let the commit through — while the secret-scan arm
+  beside it respected `general.fail_open`. That setting is documented as the
+  one opt-out for every hook ("would let hooks pass when scanners are missing.
+  Keep false"), and a comment in this same file already described the SAST arm
+  as using that shape. It does now: `fail_open = false` (the default) blocks
+  when the gate you switched on could not run, and `fail_open = true` warns.
+  Being opt-in was the argument *for* the switch applying, not against it — a
+  user who turns a gate on should be able to make it hold.
 - **`sscsb verify` reported PASS for a SAST engine `sscsb sast` refuses to
   run.** The verifier detected the configured engine by falling back to the
   OpenGrep tool spec for any name it did not recognise — and the tool registry

@@ -520,8 +520,28 @@ pub fn hook_pre_commit(ctx: &Ctx) -> Result<i32> {
                 }
             }
             Err(err) => {
-                // SAST pre-commit is opt-in advisory; degrade open with notice.
-                eprintln!("sscsb: sast pre-commit unavailable: {err:#}");
+                // This arm used to degrade open unconditionally, on the grounds
+                // that pre-commit SAST is opt-in and advisory. Being opt-in is
+                // the argument AGAINST that: a user who turned this gate on had
+                // no way to make it hold — `fail_open = false` did not apply to
+                // it, so a missing engine or a mistyped `engine =` name silently
+                // removed the gate they asked for. `fail_open` is documented as
+                // the single opt-out for every hook ("would let hooks pass when
+                // scanners are missing"), and it governs this arm too.
+                if cfg.fail_open() {
+                    eprintln!(
+                        "sscsb: WARNING (fail_open=true): sast pre-commit could not run: {err:#}"
+                    );
+                } else {
+                    blocked = true;
+                    eprintln!(
+                        "sscsb: BLOCKED (fail-closed): sast pre-commit could not run: {err:#}"
+                    );
+                    eprintln!(
+                        "sscsb: install the engine, fix `[controls.sast] engine`, or disable the \
+                         control — `sscsb verify` names which."
+                    );
+                }
             }
         }
     }
@@ -2355,7 +2375,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
     }
 
     #[test]
-    fn hook_pre_commit_sast_clean_pass_and_misconfigured_engine_degrades_without_blocking() {
+    fn hook_pre_commit_sast_passes_a_clean_stage() {
         let (_d, ctx) = test_repo();
         let cfg_text = std::fs::read_to_string(ctx.config_path())
             .unwrap()
@@ -2365,19 +2385,43 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         write_file(&ctx, "clean.md", "hello\n");
         stage(&ctx, "clean.md");
         assert_eq!(hook_pre_commit(&ctx).unwrap(), 0);
+    }
 
-        // An unusable SAST engine must degrade (advisory), never block.
+    /// M14: the SAST arm of pre-commit degraded open unconditionally, while the
+    /// secret-scan arm beside it respected `general.fail_open`. The gate is
+    /// opt-in twice over — `enabled` AND `pre_commit = true` — and that is the
+    /// argument for the switch applying, not against it: a user who turned it
+    /// on had no way to make it hold. A mistyped engine name or an engine that
+    /// is not installed removed the gate silently, and `fail_open = false`,
+    /// the setting whose entire documented job is "do not let hooks pass when
+    /// scanners are missing", did not reach it.
+    #[test]
+    fn hook_pre_commit_sast_that_cannot_run_obeys_fail_open() {
+        let (_d, ctx) = test_repo();
         let cfg_text = std::fs::read_to_string(ctx.config_path())
             .unwrap()
+            .replace("pre_commit = false", "pre_commit = true")
             .replace("engine = \"opengrep\"", "engine = \"bogus-engine\"");
         std::fs::write(ctx.config_path(), cfg_text).unwrap();
         let ctx = Ctx::discover(&ctx.root).unwrap();
-        write_file(&ctx, "clean2.md", "hello again\n");
-        stage(&ctx, "clean2.md");
+        write_file(&ctx, "clean.md", "hello\n");
+        stage(&ctx, "clean.md");
+        assert_eq!(
+            hook_pre_commit(&ctx).unwrap(),
+            1,
+            "fail_open=false (the default) must block when the SAST gate could not run"
+        );
+
+        // …and the one documented opt-out still opts out.
+        let cfg_text = std::fs::read_to_string(ctx.config_path())
+            .unwrap()
+            .replace("fail_open = false", "fail_open = true");
+        std::fs::write(ctx.config_path(), cfg_text).unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
         assert_eq!(
             hook_pre_commit(&ctx).unwrap(),
             0,
-            "an unusable SAST engine must degrade, not block"
+            "fail_open=true must let the commit through with only a warning"
         );
     }
 
