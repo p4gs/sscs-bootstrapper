@@ -453,6 +453,15 @@ fn requirements_line_spec(line: &str, out: &mut BTreeSet<DepSpec>) {
     if line.is_empty() || line.starts_with('#') {
         return;
     }
+    // pip's inline comment is a `#` preceded by whitespace — a bare `#` is a
+    // URL fragment (`…#egg=name`) and must survive.
+    let line = match line.find(" #") {
+        Some(i) => line[..i].trim_end(),
+        None => line,
+    };
+    if line.is_empty() {
+        return;
+    }
     // Split at the first separator so `-e X`, `--index-url=X` and a bare
     // `pkg==1` all decompose the same way.
     let (opt, rest) = match line.split_once(['=', ' ', '\t']) {
@@ -814,8 +823,11 @@ pub fn approve_package(ctx: &Ctx, qualified: &str) -> Result<()> {
 ///
 /// The source is the half [`current_deps`] throws away, and throwing it away is
 /// what let `deps check` ask the public registry about a `path` dependency.
-pub fn current_dep_specs(ctx: &Ctx) -> Result<Vec<(Ecosystem, DepSpec)>> {
-    let mut out = Vec::new();
+/// A `BTreeSet`, so the same dependency declared in two manifests of one
+/// ecosystem (requirements.txt and pyproject.toml both naming `requests`) is
+/// one target, not two registry lookups.
+pub fn current_dep_specs(ctx: &Ctx) -> Result<BTreeSet<(Ecosystem, DepSpec)>> {
+    let mut out = BTreeSet::new();
     for mf in MANIFEST_FILES {
         let path = ctx.root.join(mf);
         if !path.is_file() {
@@ -824,7 +836,7 @@ pub fn current_dep_specs(ctx: &Ctx) -> Result<Vec<(Ecosystem, DepSpec)>> {
         let eco = Ecosystem::of_manifest(mf).expect("manifest list");
         let content = std::fs::read_to_string(&path)?;
         for spec in parse_dep_specs(eco, &content) {
-            out.push((eco, spec));
+            out.insert((eco, spec));
         }
     }
     Ok(out)
@@ -2304,10 +2316,25 @@ mod tests {
     #[test]
     fn requirements_editable_and_index_directives_are_parsed_not_skipped() {
         let specs = python_specs(
-            "requests==2.31.0\n\
+            "requests==2.31.0  # pinned by security\n\
              -e git+https://evil.example/x#egg=evil-editable\n\
              --extra-index-url https://evil.example/simple\n\
-             https://evil.example/wheels/first.whl\n",
+             https://evil.example/wheels/first.whl\n\
+             -r shared/base.txt\n\
+             --require-hashes\n",
+        );
+        // An inline comment is stripped, but the `#` of a `#egg=` fragment (no
+        // preceding space) is not — that one names the package.
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name == "requests" && s.source == DepSource::Registry),
+            "{specs:?}"
+        );
+        // Options that carry no dependency are still skipped.
+        assert!(
+            specs.iter().all(|s| !s.name.contains("base.txt")),
+            "a -r include names no package of its own: {specs:?}"
         );
         assert!(
             specs
