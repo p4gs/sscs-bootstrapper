@@ -52,12 +52,16 @@ temporary directory and scans that.
   it called the provider and the credential is live. Unknown means it looks like a
   credential and could not be checked. Both block.
 - **Gitleaks** in directory mode against the same staged snapshot.
-- **SAST** (if `sast` is enabled) over the staged files; `ERROR`-severity findings
-  block. See [phase-4.md](phase-4.md).
+- **SAST** (if `sast` is enabled and `pre_commit = true`) over the staged files;
+  blocking-severity findings block, and so does a staged file the engine could
+  not read. See [phase-4.md](phase-4.md).
 
-If neither scanner is installed, the commit is **blocked**, not allowed. That is
-the fail-closed rule again: `sscsb` will not let you believe you are being
-scanned when you are not.
+If neither secret scanner is installed, the commit is **blocked**, not allowed.
+The same holds for a SAST gate you switched on that cannot run — a missing
+engine, or a mistyped `engine =` name. That is the fail-closed rule again:
+`sscsb` will not let you believe you are being scanned when you are not, and
+`general.fail_open = true` is the single, explicit, documented way to say you
+would rather be warned than stopped. It applies to every arm of every hook.
 
 ### commit-msg
 

@@ -7,16 +7,69 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// The -1 `status` placeholder used when a child has no exit code at all.
+/// It is a sentinel, never a code: read it through [`CmdOutput::exit_code`].
+const NO_EXIT_CODE: i32 = -1;
+
 #[derive(Debug, Clone)]
 pub struct CmdOutput {
+    /// The child's exit code, or [`NO_EXIT_CODE`] when it was killed by a
+    /// signal. Prefer [`CmdOutput::exit_code`], which cannot be mistaken for
+    /// a small exit code by a comparison like `status > 1`.
     pub status: i32,
+    /// `Some(sig)` when the child was terminated by a signal — an OOM kill, a
+    /// timeout's SIGKILL, a segfault — and therefore never exited at all.
+    pub signal: Option<i32>,
     pub stdout: String,
     pub stderr: String,
 }
 
 impl CmdOutput {
     pub fn success(&self) -> bool {
-        self.status == 0
+        self.exit_code() == Some(0)
+    }
+
+    /// The child's exit code, or `None` if it did not exit normally.
+    ///
+    /// A killed process has NO exit code. Representing that as -1 and then
+    /// comparing numerically ranks "we do not know how this ended" below every
+    /// real failure code — which is how a killed scanner reads as a clean one.
+    pub fn exit_code(&self) -> Option<i32> {
+        match self.signal {
+            Some(_) => None,
+            None => Some(self.status),
+        }
+    }
+
+    /// How the child ended, for diagnostics: `exit 2`, or `killed by signal 9`.
+    pub fn termination(&self) -> String {
+        match self.signal {
+            Some(sig) => format!("killed by signal {sig}"),
+            None => format!("exit {}", self.status),
+        }
+    }
+}
+
+/// A child's output with stdout kept as raw BYTES.
+///
+/// `CmdOutput.stdout` is `String::from_utf8_lossy`, which is lossy by name and
+/// by nature: every byte sequence that is not valid UTF-8 becomes U+FFFD, three
+/// bytes of `EF BF BD`. For a tool's diagnostics that is harmless. For a file's
+/// CONTENT it is destructive and silent — the bytes change, the length changes,
+/// and nothing reports it. Use this whenever a child's stdout *is* content
+/// (a git blob, an archive) rather than a message.
+#[derive(Debug, Clone)]
+pub struct RawOutput {
+    /// See [`CmdOutput::status`] — same sentinel, same caveat.
+    pub status: i32,
+    pub signal: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+}
+
+impl RawOutput {
+    pub fn success(&self) -> bool {
+        self.signal.is_none() && self.status == 0
     }
 }
 
@@ -32,6 +85,26 @@ pub fn run_with_stdin(
     cwd: Option<&Path>,
     stdin: Option<&[u8]>,
 ) -> Result<CmdOutput> {
+    let raw = run_raw(bin, args, cwd, stdin)?;
+    Ok(CmdOutput {
+        status: raw.status,
+        signal: raw.signal,
+        stdout: String::from_utf8_lossy(&raw.stdout).into_owned(),
+        stderr: raw.stderr,
+    })
+}
+
+/// Run `bin`, capturing stdout as raw bytes. See [`RawOutput`].
+pub fn run_bytes(bin: &str, args: &[&str], cwd: Option<&Path>) -> Result<RawOutput> {
+    run_raw(bin, args, cwd, None)
+}
+
+fn run_raw(
+    bin: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    stdin: Option<&[u8]>,
+) -> Result<RawOutput> {
     let mut cmd = Command::new(bin);
     cmd.args(args);
     if let Some(dir) = cwd {
@@ -54,11 +127,27 @@ pub fn run_with_stdin(
     let out = child
         .wait_with_output()
         .with_context(|| format!("failed while waiting for `{bin}`"))?;
-    Ok(CmdOutput {
-        status: out.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+    Ok(RawOutput {
+        status: out.status.code().unwrap_or(NO_EXIT_CODE),
+        signal: terminating_signal(&out.status),
+        stdout: out.stdout,
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     })
+}
+
+/// The signal that killed a child, if one did. Windows has no signals, and its
+/// `ExitStatus::code()` always yields a code, so this is `None` there.
+fn terminating_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
 }
 
 /// True for a bare git object name: 7-64 lowercase hex characters.
@@ -126,6 +215,12 @@ pub fn git_raw(args: &[&str], cwd: &Path) -> Result<CmdOutput> {
     run("git", args, Some(cwd))
 }
 
+/// Run git, keeping stdout as raw bytes — for `git show :<file>` and friends,
+/// where stdout is a blob's content and must survive verbatim. See [`RawOutput`].
+pub fn git_bytes(args: &[&str], cwd: &Path) -> Result<RawOutput> {
+    run_bytes("git", args, Some(cwd))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +271,70 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("git not-a-real-git-subcommand failed"));
         assert!(msg.contains("exit"));
+    }
+
+    /// A killed child has no exit code, and saying so is the whole point of
+    /// `signal`/`exit_code`: the -1 in `status` is a sentinel, and any caller
+    /// that compares it numerically ranks "we do not know how this ended"
+    /// below every real failure code.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_killed_child_has_no_exit_code_only_a_signal() {
+        let killed = run("sh", &["-c", "printf partial; kill -9 $$"], None).unwrap();
+        assert_eq!(killed.signal, Some(9));
+        assert_eq!(killed.exit_code(), None);
+        assert!(!killed.success());
+        assert_eq!(killed.termination(), "killed by signal 9");
+        assert_eq!(
+            killed.stdout, "partial",
+            "whatever it printed before dying is still captured — which is how \
+             a killed scanner can look like a finished one"
+        );
+
+        let exited = run("sh", &["-c", "exit 3"], None).unwrap();
+        assert_eq!(exited.signal, None);
+        assert_eq!(exited.exit_code(), Some(3));
+        assert!(!exited.success());
+        assert_eq!(exited.termination(), "exit 3");
+
+        let ok = run("sh", &["-c", "exit 0"], None).unwrap();
+        assert!(ok.success());
+        assert_eq!(ok.exit_code(), Some(0));
+    }
+
+    /// The distinction `RawOutput` exists for: `CmdOutput.stdout` is decoded
+    /// lossily, so a child whose stdout is CONTENT (a git blob) cannot be read
+    /// through it. Both halves are asserted — the bytes survive `git_bytes`,
+    /// and they demonstrably do NOT survive the `CmdOutput` path.
+    #[test]
+    fn run_bytes_preserves_non_utf8_stdout_that_the_string_path_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        git(&["init", "-b", "main"], dir.path()).unwrap();
+        let blob: Vec<u8> = (0u8..=255).collect();
+        let written = run_with_stdin(
+            "git",
+            &["hash-object", "-w", "--stdin"],
+            Some(dir.path()),
+            Some(&blob),
+        )
+        .unwrap();
+        assert!(written.success());
+        let sha = written.stdout.trim().to_string();
+
+        let raw = git_bytes(&["cat-file", "blob", &sha], dir.path()).unwrap();
+        assert!(raw.success());
+        assert_eq!(raw.stdout, blob, "raw bytes must round-trip verbatim");
+
+        let lossy = git_raw(&["cat-file", "blob", &sha], dir.path()).unwrap();
+        assert_ne!(
+            lossy.stdout.as_bytes(),
+            blob.as_slice(),
+            "the String path is lossy — if this ever holds, RawOutput is pointless"
+        );
+
+        let failed = git_bytes(&["not-a-real-git-subcommand"], dir.path()).unwrap();
+        assert!(!failed.success());
+        assert!(failed.stdout.is_empty());
     }
 
     #[test]

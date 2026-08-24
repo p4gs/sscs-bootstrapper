@@ -10,6 +10,69 @@ versions.
 
 ### Fixed
 
+- **The pre-commit SAST gate could not be made to hold.** Its arm degraded open
+  unconditionally — a missing engine, or a mistyped `[controls.sast] engine`
+  name, printed a notice and let the commit through — while the secret-scan arm
+  beside it respected `general.fail_open`. That setting is documented as the
+  one opt-out for every hook ("would let hooks pass when scanners are missing.
+  Keep false"), and a comment in this same file already described the SAST arm
+  as using that shape. It does now: `fail_open = false` (the default) blocks
+  when the gate you switched on could not run, and `fail_open = true` warns.
+  Being opt-in was the argument *for* the switch applying, not against it — a
+  user who turns a gate on should be able to make it hold.
+- **`sscsb verify` reported PASS for a SAST engine `sscsb sast` refuses to
+  run.** The verifier detected the configured engine by falling back to the
+  OpenGrep tool spec for any name it did not recognise — and the tool registry
+  holds every tool `sscsb` orchestrates, so `[controls.sast] engine = "trivy"`
+  found a real, installed Trivy and reported the control as passing, printing
+  `trivy: 0.74.0` as its evidence, while `sscsb sast` errored with `unknown sast
+  engine`. The supported engines are now one list consulted by both the runner
+  and the verifier, and an engine outside it is a **FAIL** naming the valid
+  choices, with no version line borrowed from another tool.
+- **SAST severity handling lost findings three ways.** All three ended with the
+  gate saying "clean" about something it had not cleared:
+  - the results JSON's `errors` array was dropped entirely. Both engines report
+    a file they could not parse there and still exit `0` with results —
+    measured on opengrep 1.25.0 and semgrep 1.169.0, which both emit a
+    `PartialParsing` entry for a file whose bytes are not the language it was
+    read as. A staged file nobody parsed was reported as a staged file with
+    nothing wrong in it. Those entries are now carried on the scan: in
+    pre-commit an unreadable staged file is an error governed by
+    `general.fail_open`, and `sscsb sast` names each uncovered part of the tree.
+    An `errors` entry at a level that is not a warning fails the scan outright.
+  - a finding whose severity could not be read defaulted to `WARNING`, i.e.
+    advisory, i.e. it stopped gating. One renamed or moved field in the engine's
+    schema would have quietly demoted every finding in the scan. It is now
+    `UNRATED`, which blocks — the rule H6 set for advisories, applied here.
+  - only the literal `ERROR` gated. Both engines accept and echo back a rule
+    declaring `severity: CRITICAL` or `HIGH` (measured), so the two strictest
+    severities a rule can carry passed straight through the gate that exists to
+    stop them. The advisory set (`INFO`, `WARNING`, `LOW`, `MEDIUM`) is now what
+    is enumerated, and everything else blocks.
+- **A SAST scanner that was killed reported a clean scan.** `run_sast` gated
+  the Semgrep engine on `exit status > 1`. A process killed by a signal — the
+  OOM killer, a CI timeout's SIGKILL, a segfault — has no exit code at all,
+  and the execution layer recorded that as `-1`, which is not greater than 1.
+  So an abnormal death ranked *below both success codes*: whatever the scanner
+  had managed to print was parsed, and a scanner killed after emitting
+  `{"results":[]}` reported zero findings, cleanly. `CmdOutput` now carries the
+  terminating signal alongside the code, `exit_code()` returns `None` when
+  there was no exit, and both engines accept only the exit codes their
+  contracts document (OpenGrep 0; Semgrep 0 or 1). Everything else — including
+  no exit at all — is a failed scan, and the diagnostic names the signal
+  instead of printing a fabricated exit code.
+- **Every staged binary file was corrupted before it was scanned.**
+  `stage_to_tempdir` materialises each staged blob by running `git show
+  :<file>` and writing the result out, and the process-execution layer decoded
+  that stdout with `String::from_utf8_lossy` — which replaces every byte
+  sequence that is not valid UTF-8 with U+FFFD, three bytes of `EF BF BD`.
+  Measured: a 264-byte staged PNG arrived in the scan directory as 522 bytes,
+  and a staged, valid zip failed its own CRC — the reported "zipfile corrupt"
+  symptom. This cost twice over: the secret scanners and the pre-commit SAST
+  scanner both read bytes that were never in the repository, and so did
+  anything else that opened that directory. Staged blobs are now carried as
+  bytes end to end, through a new `exec::run_bytes`/`RawOutput` path that
+  exists precisely to keep file content out of the lossy `String` channel.
 - **A file committed to the repository silently muted the scanners.** Trivy
   reads `trivy.yaml` and `.trivyignore` from the directory it scans;
   OSV-Scanner reads `osv-scanner.toml` from the tree. None of it is asked
