@@ -209,13 +209,28 @@ pub fn verify_model_signing(ctx: &Ctx) -> VerifyResult {
         models.len(),
         models[0]
     )];
-    if workflow_ok {
-        messages.push(".github/workflows/sign-models.yml installed".into());
-        VerifyResult::new("model-signing", Outcome::Pass, messages)
-    } else {
+    if !workflow_ok {
         messages.push(".github/workflows/sign-models.yml MISSING — run `sscsb init`".into());
-        VerifyResult::new("model-signing", Outcome::Fail, messages)
+        return VerifyResult::new("model-signing", Outcome::Fail, messages);
     }
+    messages.push(".github/workflows/sign-models.yml installed".into());
+    // The repo ships models and the workflow is installed — but an installed
+    // workflow is a YAML file, not a signature. Whether these models are signed
+    // and verifiable is only answerable with the model-signing CLI this control
+    // declares, so without it the honest verdict is "not checked", not PASS.
+    // (`sscsb status` already reports `model-signing:missing` here; PASS made
+    // the two commands contradict each other in the same session.)
+    if !crate::tools::is_available("model-signing") {
+        messages.push(crate::tools::degrade_message("model-signing", ctx.platform));
+        messages.push(
+            "model signatures NOT verified locally — the workflow's own verify step is the \
+             only evidence, and it runs in CI"
+                .into(),
+        );
+        return VerifyResult::new("model-signing", Outcome::Degraded, messages);
+    }
+    messages.push("model-signing CLI available for local `sign`/`verify`".into());
+    VerifyResult::new("model-signing", Outcome::Pass, messages)
 }
 
 // ─────────────────────────── gittuf ─────────────────────────────────────────
@@ -244,14 +259,26 @@ pub fn verify_gittuf(ctx: &Ctx) -> VerifyResult {
         );
     }
     if gittuf_policy_present(&ctx.root) {
-        VerifyResult::new(
-            "gittuf",
-            Outcome::Pass,
-            vec![
-                "gittuf policy (refs/gittuf/*) present".into(),
-                "gittuf-verify.yml installed".into(),
-            ],
-        )
+        let mut messages = vec![
+            "gittuf policy (refs/gittuf/*) present".into(),
+            "gittuf-verify.yml installed".into(),
+        ];
+        // A ref under refs/gittuf/ is just a ref name — anyone can create one
+        // with `git update-ref`. Only gittuf itself can say whether the RSL and
+        // policy actually verify, so without the binary this control has
+        // checked a name, not a guarantee.
+        if !crate::tools::is_available("gittuf") {
+            messages.push(crate::tools::degrade_message("gittuf", ctx.platform));
+            messages.push(
+                "the refs are present but NOT verified — `gittuf verify-ref` is the only \
+                 thing that proves the policy holds"
+                    .into(),
+            );
+            return VerifyResult::new("gittuf", Outcome::Degraded, messages);
+        }
+        messages
+            .push("gittuf CLI available — run `gittuf verify-ref <ref>` to check the RSL".into());
+        VerifyResult::new("gittuf", Outcome::Pass, messages)
     } else {
         VerifyResult::new(
             "gittuf",
@@ -268,6 +295,27 @@ pub fn verify_gittuf(ctx: &Ctx) -> VerifyResult {
 mod tests {
     use super::*;
     use crate::context::Ctx;
+    use crate::testutil::{env_lock, path_without, EnvGuard};
+
+    /// Make tool presence deterministic in both directions without disturbing
+    /// any other tool the concurrently-running suite needs: the real PATH minus
+    /// `hidden`, with a scratch dir of stub executables prepended.
+    fn path_fixture(stubs: &[&str], hidden: &[&str]) -> (Vec<tempfile::TempDir>, String) {
+        let stub_dir = tempfile::tempdir().unwrap();
+        for name in stubs {
+            let path = stub_dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho '{name} 9.9.9'\nexit 0\n")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let (mut keep, rest) = path_without(hidden);
+        let joined = format!("{}:{}", stub_dir.path().display(), rest.to_string_lossy());
+        keep.push(stub_dir);
+        (keep, joined)
+    }
 
     fn repo() -> (tempfile::TempDir, Ctx) {
         let dir = tempfile::tempdir().unwrap();
@@ -335,7 +383,13 @@ mod tests {
 
     #[test]
     fn model_signing_is_info_without_models_and_pass_with_a_model() {
+        let _g = env_lock();
         let (_d, ctx) = repo();
+        // The declared CLI must be present, or the Pass assertion below is
+        // testing the new degrade path instead.
+        let (_stubs, path) = path_fixture(&["model_signing"], &[]);
+        let _env = EnvGuard::new(&[("PATH", Some(&path))]);
+
         // Fresh repo has no models → Info, N/A, workflow present.
         let na = verify_model_signing(&ctx);
         assert_eq!(na.outcome, Outcome::Info);
@@ -355,6 +409,43 @@ mod tests {
         // Remove the workflow → Fail (models present, no signing).
         std::fs::remove_file(ctx.root.join(".github/workflows/sign-models.yml")).unwrap();
         assert_eq!(verify_model_signing(&ctx).outcome, Outcome::Fail);
+    }
+
+    /// Regression (H11): with models in the tree and the workflow installed the
+    /// control reported PASS while `sscsb status` said `model-signing:missing`
+    /// in the same session. An installed YAML file is not a signature — without
+    /// the declared CLI nothing about these models was verified.
+    #[test]
+    fn model_signing_degrades_when_the_declared_cli_is_absent() {
+        let _g = env_lock();
+        let (_d, ctx) = repo();
+        let (_stubs, path) = path_fixture(&[], &["model_signing"]);
+        let _env = EnvGuard::new(&[("PATH", Some(&path))]);
+        assert!(
+            !crate::tools::is_available("model-signing"),
+            "fixture must hide the model-signing CLI"
+        );
+
+        std::fs::write(ctx.root.join("weights.safetensors"), b"\x00\x01").unwrap();
+        std::fs::write(
+            ctx.root.join(".github/workflows/sign-models.yml"),
+            "name: Sign ML Models\non:\n  workflow_dispatch:\n",
+        )
+        .unwrap();
+
+        let r = verify_model_signing(&ctx);
+        assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("model-signing not found on PATH")),
+            "{:?}",
+            r.messages
+        );
+        assert!(r
+            .messages
+            .iter()
+            .any(|m| m.contains("NOT verified locally")));
     }
 
     #[test]
@@ -414,7 +505,12 @@ mod tests {
 
     #[test]
     fn gittuf_passes_once_a_policy_ref_exists() {
+        let _g = env_lock();
         let (_d, ctx) = repo();
+        // The Pass path is gated on the declared CLI being present; stub it so
+        // this test still exercises Pass and not the degrade path.
+        let (_stubs, path) = path_fixture(&["gittuf"], &[]);
+        let _env = EnvGuard::new(&[("PATH", Some(&path))]);
         std::fs::write(
             ctx.root.join(".github/workflows/gittuf-verify.yml"),
             "name: gittuf verify\non:\n  workflow_dispatch:\n",
@@ -439,6 +535,50 @@ mod tests {
         let pass = verify_gittuf(&ctx);
         assert_eq!(pass.outcome, Outcome::Pass, "{:?}", pass.messages);
         assert!(pass.messages.iter().any(|m| m.contains("refs/gittuf/*")));
+    }
+
+    /// Regression (H11): `refs/gittuf/…` is a ref NAME — the test above creates
+    /// one with a plain `git update-ref`, and so can anyone. Only gittuf can say
+    /// whether the RSL and policy actually verify, so with the declared CLI
+    /// absent this control has checked a name, not a guarantee, and PASS was a
+    /// claim it could not support.
+    #[test]
+    fn gittuf_degrades_when_the_declared_cli_is_absent() {
+        let _g = env_lock();
+        let (_d, ctx) = repo();
+        let (_stubs, path) = path_fixture(&[], &["gittuf"]);
+        let _env = EnvGuard::new(&[("PATH", Some(&path))]);
+        assert!(
+            !crate::tools::is_available("gittuf"),
+            "fixture must hide the gittuf CLI"
+        );
+
+        std::fs::write(
+            ctx.root.join(".github/workflows/gittuf-verify.yml"),
+            "name: gittuf verify\non:\n  workflow_dispatch:\n",
+        )
+        .unwrap();
+        std::fs::write(ctx.root.join("f.txt"), "x").unwrap();
+        crate::exec::git(&["add", "-A"], &ctx.root).unwrap();
+        crate::exec::git(&["commit", "-m", "c", "--no-verify"], &ctx.root).unwrap();
+        let head = crate::exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+        crate::exec::git(
+            &["update-ref", "refs/gittuf/reference-state-log", &head],
+            &ctx.root,
+        )
+        .unwrap();
+        assert!(gittuf_policy_present(&ctx.root));
+
+        let r = verify_gittuf(&ctx);
+        assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("gittuf not found on PATH")),
+            "{:?}",
+            r.messages
+        );
+        assert!(r.messages.iter().any(|m| m.contains("NOT verified")));
     }
 
     #[test]

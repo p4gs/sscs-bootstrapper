@@ -549,9 +549,26 @@ pub fn verify_branch_protection(ctx: &Ctx, cfg: &Config) -> VerifyResult {
             ],
         );
     };
+    let branches = cfg.protected_branches();
+    if branches.is_empty() {
+        return VerifyResult::new(
+            id,
+            Outcome::Degraded,
+            vec![
+                "no protected branches configured (general.protected_branches) — \
+                 there is nothing to verify, which is not the same as being protected"
+                    .into(),
+            ],
+        );
+    }
     let mut messages = Vec::new();
     let mut outcome = Outcome::Pass;
-    for branch in cfg.protected_branches() {
+    // How many branches the rules API actually answered for. A branch that
+    // could not be queried proves nothing about its protection, so if NOT ONE
+    // was answered the control verified nothing at all — see the Degraded
+    // return below.
+    let mut answered = 0usize;
+    for branch in &branches {
         let api = format!("repos/{slug}/rules/branches/{branch}");
         let out = match exec::run("gh", &["api", &api], Some(&ctx.root)) {
             Ok(o) => o,
@@ -570,6 +587,7 @@ pub fn verify_branch_protection(ctx: &Ctx, cfg: &Config) -> VerifyResult {
             ));
             continue;
         }
+        answered += 1;
         let rules: Vec<serde_json::Value> = serde_json::from_str(&out.stdout).unwrap_or_default();
         let active: Vec<&str> = rules
             .iter()
@@ -676,6 +694,17 @@ pub fn verify_branch_protection(ctx: &Ctx, cfg: &Config) -> VerifyResult {
             outcome = Outcome::Fail;
             messages.extend(gaps);
         }
+    }
+    // Not one protected branch could be read: every rule check above was
+    // skipped, so nothing was verified. "I could not check" is DEGRADED, never
+    // PASS — a green branch-protection line here would be pure fiction.
+    if answered == 0 {
+        messages.push(format!(
+            "NOTHING VERIFIED: the rules API answered for 0 of {} configured protected \
+             branch(es) — branch protection is unverified, not confirmed",
+            branches.len()
+        ));
+        return VerifyResult::new(id, Outcome::Degraded, messages);
     }
     VerifyResult::new(id, outcome, messages)
 }
@@ -962,6 +991,65 @@ jobs:
         let result = verify_branch_protection(&ctx, cfg);
         assert_eq!(result.outcome, Outcome::Degraded);
         assert!(result.messages[0].contains("no GitHub repo configured"));
+    }
+
+    /// Regression (C4): when the rules API answers for NOT ONE configured
+    /// branch, every rule check inside the loop was skipped — nothing about
+    /// branch protection was read. The failing-query arm pushed a message and
+    /// `continue`d without touching `outcome`, so the optimistic initial
+    /// `Outcome::Pass` survived and `sscsb verify --strict branch-protection`
+    /// exited 0 against a repo slug that does not even exist. "I could not
+    /// check" must report DEGRADED.
+    #[test]
+    fn branch_protection_degrades_when_not_one_branch_could_be_queried() {
+        let _guard = PATH_LOCK.lock().unwrap();
+        let gh_dir = fake_gh("#!/bin/sh\necho 'gh: Not Found (HTTP 404)' 1>&2\nexit 1\n");
+        let _path = PathPrepend::new(gh_dir.path());
+
+        let (_d, ctx) = crate::testutil::repo_with_gh_repo("acme/does-not-exist", "main");
+        let cfg = ctx.require_config().unwrap();
+        let result = verify_branch_protection(&ctx, cfg);
+
+        assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.contains("could not query rules API")),
+            "the per-branch failure must still be reported: {:?}",
+            result.messages
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.contains("NOTHING VERIFIED")
+                    && m.contains("0 of 1 configured protected branch")),
+            "the verdict must say nothing was verified: {:?}",
+            result.messages
+        );
+    }
+
+    /// An empty `protected_branches` list means the loop body never runs, which
+    /// is likewise "nothing verified" rather than "all clear".
+    #[test]
+    fn branch_protection_degrades_when_no_protected_branches_are_configured() {
+        let _guard = PATH_LOCK.lock().unwrap();
+        // `gh` must resolve for the check under test to be reached at all.
+        let gh_dir = fake_gh("#!/bin/sh\necho '[]'\nexit 0\n");
+        let _path = PathPrepend::new(gh_dir.path());
+
+        let (_d, ctx) = crate::testutil::repo_with_gh_repo("acme/demo", "main");
+        let cfg_text = std::fs::read_to_string(ctx.config_path())
+            .unwrap()
+            .replace("protected_branches = [\"main\"]", "protected_branches = []");
+        std::fs::write(ctx.config_path(), cfg_text).unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_branch_protection(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+        assert!(result.messages[0].contains("no protected branches configured"));
     }
 
     /// End-to-end matrix: one branch with every rule present (all ✓ +

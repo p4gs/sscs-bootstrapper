@@ -698,7 +698,25 @@ pub fn hook_commit_msg(ctx: &Ctx, msg_file: &Path) -> Result<i32> {
                 }
             }
             Ok(_) => {}
-            Err(err) => eprintln!("sscsb: package-trust check skipped: {err:#}"),
+            // The gate could not evaluate — an unreadable or unparseable
+            // `.sscsb/policy/packages.toml` is the common case, and a one-line
+            // append to that file must not be a way to switch the new-package
+            // gate off. Deleting the baseline already fails CLOSED (every new
+            // package reads as unapproved); corrupting it has to fail closed
+            // too, or that asymmetry IS the bypass. `fail_open = true` stays
+            // the single explicit opt-out — the same shape the secret-scan and
+            // SAST arms of these hooks already use.
+            Err(err) => {
+                if cfg.fail_open() {
+                    eprintln!(
+                        "sscsb: WARNING (fail_open=true): package-trust check could not run: {err:#}"
+                    );
+                } else {
+                    problems.push(format!(
+                        "package-trust check could not run (fail-closed): {err:#}"
+                    ));
+                }
+            }
         }
     }
 
@@ -1928,20 +1946,48 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         );
     }
 
+    /// Regression (H4): the new-package gate must fail CLOSED when it cannot
+    /// evaluate. DELETING `.sscsb/policy/packages.toml` already failed closed
+    /// (every dependency reads as unapproved), but CORRUPTING it merely printed
+    /// "package-trust check skipped" and returned 0 — so one appended line
+    /// turned the gate off. That asymmetry was the bypass.
     #[test]
-    fn hook_commit_msg_skips_package_trust_check_on_corrupt_policy_without_blocking() {
+    fn hook_commit_msg_fails_closed_when_the_package_policy_cannot_be_parsed() {
         let (_d, ctx) = test_repo();
-        // Corrupt the approved-packages policy so `unapproved_new_packages`
-        // errors; package-trust degrades advisory here, so the commit must
-        // still pass rather than being blocked by an unrelated parse bug.
+        // Baseline: an unapproved new dependency is blocked while the policy
+        // file is intact.
+        write_file(&ctx, "Cargo.toml", "[dependencies]\nleftpad-rs = \"1\"\n");
+        stage(&ctx, "Cargo.toml");
+        assert_eq!(
+            commit_msg(&ctx, "chore: add dep\n"),
+            1,
+            "an unapproved new dependency must block"
+        );
+
+        // Corrupt the policy — the gate can no longer evaluate anything.
         std::fs::write(
             crate::deps::packages_policy_path(&ctx),
             "not = [valid toml\n",
         )
         .unwrap();
-        write_file(&ctx, "a.txt", "a\n");
-        stage(&ctx, "a.txt");
-        assert_eq!(commit_msg(&ctx, "chore: x\n"), 0);
+        assert_eq!(
+            commit_msg(&ctx, "chore: add dep\n"),
+            1,
+            "a policy file that cannot be parsed must not switch the gate off"
+        );
+
+        // `fail_open = true` stays the single explicit, documented opt-out.
+        let cfg_path = ctx.config_path();
+        let text = std::fs::read_to_string(&cfg_path)
+            .unwrap()
+            .replace("fail_open = false", "fail_open = true");
+        std::fs::write(&cfg_path, text).unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        assert_eq!(
+            commit_msg(&ctx, "chore: add dep\n"),
+            0,
+            "fail_open=true must still let the commit through with a warning"
+        );
     }
 
     // ─────────────────────────── parse_push_lines ──────────────────────────

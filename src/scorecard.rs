@@ -160,14 +160,24 @@ pub fn verify_scorecard_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
         );
     }
 
-    // 2. Live scan (best-effort).
+    // 2. Live scan. NOT "best-effort" in the verdict sense: an installed
+    //    workflow proves only that a file exists. Whether Scorecard actually
+    //    scores this repository — and what it sees — is the substantive half of
+    //    this control, so every way of not reading it is DEGRADED, matching how
+    //    `branch-protection` treats the same missing prerequisites. PASS here
+    //    means "Scorecard ran and had nothing open", nothing less.
     if exec::find_in_path("gh").is_none() {
-        messages.push("live scan skipped: gh not installed".into());
-        return VerifyResult::new(id, Outcome::Pass, messages);
+        messages.push(crate::tools::degrade_message("gh", ctx.platform));
+        messages.push("live Scorecard findings NOT read — posture unverified".into());
+        return VerifyResult::new(id, Outcome::Degraded, messages);
     }
     let Some(slug) = cfg.github_repo().or_else(|| ctx.origin_slug()) else {
-        messages.push("live scan skipped: no GitHub repo configured".into());
-        return VerifyResult::new(id, Outcome::Pass, messages);
+        messages.push(
+            "no GitHub repo configured (general.github_repo) and no origin remote — \
+             live Scorecard findings NOT read, posture unverified"
+                .into(),
+        );
+        return VerifyResult::new(id, Outcome::Degraded, messages);
     };
     match fetch_findings(ctx, &slug) {
         Some(findings) if !findings.is_empty() => {
@@ -178,15 +188,33 @@ pub fn verify_scorecard_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
                     format_finding(rule_id, &score_summary(msg))
                 ));
             }
+            // Scorecard IS scoring this repo and it has open findings. sscsb
+            // deliberately does not re-gate on another scanner's rubric — each
+            // finding routes to the sscsb control that owns it, and that
+            // control fails on its own evidence — but reporting PASS while
+            // printing open findings manufactures assurance. INFO is the
+            // honest verdict: context, not a gate.
+            messages.push(
+                "reported as INFO, not PASS: open Scorecard findings exist; each is routed to \
+                 the sscsb control that gates it above"
+                    .into(),
+            );
+            VerifyResult::new(id, Outcome::Info, messages)
         }
-        Some(_) => messages.push("live scan: no open Scorecard findings 🎉".into()),
-        None => messages.push(
-            "live scan unavailable (no Scorecard code-scanning results yet — the workflow runs \
-             on push to the default branch)"
-                .into(),
-        ),
+        Some(_) => {
+            messages.push("live scan: no open Scorecard findings 🎉".into());
+            VerifyResult::new(id, Outcome::Pass, messages)
+        }
+        None => {
+            messages.push(
+                "live Scorecard results could not be read (none published yet — the workflow \
+                 runs on push to the default branch — or the code-scanning API refused) — \
+                 posture unverified"
+                    .into(),
+            );
+            VerifyResult::new(id, Outcome::Degraded, messages)
+        }
     }
-    VerifyResult::new(id, Outcome::Pass, messages)
 }
 
 /// Fetch open Scorecard code-scanning alerts as (rule_id, message) pairs.
@@ -295,7 +323,100 @@ mod tests {
     }
 
     // --- live-scan path via a stubbed `gh` on PATH ---
-    use crate::testutil::{fake_gh, repo_with_gh_repo, PathPrepend, PATH_LOCK};
+    use crate::testutil::{
+        env_lock, fake_gh, path_without, repo_with_gh_repo, EnvGuard, PathPrepend, PATH_LOCK,
+    };
+
+    /// A bootstrapped repo with NO `github_repo` in config and no origin
+    /// remote, so `verify_scorecard_control` cannot resolve a slug.
+    fn repo_without_slug() -> (tempfile::TempDir, Ctx) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::exec::git(&["init", "-b", "main"], root).unwrap();
+        crate::exec::git(&["config", "user.name", "SSCSB Test"], root).unwrap();
+        crate::exec::git(&["config", "user.email", "sscsb-test@example.com"], root).unwrap();
+        crate::init::bootstrap(root).expect("bootstrap");
+        let ctx = Ctx::discover(root).expect("discover");
+        (dir, ctx)
+    }
+
+    /// Regression (H3a): with `gh` off PATH the live half of this control
+    /// cannot run at all, and the whole verdict used to collapse to PASS on
+    /// the strength of a workflow file existing — while every other
+    /// gh-dependent control in the same run correctly said DEGRADED.
+    #[test]
+    fn scorecard_degrades_when_gh_is_absent() {
+        let _g = env_lock();
+        let (_d, ctx) = repo_with_gh_repo("acme/demo", "main");
+        let cfg_owned = crate::config::Config::load(&ctx.root).unwrap().unwrap();
+
+        // Hide ONLY gh: PATH is process-global, so blanking it would break
+        // whichever tool a concurrently-running test happens to need.
+        let (_mirrors, path) = path_without(&["gh"]);
+        let _env = EnvGuard::new(&[("PATH", Some(&path.to_string_lossy()))]);
+        assert!(exec::find_in_path("gh").is_none(), "fixture must hide gh");
+
+        let r = verify_scorecard_control(&ctx, &cfg_owned);
+        assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("gh not found on PATH")),
+            "{:?}",
+            r.messages
+        );
+        assert!(
+            r.messages.iter().any(|m| m.contains("posture unverified")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// Same hole, two lines further down: no slug means the code-scanning API
+    /// is never queried, so nothing about Scorecard's view was read.
+    #[test]
+    fn scorecard_degrades_without_a_github_slug() {
+        let _g = env_lock();
+        let gh = fake_gh("#!/bin/sh\necho '[]'\nexit 0\n");
+        let _p = PathPrepend::new(gh.path());
+        let (_d, ctx) = repo_without_slug();
+        let cfg = ctx.require_config().unwrap();
+
+        let r = verify_scorecard_control(&ctx, cfg);
+        assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
+        assert!(r
+            .messages
+            .iter()
+            .any(|m| m.contains("no GitHub repo configured")));
+    }
+
+    /// `gh` is present and answers, but the code-scanning query fails — the
+    /// live findings still were not read, so this is not a PASS either.
+    #[test]
+    fn scorecard_degrades_when_live_results_cannot_be_read() {
+        let _g = env_lock();
+        let gh = fake_gh("#!/bin/sh\necho 'HTTP 403: Resource not accessible' 1>&2\nexit 1\n");
+        let _p = PathPrepend::new(gh.path());
+        let (_d, ctx) = repo_with_gh_repo("acme/demo", "main");
+        let cfg = ctx.require_config().unwrap();
+
+        let r = verify_scorecard_control(&ctx, cfg);
+        assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
+        assert!(r
+            .messages
+            .iter()
+            .any(|m| m.contains("could not be read") && m.contains("posture unverified")));
+    }
+
+    /// A missing workflow is a real, checked finding — not a degrade.
+    #[test]
+    fn scorecard_fails_when_the_workflow_is_not_installed() {
+        let (_d, ctx) = repo_with_gh_repo("acme/demo", "main");
+        std::fs::remove_file(ctx.root.join(".github/workflows/scorecard.yml")).unwrap();
+        let cfg = ctx.require_config().unwrap();
+        let r = verify_scorecard_control(&ctx, cfg);
+        assert_eq!(r.outcome, Outcome::Fail, "{:?}", r.messages);
+    }
 
     #[test]
     fn verify_scorecard_live_scan_maps_findings() {
@@ -314,7 +435,16 @@ esac
         let cfg = ctx.require_config().unwrap();
 
         let r = verify_scorecard_control(&ctx, cfg);
-        assert_eq!(r.outcome, Outcome::Pass);
+        // Regression (H3b): open Scorecard findings used to be printed under a
+        // PASS verdict. Scorecard is scoring the repo and it has open findings;
+        // sscsb routes each to the control that gates it rather than re-gating
+        // on another scanner's rubric, so the honest verdict is INFO — context,
+        // not a green light.
+        assert_eq!(r.outcome, Outcome::Info, "{:?}", r.messages);
+        assert!(r
+            .messages
+            .iter()
+            .any(|m| m.contains("reported as INFO, not PASS")));
         assert!(r
             .messages
             .iter()

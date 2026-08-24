@@ -60,6 +60,45 @@ pub fn dtrack_upload(ctx: &Ctx, cfg: &Config, bom_path: &Path) -> Result<String>
     ))
 }
 
+/// Ask a configured Dependency-Track server whether it is really there and
+/// whether the API key in the environment is one it accepts.
+///
+/// `GET /api/version` is Dependency-Track's version endpoint — reaching it
+/// proves the URL points at a live DT API server rather than at nothing, a
+/// closed port, or the frontend. `X-Api-Key` travels on it (header only, never
+/// the URL) so a server that rejects the credential answers 401/403 here
+/// instead of at upload time.
+///
+/// Returns `Ok(description)` only for a 2xx. Everything else — transport error,
+/// wrong status — is `Err(reason)`, because the whole point is that "could not
+/// reach it" and "it works" must never collapse into the same verdict. Bounded
+/// at 5s so `sscsb verify` cannot hang on a black-holed host.
+fn dtrack_probe(url: &str, api_key: &str) -> Result<String, String> {
+    let endpoint = format!("{}/api/version", url.trim_end_matches('/'));
+    let agent = ureq::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build();
+    match agent.get(&endpoint).set("X-Api-Key", api_key).call() {
+        Ok(resp) => {
+            let body: serde_json::Value = resp.into_json().unwrap_or_default();
+            let version = body
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("version unreported");
+            Ok(format!("server reachable: {endpoint} ({version})"))
+        }
+        Err(ureq::Error::Status(code, _)) => Err(format!(
+            "server at {endpoint} answered HTTP {code} — {} (an upload would fail the same way)",
+            match code {
+                401 | 403 => "DTRACK_API_KEY was rejected",
+                404 => "not a Dependency-Track API server (is this the frontend port?)",
+                _ => "unexpected response",
+            }
+        )),
+        Err(e) => Err(format!("server at {endpoint} is unreachable: {e}")),
+    }
+}
+
 pub fn verify_dtrack_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     let mut messages = Vec::new();
     let url = cfg
@@ -75,12 +114,30 @@ pub fn verify_dtrack_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     match url {
         Some(u) => {
             messages.push(format!("server configured: {u}"));
-            if std::env::var("DTRACK_API_KEY").is_ok() {
-                messages.push("DTRACK_API_KEY present in environment".into());
-                VerifyResult::new("dependency-track", Outcome::Pass, messages)
-            } else {
+            let Ok(key) = std::env::var("DTRACK_API_KEY") else {
                 messages.push("DTRACK_API_KEY not set — upload will fail until exported".into());
-                VerifyResult::new("dependency-track", Outcome::Degraded, messages)
+                return VerifyResult::new("dependency-track", Outcome::Degraded, messages);
+            };
+            messages.push("DTRACK_API_KEY present in environment".into());
+            // A non-empty URL string and a set environment variable are two
+            // pieces of configuration, not a working integration: they were
+            // equally true of an unreachable host and a junk key, which is why
+            // `verify` used to say PASS and `dtrack upload` then said
+            // "Connection refused". Only a live answer earns PASS.
+            match dtrack_probe(&u, &key) {
+                Ok(detail) => {
+                    messages.push(detail);
+                    VerifyResult::new("dependency-track", Outcome::Pass, messages)
+                }
+                Err(reason) => {
+                    messages.push(reason);
+                    messages.push(
+                        "configuration present but the integration is UNVERIFIED — \
+                         start the server (see docs/phase-5.md) or fix the URL/key"
+                            .into(),
+                    );
+                    VerifyResult::new("dependency-track", Outcome::Degraded, messages)
+                }
             }
         }
         None => {
@@ -429,6 +486,42 @@ mod tests {
         std::env::remove_var("DTRACK_API_KEY");
     }
 
+    /// A one-shot HTTP server that answers the next connection with
+    /// `status_line` and `body`, then stops. Enough to stand in for a
+    /// Dependency-Track `GET /api/version`.
+    fn stub_http_once(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            reader
+                .get_mut()
+                .write_all(
+                    format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            request
+        });
+        (url, handle)
+    }
+
     #[test]
     fn dtrack_verify_reports_url_and_key_state_separately() {
         let _guard = ENV.lock().unwrap();
@@ -443,7 +536,7 @@ mod tests {
             .iter()
             .any(|m| m.contains("no server configured")));
 
-        set_url(&ctx, "http://localhost:8081");
+        set_url(&ctx, "http://127.0.0.1:1");
         let ctx = Ctx::discover(&ctx.root).unwrap();
         let cfg = ctx.require_config().unwrap();
 
@@ -455,12 +548,96 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.contains("DTRACK_API_KEY not set")));
+        std::env::remove_var("DTRACK_API_KEY");
+    }
 
-        // Both → pass.
+    /// Regression (H10): PASS required only a non-empty `url` STRING and
+    /// `DTRACK_API_KEY` merely being SET. Neither fact touches the network, so
+    /// `verify` reported PASS for a server that was not running — and the very
+    /// next `sscsb dtrack upload` said "Connection refused". Configuration is
+    /// not verification.
+    #[test]
+    fn dtrack_verify_degrades_when_the_configured_server_is_unreachable() {
+        let _guard = ENV.lock().unwrap();
+        let (_d, ctx) = repo();
+        // Port 1 refuses connections.
+        set_url(&ctx, "http://127.0.0.1:1");
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        let cfg = ctx.require_config().unwrap();
         std::env::set_var("DTRACK_API_KEY", "test-key-not-a-real-credential");
+
         let r = verify_dtrack_control(&ctx, cfg);
-        assert_eq!(r.outcome, Outcome::Pass);
-        assert!(r.messages.iter().any(|m| m.contains("localhost:8081")));
+        assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("is unreachable")),
+            "{:?}",
+            r.messages
+        );
+        assert!(r
+            .messages
+            .iter()
+            .any(|m| m.contains("integration is UNVERIFIED")));
+        std::env::remove_var("DTRACK_API_KEY");
+    }
+
+    /// A server that rejects the key is likewise not a working integration.
+    #[test]
+    fn dtrack_verify_degrades_when_the_server_rejects_the_api_key() {
+        let _guard = ENV.lock().unwrap();
+        let (_d, ctx) = repo();
+        let (url, handle) = stub_http_once("HTTP/1.1 401 Unauthorized", "{}");
+        set_url(&ctx, &url);
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        let cfg = ctx.require_config().unwrap();
+        std::env::set_var("DTRACK_API_KEY", "wrong-key-not-a-real-credential");
+
+        let r = verify_dtrack_control(&ctx, cfg);
+        assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("DTRACK_API_KEY was rejected")),
+            "{:?}",
+            r.messages
+        );
+        handle.join().unwrap();
+        std::env::remove_var("DTRACK_API_KEY");
+    }
+
+    /// …and a live server that answers earns the PASS it used to get for free.
+    /// The key travels in a header, never in the URL.
+    #[test]
+    fn dtrack_verify_passes_against_a_live_server() {
+        let _guard = ENV.lock().unwrap();
+        let (_d, ctx) = repo();
+        let (url, handle) = stub_http_once("HTTP/1.1 200 OK", "{\"version\":\"5.0.2\"}");
+        set_url(&ctx, &url);
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        let cfg = ctx.require_config().unwrap();
+        std::env::set_var("DTRACK_API_KEY", "good-key-not-a-real-credential");
+
+        let r = verify_dtrack_control(&ctx, cfg);
+        assert_eq!(r.outcome, Outcome::Pass, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("server reachable") && m.contains("5.0.2")),
+            "{:?}",
+            r.messages
+        );
+
+        let request = handle.join().unwrap().to_lowercase();
+        assert!(request.contains("get /api/version"), "{request}");
+        assert!(
+            request.contains("x-api-key: good-key-not-a-real-credential"),
+            "{request}"
+        );
+        assert!(
+            !r.messages
+                .iter()
+                .any(|m| m.contains("good-key-not-a-real-credential")),
+            "the key must never be echoed into the verdict"
+        );
         std::env::remove_var("DTRACK_API_KEY");
     }
 
