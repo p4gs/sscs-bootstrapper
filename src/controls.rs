@@ -63,6 +63,18 @@ pub const CONTROLS: &[ControlDef] = &[
         ],
     },
     ControlDef {
+        id: "signing-model",
+        phase: 1,
+        name: "Five-environment signing model",
+        summary: "Machine-wide signing posture: human enclave lane, distinct agent identity, cloud/web/Codespaces guidance",
+        default_enabled: true,
+        tools: &[],
+        default_options: &[
+            ("agent", "\"claude-code\""),
+            ("human_backend", "\"secretive\""),
+        ],
+    },
+    ControlDef {
         id: "branch-protection",
         phase: 1,
         name: "Branch protection verification",
@@ -498,6 +510,7 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
         "secrets" => crate::hooks::verify_secrets_control(ctx, cfg),
         "commit-signing" => crate::hooks::verify_signing_control(ctx, cfg),
         "agent-signing" => crate::signers::verify_agent_signing_control(ctx, cfg),
+        "signing-model" => crate::signing_setup::verify_signing_model_control(ctx, cfg),
         "branch-protection" => crate::audit::verify_branch_protection(ctx, cfg),
         "actions-audit" => crate::audit::verify_actions_control(ctx, false),
         "gittuf" => crate::openssf::verify_gittuf(ctx),
@@ -597,6 +610,7 @@ mod tests {
         for id in [
             "secrets",
             "commit-signing",
+            "signing-model",
             "sbom",
             "vuln-scan",
             "compliance-map",

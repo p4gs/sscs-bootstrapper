@@ -94,6 +94,7 @@ fn init_creates_config_hooks_policies_and_templates() {
         ".sscsb/policy/signers.toml",
         ".sscsb/policy/packages.toml",
         ".sscsb/policy/allowed_signers",
+        ".sscsb/policy/signing-model.toml",
         ".sscsb/rules/sscsb-default.yaml",
         ".github/PULL_REQUEST_TEMPLATE.md",
         ".github/workflows/secrets-scan.yml",
