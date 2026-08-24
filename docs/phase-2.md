@@ -137,8 +137,14 @@ sscsb deps list
 **Existence.** Every package is checked against its own public registry —
 crates.io, npm, PyPI, the Go module proxy, RubyGems. A package that is *not found*
 is reported as a likely hallucination or slopsquatting target, and must not be
-approved without verification. This is a network call; `--offline` skips it, and an
-inconclusive lookup is reported as inconclusive rather than assumed fine.
+approved without verification. This is a network call; `--offline` skips it.
+
+A lookup that cannot be *answered* — DNS failure, a proxy, a registry 503 — is a
+**problem**, not a note: `sscsb deps check` reports it and exits non-zero, and
+`sscsb deps approve` refuses without `--force`. An outage is not evidence that a
+package exists, and the alternative is a control that reports every hallucinated
+name in the manifest as clean the moment the network hiccups. `--offline` is how
+you decline the existence check deliberately; the heuristics still run.
 
 **Typosquat proximity.** A new package name within one edit of a popular package
 in the same ecosystem is flagged, with the name it shadows. The distance is
@@ -146,7 +152,35 @@ in the same ecosystem is flagged, with the name it shadows. The distance is
 typosquat shape is an adjacent transposition (`tokoi` for `tokio`, `reqeusts` for
 `requests`), which plain Levenshtein scores as distance *2* and would wave straight
 through. Hyphen/underscore confusion (`serde-json` for `serde_json`) is caught
-separately.
+separately, and so is case confusion — which is why the curated lists cover all
+five ecosystems including Go, where `github.com/Sirupsen/logrus` and
+`github.com/sirupsen/logrus` are two different module paths that read the same.
+
+One exception, because it is a *family* and not a typo: two names that differ
+only in a trailing digit of the same length — `sha1`/`sha2`/`sha3`,
+`base32`/`base64`, `gopkg.in/yaml.v2`/`gopkg.in/yaml.v3` — do not shadow each
+other. A trailing digit is the whole semantic payload of such a name; nobody
+mistypes it, and picking the wrong one lands you on a different *real* package
+that fails to compile. Only that shape is exempt: `boto` still shadows `boto3`
+(one side has no digits) and `sha22` still shadows `sha2` (the digit runs differ
+in length), and every one of these names still goes through the existence check,
+which is the arm that actually knows whether a name is real.
+
+**Where manifests are looked for.** Everywhere git tracks one, not just the repo
+root — `sub/package.json` and `services/api/requirements.txt` count. The commit
+gate has always matched a staged manifest by filename anywhere in the tree, so
+anything it can block on is something `sscsb deps baseline` can bless in bulk.
+The search is git's index, not a filesystem walk, so `node_modules/`, `target/`
+and anything else your `.gitignore` covers stays out of the baseline.
+
+**What counts as a declaration.** `pyproject.toml` is read as TOML, never scanned
+line by line, and every section that installs code is read: PEP 621 `[project]`
+and its extras, PEP 735 `[dependency-groups]`, **Poetry**
+(`[tool.poetry.dependencies]`, the legacy `dev-dependencies`, per-group
+dependencies, and `[[tool.poetry.source]]`), PDM, uv and Hatch. Poetry's
+`git`/`path`/`url`/`source` origins are classified like any other non-registry
+source, so repointing a Poetry dependency is a fresh trust decision rather than
+an unchanged name.
 
 **Human approval.** New packages introduced by a **staged** manifest change are
 compared against the previous revision and against your approved baseline. Anything
