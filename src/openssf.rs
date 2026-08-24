@@ -10,8 +10,108 @@ use crate::context::Ctx;
 use crate::controls::{Outcome, VerifyResult};
 use std::path::Path;
 use yaml_rust2::parser::{Event, EventReceiver, Parser};
+use yaml_rust2::Yaml;
 
 // ─────────────────────────── Security Insights ──────────────────────────────
+
+/// Security Insights schema MAJOR versions this verifier understands. Minor and
+/// patch releases inside a known major are accepted — that is what the version
+/// scheme promises — so a spec point release does not turn a good file red. A
+/// major sscsb has never heard of is a different matter: every structural check
+/// below is written against v1/v2 field names, so on `9.9.9` those checks are
+/// not evidence of anything and PASS would be a claim sscsb cannot support.
+const KNOWN_SI_SCHEMA_MAJORS: &[u64] = &[1, 2];
+
+/// The generator's own placeholder markers. A field still carrying one is an
+/// unfinished starter, which the Info branch below already reports; it is not a
+/// separate malformed-value complaint.
+fn is_placeholder(text: &str) -> bool {
+    text.contains("REPLACE-ME") || text.contains("TODO:")
+}
+
+/// The literal text of a YAML scalar, whatever type it resolved to. `9.9.9` is
+/// a string to YAML and `2.0` is a float; both are answers to "what version did
+/// this file claim", so both are worth reading.
+fn scalar_text(node: &Yaml) -> Option<String> {
+    match node {
+        Yaml::String(s) | Yaml::Real(s) => Some(s.clone()),
+        Yaml::Integer(i) => Some(i.to_string()),
+        Yaml::Boolean(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// MAJOR of a `MAJOR.MINOR.PATCH` version, or `None` when the text is not one.
+fn schema_major(text: &str) -> Option<u64> {
+    let mut parts = text.trim().split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    parts.next()?.parse::<u64>().ok()?;
+    parts.next()?.parse::<u64>().ok()?;
+    parts.next().is_none().then_some(major)
+}
+
+/// Fields whose name says outright that the value is a URL. Kept to the
+/// unambiguous set — `url`, `<something>-url`, `<something>_url` — because this
+/// is a structural verifier, not a schema: `si validate` is what knows that
+/// `documentation.detailed-guide` is a URI too.
+fn is_url_key(key: &str) -> bool {
+    key == "url" || key.ends_with("-url") || key.ends_with("_url")
+}
+
+/// Shape-only URL check: a scheme, `://`, and something after it. sscsb is not
+/// resolving these — it is declining to call `not-a-url` a URL.
+fn looks_like_url(value: &str) -> bool {
+    let Some((scheme, rest)) = value.trim().split_once("://") else {
+        return false;
+    };
+    !rest.is_empty()
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// Every `url`-shaped field in the document whose value is not a URL.
+///
+/// Iterative on purpose: the walk runs over a document sscsb did not write, and
+/// a recursive one would be a second way to knock `verify` over.
+fn url_field_problems(doc: &Yaml) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut stack = vec![(String::new(), doc)];
+    while let Some((path, node)) = stack.pop() {
+        match node {
+            Yaml::Hash(map) => {
+                for (k, v) in map {
+                    let key = k.as_str().unwrap_or("?");
+                    let child = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if is_url_key(key) {
+                        match scalar_text(v) {
+                            Some(text) if is_placeholder(&text) => {}
+                            Some(text) if !looks_like_url(&text) => {
+                                problems.push(format!("{child} is not a URL: `{text}`"));
+                            }
+                            Some(_) => {}
+                            None => problems.push(format!("{child} must be a URL string")),
+                        }
+                    }
+                    stack.push((child, v));
+                }
+            }
+            Yaml::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    stack.push((format!("{path}[{i}]"), v));
+                }
+            }
+            _ => {}
+        }
+    }
+    problems.sort();
+    problems
+}
 
 /// Ceiling on the bytes sscsb reads from `security-insights.yml`. It is project
 /// metadata — the OpenSSF spec's own examples are a couple of kilobytes — and a
@@ -177,8 +277,26 @@ pub fn verify_security_insights(ctx: &Ctx) -> VerifyResult {
     // Structural checks mirroring the v2-required fields `si validate` enforces
     // (not the full CUE evaluation — that's si-tooling's job).
     let mut problems: Vec<String> = Vec::new();
-    if doc["header"]["schema-version"].is_badvalue() {
+    let declared = &doc["header"]["schema-version"];
+    if declared.is_badvalue() {
         problems.push("MISSING header.schema-version".into());
+    } else {
+        // A version this tool has never heard of is cheap to catch and makes
+        // every check below meaningless — it must not read as PASS.
+        match scalar_text(declared) {
+            None => problems
+                .push("header.schema-version must be a version string like \"2.0.0\"".into()),
+            Some(text) => match schema_major(&text) {
+                None => problems.push(format!(
+                    "header.schema-version `{text}` is not a MAJOR.MINOR.PATCH version"
+                )),
+                Some(major) if !KNOWN_SI_SCHEMA_MAJORS.contains(&major) => problems.push(format!(
+                    "header.schema-version `{text}` declares Security Insights v{major}; sscsb's \
+                     structural checks only know v1 and v2 — upgrade sscsb or fix the version"
+                )),
+                Some(_) => {}
+            },
+        }
     }
     let has_project = !doc["project"].is_badvalue();
     let has_repository = !doc["repository"].is_badvalue();
@@ -206,6 +324,9 @@ pub fn verify_security_insights(ctx: &Ctx) -> VerifyResult {
             problems.push("repository.license must be an object with `expression` + `url`".into());
         }
     }
+    // A field the file itself names `url` and fills with `not-a-url` is not a
+    // schema question — it is wrong on its face, wherever in the document it is.
+    problems.extend(url_field_problems(doc));
     if !problems.is_empty() {
         return VerifyResult::new("security-insights", Outcome::Fail, problems);
     }
@@ -698,6 +819,130 @@ mod tests {
             r.messages
         );
         assert!(r.messages.iter().any(|m| m.contains("NOT verified")));
+    }
+
+    /// Regression (M22): this exact document — a schema version that does not
+    /// exist, a `url` that is not a URL, and a second `url` that is a number —
+    /// reported `[PASS] structurally valid`. The verifier is deliberately
+    /// structural rather than a schema check (`si validate` owns conformance),
+    /// but "structural" was never a licence to pass things that are wrong on
+    /// their face.
+    #[test]
+    fn security_insights_rejects_an_unknown_schema_version_and_non_urls() {
+        let (_d, ctx) = repo();
+        let path = ctx.root.join("security-insights.yml");
+        std::fs::write(
+            &path,
+            "header:\n  schema-version: 9.9.9\n  url: not-a-url\nproject:\n  name: \"acme/widget\"\n  administrators:\n    - name: \"Real Maintainer\"\n      primary: true\n  repositories:\n    - name: \"acme/widget\"\n      url: 42\n",
+        )
+        .unwrap();
+        let r = verify_security_insights(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("9.9.9") && m.contains("v9")),
+            "{:?}",
+            r.messages
+        );
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m == "header.url is not a URL: `not-a-url`"),
+            "{:?}",
+            r.messages
+        );
+        // A numeric `url` is reported by path, wherever it is nested.
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m == "project.repositories[0].url is not a URL: `42`"),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// A malformed version is as unusable as an unknown one, and a `url:` with
+    /// no scalar value at all is its own kind of wrong.
+    #[test]
+    fn security_insights_rejects_a_malformed_version_and_a_non_scalar_url() {
+        let (_d, ctx) = repo();
+        let path = ctx.root.join("security-insights.yml");
+        std::fs::write(
+            &path,
+            "header:\n  schema-version: \"two\"\n  url:\n    - \"https://example.com\"\nproject:\n  name: \"x\"\n  administrators:\n    - name: \"m\"\n      primary: true\n",
+        )
+        .unwrap();
+        let r = verify_security_insights(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("not a MAJOR.MINOR.PATCH")),
+            "{:?}",
+            r.messages
+        );
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m == "header.url must be a URL string"),
+            "{:?}",
+            r.messages
+        );
+        // A non-string schema-version (a plain YAML mapping) is caught too.
+        std::fs::write(
+            &path,
+            "header:\n  schema-version:\n    major: 2\n  url: \"https://example.com\"\nproject:\n  name: \"x\"\n  administrators:\n    - name: \"m\"\n      primary: true\n",
+        )
+        .unwrap();
+        let r = verify_security_insights(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("must be a version string")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// The version gate is on the MAJOR, not the exact string: a spec point
+    /// release inside a known major must not turn a good file red, and v1 files
+    /// still verify. Nor may the URL check flinch at real-world URL shapes.
+    #[test]
+    fn security_insights_accepts_known_majors_and_real_url_shapes() {
+        let (_d, ctx) = repo();
+        let path = ctx.root.join("security-insights.yml");
+        for version in ["1.0.0", "2.0.0", "2.7.13"] {
+            std::fs::write(
+                &path,
+                format!("header:\n  schema-version: \"{version}\"\n  url: \"https://example.com/si.yml\"\nproject:\n  name: \"x\"\n  administrators:\n    - name: \"m\"\n      primary: true\n"),
+            )
+            .unwrap();
+            let r = verify_security_insights(&ctx);
+            assert_eq!(r.outcome, Outcome::Pass, "{version}: {:?}", r.messages);
+        }
+        // Schemes other than https, ports, and query strings are all URLs.
+        for url in [
+            "https://example.com/a?b=c#d",
+            "http://127.0.0.1:8080/x",
+            "git://example.com/r.git",
+            "ssh://git@example.com/r.git",
+        ] {
+            assert!(looks_like_url(url), "{url} should read as a URL");
+        }
+        for not_url in [
+            "not-a-url",
+            "",
+            "://nohost",
+            "1https://x.com",
+            "example.com",
+        ] {
+            assert!(
+                !looks_like_url(not_url),
+                "{not_url} should not read as a URL"
+            );
+        }
     }
 
     /// A structurally COMPLETE Security Insights document — it would PASS every
