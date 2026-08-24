@@ -9,8 +9,107 @@
 use crate::context::Ctx;
 use crate::controls::{Outcome, VerifyResult};
 use std::path::Path;
+use yaml_rust2::parser::{Event, EventReceiver, Parser};
 
 // ─────────────────────────── Security Insights ──────────────────────────────
+
+/// Ceiling on the bytes sscsb reads from `security-insights.yml`. It is project
+/// metadata — the OpenSSF spec's own examples are a couple of kilobytes — and a
+/// repository sscsb is pointed at is not a repository sscsb trusts.
+const MAX_SI_BYTES: usize = 1024 * 1024;
+
+/// Ceiling on the number of YAML nodes the document may expand to once anchors
+/// and aliases are resolved.
+///
+/// yaml-rust2 resolves an alias by CLONING the node it points at (`yaml.rs`:
+/// `anchor_map.insert(node.1, node.0.clone())`), and exposes no limit on that —
+/// its only "recursion limit" is a `u8` overflow on flow nesting depth. So a few
+/// hundred bytes of nested anchors expand geometrically: a 439-byte file of
+/// eight 9-way alias levels drove `sscsb verify` past 4.5 GB RSS before it was
+/// killed, still growing. That is a denial of service reachable by anyone who
+/// can add a file to a repository, and `verify` is what people wire into CI.
+///
+/// The expansion is counted on the parser's EVENT stream, which is linear in
+/// the input (an alias is one event, not a subtree), and the document is
+/// refused before it ever reaches the loader. 500 000 nodes is roughly the most
+/// an alias-free document of `MAX_SI_BYTES` could contain, so nothing that
+/// would have parsed on its own text is turned away.
+const MAX_SI_NODES: u64 = 500_000;
+
+/// Read at most `max` bytes of `path`, so an oversized (or endless) file is a
+/// reported refusal rather than an unbounded read.
+fn read_bounded(path: &Path, max: usize) -> Result<String, String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|e| format!("unreadable: {e}"))?;
+    let mut buf = Vec::new();
+    file.take(max as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("unreadable: {e}"))?;
+    if buf.len() > max {
+        return Err(format!(
+            "is larger than the {max}-byte ceiling sscsb reads — Security Insights is a \
+             metadata file, not a data file"
+        ));
+    }
+    String::from_utf8(buf).map_err(|_| "is not valid UTF-8".to_string())
+}
+
+/// Counts the nodes a YAML document would expand to *without* expanding it, by
+/// walking the parser's event stream. Anchored node sizes are remembered, and an
+/// alias is charged the size of the node it points at — exactly the clone the
+/// loader would make.
+#[derive(Default)]
+struct NodeBudget {
+    /// Expanded size of each anchored node, by anchor id.
+    anchors: std::collections::HashMap<usize, u64>,
+    /// (anchor id, accumulated child cost) per still-open collection.
+    open: Vec<(usize, u64)>,
+    /// Expanded size of every completed top-level node.
+    total: u64,
+}
+
+impl NodeBudget {
+    fn finish(&mut self, anchor: usize, cost: u64) {
+        if anchor > 0 {
+            self.anchors.insert(anchor, cost);
+        }
+        match self.open.last_mut() {
+            Some((_, acc)) => *acc = acc.saturating_add(cost),
+            None => self.total = self.total.saturating_add(cost),
+        }
+    }
+}
+
+impl EventReceiver for NodeBudget {
+    fn on_event(&mut self, ev: Event) {
+        match ev {
+            Event::Scalar(_, _, anchor, _) => self.finish(anchor, 1),
+            // An alias that resolves to nothing is stored as BadValue by the
+            // loader — one node, not a subtree.
+            Event::Alias(id) => {
+                let cost = self.anchors.get(&id).copied().unwrap_or(1);
+                self.finish(0, cost);
+            }
+            Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
+                self.open.push((anchor, 0));
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                if let Some((anchor, children)) = self.open.pop() {
+                    self.finish(anchor, children.saturating_add(1));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// How many YAML nodes `content` expands to. `None` when the document does not
+/// parse — the loader reports that with its own message and marker.
+fn expanded_node_count(content: &str) -> Option<u64> {
+    let mut budget = NodeBudget::default();
+    Parser::new_from_str(content).load(&mut budget, true).ok()?;
+    Some(budget.total)
+}
 
 /// `security-insights.yml` must exist, parse as YAML, carry a `header` with a
 /// `schema-version`, and describe the `project` or `repository`. Full schema
@@ -25,16 +124,36 @@ pub fn verify_security_insights(ctx: &Ctx) -> VerifyResult {
             vec!["security-insights.yml missing — run `sscsb init`".into()],
         );
     }
-    let content = match std::fs::read_to_string(&path) {
+    let content = match read_bounded(&path, MAX_SI_BYTES) {
         Ok(c) => c,
         Err(e) => {
             return VerifyResult::new(
                 "security-insights",
                 Outcome::Fail,
-                vec![format!("security-insights.yml unreadable: {e}")],
+                vec![format!("security-insights.yml {e}")],
             )
         }
     };
+    // Count the alias expansion on the event stream and refuse the document
+    // before the loader can materialize it. See `MAX_SI_NODES`.
+    if let Some(nodes) = expanded_node_count(&content) {
+        if nodes > MAX_SI_NODES {
+            return VerifyResult::new(
+                "security-insights",
+                Outcome::Fail,
+                vec![
+                    format!(
+                        "security-insights.yml expands to {nodes} YAML nodes from {} bytes \
+                         (ceiling {MAX_SI_NODES}) — REFUSED, not parsed",
+                        content.len()
+                    ),
+                    "its anchors/aliases amplify a small document into a huge one (a \
+                     \"billion laughs\" denial of service); remove the nested aliases"
+                        .into(),
+                ],
+            );
+        }
+    }
     let docs = match yaml_rust2::YamlLoader::load_from_str(&content) {
         Ok(d) => d,
         Err(e) => {
@@ -579,6 +698,112 @@ mod tests {
             r.messages
         );
         assert!(r.messages.iter().any(|m| m.contains("NOT verified")));
+    }
+
+    /// A structurally COMPLETE Security Insights document — it would PASS every
+    /// check below — whose five nested 9-way anchor levels expand to ~672 000
+    /// YAML nodes from 434 bytes. Deliberately sized just over `MAX_SI_NODES`
+    /// rather than as large as it could be: pre-fix this costs ~125 MB and ~1 s,
+    /// so a future regression of the guard is caught without the test itself
+    /// allocating gigabytes.
+    const ALIAS_BOMB: &str = concat!(
+        "header:\n",
+        "  schema-version: \"2.0.0\"\n",
+        "  url: \"https://example.com/si.yml\"\n",
+        "project:\n",
+        "  name: \"acme/widget\"\n",
+        "  administrators:\n",
+        "    - name: \"Real Maintainer\"\n",
+        "      primary: true\n",
+        "  a0: &a0 [\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\"]\n",
+        "  a1: &a1 [*a0,*a0,*a0,*a0,*a0,*a0,*a0,*a0,*a0]\n",
+        "  a2: &a2 [*a1,*a1,*a1,*a1,*a1,*a1,*a1,*a1,*a1]\n",
+        "  a3: &a3 [*a2,*a2,*a2,*a2,*a2,*a2,*a2,*a2,*a2]\n",
+        "  a4: &a4 [*a3,*a3,*a3,*a3,*a3,*a3,*a3,*a3,*a3]\n",
+        "  a5: &a5 [*a4,*a4,*a4,*a4,*a4,*a4,*a4,*a4,*a4]\n",
+    );
+
+    /// Regression (M23): `verify` is what people wire into CI, and sscsb is
+    /// pointed at repositories it does not trust. A few hundred bytes of nested
+    /// YAML anchors made yaml-rust2 clone its way past 4.5 GB RSS with no end
+    /// in sight — a denial of service reachable by anyone who can add a file to
+    /// the repository. The document must be REFUSED, not expanded.
+    #[test]
+    fn security_insights_refuses_an_alias_bomb_instead_of_expanding_it() {
+        let (_d, ctx) = repo();
+        assert!(
+            ALIAS_BOMB.len() < 1000,
+            "the bomb must stay small — the point is that the FILE is tiny"
+        );
+        std::fs::write(ctx.root.join("security-insights.yml"), ALIAS_BOMB).unwrap();
+
+        let started = std::time::Instant::now();
+        let r = verify_security_insights(&ctx);
+        let elapsed = started.elapsed();
+
+        assert_eq!(r.outcome, Outcome::Fail, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("REFUSED, not parsed")),
+            "{:?}",
+            r.messages
+        );
+        assert!(
+            r.messages.iter().any(|m| m.contains("billion laughs")),
+            "{:?}",
+            r.messages
+        );
+        // Refusing is cheap; expanding is not. Pre-fix this same document took
+        // ~1s and ~125MB before answering (and grows geometrically with one
+        // more line), so the bound is the regression signal, not decoration.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "refusing the bomb took {elapsed:?} — the guard is not short-circuiting"
+        );
+    }
+
+    /// The guard must catch amplification, not anchors. A file that reuses an
+    /// anchor the way a human would still parses and still passes.
+    #[test]
+    fn security_insights_still_accepts_ordinary_anchor_reuse() {
+        let (_d, ctx) = repo();
+        let legit = "header:\n  schema-version: \"2.0.0\"\n  url: \"https://example.com/si.yml\"\nproject:\n  name: \"acme/widget\"\n  administrators: &admins\n    - name: \"Real Maintainer\"\n      primary: true\n  responsible-disclosure: *admins\n  security-contacts: *admins\n";
+        std::fs::write(ctx.root.join("security-insights.yml"), legit).unwrap();
+        let r = verify_security_insights(&ctx);
+        assert_eq!(r.outcome, Outcome::Pass, "{:?}", r.messages);
+    }
+
+    /// The bounded read is the other half of M23: sscsb must not slurp an
+    /// arbitrarily large file just because it is named `security-insights.yml`.
+    #[test]
+    fn security_insights_refuses_a_file_past_the_byte_ceiling() {
+        let (_d, ctx) = repo();
+        let mut huge = String::from("header:\n  schema-version: \"2.0.0\"\n");
+        while huge.len() <= MAX_SI_BYTES {
+            huge.push_str("# padding padding padding padding padding padding padding\n");
+        }
+        std::fs::write(ctx.root.join("security-insights.yml"), &huge).unwrap();
+        let r = verify_security_insights(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("byte ceiling")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// The node counter models the loader's own cost: a scalar is one node, a
+    /// collection is one plus its children, and an alias costs what it clones.
+    #[test]
+    fn node_budget_charges_an_alias_what_the_loader_would_clone() {
+        // 3 scalars + 1 seq node = 4; the root map is 1 + key + value.
+        assert_eq!(expanded_node_count("a: [1, 2, 3]\n"), Some(6));
+        // The alias costs the whole 4-node sequence again, not one token.
+        assert_eq!(expanded_node_count("a: &s [1, 2, 3]\nb: *s\n"), Some(11));
+        // An alias to an anchor that never resolves is the loader's BadValue:
+        // one node, so a dangling reference cannot be inflated either.
+        assert_eq!(expanded_node_count("a: *nope\n"), None);
+        // Not YAML at all: the caller falls through to the loader's own error.
+        assert_eq!(expanded_node_count("header: [this is: not: valid"), None);
     }
 
     #[test]
