@@ -518,15 +518,18 @@ fn verify_receipt_signature(
             bundle.display()
         ));
     }
-    let opt = |key: &str| {
-        ctx.config
-            .as_ref()
-            .and_then(|c| c.control_opt_str("ai-receipts", key))
+    // Each key is read by its own literal `control_opt_str` call rather than
+    // through a shared `|key|` closure. `every_generated_config_key_has_a_reader`
+    // proves a generated key is not inert by finding the accessor next to the key
+    // name in source, and a closure taking the key as a parameter reads the config
+    // correctly while being invisible to that scan — which is indistinguishable,
+    // to the guard, from the dead keys it exists to catch. Keep the accessor and
+    // the key literal together; the duplicated `.filter` is the price.
+    let cfg = ctx.config.as_ref();
+    let identity = identity.map(str::to_string).or_else(|| {
+        cfg.and_then(|c| c.control_opt_str("ai-receipts", "cosign_identity"))
             .filter(|s| !s.trim().is_empty())
-    };
-    let identity = identity
-        .map(str::to_string)
-        .or_else(|| opt("cosign_identity"));
+    });
     let identity = identity.context(
         "this receipt is SIGNED but there is no identity to verify the signature against — \
          pass `--identity <certificate identity>` or set cosign_identity under \
@@ -535,7 +538,10 @@ fn verify_receipt_signature(
     )?;
     let issuer = issuer
         .map(str::to_string)
-        .or_else(|| opt("cosign_issuer"))
+        .or_else(|| {
+            cfg.and_then(|c| c.control_opt_str("ai-receipts", "cosign_issuer"))
+                .filter(|s| !s.trim().is_empty())
+        })
         .unwrap_or_else(|| GITHUB_OIDC_ISSUER.to_string());
     cosign_verify_blob(ctx, receipt_path, &bundle, &identity, &issuer)?;
     Ok(format!(
