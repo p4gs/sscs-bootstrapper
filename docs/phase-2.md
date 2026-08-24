@@ -79,6 +79,44 @@ sscsb vex create --vuln RUSTSEC-2024-0375 --product pkg:cargo/atty \
   --status not_affected --justification vulnerable_code_not_present
 ```
 
+### Suppression is allowed. Silence is not.
+
+The scanners take configuration out of the repository without being asked:
+Trivy reads `trivy.yaml` and `.trivyignore` from the directory it scans,
+OSV-Scanner reads `osv-scanner.toml` from the tree. Committing the file is the
+whole install step. On one fixture a `trivy.yaml` of `severity: [CRITICAL]`
+took a scan from 3 findings to 1, and a single `[[IgnoredVulns]]` entry took
+OSV-Scanner from 8 to 6 — and the report said nothing at all.
+
+`sscsb` does not override these files. They are legitimate, and this repo's own
+`.trivyignore` is the example: two container rules that cannot model an
+OSS-Fuzz build image, waived with per-ID rationale in the file. Overriding a
+deliberate waiver would break real decisions and push people into disabling
+scanning altogether, which is worse than the waiver. What was wrong was never
+that suppression exists — it was that it was invisible.
+
+So `sscsb` inherits the waiver and states it, the way it already states VEX
+suppressions:
+
+```text
+note: scanner config: trivy.yaml is present and trivy loads it automatically, and it
+      NARROWS this scan: severity=[CRITICAL] (only these severities are reported at all)
+note: scanner config: .trivyignore is present with 1 entr(ies): CVE-2021-25900
+suppressed: CVE-2021-25900 (smallvec) — trivy ignored via .trivyignore: reviewed 2026-08
+suppressed: RUSTSEC-2021-0003 and 2 aliases — osv-scanner filtered out: not reachable here
+```
+
+Two layers, because one is not enough. The `suppressed:` rows come from the
+scanners themselves — Trivy's `--show-suppressed`, OSV-Scanner's stderr (which
+is the only place it says so; its JSON never mentions a filtered vulnerability,
+even under `--all-vulns`). The `note:` lines come from reading the config files
+directly, which is the *only* signal for `trivy.yaml` narrowing: findings
+excluded by a `severity` allowlist or a `skip-dirs` entry are filtered before
+they are findings, and Trivy reports nothing about them even when asked to show
+suppressions. `sscsb verify` prints the same inventory. It does not change the
+verdict — a documented waiver is a decision, not a failure — so if you want a
+gate on it, `verify --strict` plus a review of that inventory is the place.
+
 ## Package trust — the AI-era control
 
 A model will confidently tell you to install a package that does not exist. If an

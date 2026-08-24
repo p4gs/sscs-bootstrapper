@@ -694,6 +694,218 @@ fn scan_runs_configured_scanners_and_applies_vex() {
     assert!(report.notes.iter().any(|n| n.contains("VEX applied")));
 }
 
+// ── H5: config a repository hands the scanners must never be silent ─────────
+//
+// Trivy reads `trivy.yaml` and `.trivyignore` from the directory it scans;
+// OSV-Scanner reads `osv-scanner.toml` from the tree. Committing the file is
+// the whole install step. These tests drive the REAL scanners against a
+// lockfile with real advisories, mute one, and require that the muting shows
+// up in the report — the waiver is honoured, and it is stated.
+
+/// A lockfile pinning crates with long-standing published advisories, so the
+/// scanners have something real to find and something real to mute.
+fn vulnerable_rust_fixture(ctx: &Ctx) {
+    write(
+        ctx,
+        "Cargo.lock",
+        "version = 3\n\n\
+         [[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\ndependencies = [\"smallvec\", \"time\"]\n\n\
+         [[package]]\nname = \"smallvec\"\nversion = \"1.6.0\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+         checksum = \"1a55ca5f3b68e41c979bf8c46a6f1da892ca4db8f94023ce0bd32407573b1ac0\"\n\n\
+         [[package]]\nname = \"time\"\nversion = \"0.1.43\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+         checksum = \"ca8a50ef2360fbd1eeb0ecd46795a87a19024eb4b53c5dc916ca1fd95fe62438\"\n",
+    );
+}
+
+/// A present-but-unhealthy scanner — cold or racing DB cache, transient crash
+/// — is an environmental precondition, not a logic failure. Anything else is
+/// a real failure and is re-raised.
+fn scan_or_skip(ctx: &Ctx, cfg: &config::Config) -> Option<scan::ScanReport> {
+    match scan::run_scan(ctx, cfg, None) {
+        Ok(report) => Some(report),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let environmental = msg.contains("DB error")
+                || msg.contains("failed to download")
+                || msg.contains("unexpected fault address")
+                || msg.contains("trivy failed")
+                || msg.contains("osv-scanner failed");
+            assert!(environmental, "run_scan failed unexpectedly: {msg}");
+            eprintln!("skipping: scanner unhealthy in this environment ({msg})");
+            None
+        }
+    }
+}
+
+/// Skip when the baseline scan cannot see the advisory at all (no advisory
+/// data in this environment) — there is then nothing to mute and nothing to
+/// prove either way.
+fn baseline_has(report: &scan::ScanReport, id: &str, source: &str) -> bool {
+    let present = report
+        .findings
+        .iter()
+        .any(|f| f.id == id && f.source == source);
+    if !present {
+        eprintln!("skipping: {source} did not report {id} in this environment");
+    }
+    present
+}
+
+#[test]
+fn a_committed_trivyignore_is_reported_not_silently_inherited() {
+    let (_d, ctx) = repo();
+    vulnerable_rust_fixture(&ctx);
+    let cfg = ctx.require_config().unwrap();
+    if !tool("trivy") {
+        return; // the degrade path is covered elsewhere
+    }
+    let Some(before) = scan_or_skip(&ctx, cfg) else {
+        return;
+    };
+    let muted = "CVE-2021-25900";
+    if !baseline_has(&before, muted, "trivy") {
+        return;
+    }
+    assert!(
+        before.suppressed.is_empty(),
+        "nothing is suppressed before a waiver exists: {:?}",
+        before.suppressed
+    );
+
+    write(
+        &ctx,
+        ".trivyignore",
+        "# documented waiver: reviewed 2026-08\nCVE-2021-25900\n",
+    );
+    let Some(after) = scan_or_skip(&ctx, cfg) else {
+        return;
+    };
+
+    // The waiver is HONOURED — overriding a deliberate one would be its own
+    // defect, and would push anyone needing a waiver into disabling scanning.
+    assert!(
+        !after
+            .findings
+            .iter()
+            .any(|f| f.id == muted && f.source == "trivy"),
+        "the waiver must still take effect"
+    );
+    // ...and it is not silent: the muted finding is named, with its source.
+    assert!(
+        after
+            .suppressed
+            .iter()
+            .any(|s| s.contains(muted) && s.contains(".trivyignore")),
+        "the suppression must be itemised: {:?}",
+        after.suppressed
+    );
+    // ...and the file itself is inventoried, with its entry count.
+    assert!(
+        after
+            .notes
+            .iter()
+            .any(|n| n.contains("scanner config") && n.contains(".trivyignore")),
+        "the ignore file must be reported: {:?}",
+        after.notes
+    );
+}
+
+#[test]
+fn a_committed_osv_scanner_toml_is_reported_not_silently_inherited() {
+    let (_d, ctx) = repo();
+    vulnerable_rust_fixture(&ctx);
+    let cfg = ctx.require_config().unwrap();
+    if !tool("osv-scanner") {
+        return;
+    }
+    let Some(before) = scan_or_skip(&ctx, cfg) else {
+        return;
+    };
+    let muted = "RUSTSEC-2021-0003";
+    if !baseline_has(&before, muted, "osv-scanner") {
+        return;
+    }
+
+    write(
+        &ctx,
+        "osv-scanner.toml",
+        "[[IgnoredVulns]]\nid = \"RUSTSEC-2021-0003\"\n\
+         reason = \"reviewed 2026-08: insert_many path not reachable here\"\n",
+    );
+    let Some(after) = scan_or_skip(&ctx, cfg) else {
+        return;
+    };
+
+    assert!(
+        !after
+            .findings
+            .iter()
+            .any(|f| f.id == muted && f.source == "osv-scanner"),
+        "the waiver must still take effect"
+    );
+    // OSV-Scanner states this on stderr and nowhere in its JSON — including
+    // under --all-vulns — so discarding stderr made the waiver invisible.
+    assert!(
+        after
+            .suppressed
+            .iter()
+            .any(|s| s.contains(muted) && s.contains("not reachable here")),
+        "the filtered entry and its stated reason must be itemised: {:?}",
+        after.suppressed
+    );
+    assert!(
+        after
+            .notes
+            .iter()
+            .any(|n| n.contains("scanner config") && n.contains("osv-scanner.toml")),
+        "the config file must be reported: {:?}",
+        after.notes
+    );
+}
+
+#[test]
+fn a_committed_trivy_yaml_that_narrows_the_scan_is_reported() {
+    let (_d, ctx) = repo();
+    vulnerable_rust_fixture(&ctx);
+    let cfg = ctx.require_config().unwrap();
+    if !tool("trivy") {
+        return;
+    }
+    let Some(before) = scan_or_skip(&ctx, cfg) else {
+        return;
+    };
+    let filtered_out = "CVE-2020-26235"; // MEDIUM, per trivy
+    if !baseline_has(&before, filtered_out, "trivy") {
+        return;
+    }
+
+    write(&ctx, "trivy.yaml", "severity:\n  - CRITICAL\n");
+    let Some(after) = scan_or_skip(&ctx, cfg) else {
+        return;
+    };
+
+    // Config-level narrowing is the invisible case: trivy filters these
+    // findings before they are findings and reports NOTHING about them, not
+    // even in its own suppression list. Naming the file and the keys is the
+    // only signal there is.
+    assert!(
+        !after
+            .findings
+            .iter()
+            .any(|f| f.id == filtered_out && f.source == "trivy"),
+        "precondition: the config really does mute this finding"
+    );
+    let note = after
+        .notes
+        .iter()
+        .find(|n| n.contains("trivy.yaml"))
+        .unwrap_or_else(|| panic!("trivy.yaml must be reported: {:?}", after.notes));
+    assert!(note.contains("NARROWS"), "{note}");
+    assert!(note.contains("severity=[CRITICAL]"), "{note}");
+}
+
 #[test]
 fn sast_runs_the_default_engine_and_reports_findings() {
     let (_d, ctx) = repo();

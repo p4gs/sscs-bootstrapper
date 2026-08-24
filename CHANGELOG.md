@@ -10,6 +10,32 @@ versions.
 
 ### Fixed
 
+- **A file committed to the repository silently muted the scanners.** Trivy
+  reads `trivy.yaml` and `.trivyignore` from the directory it scans;
+  OSV-Scanner reads `osv-scanner.toml` from the tree. None of it is asked
+  for — committing the file is the entire install step. Measured on one
+  fixture: a `trivy.yaml` of `severity: [CRITICAL]` took a scan from 3 findings
+  to 1, and one `[[IgnoredVulns]]` entry took OSV-Scanner from 8 to 6, with not
+  one `note:` or `suppressed:` line to show for it.
+  The fix **inherits the waiver and reports it**, rather than overriding it —
+  these files are legitimate, and this repository's own `.trivyignore` is the
+  example (two container rules that genuinely cannot model an OSS-Fuzz build
+  image, with per-ID rationale in the file). Overriding them would break that
+  class of documented waiver, and would push anyone who needs one into turning
+  the control off. So suppression is honoured and *named*, the way `apply_vex`
+  already did it, in two layers:
+  - the scanners' own suppression channels — Trivy's `--show-suppressed` and
+    OSV-Scanner's stderr — now yield one `suppressed:` row per muted finding,
+    carrying the source (`.trivyignore`, a VEX document) and the reason its
+    author wrote. OSV-Scanner states this on stderr and nowhere in its JSON,
+    not even under `--all-vulns`; discarding stderr on success was what made
+    an `osv-scanner.toml` invisible.
+  - `sscsb` names every scanner-config file it finds and what that file does.
+    This is the only signal there is for `trivy.yaml` narrowing, which Trivy
+    reports nothing about even under `--show-suppressed` (measured on 0.72.0),
+    and it is the backstop if a scanner's output shape changes underneath the
+    first layer. `sscsb verify` states the same inventory without changing the
+    verdict: a documented waiver is a decision, not a failure.
 - **A severity we could not determine ranked below `low`, so real advisories
   could not breach the gate.** `severity_rank` ended in `.unwrap_or(0)`: every
   string that was not one of `low|medium|high|critical` ranked *beneath the

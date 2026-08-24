@@ -93,6 +93,10 @@ pub fn run_scan(ctx: &Ctx, cfg: &Config, vex_path: Option<&Path>) -> Result<Scan
     let mut report = ScanReport::default();
     let mut ran = 0u32;
 
+    // Before anything runs: say what configuration the scanners are about to
+    // pick up out of the repository. See `scanner_config_notes`.
+    report.notes.extend(scanner_config_notes(&ctx.root));
+
     if tools::is_available("trivy") {
         ran += 1;
         run_trivy(ctx, &mut report)?;
@@ -130,6 +134,209 @@ pub fn run_scan(ctx: &Ctx, cfg: &Config, vex_path: Option<&Path>) -> Result<Scan
     Ok(report)
 }
 
+/// `trivy.yaml` keys that REDUCE what a scan can report, and what each does.
+///
+/// Trivy has many settings; these are the ones whose effect is, in the output,
+/// indistinguishable from a clean scan. Operational keys (`cache`, `timeout`,
+/// `db.repository` for an air-gapped mirror) narrow nothing and are reported
+/// as present without being called out.
+const TRIVY_NARROWING_KEYS: &[(&str, &str)] = &[
+    ("severity", "only these severities are reported at all"),
+    ("ignorefile", "ignore entries are read from another path"),
+    ("ignore-policy", "a Rego policy decides what is dropped"),
+    ("scan.scanners", "only these scanners run"),
+    ("scan.skip-dirs", "these directories are never scanned"),
+    ("scan.skip-files", "these files are never scanned"),
+    ("scan.offline-scan", "no advisory lookups are performed"),
+    (
+        "vulnerability.ignore-unfixed",
+        "vulnerabilities without a fix are dropped",
+    ),
+    ("vulnerability.type", "only these package types are scanned"),
+    (
+        "secret.config",
+        "custom secret rules, which can disable built-in ones",
+    ),
+    (
+        "db.skip-update",
+        "the vulnerability database is not refreshed",
+    ),
+];
+
+/// Report the scanner configuration this repository hands the scanners.
+///
+/// Trivy reads `trivy.yaml` and `.trivyignore` from the directory it is run
+/// in; OSV-Scanner reads `osv-scanner.toml` from the tree it scans. Neither is
+/// asked for — committing the file is enough. Measured on one fixture: a
+/// `trivy.yaml` of `severity: [CRITICAL]` took a scan from 3 findings to 1,
+/// and an `osv-scanner.toml` with one `[[IgnoredVulns]]` entry took 8 to 6.
+/// Nothing in either scanner's JSON said a word about it.
+///
+/// **The deliberate choice here is to inherit, and report — not to override.**
+/// These files are legitimate: this repository's own `.trivyignore` waives two
+/// container rules that genuinely cannot model an OSS-Fuzz build image, with
+/// per-ID rationale in the file. Passing `--config`/`--ignorefile` to neutralise
+/// them would break that class of documented waiver, and — worse — would push
+/// anyone who needs one into disabling the control outright. The defect was
+/// never that suppression exists; it is that it was silent. So suppression is
+/// honoured and *named*, exactly as [`apply_vex`] does it.
+///
+/// Two layers, because one is not enough:
+/// * the scanners' own suppression channels — Trivy's `--show-suppressed` and
+///   OSV-Scanner's stderr — itemise each muted finding with its reason;
+/// * this function names the files and what they change, which is the only
+///   signal for `trivy.yaml` narrowing (Trivy reports nothing for it even
+///   under `--show-suppressed` — measured on 0.72.0) and the backstop if a
+///   scanner's output shape ever changes underneath the first layer.
+pub fn scanner_config_notes(root: &Path) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(note) = trivy_config_note(&root.join("trivy.yaml")) {
+        notes.push(note);
+    }
+    for name in [".trivyignore", ".trivyignore.yaml"] {
+        if let Some(note) = trivy_ignorefile_note(&root.join(name), name) {
+            notes.push(note);
+        }
+    }
+    if let Some(note) = osv_config_note(&root.join("osv-scanner.toml")) {
+        notes.push(note);
+    }
+    notes
+}
+
+fn trivy_config_note(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let head = "scanner config: trivy.yaml is present and trivy loads it automatically";
+    let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(&text) else {
+        // Unparseable to us is not "absent": trivy may still act on it.
+        return Some(format!(
+            "{head} — sscsb could not parse it to say what it does"
+        ));
+    };
+    let Some(doc) = docs.first() else {
+        return Some(format!("{head} — it is empty"));
+    };
+    let narrowing: Vec<String> = TRIVY_NARROWING_KEYS
+        .iter()
+        .filter_map(|(key, effect)| {
+            let node = yaml_at(doc, key);
+            (!node.is_badvalue()).then(|| format!("{key}={} ({effect})", yaml_summary(node)))
+        })
+        .collect();
+    Some(if narrowing.is_empty() {
+        format!("{head} — no key in it narrows what this scan reports")
+    } else {
+        format!(
+            "{head}, and it NARROWS this scan: {}. Findings excluded this way are \
+             not reported by trivy at all, here or in its own suppression list",
+            narrowing.join("; ")
+        )
+    })
+}
+
+/// Walk a dotted path (`scan.skip-dirs`) into a YAML document. Missing nodes
+/// come back as `BadValue`, which is how the caller tests for absence.
+fn yaml_at<'a>(doc: &'a yaml_rust2::Yaml, dotted: &str) -> &'a yaml_rust2::Yaml {
+    let mut node = doc;
+    for key in dotted.split('.') {
+        node = &node[key];
+    }
+    node
+}
+
+fn yaml_summary(node: &yaml_rust2::Yaml) -> String {
+    use yaml_rust2::Yaml;
+    match node {
+        Yaml::String(s) => s.clone(),
+        Yaml::Boolean(b) => b.to_string(),
+        Yaml::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(yaml_summary)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        // Anything else (a bare key with no value, a number, a nested map)
+        // gets a presence marker: the point of the note is WHICH key narrows
+        // the scan, and the file is right there to read for the detail.
+        _ => "set".to_string(),
+    }
+}
+
+fn trivy_ignorefile_note(path: &Path, name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let entries: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    let preview = entries
+        .iter()
+        .take(8)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ellipsis = if entries.len() > 8 { ", …" } else { "" };
+    Some(format!(
+        "scanner config: {name} is present with {} entr(ies){}{preview}{ellipsis} — \
+         suppressions it causes are listed individually as `suppressed:` rows",
+        entries.len(),
+        if entries.is_empty() { "" } else { ": " },
+    ))
+}
+
+fn osv_config_note(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let head = "scanner config: osv-scanner.toml is present and osv-scanner loads it automatically";
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Some(format!(
+            "{head} — sscsb could not parse it to say what it does"
+        ));
+    };
+    let entries = |key: &str, field: &str| -> Vec<String> {
+        table
+            .get(key)
+            .and_then(toml::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|e| {
+                        e.get(field)
+                            .and_then(toml::Value::as_str)
+                            .unwrap_or("?")
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let ignored = entries("IgnoredVulns", "id");
+    let overrides = entries("PackageOverrides", "name");
+    if ignored.is_empty() && overrides.is_empty() {
+        return Some(format!("{head} — it names no vulnerabilities or packages"));
+    }
+    let mut parts = Vec::new();
+    if !ignored.is_empty() {
+        parts.push(format!(
+            "ignores {} ({})",
+            ignored.len(),
+            ignored.join(", ")
+        ));
+    }
+    if !overrides.is_empty() {
+        parts.push(format!(
+            "overrides {} package(s) ({})",
+            overrides.len(),
+            overrides.join(", ")
+        ));
+    }
+    Some(format!(
+        "{head}: it {} — an ignore entry mutes the whole alias group, and each \
+         filtered entry is listed as a `suppressed:` row",
+        parts.join(" and ")
+    ))
+}
+
 fn run_trivy(ctx: &Ctx, report: &mut ScanReport) -> Result<()> {
     let root = ctx.root.display().to_string();
     let out = exec::run(
@@ -141,6 +348,12 @@ fn run_trivy(ctx: &Ctx, report: &mut ScanReport) -> Result<()> {
             "--format",
             "json",
             "--quiet",
+            // Trivy honours a `.trivyignore` it finds in the scan directory,
+            // and without this it reports the survivors only. This asks it to
+            // itemise what it muted, so a waiver stays a waiver but stops
+            // being invisible. It changes nothing about which findings are
+            // reported as findings.
+            "--show-suppressed",
             &root,
         ],
         Some(&ctx.root),
@@ -149,7 +362,86 @@ fn run_trivy(ctx: &Ctx, report: &mut ScanReport) -> Result<()> {
         anyhow::bail!("trivy failed (exit {}): {}", out.status, out.stderr.trim());
     }
     report.findings.extend(parse_trivy(&out.stdout)?);
+    let suppressed = parse_trivy_suppressions(&out.stdout)?;
+    if !suppressed.is_empty() {
+        report.notes.push(format!(
+            "trivy: {} finding(s) suppressed by configuration trivy loaded from the \
+             repository — each is listed as a `suppressed:` row",
+            suppressed.len()
+        ));
+        report.suppressed.extend(suppressed);
+    }
     Ok(())
+}
+
+/// The suppressions Trivy itself reports under `--show-suppressed`: one row
+/// per finding an ignore file, an ignore policy, or a VEX document muted.
+///
+/// This is the same contract [`apply_vex`] holds itself to — suppression is
+/// honoured and *named*, never silent. Trivy states the source (`.trivyignore`,
+/// a policy path, a VEX document) and the statement its author wrote, so the
+/// row can carry the reason rather than just the count.
+///
+/// It does NOT cover everything a config file can do: `trivy.yaml` narrowing
+/// (a `severity` allowlist, `skip-dirs`, disabled scanners) filters findings
+/// before they are ever findings, and Trivy reports nothing at all for it —
+/// measured on 0.72.0. That gap is why [`scanner_config_notes`] exists.
+pub fn parse_trivy_suppressions(stdout: &str) -> Result<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(stdout).context("trivy output not JSON")?;
+    let mut rows = Vec::new();
+    for result in v
+        .get("Results")
+        .and_then(|r| r.as_array())
+        .unwrap_or(&Vec::new())
+    {
+        let target = result
+            .get("Target")
+            .and_then(|x| x.as_str())
+            .unwrap_or("this repository");
+        for modified in result
+            .get("ExperimentalModifiedFindings")
+            .and_then(|x| x.as_array())
+            .unwrap_or(&Vec::new())
+        {
+            let status = modified
+                .get("Status")
+                .and_then(|x| x.as_str())
+                .unwrap_or("modified");
+            let source = modified
+                .get("Source")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("trivy configuration");
+            let finding = modified.get("Finding");
+            let id = finding
+                .and_then(|f| {
+                    f.get("VulnerabilityID")
+                        .or_else(|| f.get("ID"))
+                        .or_else(|| f.get("RuleID"))
+                })
+                .and_then(|x| x.as_str())
+                .unwrap_or("?");
+            let package = finding
+                .and_then(|f| f.get("PkgName"))
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(target);
+            let statement = modified
+                .get("Statement")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim();
+            let reason = if statement.is_empty() {
+                String::new()
+            } else {
+                format!(": {statement}")
+            };
+            rows.push(format!(
+                "{id} ({package}) — trivy {status} via {source}{reason}"
+            ));
+        }
+    }
+    Ok(rows)
 }
 
 pub fn parse_trivy(stdout: &str) -> Result<Vec<VulnFinding>> {
@@ -260,7 +552,67 @@ fn run_osv(ctx: &Ctx, report: &mut ScanReport) -> Result<()> {
             .push("osv-scanner: no packages found to scan".into()),
         code => anyhow::bail!("osv-scanner failed (exit {code}): {}", out.stderr.trim()),
     }
+    // What an `osv-scanner.toml` muted is stated on stderr and nowhere in the
+    // JSON — including under `--all-vulns`. Discarding stderr on success is
+    // what made a committed config file invisible.
+    let (suppressed, notes) = osv_filter_report(&out.stderr);
+    if !suppressed.is_empty() {
+        report.notes.push(format!(
+            "osv-scanner: {} entr(ies) filtered out by configuration it loaded from the \
+             repository — each is listed as a `suppressed:` row",
+            suppressed.len()
+        ));
+    }
+    report.suppressed.extend(suppressed);
+    report.notes.extend(notes);
     Ok(())
+}
+
+/// Read OSV-Scanner's own account of what its config filtered, off stderr.
+///
+/// Returns `(suppressed rows, notes)`. The shapes below are `osv-scanner
+/// 2.4.0`'s, captured from live runs:
+///
+/// ```text
+/// Loaded filter from: /repo/osv-scanner.toml
+/// RUSTSEC-2021-0003 and 2 aliases have been filtered out because: <reason>
+/// RUSTSEC-2020-0159 has been filtered out because: <reason>
+/// Package crates.io/atty/0.2.14 has been filtered out because: <reason>
+/// ```
+///
+/// Note the two verb forms: an entry with aliases says "have been", a lone one
+/// says "has been". Matching only the singular silently dropped exactly the
+/// alias-group case — the one that mutes the most.
+///
+/// The match is deliberately loose — the marker phrase, not a full grammar —
+/// so a wording change costs detail rather than the whole signal, and
+/// [`scanner_config_notes`] still reports the file either way.
+fn osv_filter_report(stderr: &str) -> (Vec<String>, Vec<String>) {
+    const FILTERED: &str = " been filtered out because:";
+    let mut suppressed = Vec::new();
+    let mut notes = Vec::new();
+    for line in stderr.lines().map(str::trim) {
+        if let Some(path) = line.strip_prefix("Loaded filter from:") {
+            notes.push(format!(
+                "osv-scanner loaded a filter config from the repository: {}",
+                path.trim()
+            ));
+        } else if let Some((subject, reason)) = line.split_once(FILTERED) {
+            // "X and N aliases" keeps the alias count, which matters: an
+            // ignore entry mutes the whole alias group, not one id. The verb
+            // is left out of the subject, whichever form it took.
+            let subject = subject.trim();
+            let subject = subject
+                .strip_suffix(" have")
+                .or_else(|| subject.strip_suffix(" has"))
+                .unwrap_or(subject);
+            suppressed.push(format!(
+                "{subject} — osv-scanner filtered out: {}",
+                reason.trim()
+            ));
+        }
+    }
+    (suppressed, notes)
 }
 
 pub fn parse_osv(stdout: &str) -> Result<Vec<VulnFinding>> {
@@ -703,6 +1055,12 @@ pub fn verify_scan_control(ctx: &Ctx) -> VerifyResult {
             }
         }
     }
+    // Which tools are installed is only half of what this control depends on;
+    // the other half is what the repository tells them to skip. `verify` is
+    // where a reviewer looks, so the inventory is stated here too. It does not
+    // move the verdict: a documented waiver is a decision, not a failure —
+    // see `scanner_config_notes` for why inherit-and-report is the contract.
+    messages.extend(scanner_config_notes(&ctx.root));
     VerifyResult::new("vuln-scan", outcome, messages)
 }
 
@@ -1428,5 +1786,202 @@ mod tests {
         } else {
             assert_eq!(result.outcome, Outcome::Degraded);
         }
+    }
+
+    // ── H5: scanner configuration the repository supplies ───────────────────
+
+    /// Every file the scanners pick up on their own is named, along with what
+    /// it does — the part a `trivy.yaml` narrowing never reveals any other way.
+    #[test]
+    fn scanner_config_files_are_reported_with_what_they_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(
+            scanner_config_notes(root).is_empty(),
+            "a repo with no scanner config has nothing to report"
+        );
+
+        std::fs::write(
+            root.join("trivy.yaml"),
+            "severity:\n  - CRITICAL\n\
+             scan:\n  skip-dirs:\n    - vendor\n\
+             ignorefile: waivers/custom.ignore\n\
+             vulnerability:\n  ignore-unfixed: true\n\
+             db:\n  skip-update:\n\
+             timeout: 5m\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".trivyignore"),
+            "# documented waiver\nDS-0002\nDS-0026\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("osv-scanner.toml"),
+            "[[IgnoredVulns]]\nid = \"RUSTSEC-2021-0003\"\nreason = \"reviewed\"\n\n\
+             [[PackageOverrides]]\nname = \"atty\"\nignore = true\n",
+        )
+        .unwrap();
+        let notes = scanner_config_notes(root).join("\n");
+
+        // trivy.yaml: named, and its narrowing keys spelled out with values.
+        assert!(notes.contains("trivy.yaml"), "{notes}");
+        assert!(notes.contains("NARROWS"), "{notes}");
+        assert!(notes.contains("severity=[CRITICAL]"), "{notes}");
+        assert!(notes.contains("scan.skip-dirs=[vendor]"), "{notes}");
+        // Every value shape a real trivy.yaml uses renders readably.
+        assert!(
+            notes.contains("ignorefile=waivers/custom.ignore"),
+            "{notes}"
+        );
+        assert!(
+            notes.contains("vulnerability.ignore-unfixed=true"),
+            "{notes}"
+        );
+        // A key present with no value still narrows, and still shows up.
+        assert!(notes.contains("db.skip-update=set"), "{notes}");
+        // An operational key is not misreported as a narrowing one.
+        assert!(!notes.contains("timeout="), "{notes}");
+
+        // .trivyignore: entry count and the ids, comments excluded.
+        assert!(
+            notes.contains(".trivyignore is present with 2 entr"),
+            "{notes}"
+        );
+        assert!(notes.contains("DS-0002, DS-0026"), "{notes}");
+        assert!(!notes.contains("documented waiver"), "{notes}");
+
+        // osv-scanner.toml: what it ignores and what it overrides.
+        assert!(notes.contains("osv-scanner.toml"), "{notes}");
+        assert!(notes.contains("ignores 1 (RUSTSEC-2021-0003)"), "{notes}");
+        assert!(notes.contains("overrides 1 package(s) (atty)"), "{notes}");
+    }
+
+    /// A config file we cannot read is still a config file the scanner acts
+    /// on: unparseable must report presence, never absence.
+    #[test]
+    fn unparseable_scanner_config_is_reported_as_present_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("trivy.yaml"), "\tthis: [is not: yaml\n").unwrap();
+        std::fs::write(root.join("osv-scanner.toml"), "not [ valid toml\n").unwrap();
+        let notes = scanner_config_notes(root).join("\n");
+        assert_eq!(notes.matches("could not parse it").count(), 2, "{notes}");
+        assert!(notes.contains("trivy.yaml is present"), "{notes}");
+        assert!(notes.contains("osv-scanner.toml is present"), "{notes}");
+
+        // An empty or effect-free config says so rather than implying muting.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("trivy.yaml"), "timeout: 5m\n").unwrap();
+        std::fs::write(dir.path().join("osv-scanner.toml"), "# nothing\n").unwrap();
+        std::fs::write(dir.path().join(".trivyignore"), "# only a comment\n").unwrap();
+        let notes = scanner_config_notes(dir.path()).join("\n");
+        assert!(notes.contains("no key in it narrows"), "{notes}");
+        assert!(
+            notes.contains("names no vulnerabilities or packages"),
+            "{notes}"
+        );
+        assert!(
+            notes.contains(".trivyignore is present with 0 entr"),
+            "{notes}"
+        );
+
+        // A completely empty trivy.yaml parses to no documents at all.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("trivy.yaml"), "").unwrap();
+        assert!(scanner_config_notes(dir.path())[0].contains("it is empty"));
+    }
+
+    /// Trivy's own suppression channel, as it reports it under
+    /// `--show-suppressed` — the row carries the source and the author's
+    /// statement, not just a count.
+    #[test]
+    fn parse_trivy_suppressions_names_the_source_and_the_stated_reason() {
+        let sample = r#"{"Results":[{"Target":"Cargo.lock","Type":"cargo","Vulnerabilities":[],
+            "ExperimentalModifiedFindings":[
+              {"Type":"vulnerability","Status":"ignored","Statement":"reviewed 2026-08",
+               "Source":".trivyignore",
+               "Finding":{"VulnerabilityID":"CVE-2021-25900","PkgName":"smallvec"}},
+              {"Type":"vulnerability","Status":"not_affected","Statement":"",
+               "Source":"vex.json",
+               "Finding":{"VulnerabilityID":"CVE-2020-26235","PkgName":"time"}}]},
+            {"Target":"Dockerfile","ExperimentalModifiedFindings":[
+              {"Status":"ignored","Source":".trivyignore","Finding":{"ID":"DS-0002"}}]},
+            {"Target":"clean.lock","Vulnerabilities":[]}]}"#;
+        let rows = parse_trivy_suppressions(sample).unwrap();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(
+            rows[0],
+            "CVE-2021-25900 (smallvec) — trivy ignored via .trivyignore: reviewed 2026-08"
+        );
+        // No statement: the row still names id, package, status and source.
+        assert_eq!(
+            rows[1],
+            "CVE-2020-26235 (time) — trivy not_affected via vex.json"
+        );
+        // A misconfiguration has no PkgName; the target stands in for it.
+        assert_eq!(
+            rows[2],
+            "DS-0002 (Dockerfile) — trivy ignored via .trivyignore"
+        );
+
+        // A report with no suppressions produces no rows, and a non-JSON blob
+        // is an error rather than a silent empty list.
+        assert!(parse_trivy_suppressions(TRIVY_SAMPLE).unwrap().is_empty());
+        assert!(parse_trivy_suppressions("not json").is_err());
+    }
+
+    /// OSV-Scanner states its filtering on stderr and nowhere else — not in
+    /// the JSON, not even under `--all-vulns`. Both verb forms it uses are
+    /// parsed; matching only the singular dropped exactly the alias-group
+    /// case, which is the one that mutes the most.
+    #[test]
+    fn osv_filter_report_reads_both_verb_forms_off_stderr() {
+        let stderr = "Scanning dir /repo\n\
+             Loaded filter from: /repo/osv-scanner.toml\n\
+             RUSTSEC-2021-0003 and 2 aliases have been filtered out because: not reachable\n\
+             RUSTSEC-2020-0159 has been filtered out because: accepted risk\n\
+             Package crates.io/atty/0.2.14 has been filtered out because: unmaintained, pinned\n\
+             Filtered 3 vulnerabilities from output\n";
+        let (suppressed, notes) = osv_filter_report(stderr);
+        assert_eq!(
+            suppressed,
+            vec![
+                "RUSTSEC-2021-0003 and 2 aliases — osv-scanner filtered out: not reachable",
+                "RUSTSEC-2020-0159 — osv-scanner filtered out: accepted risk",
+                "Package crates.io/atty/0.2.14 — osv-scanner filtered out: unmaintained, pinned",
+            ]
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("/repo/osv-scanner.toml"), "{:?}", notes);
+
+        // An ordinary run says nothing of the sort.
+        let (suppressed, notes) = osv_filter_report("Scanning dir /repo\nEnd status: 1 dirs\n");
+        assert!(suppressed.is_empty() && notes.is_empty());
+    }
+
+    /// `verify` is where a reviewer looks, so the inventory is stated there
+    /// too — without moving the verdict, because a documented waiver is a
+    /// decision rather than a failure.
+    #[test]
+    fn verify_scan_control_reports_repository_supplied_scanner_config() {
+        let (_d, ctx) = fresh_bootstrapped_repo();
+        let clean = verify_scan_control(&ctx);
+        assert!(!clean.messages.iter().any(|m| m.contains("scanner config")));
+
+        std::fs::write(ctx.root.join(".trivyignore"), "CVE-2021-25900\n").unwrap();
+        let with_config = verify_scan_control(&ctx);
+        assert!(
+            with_config
+                .messages
+                .iter()
+                .any(|m| m.contains("scanner config") && m.contains(".trivyignore")),
+            "{:?}",
+            with_config.messages
+        );
+        assert_eq!(
+            with_config.outcome, clean.outcome,
+            "a documented waiver is not a control failure"
+        );
     }
 }
