@@ -159,6 +159,30 @@ fn agents_md_exit_code_table_matches_reality() {
     );
 }
 
+/// The verdict table is the part of this doc an agent parses most literally,
+/// so its spellings must be the binary's own. `Outcome::Disabled` renders as
+/// lowercase `disabled` while every other symbol is uppercase, and the doc
+/// carried `DISABLED` until an evidence pass caught it — an agent
+/// string-matching the table would simply never match that row.
+#[test]
+fn agents_md_verdict_table_uses_the_binary_symbols() {
+    for outcome in [
+        controls::Outcome::Pass,
+        controls::Outcome::Fail,
+        controls::Outcome::Degraded,
+        controls::Outcome::Disabled,
+        controls::Outcome::Info,
+    ] {
+        let symbol = outcome.symbol();
+        assert!(
+            AGENTS_MD.contains(&format!("`{symbol}`")),
+            "AGENTS.md's verdict table is missing the exact symbol `{symbol}` \
+             that the binary prints — an agent matching on the doc's spelling \
+             would never match this outcome"
+        );
+    }
+}
+
 #[test]
 fn agents_md_states_the_ai_cannot_sign_invariant() {
     // This is the single load-bearing safety claim in the file. If a future
