@@ -1691,7 +1691,6 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         assert_eq!(signers[0].principal, "human@example.com");
     }
 
-    #[test]
     /// One key, two principals, two classes — the shape that defeated the
     /// protected-branch class gate entirely.
     ///
