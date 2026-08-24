@@ -960,9 +960,30 @@ pub fn verify_package_trust(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     }
     messages.push("new-package approval gate enforced in commit-msg hook".into());
     let outcome = if packages_policy_path(ctx).is_file() {
-        let approved = load_approved(ctx).map(|s| s.len()).unwrap_or(0);
-        messages.push(format!("approved baseline present ({approved} package(s))"));
-        Outcome::Pass
+        // A baseline that cannot be parsed is not a baseline of zero packages —
+        // it is a baseline nobody can read, and the commit gate that consumes it
+        // cannot evaluate. Swallowing the error into `0 package(s)` reported the
+        // broken state as PASS.
+        match load_approved(ctx) {
+            Ok(approved) => {
+                messages.push(format!(
+                    "approved baseline present ({} package(s))",
+                    approved.len()
+                ));
+                Outcome::Pass
+            }
+            Err(err) => {
+                messages.push(format!(
+                    "approved baseline UNREADABLE — the commit gate cannot evaluate it: {err:#}"
+                ));
+                messages.push(
+                    "fix .sscsb/policy/packages.toml (or delete it and re-run \
+                     `sscsb deps baseline`) — nothing was verified"
+                        .into(),
+                );
+                Outcome::Degraded
+            }
+        }
     } else {
         messages.push(
             "no approved-packages baseline yet — run `sscsb deps baseline` to bless current deps"
@@ -1637,6 +1658,44 @@ mod tests {
         // the control passes.
         approve_package(&ctx, "cargo:serde").unwrap();
         assert_eq!(verify_package_trust(&ctx, cfg).outcome, Outcome::Pass);
+    }
+
+    /// Regression (H4): a baseline file that exists but cannot be parsed is not
+    /// a baseline of zero packages — it is a baseline the commit gate cannot
+    /// evaluate. `load_approved(..).map(len).unwrap_or(0)` swallowed the parse
+    /// error and reported `approved baseline present (0 package(s))` under a
+    /// PASS verdict, so corrupting the file looked healthier than deleting it.
+    #[test]
+    fn verify_package_trust_degrades_when_the_baseline_cannot_be_parsed() {
+        let (_d, ctx) = repo_ctx();
+        let cfg = ctx.require_config().unwrap();
+        // Sanity: the pristine bootstrapped baseline passes.
+        assert_eq!(verify_package_trust(&ctx, cfg).outcome, Outcome::Pass);
+
+        // One appended line — the whole file stops parsing.
+        let path = packages_policy_path(&ctx);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("garbage [ not toml\n");
+        std::fs::write(&path, text).unwrap();
+
+        let result = verify_package_trust(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.contains("approved baseline UNREADABLE")),
+            "{:?}",
+            result.messages
+        );
+        assert!(
+            !result
+                .messages
+                .iter()
+                .any(|m| m.contains("baseline present (0 package(s))")),
+            "an unparseable baseline must never be reported as an empty one: {:?}",
+            result.messages
+        );
     }
 
     #[test]

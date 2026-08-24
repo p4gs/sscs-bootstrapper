@@ -232,6 +232,9 @@ $ sscsb verify
            policy: hardware-backed keys required on protected branches
 [disabled] agent-signing
            disabled in .sscsb/config.toml
+[DEGRADED] signing-model
+           human-local: incomplete — run `sscsb signing setup human-local`
+           ... (every signing environment reported individually)
 [DEGRADED] branch-protection
            no GitHub repo configured (general.github_repo) and no origin remote —
            cannot verify branch protection
@@ -241,6 +244,10 @@ $ sscsb verify
            for slsa-verifier to verify the trusted builder
 [PASS    ] ai-trailers
            enforced by commit-msg hook (installed)
+[DEGRADED] scorecard
+           .github/workflows/scorecard.yml installed
+           no GitHub repo configured (general.github_repo) and no origin remote —
+           live Scorecard findings NOT read, posture unverified
 ...
 [PASS    ] github-attestations
            .github/workflows/release-attest.yml installed
@@ -263,12 +270,14 @@ $ sscsb verify
 [PASS    ] compliance-map
            map covers all 43 controls across SLSA/SSDF/CRA/Badge
 
-verify: 0 failed, 2 degraded
+verify: 0 failed, 4 degraded
 ```
 
-This is what "no fakery" looks like in practice. Two controls are **DEGRADED**, and
-the reason is stated: this demo repo has no signing key and no GitHub remote. `sscsb`
-does not paper over that. Under `sscsb verify --strict`, those two degrades exit
+This is what "no fakery" looks like in practice. Four controls are **DEGRADED**, and
+the reason is stated in each: this demo repo has no signing key and no GitHub remote,
+so nothing can be read back about its signing posture, its branch protection, or what
+Scorecard sees. `sscsb` does not paper over that — a check it could not run is never
+reported as one that passed. Under `sscsb verify --strict`, those four degrades exit
 non-zero.
 
 Note also that the single tag-pinned action is reported as an `[info]`, with the

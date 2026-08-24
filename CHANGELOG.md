@@ -6,6 +6,44 @@ All notable changes to `sscsb` are recorded here. Format follows
 CLI surface and `.sscsb/config.toml` schema may still change between minor
 versions.
 
+## [Unreleased]
+
+### Fixed
+
+- **Five controls reported `PASS` for checks that never ran.** `sscsb`'s value
+  rests on a green `verify --strict` meaning the named controls actually work,
+  and `--strict` only escalates `DEGRADED` — so a false `PASS` sailed straight
+  through CI. Each of these now reports `DEGRADED`, with the reason:
+  - `branch-protection` passed when the GitHub rules API answered for **no**
+    configured branch (e.g. a slug that does not exist): the failing-query arm
+    pushed a message and `continue`d without touching the verdict.
+  - `scorecard` passed when `gh` was absent, when no repo slug could be
+    resolved, and when the code-scanning query failed — while every other
+    gh-dependent control in the same run correctly degraded.
+  - `package-trust` reported an unparseable `.sscsb/policy/packages.toml` as
+    `approved baseline present (0 package(s))` and passed.
+  - `dependency-track` passed on a non-empty `url` string plus `DTRACK_API_KEY`
+    merely being *set*; `verify` now probes `GET /api/version` (5s bound, key in
+    the header) so an unreachable server or a rejected key degrades instead of
+    passing and then failing at upload time.
+  - `model-signing` and `gittuf` passed with the declared tool absent, while
+    `sscsb status` said `…:missing` in the same session. An installed workflow is
+    not a signature, and a `refs/gittuf/*` ref is a name anyone can create with
+    `git update-ref`.
+- **The new-package commit gate failed OPEN on a corrupt policy file.** Deleting
+  `.sscsb/policy/packages.toml` already failed closed (every dependency reads as
+  unapproved), but corrupting it printed "package-trust check skipped" and
+  returned `0` — one appended line switched the gate off. It now fails closed,
+  with `fail_open = true` as the single explicit opt-out, matching the
+  secret-scan and SAST arms of the same hook.
+
+### Changed
+
+- `scorecard` reports `INFO` rather than `PASS` when the live scan returns open
+  Scorecard findings. sscsb does not re-gate on another scanner's rubric — each
+  finding is routed to the sscsb control that owns it — but printing open
+  findings under a `PASS` verdict manufactured assurance.
+
 ## [0.2.0] — 2026-08-24
 
 The distribution release: `sscsb` becomes installable by someone who is not its

@@ -78,6 +78,60 @@ impl Drop for PathPrepend {
     }
 }
 
+/// Build a `PATH` that resolves everything the real `PATH` does **except** the
+/// named binaries, so a test can prove the "tool is missing" branch of a
+/// verifier without lying to the rest of the suite.
+///
+/// PATH is process-global and the harness is multi-threaded: simply pointing
+/// PATH at an empty directory hides *every* tool, and a concurrently-running
+/// test that shells out to trufflehog or gitleaks then fails for reasons that
+/// have nothing to do with it. So directories that do not contain a hidden
+/// binary are reused as-is, and a directory that does is replaced by a mirror
+/// of symlinks with just that entry omitted.
+///
+/// Returns the temp dirs backing any mirrors (keep them alive for the duration
+/// of the test) and the PATH value to install with [`EnvGuard`]. Callers MUST
+/// hold [`env_lock`].
+pub fn path_without(hidden: &[&str]) -> (Vec<tempfile::TempDir>, std::ffi::OsString) {
+    let mut keep = Vec::new();
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_var) {
+        if !hidden.iter().any(|b| dir.join(b).is_file()) {
+            dirs.push(dir);
+            continue;
+        }
+        // When no mirror can be built (non-unix), the directory is dropped
+        // rather than left with the binary resolvable — correctness of the test
+        // under way beats the (already unlikely) concurrency cost.
+        if let Some(mirror) = mirror_without(&dir, hidden) {
+            dirs.push(mirror.path().to_path_buf());
+            keep.push(mirror);
+        }
+    }
+    let joined = std::env::join_paths(dirs).expect("PATH entries must not contain ':'");
+    (keep, joined)
+}
+
+/// Symlink every entry of `dir` into a fresh temp dir except the `hidden` names.
+#[cfg(unix)]
+fn mirror_without(dir: &std::path::Path, hidden: &[&str]) -> Option<tempfile::TempDir> {
+    let mirror = tempfile::tempdir().ok()?;
+    for entry in std::fs::read_dir(dir).ok()?.filter_map(|e| e.ok()) {
+        let name = entry.file_name();
+        if hidden.iter().any(|h| std::ffi::OsStr::new(h) == name) {
+            continue;
+        }
+        let _ = std::os::unix::fs::symlink(entry.path(), mirror.path().join(&name));
+    }
+    Some(mirror)
+}
+
+#[cfg(not(unix))]
+fn mirror_without(_dir: &std::path::Path, _hidden: &[&str]) -> Option<tempfile::TempDir> {
+    None
+}
+
 /// Write an executable POSIX `gh` shim running `script` into a fresh temp dir.
 pub fn fake_gh(script: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();

@@ -60,6 +60,45 @@ pub fn dtrack_upload(ctx: &Ctx, cfg: &Config, bom_path: &Path) -> Result<String>
     ))
 }
 
+/// Ask a configured Dependency-Track server whether it is really there and
+/// whether the API key in the environment is one it accepts.
+///
+/// `GET /api/version` is Dependency-Track's version endpoint — reaching it
+/// proves the URL points at a live DT API server rather than at nothing, a
+/// closed port, or the frontend. `X-Api-Key` travels on it (header only, never
+/// the URL) so a server that rejects the credential answers 401/403 here
+/// instead of at upload time.
+///
+/// Returns `Ok(description)` only for a 2xx. Everything else — transport error,
+/// wrong status — is `Err(reason)`, because the whole point is that "could not
+/// reach it" and "it works" must never collapse into the same verdict. Bounded
+/// at 5s so `sscsb verify` cannot hang on a black-holed host.
+fn dtrack_probe(url: &str, api_key: &str) -> Result<String, String> {
+    let endpoint = format!("{}/api/version", url.trim_end_matches('/'));
+    let agent = ureq::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build();
+    match agent.get(&endpoint).set("X-Api-Key", api_key).call() {
+        Ok(resp) => {
+            let body: serde_json::Value = resp.into_json().unwrap_or_default();
+            let version = body
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("version unreported");
+            Ok(format!("server reachable: {endpoint} ({version})"))
+        }
+        Err(ureq::Error::Status(code, _)) => Err(format!(
+            "server at {endpoint} answered HTTP {code} — {} (an upload would fail the same way)",
+            match code {
+                401 | 403 => "DTRACK_API_KEY was rejected",
+                404 => "not a Dependency-Track API server (is this the frontend port?)",
+                _ => "unexpected response",
+            }
+        )),
+        Err(e) => Err(format!("server at {endpoint} is unreachable: {e}")),
+    }
+}
+
 pub fn verify_dtrack_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     let mut messages = Vec::new();
     let url = cfg
@@ -75,12 +114,30 @@ pub fn verify_dtrack_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     match url {
         Some(u) => {
             messages.push(format!("server configured: {u}"));
-            if std::env::var("DTRACK_API_KEY").is_ok() {
-                messages.push("DTRACK_API_KEY present in environment".into());
-                VerifyResult::new("dependency-track", Outcome::Pass, messages)
-            } else {
+            let Ok(key) = std::env::var("DTRACK_API_KEY") else {
                 messages.push("DTRACK_API_KEY not set — upload will fail until exported".into());
-                VerifyResult::new("dependency-track", Outcome::Degraded, messages)
+                return VerifyResult::new("dependency-track", Outcome::Degraded, messages);
+            };
+            messages.push("DTRACK_API_KEY present in environment".into());
+            // A non-empty URL string and a set environment variable are two
+            // pieces of configuration, not a working integration: they were
+            // equally true of an unreachable host and a junk key, which is why
+            // `verify` used to say PASS and `dtrack upload` then said
+            // "Connection refused". Only a live answer earns PASS.
+            match dtrack_probe(&u, &key) {
+                Ok(detail) => {
+                    messages.push(detail);
+                    VerifyResult::new("dependency-track", Outcome::Pass, messages)
+                }
+                Err(reason) => {
+                    messages.push(reason);
+                    messages.push(
+                        "configuration present but the integration is UNVERIFIED — \
+                         start the server (see docs/phase-5.md) or fix the URL/key"
+                            .into(),
+                    );
+                    VerifyResult::new("dependency-track", Outcome::Degraded, messages)
+                }
             }
         }
         None => {
@@ -202,14 +259,97 @@ pub fn vex_create(ctx: &Ctx, args: &VexArgs) -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
-pub fn verify_openvex_control(_ctx: &Ctx) -> VerifyResult {
-    let mut messages = vec![
-        "native OpenVEX generation: `sscsb vex create --vuln CVE-… --product pkg:… \
-         --status not_affected --justification …`"
-            .into(),
-        "ingestion: `sscsb scan --vex <file>` suppresses not_affected/fixed findings visibly"
-            .into(),
-    ];
+/// Verify every OpenVEX document this repository has actually produced.
+///
+/// This control used to be an unconditional `Pass` that examined nothing — the
+/// one control in the registry that could not fail, shipping default-ON. A
+/// control that cannot fail is not evidence of anything.
+///
+/// There is nothing to check by *default*, because `sscsb init` installs no VEX
+/// artifact: documents are written on demand by `sscsb vex create`. So the
+/// honest shape is the one `model-signing` already uses — `Info` while the
+/// control does not apply to this repo, a real verdict once it does. The
+/// discovery path is not an invented convention: `.sscsb/out/*.vex.json` is
+/// exactly where `vex_create` writes (see `vex_create` above).
+///
+/// Each document is checked against the two properties `scan::apply_vex`
+/// requires before it will suppress anything, so a document that passes here is
+/// one that will actually be honoured at scan time rather than silently
+/// ignored — a VEX file that suppresses nothing is worse than no VEX file,
+/// because it looks like a decision that was recorded.
+pub fn verify_openvex_control(ctx: &Ctx) -> VerifyResult {
+    let mut messages: Vec<String> = Vec::new();
+
+    let mut docs: Vec<std::path::PathBuf> = match std::fs::read_dir(ctx.sscsb_dir().join("out")) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().ends_with(".vex.json"))
+            .collect(),
+        // An absent out/ is the normal state of a repo that has never generated
+        // a document, not a failure to read the directory.
+        Err(_) => Vec::new(),
+    };
+    docs.sort();
+
+    if docs.is_empty() {
+        messages.push(
+            "no OpenVEX documents in .sscsb/out — N/A for this repo until one is generated".into(),
+        );
+        messages.push(
+            "generate: `sscsb vex create --vuln CVE-… --product pkg:… --status not_affected \
+             --justification …`"
+                .into(),
+        );
+        messages.push(
+            "ingest: `sscsb scan --vex <file>` suppresses not_affected/fixed findings visibly"
+                .into(),
+        );
+        return VerifyResult::new("openvex", Outcome::Info, messages);
+    }
+
+    let mut bad = 0usize;
+    for path in &docs {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        match std::fs::read_to_string(path) {
+            Err(e) => {
+                bad += 1;
+                messages.push(format!("{name}: unreadable — {e}"));
+            }
+            Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                Err(e) => {
+                    bad += 1;
+                    messages.push(format!("{name}: not valid JSON — {e}"));
+                }
+                Ok(doc) => {
+                    let context_ok = doc
+                        .get("@context")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.contains("openvex.dev"));
+                    let statements = doc
+                        .get("statements")
+                        .and_then(|s| s.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    if !context_ok {
+                        bad += 1;
+                        messages.push(format!(
+                            "{name}: @context is not an openvex.dev namespace — \
+                             `sscsb scan --vex` would reject it"
+                        ));
+                    } else if statements == 0 {
+                        bad += 1;
+                        messages.push(format!("{name}: no statements — it would suppress nothing"));
+                    } else {
+                        messages.push(format!("{name}: valid OpenVEX, {statements} statement(s)"));
+                    }
+                }
+            },
+        }
+    }
+
     match tools::detect(tools::spec("vexctl").expect("registry")) {
         tools::ToolStatus::Found { version, .. } => messages.push(format!(
             "vexctl {} also available (merge/attest)",
@@ -219,7 +359,13 @@ pub fn verify_openvex_control(_ctx: &Ctx) -> VerifyResult {
             messages.push("vexctl not installed (optional — brew install vexctl)".into());
         }
     }
-    VerifyResult::new("openvex", Outcome::Pass, messages)
+
+    let outcome = if bad > 0 {
+        Outcome::Fail
+    } else {
+        Outcome::Pass
+    };
+    VerifyResult::new("openvex", outcome, messages)
 }
 
 // ─────────────────────────── ORAS ───────────────────────────────────────────
@@ -429,6 +575,42 @@ mod tests {
         std::env::remove_var("DTRACK_API_KEY");
     }
 
+    /// A one-shot HTTP server that answers the next connection with
+    /// `status_line` and `body`, then stops. Enough to stand in for a
+    /// Dependency-Track `GET /api/version`.
+    fn stub_http_once(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            reader
+                .get_mut()
+                .write_all(
+                    format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            request
+        });
+        (url, handle)
+    }
+
     #[test]
     fn dtrack_verify_reports_url_and_key_state_separately() {
         let _guard = ENV.lock().unwrap();
@@ -443,7 +625,7 @@ mod tests {
             .iter()
             .any(|m| m.contains("no server configured")));
 
-        set_url(&ctx, "http://localhost:8081");
+        set_url(&ctx, "http://127.0.0.1:1");
         let ctx = Ctx::discover(&ctx.root).unwrap();
         let cfg = ctx.require_config().unwrap();
 
@@ -455,12 +637,96 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.contains("DTRACK_API_KEY not set")));
+        std::env::remove_var("DTRACK_API_KEY");
+    }
 
-        // Both → pass.
+    /// Regression (H10): PASS required only a non-empty `url` STRING and
+    /// `DTRACK_API_KEY` merely being SET. Neither fact touches the network, so
+    /// `verify` reported PASS for a server that was not running — and the very
+    /// next `sscsb dtrack upload` said "Connection refused". Configuration is
+    /// not verification.
+    #[test]
+    fn dtrack_verify_degrades_when_the_configured_server_is_unreachable() {
+        let _guard = ENV.lock().unwrap();
+        let (_d, ctx) = repo();
+        // Port 1 refuses connections.
+        set_url(&ctx, "http://127.0.0.1:1");
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        let cfg = ctx.require_config().unwrap();
         std::env::set_var("DTRACK_API_KEY", "test-key-not-a-real-credential");
+
         let r = verify_dtrack_control(&ctx, cfg);
-        assert_eq!(r.outcome, Outcome::Pass);
-        assert!(r.messages.iter().any(|m| m.contains("localhost:8081")));
+        assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("is unreachable")),
+            "{:?}",
+            r.messages
+        );
+        assert!(r
+            .messages
+            .iter()
+            .any(|m| m.contains("integration is UNVERIFIED")));
+        std::env::remove_var("DTRACK_API_KEY");
+    }
+
+    /// A server that rejects the key is likewise not a working integration.
+    #[test]
+    fn dtrack_verify_degrades_when_the_server_rejects_the_api_key() {
+        let _guard = ENV.lock().unwrap();
+        let (_d, ctx) = repo();
+        let (url, handle) = stub_http_once("HTTP/1.1 401 Unauthorized", "{}");
+        set_url(&ctx, &url);
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        let cfg = ctx.require_config().unwrap();
+        std::env::set_var("DTRACK_API_KEY", "wrong-key-not-a-real-credential");
+
+        let r = verify_dtrack_control(&ctx, cfg);
+        assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("DTRACK_API_KEY was rejected")),
+            "{:?}",
+            r.messages
+        );
+        handle.join().unwrap();
+        std::env::remove_var("DTRACK_API_KEY");
+    }
+
+    /// …and a live server that answers earns the PASS it used to get for free.
+    /// The key travels in a header, never in the URL.
+    #[test]
+    fn dtrack_verify_passes_against_a_live_server() {
+        let _guard = ENV.lock().unwrap();
+        let (_d, ctx) = repo();
+        let (url, handle) = stub_http_once("HTTP/1.1 200 OK", "{\"version\":\"5.0.2\"}");
+        set_url(&ctx, &url);
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        let cfg = ctx.require_config().unwrap();
+        std::env::set_var("DTRACK_API_KEY", "good-key-not-a-real-credential");
+
+        let r = verify_dtrack_control(&ctx, cfg);
+        assert_eq!(r.outcome, Outcome::Pass, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("server reachable") && m.contains("5.0.2")),
+            "{:?}",
+            r.messages
+        );
+
+        let request = handle.join().unwrap().to_lowercase();
+        assert!(request.contains("get /api/version"), "{request}");
+        assert!(
+            request.contains("x-api-key: good-key-not-a-real-credential"),
+            "{request}"
+        );
+        assert!(
+            !r.messages
+                .iter()
+                .any(|m| m.contains("good-key-not-a-real-credential")),
+            "the key must never be echoed into the verdict"
+        );
         std::env::remove_var("DTRACK_API_KEY");
     }
 
@@ -569,15 +835,83 @@ mod tests {
         assert!(format!("{err:#}").contains("invalid status"));
     }
 
+    /// A repo that has never generated a VEX document gets `Info`, not `Pass`.
+    /// This control was previously an unconditional `Pass` that read nothing —
+    /// the only control in the registry that could not fail. `Info` is the same
+    /// honest shape `model-signing` uses for "does not apply here".
     #[test]
-    fn openvex_control_always_passes_because_generation_is_native() {
+    fn openvex_is_not_applicable_until_a_document_exists() {
         let (_d, ctx) = repo();
         let r = verify_openvex_control(&ctx);
-        assert_eq!(r.outcome, Outcome::Pass);
+        assert_eq!(
+            r.outcome,
+            Outcome::Info,
+            "a control with nothing to check must not report Pass"
+        );
+        assert!(r.messages.iter().any(|m| m.contains("N/A for this repo")));
         assert!(r.messages.iter().any(|m| m.contains("sscsb vex create")));
-        // vexctl is optional either way; the control states which it found.
-        let mentions_vexctl = r.messages.iter().any(|m| m.contains("vexctl"));
-        assert!(mentions_vexctl);
+    }
+
+    /// The document `vex create` writes must verify, or generation and
+    /// verification disagree about what a valid document is.
+    #[test]
+    fn openvex_passes_on_a_document_this_tool_generated() {
+        let (_d, ctx) = repo();
+        vex_create(
+            &ctx,
+            &VexArgs {
+                vuln: "CVE-2024-12345",
+                product: "pkg:cargo/serde",
+                status: "not_affected",
+                justification: Some("vulnerable_code_not_in_execute_path"),
+            },
+        )
+        .unwrap();
+
+        let r = verify_openvex_control(&ctx);
+        assert_eq!(r.outcome, Outcome::Pass);
+        assert!(r
+            .messages
+            .iter()
+            .any(|m| m.contains("cve-2024-12345.vex.json") && m.contains("1 statement")));
+    }
+
+    /// A document that `scan --vex` would silently refuse to honour must not
+    /// read as a satisfied control — that is the failure mode this control
+    /// exists to catch. Both properties are the ones `apply_vex` actually
+    /// requires.
+    #[test]
+    fn openvex_fails_on_a_document_that_would_suppress_nothing() {
+        let (_d, ctx) = repo();
+        let out = ctx.sscsb_dir().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        // Right shape, wrong namespace: apply_vex rejects it outright.
+        std::fs::write(
+            out.join("wrong-context.vex.json"),
+            r#"{"@context":"https://example.invalid/ns","statements":[{"vulnerability":{"name":"CVE-1"}}]}"#,
+        )
+        .unwrap();
+        let r = verify_openvex_control(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(r.messages.iter().any(|m| m.contains("not an openvex.dev")));
+
+        // Right namespace, no statements: parses, suppresses nothing.
+        std::fs::remove_file(out.join("wrong-context.vex.json")).unwrap();
+        std::fs::write(
+            out.join("empty.vex.json"),
+            r#"{"@context":"https://openvex.dev/ns/v0.2.0","statements":[]}"#,
+        )
+        .unwrap();
+        let r = verify_openvex_control(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(r.messages.iter().any(|m| m.contains("suppress nothing")));
+
+        // Not JSON at all.
+        std::fs::write(out.join("empty.vex.json"), "{ not json").unwrap();
+        let r = verify_openvex_control(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(r.messages.iter().any(|m| m.contains("not valid JSON")));
     }
 
     #[test]
