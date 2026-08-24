@@ -10,6 +10,26 @@ versions.
 
 ### Fixed
 
+- **SAST severity handling lost findings three ways.** All three ended with the
+  gate saying "clean" about something it had not cleared:
+  - the results JSON's `errors` array was dropped entirely. Both engines report
+    a file they could not parse there and still exit `0` with results —
+    measured on opengrep 1.25.0 and semgrep 1.169.0, which both emit a
+    `PartialParsing` entry for a file whose bytes are not the language it was
+    read as. A staged file nobody parsed was reported as a staged file with
+    nothing wrong in it. Those entries are now carried on the scan: in
+    pre-commit an unreadable staged file is an error governed by
+    `general.fail_open`, and `sscsb sast` names each uncovered part of the tree.
+    An `errors` entry at a level that is not a warning fails the scan outright.
+  - a finding whose severity could not be read defaulted to `WARNING`, i.e.
+    advisory, i.e. it stopped gating. One renamed or moved field in the engine's
+    schema would have quietly demoted every finding in the scan. It is now
+    `UNRATED`, which blocks — the rule H6 set for advisories, applied here.
+  - only the literal `ERROR` gated. Both engines accept and echo back a rule
+    declaring `severity: CRITICAL` or `HIGH` (measured), so the two strictest
+    severities a rule can carry passed straight through the gate that exists to
+    stop them. The advisory set (`INFO`, `WARNING`, `LOW`, `MEDIUM`) is now what
+    is enumerated, and everything else blocks.
 - **A SAST scanner that was killed reported a clean scan.** `run_sast` gated
   the Semgrep engine on `exit status > 1`. A process killed by a signal — the
   OOM killer, a CI timeout's SIGKILL, a segfault — has no exit code at all,

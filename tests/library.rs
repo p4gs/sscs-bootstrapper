@@ -921,7 +921,7 @@ fn sast_runs_the_default_engine_and_reports_findings() {
         assert!(format!("{err:#}").contains("opengrep not found"));
         return;
     }
-    let findings = sast::run_sast(&ctx, cfg, &ctx.root).unwrap();
+    let findings = sast::run_sast(&ctx, cfg, &ctx.root).unwrap().findings;
     let hit = findings
         .iter()
         .find(|f| f.check_id.contains("curl-pipe-shell"))

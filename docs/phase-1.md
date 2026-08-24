@@ -52,8 +52,9 @@ temporary directory and scans that.
   it called the provider and the credential is live. Unknown means it looks like a
   credential and could not be checked. Both block.
 - **Gitleaks** in directory mode against the same staged snapshot.
-- **SAST** (if `sast` is enabled) over the staged files; `ERROR`-severity findings
-  block. See [phase-4.md](phase-4.md).
+- **SAST** (if `sast` is enabled) over the staged files; blocking-severity
+  findings block, and so does a staged file the engine could not read.
+  See [phase-4.md](phase-4.md).
 
 If neither scanner is installed, the commit is **blocked**, not allowed. That is
 the fail-closed rule again: `sscsb` will not let you believe you are being

@@ -46,6 +46,38 @@ fn exclude_args(cfg: &Config) -> Vec<String> {
     }
 }
 
+/// Severity labels that are advisory — reported, never blocking.
+///
+/// The list is deliberately the *permissive* half, so the gate is closed by
+/// default: a label absent from it blocks. Semgrep's rule schema documents
+/// `INFO | WARNING | ERROR`, and the four-band vocabulary is what rules in the
+/// wild and other tooling use; both are bridged here the way `scan.rs` bridges
+/// GHSA's `MODERATE`.
+const ADVISORY_SEVERITIES: &[&str] = &["INFO", "INFORMATIONAL", "NOTE", "LOW", "MEDIUM", "WARNING"];
+
+/// The severity recorded for a finding whose severity could not be read.
+///
+/// It is not a label any engine emits, so it can never be confused with one,
+/// and it is not in [`ADVISORY_SEVERITIES`], so it blocks.
+pub const SEVERITY_UNRATED: &str = "UNRATED";
+
+/// Does a finding at this severity block the commit?
+///
+/// The gate used to be the literal string `ERROR`. Measured against
+/// opengrep 1.25.0 and semgrep 1.169.0: a rule declaring `severity: CRITICAL`
+/// or `severity: HIGH` is accepted by both engines and echoed verbatim into
+/// `extra.severity` — so the two strictest severities a rule can carry sailed
+/// straight through the gate that exists to stop exactly them.
+///
+/// Anything unrecognised blocks, on the principle H6 established one module
+/// over: a severity we cannot place is not a low severity.
+pub fn blocks(severity: &str) -> bool {
+    let label = severity.trim();
+    !ADVISORY_SEVERITIES
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(label))
+}
+
 #[derive(Debug, Clone)]
 pub struct SastFinding {
     pub check_id: String,
@@ -62,10 +94,33 @@ impl SastFinding {
             self.severity, self.path, self.line, self.check_id, self.message
         )
     }
+
+    /// See [`blocks`].
+    pub fn blocks(&self) -> bool {
+        blocks(&self.severity)
+    }
 }
 
-/// Run the configured engine over `target`. Returns findings.
-pub fn run_sast(ctx: &Ctx, cfg: &Config, target: &Path) -> Result<Vec<SastFinding>> {
+/// One scan: what the engine found, and what it could not read.
+#[derive(Debug, Clone)]
+pub struct SastScan {
+    pub findings: Vec<SastFinding>,
+    /// Parts of the target the engine reported it could not fully scan — a
+    /// file it failed to parse, a rule that timed out. Not findings, and not
+    /// nothing either: coverage the scan does not have. Dropping these is how
+    /// a scan of a file nobody read reports "clean".
+    pub incomplete: Vec<String>,
+}
+
+impl SastScan {
+    pub fn blocking(&self) -> impl Iterator<Item = &SastFinding> {
+        self.findings.iter().filter(|f| f.blocks())
+    }
+}
+
+/// Run the configured engine over `target`. Returns what it found AND what it
+/// could not read.
+pub fn run_sast(ctx: &Ctx, cfg: &Config, target: &Path) -> Result<SastScan> {
     let engine = engine(cfg);
     let rules = rules_arg(ctx, cfg);
     let target_arg = target.display().to_string();
@@ -90,7 +145,7 @@ pub fn run_sast(ctx: &Ctx, cfg: &Config, target: &Path) -> Result<Vec<SastFindin
                     diagnostic(&out.stderr, &out.stdout)
                 );
             }
-            parse_semgrep_json(&out.stdout)
+            parse_semgrep_output(&out.stdout)
         }
         "semgrep" => {
             if !tools::is_available("semgrep") {
@@ -123,7 +178,7 @@ pub fn run_sast(ctx: &Ctx, cfg: &Config, target: &Path) -> Result<Vec<SastFindin
                     diagnostic(&out.stderr, &out.stdout)
                 );
             }
-            parse_semgrep_json(&out.stdout)
+            parse_semgrep_output(&out.stdout)
         }
         other => anyhow::bail!("unknown sast engine `{other}` — use opengrep or semgrep"),
     }
@@ -143,8 +198,11 @@ fn diagnostic(stderr: &str, stdout: &str) -> String {
     }
 }
 
-/// Both OpenGrep and Semgrep emit the same results JSON shape.
-pub fn parse_semgrep_json(stdout: &str) -> Result<Vec<SastFinding>> {
+/// Both OpenGrep and Semgrep emit the same results JSON shape: a `results`
+/// array of findings, and an `errors` array of everything the engine could not
+/// do. Both are read — a scan that skipped part of its target has not cleared
+/// that target.
+pub fn parse_semgrep_output(stdout: &str) -> Result<SastScan> {
     let v: serde_json::Value = serde_json::from_str(stdout).context("SAST output is not JSON")?;
     let mut findings = Vec::new();
     for r in v
@@ -167,10 +225,16 @@ pub fn parse_semgrep_json(stdout: &str) -> Result<Vec<SastFinding>> {
                 .pointer("/start/line")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
+            // A finding whose severity we could not read is UNRATED, which
+            // blocks. Defaulting to `WARNING` silently demoted it to advisory:
+            // one schema change — a renamed field, a moved one — and every
+            // finding in the scan would have stopped gating, quietly.
             severity: r
                 .pointer("/extra/severity")
                 .and_then(|x| x.as_str())
-                .unwrap_or("WARNING")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(SEVERITY_UNRATED)
                 .to_string(),
             message: r
                 .pointer("/extra/message")
@@ -182,23 +246,89 @@ pub fn parse_semgrep_json(stdout: &str) -> Result<Vec<SastFinding>> {
                 .to_string(),
         });
     }
-    Ok(findings)
+    let mut incomplete = Vec::new();
+    let mut fatal = Vec::new();
+    for e in v
+        .get("errors")
+        .and_then(|x| x.as_array())
+        .unwrap_or(&Vec::new())
+    {
+        let level = e
+            .get("level")
+            .and_then(|x| x.as_str())
+            .unwrap_or("error")
+            .to_string();
+        let path = e.get("path").and_then(|x| x.as_str()).unwrap_or("?");
+        let rendered = format!("{path}: {}", scan_error_message(e));
+        // `warn`/`info` mean the scan continued without part of its target;
+        // anything else — including a level we do not recognise — means the
+        // scan itself did not work, and its results cannot be trusted.
+        if matches!(level.as_str(), "warn" | "warning" | "info") {
+            incomplete.push(rendered);
+        } else {
+            fatal.push(format!("[{level}] {rendered}"));
+        }
+    }
+    if !fatal.is_empty() {
+        anyhow::bail!("SAST engine reported errors: {}", fatal.join("; "));
+    }
+    Ok(SastScan {
+        findings,
+        incomplete,
+    })
 }
 
-/// Pre-commit SAST over staged files (ERROR severity blocks). Uses the same
-/// fail-closed, quote-safe staged materialization as the secret scanner, so a
-/// C-quoted filename can neither be skipped silently nor escape the scan.
+/// The first line of an engine error, capped.
+///
+/// A parse error's message quotes the text that failed to parse, so on a
+/// binary file it carries the file's own bytes — measured against opengrep
+/// 1.25.0, which embedded 60 bytes of a random blob in a `PartialParsing`
+/// message. That is not something to splice whole into a terminal.
+fn scan_error_message(e: &serde_json::Value) -> String {
+    const MAX: usize = 160;
+    let raw = e
+        .get("message")
+        .and_then(|x| x.as_str())
+        .unwrap_or("(no message)")
+        .lines()
+        .next()
+        .unwrap_or("(no message)")
+        .trim();
+    let clean: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    match clean.char_indices().nth(MAX) {
+        None => clean,
+        Some((cut, _)) => format!("{}…", &clean[..cut]),
+    }
+}
+
+/// Pre-commit SAST over staged files. Blocking severities block; advisory ones
+/// are reported and do not. Uses the same fail-closed, quote-safe staged
+/// materialization as the secret scanner, so a C-quoted filename can neither be
+/// skipped silently nor escape the scan.
+///
+/// A staged file the engine could not read is an ERROR, not an empty result:
+/// the gate's whole claim is about the files being committed right now, and it
+/// cannot make that claim about a file nobody parsed. The caller applies the
+/// `general.fail_open` policy to it, exactly as it does to a scanner that could
+/// not run at all.
 pub fn scan_staged(ctx: &Ctx, cfg: &Config) -> Result<Vec<String>> {
     let (dir, files) = crate::hooks::stage_to_tempdir(ctx)?;
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    let findings = run_sast(ctx, cfg, dir.path())?;
-    Ok(findings
-        .iter()
-        .filter(|f| f.severity.eq_ignore_ascii_case("ERROR"))
-        .map(SastFinding::render)
-        .collect())
+    let scan = run_sast(ctx, cfg, dir.path())?;
+    if !scan.incomplete.is_empty() {
+        anyhow::bail!(
+            "SAST could not scan {} of the staged file(s), so they are not covered by this \
+             gate: {}",
+            scan.incomplete.len(),
+            scan.incomplete.join("; ")
+        );
+    }
+    Ok(scan.blocking().map(SastFinding::render).collect())
 }
 
 pub fn verify_sast_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
@@ -368,13 +498,13 @@ pub(crate) mod tests {
         std::fs::write(path, content).unwrap();
     }
 
-    // ─────────────────────────── parse_semgrep_json ─────────────────────────
+    // ────────────────────────── parse_semgrep_output ────────────────────────
 
     #[test]
     fn semgrep_json_parses_shared_shape() {
         let sample = r#"{"results":[{"check_id":"rules.curl-pipe-shell","path":"install.sh",
             "start":{"line":3},"extra":{"severity":"ERROR","message":"piping remote script to shell"}}]}"#;
-        let f = parse_semgrep_json(sample).unwrap();
+        let f = parse_semgrep_output(sample).unwrap().findings;
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].check_id, "rules.curl-pipe-shell");
         assert_eq!(f[0].line, 3);
@@ -383,26 +513,148 @@ pub(crate) mod tests {
 
     #[test]
     fn empty_results_yield_no_findings() {
-        assert!(parse_semgrep_json(r#"{"results":[]}"#).unwrap().is_empty());
-        assert!(parse_semgrep_json("not json").is_err());
+        let scan = parse_semgrep_output(r#"{"results":[]}"#).unwrap();
+        assert!(scan.findings.is_empty());
+        assert!(scan.incomplete.is_empty());
+        assert!(parse_semgrep_output("not json").is_err());
     }
 
+    /// M6(b): a finding whose severity could not be read defaulted to
+    /// `WARNING` — i.e. advisory, i.e. it stopped gating. One renamed or moved
+    /// field in the engine's schema and EVERY finding would have quietly
+    /// become non-blocking, with the scan still reporting them all.
     #[test]
-    fn parse_semgrep_json_defaults_missing_fields_and_keeps_only_the_first_message_line() {
-        let f = parse_semgrep_json(r#"{"results":[{}]}"#).unwrap();
+    fn a_finding_with_no_readable_severity_is_unrated_and_blocks() {
+        let f = parse_semgrep_output(r#"{"results":[{}]}"#)
+            .unwrap()
+            .findings;
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].check_id, "?");
         assert_eq!(f[0].path, "?");
         assert_eq!(f[0].line, 0);
-        assert_eq!(f[0].severity, "WARNING");
+        assert_eq!(f[0].severity, SEVERITY_UNRATED);
+        assert!(
+            f[0].blocks(),
+            "a severity we could not read is not an advisory severity"
+        );
         assert_eq!(f[0].message, "");
 
+        // Schema drift, concretely: the severity moved out from under
+        // `extra`. The finding is still reported, and still gates.
+        let drifted = r#"{"results":[{"check_id":"x","path":"y","severity":"ERROR"}]}"#;
+        let f = parse_semgrep_output(drifted).unwrap().findings;
+        assert_eq!(f[0].severity, SEVERITY_UNRATED);
+        assert!(f[0].blocks());
+
+        // An empty string is not a severity either.
+        let blank = r#"{"results":[{"extra":{"severity":"  "}}]}"#;
+        assert_eq!(
+            parse_semgrep_output(blank).unwrap().findings[0].severity,
+            SEVERITY_UNRATED
+        );
+    }
+
+    #[test]
+    fn parse_semgrep_output_keeps_only_the_first_message_line() {
         let sample = r#"{"results":[{"check_id":"x","path":"y","start":{"line":9},
             "extra":{"severity":"ERROR","message":"first line\nsecond line"}}]}"#;
-        let f = parse_semgrep_json(sample).unwrap();
+        let f = parse_semgrep_output(sample).unwrap().findings;
         assert_eq!(
             f[0].message, "first line",
             "only the first line of a multi-line message is kept"
+        );
+    }
+
+    /// M6(c): the gate was the literal string `ERROR`, so the two strictest
+    /// severities a rule can declare — both accepted and echoed back by
+    /// opengrep 1.25.0 and semgrep 1.169.0, measured — passed straight through.
+    #[test]
+    fn critical_and_high_findings_block_and_advisory_ones_do_not() {
+        for blocking in ["ERROR", "CRITICAL", "HIGH", "error", " Critical ", "SEV-1"] {
+            assert!(blocks(blocking), "{blocking} must block");
+        }
+        for advisory in ["WARNING", "INFO", "LOW", "MEDIUM", "note", "warning"] {
+            assert!(!advisory.is_empty() && !blocks(advisory), "{advisory}");
+        }
+
+        let sample = r#"{"results":[
+            {"check_id":"c","path":"a.py","start":{"line":1},"extra":{"severity":"CRITICAL","message":"m"}},
+            {"check_id":"h","path":"b.py","start":{"line":2},"extra":{"severity":"HIGH","message":"m"}},
+            {"check_id":"w","path":"c.py","start":{"line":3},"extra":{"severity":"WARNING","message":"m"}}]}"#;
+        let scan = parse_semgrep_output(sample).unwrap();
+        let blocking: Vec<&str> = scan.blocking().map(|f| f.check_id.as_str()).collect();
+        assert_eq!(
+            blocking,
+            vec!["c", "h"],
+            "CRITICAL and HIGH block; WARNING stays advisory"
+        );
+    }
+
+    /// M6(a): the `errors` array was dropped on the floor. Both engines report
+    /// a file they could not parse there and still exit 0 with results —
+    /// measured on opengrep 1.25.0 and semgrep 1.169.0 — so a scan that never
+    /// read a file reported that file clean.
+    #[test]
+    fn a_file_the_engine_could_not_parse_is_reported_not_dropped() {
+        // The real shape, from an opengrep run over a binary file.
+        let sample = r#"{"results":[],"errors":[{"code":3,"level":"warn",
+            "type":["PartialParsing",[]],"path":"src/binary.py",
+            "message":"Syntax error at line src/binary.py:1:\n `garbage` was unexpected"}]}"#;
+        let scan = parse_semgrep_output(sample).unwrap();
+        assert!(scan.findings.is_empty());
+        assert_eq!(scan.incomplete.len(), 1, "{:?}", scan.incomplete);
+        assert!(
+            scan.incomplete[0].contains("src/binary.py")
+                && scan.incomplete[0].contains("Syntax error"),
+            "{:?}",
+            scan.incomplete
+        );
+
+        // A hard engine error is not a partial result — it is a failed scan.
+        let fatal = r#"{"results":[],"errors":[{"level":"error","path":"rules.yaml",
+            "message":"invalid rule schema"}]}"#;
+        let err = parse_semgrep_output(fatal).unwrap_err();
+        assert!(format!("{err:#}").contains("invalid rule schema"));
+
+        // An error whose level we do not recognise is treated as fatal, not
+        // waved through as a warning.
+        let odd = r#"{"results":[],"errors":[{"level":"catastrophe","message":"?"}]}"#;
+        assert!(parse_semgrep_output(odd).is_err());
+    }
+
+    /// A parse error quotes the text that failed to parse, so on a binary file
+    /// the message carries that file's own bytes (measured: opengrep 1.25.0
+    /// embedded 60 bytes of a random blob). It is not spliced whole into a
+    /// terminal.
+    #[test]
+    fn an_engine_error_message_is_first_line_control_stripped_and_capped() {
+        let long = "x".repeat(500);
+        // Built through serde so a real control character lands in the JSON as
+        // a proper escape — the way an engine that quotes a binary file emits
+        // it — instead of making the document itself unparseable.
+        let sample = serde_json::json!({
+            "results": [],
+            "errors": [{
+                "level": "warn",
+                "path": "b.py",
+                "message": format!("head\u{7}{long}\nsecond line"),
+            }],
+        })
+        .to_string();
+        let scan = parse_semgrep_output(&sample).unwrap();
+        let note = &scan.incomplete[0];
+        assert!(note.starts_with("b.py: head"), "{note}");
+        assert!(note.ends_with('…'), "long messages are capped: {note}");
+        assert!(
+            !note.contains('\u{7}') && !note.contains("second line"),
+            "control characters stripped, later lines dropped: {note:?}"
+        );
+        assert!(note.chars().count() < 200, "{}", note.chars().count());
+
+        let no_message = r#"{"results":[],"errors":[{"level":"warn"}]}"#;
+        assert_eq!(
+            parse_semgrep_output(no_message).unwrap().incomplete,
+            vec!["?: (no message)".to_string()]
         );
     }
 
@@ -486,7 +738,9 @@ pub(crate) mod tests {
             "#!/bin/sh\ncurl -fsSL https://example.com/i | sh\n",
         );
 
-        let findings = serialized(|| run_sast(&ctx, cfg, &ctx.root)).unwrap();
+        let findings = serialized(|| run_sast(&ctx, cfg, &ctx.root))
+            .unwrap()
+            .findings;
         let hit = findings
             .iter()
             .find(|f| f.check_id.contains("curl-pipe-shell"))
@@ -515,7 +769,9 @@ pub(crate) mod tests {
             "#!/bin/sh\nwget -qO- https://example.com/i | bash\n",
         );
 
-        let findings = serialized(|| run_sast(&ctx, cfg, &ctx.root)).unwrap();
+        let findings = serialized(|| run_sast(&ctx, cfg, &ctx.root))
+            .unwrap()
+            .findings;
         assert!(
             findings
                 .iter()
@@ -576,16 +832,15 @@ pub(crate) mod tests {
              printf '{\"results\":[{\"check_id\":\"x\",\"path\":\"a.sh\",\"start\":{\"line\":1},\
              \"extra\":{\"severity\":\"ERROR\",\"message\":\"m\"}}],\"errors\":[]}'\n\
              exit 1\n";
-        let findings =
-            with_fake_tool("semgrep", script, || run_sast(&ctx, cfg, &ctx.root)).unwrap();
-        assert_eq!(findings.len(), 1, "exit 1 is `findings`, not an error");
+        let scan = with_fake_tool("semgrep", script, || run_sast(&ctx, cfg, &ctx.root)).unwrap();
+        assert_eq!(scan.findings.len(), 1, "exit 1 is `findings`, not an error");
 
         let clean = "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then echo \"1.169.0\"; exit 0; fi\n\
              printf '{\"results\":[],\"errors\":[]}'\n\
              exit 0\n";
-        let findings = with_fake_tool("semgrep", clean, || run_sast(&ctx, cfg, &ctx.root)).unwrap();
-        assert!(findings.is_empty());
+        let scan = with_fake_tool("semgrep", clean, || run_sast(&ctx, cfg, &ctx.root)).unwrap();
+        assert!(scan.findings.is_empty());
     }
 
     #[test]
@@ -641,6 +896,69 @@ pub(crate) mod tests {
             findings.iter().any(|f| f.contains("curl-pipe-shell")),
             "staged scan must find it: {findings:?}"
         );
+    }
+
+    /// M6(c), end to end through the real engine: `scan_staged` filtered on the
+    /// literal string `ERROR`, so a rule declaring `severity: CRITICAL` — which
+    /// both engines accept and echo back verbatim — produced a finding the
+    /// pre-commit gate then ignored.
+    #[test]
+    fn a_critical_severity_finding_blocks_the_staged_scan() {
+        let (_d, ctx) = repo();
+        write(
+            &ctx,
+            ".sscsb/rules/sscsb-test-critical.yaml",
+            "rules:\n  \
+             - id: sscsb-test.critical-marker\n    \
+             languages: [generic]\n    \
+             severity: CRITICAL\n    \
+             message: a critical marker\n    \
+             pattern-regex: 'SSCSB-CRITICAL-MARKER'\n",
+        );
+        write(&ctx, "app.txt", "line one\nSSCSB-CRITICAL-MARKER\n");
+        exec::git(&["add", "app.txt"], &ctx.root).unwrap();
+
+        let blocking = serialized(|| scan_staged(&ctx, ctx.require_config().unwrap())).unwrap();
+        assert!(
+            blocking.iter().any(|f| f.contains("critical-marker")),
+            "a CRITICAL finding must block the commit: {blocking:?}"
+        );
+        assert!(
+            blocking
+                .iter()
+                .all(|f| !f.contains("git-protocol-insecure")),
+            "advisory findings must still NOT block: {blocking:?}"
+        );
+    }
+
+    /// M6(a), end to end: a staged file the engine could not parse is reported
+    /// in `errors[]` while the process exits 0 with results — measured on
+    /// opengrep 1.25.0 and semgrep 1.169.0. Dropping that array made the gate
+    /// report "staged changes clean" about a file it never read.
+    #[test]
+    fn a_staged_file_the_engine_cannot_parse_is_not_a_clean_scan() {
+        let (_d, ctx) = repo();
+        write(
+            &ctx,
+            ".sscsb/rules/sscsb-test-python.yaml",
+            "rules:\n  \
+             - id: sscsb-test.py-eval\n    \
+             languages: [python]\n    \
+             severity: ERROR\n    \
+             message: eval\n    \
+             pattern: eval(...)\n",
+        );
+        // Deterministic bytes that are not Python: enough to make the parser
+        // give up rather than recover.
+        let garbage: Vec<u8> = (1u8..=255).chain(1u8..=255).collect();
+        std::fs::write(ctx.root.join("mystery.py"), &garbage).unwrap();
+        exec::git(&["add", "mystery.py"], &ctx.root).unwrap();
+
+        let err = serialized(|| scan_staged(&ctx, ctx.require_config().unwrap()))
+            .expect_err("a staged file the engine could not read is not a clean scan");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("could not scan"), "{msg}");
+        assert!(msg.contains("mystery.py"), "the file must be named: {msg}");
     }
 
     #[test]
@@ -742,7 +1060,7 @@ pub(crate) mod tests {
         }
         // The real engine, over a real bootstrapped repo: zero findings inside
         // .sscsb/rules, even though the rule file contains its own patterns.
-        let findings = run_sast(&ctx, cfg, &ctx.root).unwrap();
+        let findings = run_sast(&ctx, cfg, &ctx.root).unwrap().findings;
         assert!(
             !findings.iter().any(|f| f.path.contains(".sscsb/rules")),
             "the ruleset must never appear in its own findings: {findings:?}"

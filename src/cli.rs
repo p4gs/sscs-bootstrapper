@@ -628,15 +628,24 @@ fn cmd_scan(cwd: &std::path::Path, vex: Option<&std::path::Path>, grype: bool) -
 fn cmd_sast(cwd: &std::path::Path) -> Result<ExitCode> {
     let ctx = Ctx::discover(cwd)?;
     let cfg = ctx.require_config()?;
-    let findings = sast::run_sast(&ctx, cfg, &ctx.root)?;
-    println!("{} finding(s)", findings.len());
-    for f in findings.iter().take(50) {
+    let scan = sast::run_sast(&ctx, cfg, &ctx.root)?;
+    // What the engine could not read is stated before what it found: a scan
+    // that skipped part of the tree has not cleared that part of the tree, and
+    // "0 finding(s)" alone would say otherwise.
+    if !scan.incomplete.is_empty() {
+        println!(
+            "note: {} part(s) of the tree could not be scanned, and are not covered by this run:",
+            scan.incomplete.len()
+        );
+        for i in scan.incomplete.iter().take(20) {
+            println!("  ? {i}");
+        }
+    }
+    println!("{} finding(s)", scan.findings.len());
+    for f in scan.findings.iter().take(50) {
         println!("  {}", f.render());
     }
-    if findings
-        .iter()
-        .any(|f| f.severity.eq_ignore_ascii_case("ERROR"))
-    {
+    if scan.blocking().next().is_some() {
         return fail(1);
     }
     ok()
