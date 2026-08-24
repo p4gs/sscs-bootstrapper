@@ -62,6 +62,53 @@ drift apart. Secure defaults on. If you disable a control, its code does not run
 reports `DEGRADED` — it does not quietly pass. Nothing here claims to protect you
 with a tool that isn't there.
 
+## Threat & Control Model
+
+Kept deliberately high level — SDLC-stage threats, not individual MITRE ATT&CK
+techniques. Every arrow below maps to one of the five phases above; every
+control listed is a real, `verify`-able check, not an aspiration.
+
+```mermaid
+flowchart LR
+    A["Attacker /<br/>compromised AI agent"]
+    S["1 . Source<br/>(commit)"]
+    D["2 . Dependencies<br/>(packages)"]
+    B["3 . Build and<br/>Provenance"]
+    C["4 . Code<br/>Analysis"]
+    R["Release<br/>Artifact"]
+    P["5 . Continuous<br/>Posture"]
+    U["Consumer"]
+
+    S --> D --> B --> C --> R --> P --> U
+
+    A -->|"T1 unsigned/unreviewed commit"| S
+    A -->|"T2 leaked secret"| S
+    A -->|"T3 malicious/typosquat/vulnerable dependency"| D
+    A -->|"T4 tampered build,<br/>exfiltrated CI creds"| B
+    A -->|"T5 injected vuln,<br/>risky workflow pattern"| C
+    A -->|"T6 unverifiable provenance"| R
+    A -->|"T7 drift: new CVE<br/>after release, unnoticed"| P
+
+    style A fill:#ff7676,stroke:#940000,color:#000
+    style R fill:#9bb8ff,stroke:#0035b3,color:#000
+    style U fill:#9bb8ff,stroke:#0035b3,color:#000
+    style S fill:#f9ebb9,stroke:#fb9400,color:#000
+    style D fill:#f9ebb9,stroke:#fb9400,color:#000
+    style B fill:#f9ebb9,stroke:#fb9400,color:#000
+    style C fill:#f9ebb9,stroke:#fb9400,color:#000
+    style P fill:#f9ebb9,stroke:#fb9400,color:#000
+```
+
+| ID | Threat | Stage | Example | `sscsb` control | Phase |
+|----|--------|-------|---------|------------------|-------|
+| T1 | Unsigned or unreviewed commit lands on a protected branch | Source | An attacker — or a compromised AI agent — pushes a commit no human ever reviewed or cryptographically attested | Hardware-backed, human-only commit signing (AI keys are refused, not just discouraged); branch protection audit; AI-provenance commit trailers | 1 |
+| T2 | Secret or credential committed to source | Source | An API key gets pasted into a config file and committed | Pre-commit + pre-push secret blocking (TruffleHog + Gitleaks) | 1 |
+| T3 | Malicious, typosquatted, or known-vulnerable dependency introduced | Dependencies | An AI agent (or a human) adds a package one edit away from a popular name, or one with an unpatched CVE | SBOM (Syft); vulnerability scanning (Trivy + OSV-Scanner V2); package-trust checks (does it exist, is it a look-alike, did a human approve it); Renovate with digest pinning | 2 |
+| T4 | Build process tampered with, or CI credentials exfiltrated | Build | A malicious build step alters what's actually compiled, or a workflow leaks a long-lived cloud credential | Harden-Runner egress control on every job; short-lived credentials (Octo STS); every CI template SHA-pinned to a 40-char commit digest | 1 & 3 |
+| T5 | Vulnerability injected into first-party code, or a risky Actions pattern shipped | Code | A command-injection bug lands in application code; a workflow misuses `pull_request_target` against untrusted input | OpenGrep SAST (Semgrep selectable) in pre-commit and CI; CodeQL on PRs and default branch; workflow auditing for `pull_request_target` misuse, credential persistence, secret echo | 4 |
+| T6 | Released artifact's provenance can't be verified — no proof of what built it, or from which commit | Build → Release | A binary is downloaded with nothing to confirm it came from the claimed pipeline and source | Keyless signing (Cosign/Fulcio/Rekor); SLSA Build L3 provenance via the official generator, checked with `slsa-verifier` before anything is promoted | 3 |
+| T7 | A shipped artifact becomes vulnerable after release and the drift goes unnoticed | Post-release | A CVE is disclosed in a dependency months after release; nobody re-scans what's already out | Dependency-Track continuous SBOM management; GUAC supply-chain graph; OpenVEX so "not exploitable" is an auditable, first-class answer | 5 |
+
 ## Install
 
 ```sh
