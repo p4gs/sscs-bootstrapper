@@ -127,7 +127,7 @@ Every command below exists in the binary. Run `sscsb <command> --help` for flags
 | `sscsb signers check` | Classify recent commits as human / ci / agent / unsigned. |
 | `sscsb signers verify-policy` | Server-side gate: reject policy changes not made by a pre-trusted human. |
 | `sscsb signing status` / `setup` / `verify` | The multi-environment commit-signing model. |
-| `sscsb agent-key setup <backend>` | Setup guidance for a hardware-backed or remote agent signing key. |
+| `sscsb agent-key setup --backend <backend>` | Setup guidance for a hardware-backed or remote agent signing key. `--backend` is a flag, not a positional. |
 | `sscsb receipt create` / `verify <file>` | AI provenance receipts. |
 
 ### Remote and integrations
@@ -214,7 +214,7 @@ cargo build --release
 GIT_CONFIG_COUNT=0 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-cargo llvm-cov --ignore-filename-regex '(main\.rs|cli\.rs)'   # 95% line / 95% fn floor
+cargo llvm-cov --ignore-filename-regex '(main\.rs|cli\.rs)'   # gate: 95% lines / 94% functions (see ci.yml)
 ```
 
 `main.rs` and `cli.rs` are excluded from the coverage floor — they are argument

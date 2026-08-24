@@ -1,9 +1,23 @@
 //! Repository bootstrap: everything `sscsb init` does, as a library function.
 //!
 //! Init is a core path, so it lives here rather than in the CLI shell — the
-//! command layer only prints what this returns. Every step is idempotent: an
-//! existing config, hook, policy file, or workflow is kept, never overwritten,
-//! so re-running init on a live repo cannot clobber local edits.
+//! command layer only prints what this returns.
+//!
+//! Re-running init on a live repo cannot clobber local edits, but the rule is
+//! not "nothing is overwritten" — it is "nothing you are meant to edit is
+//! overwritten". Two classes:
+//!
+//! - **Kept if present** (`write_if_absent`): `.sscsb/config.toml`, the policy
+//!   TOMLs (`signers`, `packages`, `signing-model`), and every workflow or
+//!   config artifact. These are yours; a local edit survives forever.
+//! - **Always regenerated**: the three hook shims and
+//!   `.sscsb/policy/allowed_signers`. The shims carry a `DO NOT EDIT` banner and
+//!   are rewritten so a tampered or stale shim is repaired; `allowed_signers` is
+//!   derived from `signers.toml` and is rewritten on every push that touches a
+//!   protected branch, not only here. Hand edits to either are discarded.
+//!
+//! This is why the idempotence test asserts the second run writes *strictly
+//! fewer* lines than the first rather than zero — a claim of zero would be false.
 
 use crate::config;
 use crate::context::Ctx;
