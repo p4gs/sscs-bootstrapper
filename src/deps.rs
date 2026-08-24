@@ -1361,17 +1361,20 @@ pub fn verify_package_trust(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     let checks = TrustChecks::from_config(Some(cfg));
     messages.push(if checks.registry {
         "registry existence validation ON for `sscsb deps check` and approvals (anti-slopsquat)"
-            .into()
+            .to_string()
     } else {
         "registry existence validation OFF (registry_check = false) — hallucinated package \
          names will not be caught"
             .to_string()
     });
     messages.push(if checks.typosquat {
-        "typosquat proximity heuristic ON for `sscsb deps check` and approvals".into()
+        "typosquat proximity heuristic ON for `sscsb deps check`, approvals, and the \
+         commit gate"
+            .to_string()
     } else {
         "typosquat proximity heuristic OFF (typosquat_check = false) — names one edit from a \
-         popular package will not be flagged"
+         popular package will not be flagged, in `deps check`, at approval, or at the \
+         commit gate; a new unapproved dependency is still blocked"
             .to_string()
     });
     let outcome = if checks.registry && checks.typosquat {
