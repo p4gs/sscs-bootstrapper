@@ -259,14 +259,97 @@ pub fn vex_create(ctx: &Ctx, args: &VexArgs) -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
-pub fn verify_openvex_control(_ctx: &Ctx) -> VerifyResult {
-    let mut messages = vec![
-        "native OpenVEX generation: `sscsb vex create --vuln CVE-… --product pkg:… \
-         --status not_affected --justification …`"
-            .into(),
-        "ingestion: `sscsb scan --vex <file>` suppresses not_affected/fixed findings visibly"
-            .into(),
-    ];
+/// Verify every OpenVEX document this repository has actually produced.
+///
+/// This control used to be an unconditional `Pass` that examined nothing — the
+/// one control in the registry that could not fail, shipping default-ON. A
+/// control that cannot fail is not evidence of anything.
+///
+/// There is nothing to check by *default*, because `sscsb init` installs no VEX
+/// artifact: documents are written on demand by `sscsb vex create`. So the
+/// honest shape is the one `model-signing` already uses — `Info` while the
+/// control does not apply to this repo, a real verdict once it does. The
+/// discovery path is not an invented convention: `.sscsb/out/*.vex.json` is
+/// exactly where `vex_create` writes (see `vex_create` above).
+///
+/// Each document is checked against the two properties `scan::apply_vex`
+/// requires before it will suppress anything, so a document that passes here is
+/// one that will actually be honoured at scan time rather than silently
+/// ignored — a VEX file that suppresses nothing is worse than no VEX file,
+/// because it looks like a decision that was recorded.
+pub fn verify_openvex_control(ctx: &Ctx) -> VerifyResult {
+    let mut messages: Vec<String> = Vec::new();
+
+    let mut docs: Vec<std::path::PathBuf> = match std::fs::read_dir(ctx.sscsb_dir().join("out")) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().ends_with(".vex.json"))
+            .collect(),
+        // An absent out/ is the normal state of a repo that has never generated
+        // a document, not a failure to read the directory.
+        Err(_) => Vec::new(),
+    };
+    docs.sort();
+
+    if docs.is_empty() {
+        messages.push(
+            "no OpenVEX documents in .sscsb/out — N/A for this repo until one is generated".into(),
+        );
+        messages.push(
+            "generate: `sscsb vex create --vuln CVE-… --product pkg:… --status not_affected \
+             --justification …`"
+                .into(),
+        );
+        messages.push(
+            "ingest: `sscsb scan --vex <file>` suppresses not_affected/fixed findings visibly"
+                .into(),
+        );
+        return VerifyResult::new("openvex", Outcome::Info, messages);
+    }
+
+    let mut bad = 0usize;
+    for path in &docs {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        match std::fs::read_to_string(path) {
+            Err(e) => {
+                bad += 1;
+                messages.push(format!("{name}: unreadable — {e}"));
+            }
+            Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                Err(e) => {
+                    bad += 1;
+                    messages.push(format!("{name}: not valid JSON — {e}"));
+                }
+                Ok(doc) => {
+                    let context_ok = doc
+                        .get("@context")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.contains("openvex.dev"));
+                    let statements = doc
+                        .get("statements")
+                        .and_then(|s| s.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    if !context_ok {
+                        bad += 1;
+                        messages.push(format!(
+                            "{name}: @context is not an openvex.dev namespace — \
+                             `sscsb scan --vex` would reject it"
+                        ));
+                    } else if statements == 0 {
+                        bad += 1;
+                        messages.push(format!("{name}: no statements — it would suppress nothing"));
+                    } else {
+                        messages.push(format!("{name}: valid OpenVEX, {statements} statement(s)"));
+                    }
+                }
+            },
+        }
+    }
+
     match tools::detect(tools::spec("vexctl").expect("registry")) {
         tools::ToolStatus::Found { version, .. } => messages.push(format!(
             "vexctl {} also available (merge/attest)",
@@ -276,7 +359,13 @@ pub fn verify_openvex_control(_ctx: &Ctx) -> VerifyResult {
             messages.push("vexctl not installed (optional — brew install vexctl)".into());
         }
     }
-    VerifyResult::new("openvex", Outcome::Pass, messages)
+
+    let outcome = if bad > 0 {
+        Outcome::Fail
+    } else {
+        Outcome::Pass
+    };
+    VerifyResult::new("openvex", outcome, messages)
 }
 
 // ─────────────────────────── ORAS ───────────────────────────────────────────
@@ -746,15 +835,83 @@ mod tests {
         assert!(format!("{err:#}").contains("invalid status"));
     }
 
+    /// A repo that has never generated a VEX document gets `Info`, not `Pass`.
+    /// This control was previously an unconditional `Pass` that read nothing —
+    /// the only control in the registry that could not fail. `Info` is the same
+    /// honest shape `model-signing` uses for "does not apply here".
     #[test]
-    fn openvex_control_always_passes_because_generation_is_native() {
+    fn openvex_is_not_applicable_until_a_document_exists() {
         let (_d, ctx) = repo();
         let r = verify_openvex_control(&ctx);
-        assert_eq!(r.outcome, Outcome::Pass);
+        assert_eq!(
+            r.outcome,
+            Outcome::Info,
+            "a control with nothing to check must not report Pass"
+        );
+        assert!(r.messages.iter().any(|m| m.contains("N/A for this repo")));
         assert!(r.messages.iter().any(|m| m.contains("sscsb vex create")));
-        // vexctl is optional either way; the control states which it found.
-        let mentions_vexctl = r.messages.iter().any(|m| m.contains("vexctl"));
-        assert!(mentions_vexctl);
+    }
+
+    /// The document `vex create` writes must verify, or generation and
+    /// verification disagree about what a valid document is.
+    #[test]
+    fn openvex_passes_on_a_document_this_tool_generated() {
+        let (_d, ctx) = repo();
+        vex_create(
+            &ctx,
+            &VexArgs {
+                vuln: "CVE-2024-12345",
+                product: "pkg:cargo/serde",
+                status: "not_affected",
+                justification: Some("vulnerable_code_not_in_execute_path"),
+            },
+        )
+        .unwrap();
+
+        let r = verify_openvex_control(&ctx);
+        assert_eq!(r.outcome, Outcome::Pass);
+        assert!(r
+            .messages
+            .iter()
+            .any(|m| m.contains("cve-2024-12345.vex.json") && m.contains("1 statement")));
+    }
+
+    /// A document that `scan --vex` would silently refuse to honour must not
+    /// read as a satisfied control — that is the failure mode this control
+    /// exists to catch. Both properties are the ones `apply_vex` actually
+    /// requires.
+    #[test]
+    fn openvex_fails_on_a_document_that_would_suppress_nothing() {
+        let (_d, ctx) = repo();
+        let out = ctx.sscsb_dir().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        // Right shape, wrong namespace: apply_vex rejects it outright.
+        std::fs::write(
+            out.join("wrong-context.vex.json"),
+            r#"{"@context":"https://example.invalid/ns","statements":[{"vulnerability":{"name":"CVE-1"}}]}"#,
+        )
+        .unwrap();
+        let r = verify_openvex_control(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(r.messages.iter().any(|m| m.contains("not an openvex.dev")));
+
+        // Right namespace, no statements: parses, suppresses nothing.
+        std::fs::remove_file(out.join("wrong-context.vex.json")).unwrap();
+        std::fs::write(
+            out.join("empty.vex.json"),
+            r#"{"@context":"https://openvex.dev/ns/v0.2.0","statements":[]}"#,
+        )
+        .unwrap();
+        let r = verify_openvex_control(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(r.messages.iter().any(|m| m.contains("suppress nothing")));
+
+        // Not JSON at all.
+        std::fs::write(out.join("empty.vex.json"), "{ not json").unwrap();
+        let r = verify_openvex_control(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(r.messages.iter().any(|m| m.contains("not valid JSON")));
     }
 
     #[test]
