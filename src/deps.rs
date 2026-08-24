@@ -139,6 +139,40 @@ impl DepSpec {
 }
 
 /// Source-aware parse: every direct dependency with where it comes from.
+/// Why this manifest could not be read, or `None` if it parses.
+///
+/// The set-returning parsers below deliberately keep their infallible shape —
+/// they are called from a fuzz target and from `current_deps`, where a partial
+/// answer is fine. This is the separate question the GATE has to ask, because
+/// there the difference between "declares nothing" and "cannot be read" decides
+/// whether a commit is allowed through.
+///
+/// Only the two structured formats can fail: `Cargo.toml` (TOML) and
+/// `package.json` (JSON). The line-scanned formats — requirements.txt, go.mod,
+/// Gemfile — have no failure mode, they simply match fewer lines, so they are
+/// `None` by construction rather than by omission. `pyproject.toml` is checked
+/// as TOML because that is what it is, even though the parser falls back to a
+/// line scan when `[project].dependencies` is absent.
+pub fn manifest_parse_error(eco: Ecosystem, file: &str, content: &str) -> Option<String> {
+    // An empty staged file declares nothing and parses as nothing; that is a
+    // real answer, not a failure.
+    if content.trim().is_empty() {
+        return None;
+    }
+    match eco {
+        Ecosystem::Cargo => content.parse::<toml::Table>().err().map(|e| e.to_string()),
+        Ecosystem::Npm => serde_json::from_str::<serde_json::Value>(content)
+            .err()
+            .map(|e| e.to_string()),
+        Ecosystem::PyPi if file.ends_with("pyproject.toml") => {
+            content.parse::<toml::Table>().err().map(|e| e.to_string())
+        }
+        // requirements.txt, go.mod and Gemfile are line-scanned: no parse step,
+        // so no parse failure to distinguish from an empty declaration.
+        Ecosystem::PyPi | Ecosystem::Go | Ecosystem::RubyGems => None,
+    }
+}
+
 pub fn parse_dep_specs(eco: Ecosystem, content: &str) -> BTreeSet<DepSpec> {
     match eco {
         Ecosystem::Cargo => cargo_specs(content),
@@ -625,6 +659,16 @@ pub enum NewDepReason {
     /// The package points at code the registry never vetted (git/path/alias/url),
     /// so it needs review even if the NAME was previously approved.
     NonRegistrySource(String),
+    /// The staged manifest is present but could not be parsed, so what it
+    /// declares is UNKNOWN — not empty.
+    ///
+    /// Conflating those two is how this gate was bypassed: a parse failure
+    /// yielded an empty dependency set, the staged-vs-HEAD diff found nothing
+    /// new, and the commit passed with no output at all. A UTF-8 BOM on
+    /// `package.json` was enough — npm strips it and installs happily,
+    /// `serde_json` does not. A JSONC comment or any TOML syntax error did the
+    /// same. A gate that cannot read its input must fail closed.
+    UnparseableManifest(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -646,6 +690,14 @@ impl NewDep {
                  never vetted this code, so it needs explicit review even though the \
                  name may already be approved; confirm intent, then `sscsb deps approve {}`",
                 self.qualified, self.qualified
+            ),
+            NewDepReason::UnparseableManifest(detail) => format!(
+                "staged manifest `{}` could not be parsed ({detail}) — its dependencies \
+                 are UNKNOWN, not none, so this gate cannot clear the commit. Note a \
+                 UTF-8 BOM or a JSONC-style comment will do this: the package manager \
+                 tolerates them, the strict parser does not. Fix the file, or stage a \
+                 version that parses.",
+                self.qualified
             ),
         }
     }
@@ -712,6 +764,17 @@ pub fn new_unapproved_deps(ctx: &Ctx) -> Result<Vec<NewDep>> {
         let head_content = exec::git_raw(&["show", &format!("HEAD:{file}")], &ctx.root)
             .map(|o| if o.success() { o.stdout } else { String::new() })
             .unwrap_or_default();
+        // Fail closed on a manifest we cannot read. Its dependencies are
+        // unknown, not none, and treating them as none is exactly how this gate
+        // was bypassed. Only the STAGED side matters: an unparseable HEAD is
+        // history we cannot change, and blocking on it would wedge the repo.
+        if let Some(detail) = manifest_parse_error(eco, file, &staged_content.stdout) {
+            out.push(NewDep {
+                qualified: file.to_string(),
+                reason: NewDepReason::UnparseableManifest(detail),
+            });
+            continue;
+        }
         let before = parse_dep_specs(eco, &head_content);
         let after = parse_dep_specs(eco, &staged_content.stdout);
         let before_keys: BTreeSet<String> = before.iter().map(DepSpec::key).collect();
@@ -1500,6 +1563,84 @@ mod tests {
                 .any(|d| d.starts_with("pypi:") || d.starts_with("go:")),
             "no requirements.txt/go.mod present: {deps:?}"
         );
+    }
+
+    /// A manifest that is present but unreadable must fail the gate closed.
+    ///
+    /// Before this, every parser turned a parse failure into an EMPTY dependency
+    /// set, so the staged-vs-HEAD diff found nothing new and the commit passed
+    /// with no output at all. The cheapest trigger is a UTF-8 BOM on
+    /// `package.json`: npm strips it and installs happily, `serde_json` does
+    /// not. Reproduced end to end — clean manifest blocked at exit 1, the same
+    /// manifest with a BOM exited 0 silently.
+    #[test]
+    fn unparseable_staged_manifest_blocks_instead_of_reading_as_no_dependencies() {
+        for (file, baseline, broken) in [
+            (
+                "package.json",
+                r#"{"dependencies":{"lodash":"4"}}"#.to_string(),
+                // BOM first: the package manager tolerates it, the parser does not.
+                format!("\u{feff}{}", r#"{"dependencies":{"evil-abc":"1"}}"#),
+            ),
+            (
+                "package.json",
+                r#"{"dependencies":{"lodash":"4"}}"#.to_string(),
+                "// deps\n{\"dependencies\":{\"evil-abc\":\"1\"}}".to_string(),
+            ),
+            (
+                "Cargo.toml",
+                "[dependencies]\nserde = \"1\"\n".to_string(),
+                "[dependencies]\nserde = \"1\"\n= = =\n".to_string(),
+            ),
+        ] {
+            let (_d, ctx) = repo_ctx();
+            write_file(&ctx, file, &baseline);
+            stage(&ctx, file);
+            exec::git_raw(&["commit", "-m", "base", "--no-verify"], &ctx.root).unwrap();
+
+            write_file(&ctx, file, &broken);
+            stage(&ctx, file);
+
+            let found = new_unapproved_deps(&ctx).unwrap();
+            assert_eq!(
+                found.len(),
+                1,
+                "{file}: an unreadable manifest must produce exactly one problem, got {found:?}"
+            );
+            assert!(
+                matches!(found[0].reason, NewDepReason::UnparseableManifest(_)),
+                "{file}: expected UnparseableManifest, got {:?}",
+                found[0].reason
+            );
+            assert!(
+                found[0].explain().contains("UNKNOWN, not none"),
+                "the message must say why an empty read is not a clean read"
+            );
+        }
+    }
+
+    /// The guard must not fire on manifests that legitimately declare nothing,
+    /// or on the three line-scanned formats that have no parse step at all.
+    #[test]
+    fn manifest_parse_error_distinguishes_unreadable_from_empty() {
+        // Structured formats: real failures.
+        assert!(manifest_parse_error(Ecosystem::Npm, "package.json", "{ not json").is_some());
+        assert!(manifest_parse_error(Ecosystem::Cargo, "Cargo.toml", "= = =").is_some());
+        assert!(
+            manifest_parse_error(Ecosystem::PyPi, "pyproject.toml", "= = =").is_some(),
+            "pyproject.toml is TOML and must be checked as TOML"
+        );
+
+        // Valid, and validly empty.
+        assert!(manifest_parse_error(Ecosystem::Npm, "package.json", "{}").is_none());
+        assert!(manifest_parse_error(Ecosystem::Cargo, "Cargo.toml", "").is_none());
+        assert!(manifest_parse_error(Ecosystem::Npm, "package.json", "   \n ").is_none());
+
+        // Line-scanned formats cannot fail to parse; they match fewer lines.
+        // These are None by construction, not by omission.
+        assert!(manifest_parse_error(Ecosystem::PyPi, "requirements.txt", "= = =").is_none());
+        assert!(manifest_parse_error(Ecosystem::Go, "go.mod", "= = =").is_none());
+        assert!(manifest_parse_error(Ecosystem::RubyGems, "Gemfile", "= = =").is_none());
     }
 
     #[test]
