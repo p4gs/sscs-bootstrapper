@@ -81,9 +81,12 @@ covers everything else shell can do.
 
 Two hard stops, from [signing.md](signing.md):
 
-- **An AI may not sign.** An `ai`-class key is never emitted into
-  `allowed_signers`, so an AI's signature cannot be verification-valid — no matter
-  how the policy file is edited.
+- **An AI may not sign onto a protected branch.** The gate keys on the signer's
+  **class**, not on presence in `allowed_signers`. With `agent-signing` off (the
+  default) an `ai`-class key is not emitted into that file; with it on the key
+  *is* emitted, so an agent's commit can verify as a genuine agent signature on a
+  feature branch. The protected-branch answer does not change either way. See
+  [signing.md](signing.md) § "The one thing `agent-signing` changes".
 - **An AI may not land on a protected branch.** Pre-push requires every commit on a
   protected branch to be signed by a `human`-class key.
 
