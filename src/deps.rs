@@ -1127,6 +1127,17 @@ pub fn registry_exists(eco: Ecosystem, name: &str) -> RegistryStatus {
 /// Popular package names per ecosystem (embedded, deliberately small): a NEW
 /// dependency within edit-distance 1 of one of these — but not equal to it —
 /// is a typosquat suspect.
+///
+/// The list is doing two jobs at once, which is why membership also *clears* a
+/// name: an entry is a package worth protecting AND a package asserted to be
+/// real, so `rake` and `rack` — one edit apart, both entirely legitimate — must
+/// either both be here or neither.
+///
+/// Go and RubyGems used to be absent, so `typosquat_suspect` returned `None` for
+/// them and two whole ecosystems had no typosquat coverage at all. Go is
+/// arguably where it matters most: module paths are case-sensitive, and
+/// `github.com/Sirupsen/logrus` versus `github.com/sirupsen/logrus` is a real
+/// historical split that the `normalize` arm below catches.
 pub const POPULAR: &[(&str, &[&str])] = &[
     (
         "cargo",
@@ -1203,6 +1214,66 @@ pub const POPULAR: &[(&str, &[&str])] = &[
             "pillow",
         ],
     ),
+    (
+        "go",
+        &[
+            "github.com/stretchr/testify",
+            "github.com/sirupsen/logrus",
+            "github.com/spf13/cobra",
+            "github.com/spf13/viper",
+            "github.com/pkg/errors",
+            "github.com/google/uuid",
+            "github.com/gorilla/mux",
+            "github.com/gin-gonic/gin",
+            "github.com/prometheus/client_golang",
+            "github.com/davecgh/go-spew",
+            "github.com/lib/pq",
+            "github.com/go-sql-driver/mysql",
+            "github.com/mattn/go-sqlite3",
+            "github.com/aws/aws-sdk-go-v2",
+            "go.uber.org/zap",
+            "google.golang.org/grpc",
+            "google.golang.org/protobuf",
+            "gopkg.in/yaml.v3",
+            "golang.org/x/crypto",
+            "golang.org/x/net",
+            "golang.org/x/sync",
+            "golang.org/x/sys",
+            "golang.org/x/text",
+        ],
+    ),
+    (
+        "rubygems",
+        &[
+            "rails",
+            // `rake` and `rack` are one edit apart and both real. Listing both
+            // is what stops each from being reported as a squat of the other.
+            "rake",
+            "rack",
+            "rspec",
+            "nokogiri",
+            "puma",
+            "sinatra",
+            "devise",
+            "pg",
+            "mysql2",
+            "sqlite3",
+            "sidekiq",
+            "redis",
+            "activerecord",
+            "activesupport",
+            "bundler",
+            "json",
+            "faraday",
+            "rubocop",
+            "httparty",
+            "jwt",
+            "dotenv",
+            "pry",
+            "minitest",
+            "octokit",
+        ],
+    ),
 ];
 
 /// Damerau-Levenshtein distance of at most 1: one substitution, insertion,
@@ -1250,6 +1321,53 @@ fn normalize(name: &str) -> String {
     name.to_lowercase().replace(['-', '_'], "")
 }
 
+/// Split a name into its stem and its trailing run of ASCII digits.
+fn split_digit_suffix(name: &str) -> (&str, &str) {
+    name.split_at(name.trim_end_matches(|c: char| c.is_ascii_digit()).len())
+}
+
+/// True when two names are members of one *family*, distinguished only by a
+/// trailing digit — `sha1`/`sha2`/`sha3`, `base32`/`base64`,
+/// `gopkg.in/yaml.v2`/`gopkg.in/yaml.v3`.
+///
+/// These are not typos of one another, and treating them as such was a real
+/// false positive: `sha1` and `sha3` are ubiquitous RustCrypto crates, yet each
+/// was reported as a typosquat of `sha2` and could not be baselined without
+/// `--force`. A false "unapproved dependency" blocks somebody's commit, so the
+/// heuristic has to be right about this class, not merely loud.
+///
+/// A typosquat works by *misreading or mistyping* a name. A trailing digit is
+/// the one token nobody glosses over — it is the whole semantic payload of the
+/// name (which SHA? which base?) and picking the wrong one lands you on a
+/// different real package that fails to compile, not on attacker-controlled
+/// code.
+///
+/// Three conditions keep this from becoming a bypass, and all three are load-
+/// bearing:
+///
+/// * **Both** sides must carry a digit suffix. `requests2` shadowing `requests`,
+///   or `boto` shadowing `boto3`, is a classic squat and stays flagged — only
+///   one side has digits.
+/// * The digit runs must be the **same length**, so `sha22` is still a suspect
+///   of `sha2` while `sha1` is not.
+/// * The stems must be identical and non-empty, so this never fires on names
+///   that merely both happen to end in a digit.
+///
+/// The residue: it does exempt an unknown `<popular-stem><other-digit>` — `sha7`,
+/// `urllib2` — from the *distance* heuristic. Those names still go through the
+/// registry-existence check, which is the arm that actually knows whether a name
+/// is real; the distance heuristic never did.
+fn digit_variant_siblings(a: &str, b: &str) -> bool {
+    let (stem_a, digits_a) = split_digit_suffix(a);
+    let (stem_b, digits_b) = split_digit_suffix(b);
+    !digits_a.is_empty()
+        && !digits_b.is_empty()
+        && digits_a.len() == digits_b.len()
+        && digits_a != digits_b
+        && !stem_a.is_empty()
+        && stem_a == stem_b
+}
+
 /// Typosquat suspicion for a new package name. Returns the popular package it
 /// shadows, if any.
 pub fn typosquat_suspect(eco: Ecosystem, name: &str) -> Option<&'static str> {
@@ -1262,8 +1380,9 @@ pub fn typosquat_suspect(eco: Ecosystem, name: &str) -> Option<&'static str> {
     }
     list.iter()
         .find(|popular| {
-            edit_distance_leq1(name, popular)
-                || (normalize(name) == normalize(popular) && name != **popular)
+            !digit_variant_siblings(name, popular)
+                && (edit_distance_leq1(name, popular)
+                    || (normalize(name) == normalize(popular) && name != **popular))
         })
         .copied()
 }
@@ -1998,15 +2117,140 @@ mod tests {
         );
     }
 
+    /// M17 (a): `sha1`, `sha2` and `sha3` are three different, ubiquitous
+    /// crates. Each was reported as a typosquat of the others, so baselining a
+    /// perfectly ordinary hashing dependency needed `--force`. A false
+    /// "unapproved dependency" blocks somebody's commit; that is the expensive
+    /// direction to be wrong in.
     #[test]
-    fn typosquat_suspect_is_none_for_ecosystems_without_a_curated_popular_list() {
-        // POPULAR only curates cargo/npm/pypi; go and rubygems fall through
-        // the lookup's `?` and correctly return None rather than panicking.
+    fn digit_variant_siblings_are_a_family_not_a_typosquat() {
+        // `sha2` is the POPULAR entry; its siblings must clear.
+        assert_eq!(typosquat_suspect(Ecosystem::Cargo, "sha1"), None);
+        assert_eq!(typosquat_suspect(Ecosystem::Cargo, "sha3"), None);
+        // `base64` is a POPULAR entry and `base32` is a real crate.
+        assert_eq!(typosquat_suspect(Ecosystem::Cargo, "base32"), None);
+        // Go: `gopkg.in/yaml.v2` and `.v3` are both in wide use.
+        assert_eq!(
+            typosquat_suspect(Ecosystem::Go, "gopkg.in/yaml.v2"),
+            None,
+            "the two live major versions of a module are not typos of each other"
+        );
+
+        // …and none of the three guards may be relaxed. Each of these is still
+        // a suspect, which is what stops the exemption becoming a bypass.
+        assert_eq!(
+            typosquat_suspect(Ecosystem::Cargo, "shal"),
+            Some("sha2"),
+            "a lookalike letter for the digit is exactly the squat this catches"
+        );
+        assert_eq!(
+            typosquat_suspect(Ecosystem::Cargo, "sha22"),
+            Some("sha2"),
+            "differing digit-run LENGTH is an appended digit, not a sibling"
+        );
+        assert_eq!(
+            typosquat_suspect(Ecosystem::PyPi, "boto"),
+            Some("boto3"),
+            "only one side carries digits — dropping the `3` is a squat shape"
+        );
+        assert_eq!(
+            typosquat_suspect(Ecosystem::Cargo, "sha"),
+            Some("sha2"),
+            "same: no digit suffix on one side"
+        );
+
+        // The predicate itself, at its boundaries.
+        assert!(digit_variant_siblings("sha1", "sha2"));
+        assert!(!digit_variant_siblings("sha1", "sha1")); // identical digits
+        assert!(!digit_variant_siblings("sha", "sha2")); // one side bare
+        assert!(!digit_variant_siblings("sha2", "sha22")); // different lengths
+        assert!(!digit_variant_siblings("1", "2")); // empty stem
+        assert!(!digit_variant_siblings("abc1", "xyz2")); // different stems
+    }
+
+    /// M17 (b): `POPULAR` curated cargo/npm/pypi only, so `typosquat_suspect`
+    /// fell out of the lookup's `?` for Go and RubyGems and two whole
+    /// ecosystems had NO typosquat coverage — `sscsb deps check` on a Go or
+    /// Rails repo could not flag a single lookalike.
+    #[test]
+    fn go_and_rubygems_have_typosquat_coverage() {
+        // Go: a transposed module path.
+        assert_eq!(
+            typosquat_suspect(Ecosystem::Go, "github.com/stretchr/testfiy"),
+            Some("github.com/stretchr/testify")
+        );
+        // Go's own hazard: module paths are case-sensitive, so a capitalised
+        // path is a different module that reads identically.
+        assert_eq!(
+            typosquat_suspect(Ecosystem::Go, "github.com/Sirupsen/logrus"),
+            Some("github.com/sirupsen/logrus")
+        );
+        // The real ones still clear.
         assert_eq!(
             typosquat_suspect(Ecosystem::Go, "github.com/pkg/errors"),
             None
         );
+        assert_eq!(typosquat_suspect(Ecosystem::Go, "golang.org/x/sync"), None);
+        assert_eq!(
+            typosquat_suspect(Ecosystem::Go, "github.com/something/entirely-else"),
+            None
+        );
+
+        // RubyGems.
+        assert_eq!(
+            typosquat_suspect(Ecosystem::RubyGems, "nokogiri "),
+            Some("nokogiri"),
+            "a trailing space is a distinct gem name one edit away"
+        );
+        assert_eq!(
+            typosquat_suspect(Ecosystem::RubyGems, "sinatr"),
+            Some("sinatra")
+        );
         assert_eq!(typosquat_suspect(Ecosystem::RubyGems, "rails"), None);
+        // `rake` and `rack` are one edit apart and BOTH real: listing both is
+        // what keeps each from being reported as a squat of the other.
+        assert_eq!(typosquat_suspect(Ecosystem::RubyGems, "rake"), None);
+        assert_eq!(typosquat_suspect(Ecosystem::RubyGems, "rack"), None);
+        assert_eq!(
+            typosquat_suspect(Ecosystem::RubyGems, "unrelated-gem"),
+            None
+        );
+    }
+
+    /// Structural guard for the same finding: every ecosystem sscsb can parse
+    /// must have a curated list, or `typosquat_suspect` drops out of the
+    /// lookup's `?` and that ecosystem gets no coverage at all — silently, with
+    /// `deps check` reporting clean.
+    ///
+    /// And every curated name must clear its own ecosystem's heuristic,
+    /// otherwise adding a protected name silently converts it into a suspect —
+    /// which is precisely the `rake`/`rack` trap.
+    #[test]
+    fn every_ecosystem_has_a_popular_list_and_no_curated_name_is_a_suspect() {
+        for eco in [
+            Ecosystem::Cargo,
+            Ecosystem::Npm,
+            Ecosystem::PyPi,
+            Ecosystem::Go,
+            Ecosystem::RubyGems,
+        ] {
+            assert!(
+                POPULAR.iter().any(|(label, _)| *label == eco.label()),
+                "`{}` has no curated popular list, so it has no typosquat coverage at all",
+                eco.label()
+            );
+        }
+        for (label, names) in POPULAR {
+            let eco = Ecosystem::from_label(label).expect("POPULAR label is an ecosystem");
+            for name in *names {
+                assert_eq!(
+                    typosquat_suspect(eco, name),
+                    None,
+                    "{label}: `{name}` is curated as popular and must never be \
+                     reported as a squat of another curated name"
+                );
+            }
+        }
     }
 
     #[test]

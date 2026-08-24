@@ -152,7 +152,19 @@ in the same ecosystem is flagged, with the name it shadows. The distance is
 typosquat shape is an adjacent transposition (`tokoi` for `tokio`, `reqeusts` for
 `requests`), which plain Levenshtein scores as distance *2* and would wave straight
 through. Hyphen/underscore confusion (`serde-json` for `serde_json`) is caught
-separately.
+separately, and so is case confusion — which is why the curated lists cover all
+five ecosystems including Go, where `github.com/Sirupsen/logrus` and
+`github.com/sirupsen/logrus` are two different module paths that read the same.
+
+One exception, because it is a *family* and not a typo: two names that differ
+only in a trailing digit of the same length — `sha1`/`sha2`/`sha3`,
+`base32`/`base64`, `gopkg.in/yaml.v2`/`gopkg.in/yaml.v3` — do not shadow each
+other. A trailing digit is the whole semantic payload of such a name; nobody
+mistypes it, and picking the wrong one lands you on a different *real* package
+that fails to compile. Only that shape is exempt: `boto` still shadows `boto3`
+(one side has no digits) and `sha22` still shadows `sha2` (the digit runs differ
+in length), and every one of these names still goes through the existence check,
+which is the arm that actually knows whether a name is real.
 
 **Human approval.** New packages introduced by a **staged** manifest change are
 compared against the previous revision and against your approved baseline. Anything
