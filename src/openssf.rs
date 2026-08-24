@@ -367,16 +367,47 @@ const MODEL_EXTS: &[&str] = &[
     "npz",
 ];
 
+/// Bound on DIRECTORIES traversed (not just matches) so a match-free tree
+/// can't stall verify, independent of the match cap.
+const MODEL_SCAN_DIR_BUDGET: usize = 4000;
+
+/// Bound on matches collected: enough to prove the control applies.
+const MODEL_SCAN_MATCH_CAP: usize = 50;
+
+/// What a bounded scan actually established.
+struct ModelScan {
+    files: Vec<String>,
+    /// The directory budget ran out with directories still unvisited. The tree
+    /// was NOT searched to the end, so "this repo ships no models" is unproven —
+    /// the distinction between a completed search and an abandoned one.
+    incomplete: bool,
+    /// The match cap stopped collection; there may be more model files than the
+    /// ones listed.
+    more_matches: bool,
+}
+
 /// Bounded recursive scan for model files under `root`, skipping VCS/build dirs.
-/// Capped so a large repo can't stall `verify`.
-fn find_model_files(root: &Path) -> Vec<String> {
+/// Capped so a large repo can't stall `verify` — and the caps are reported, not
+/// swallowed, so a truncated search cannot be read as a completed one.
+fn find_model_files(root: &Path) -> ModelScan {
+    scan_model_files(root, MODEL_SCAN_DIR_BUDGET, MODEL_SCAN_MATCH_CAP)
+}
+
+fn scan_model_files(root: &Path, dir_budget: usize, match_cap: usize) -> ModelScan {
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
-    // Bound on DIRECTORIES traversed (not just matches) so a match-free tree
-    // can't stall verify, independent of the 50-match cap below.
     let mut dirs_visited = 0usize;
+    let mut incomplete = false;
+    let mut more_matches = false;
     while let Some(dir) = stack.pop() {
-        if found.len() >= 50 || dirs_visited >= 4000 {
+        if found.len() >= match_cap {
+            more_matches = true;
+            break;
+        }
+        if dirs_visited >= dir_budget {
+            // `dir` was popped but never read, so whatever is under it is
+            // unexamined — that is exactly what `incomplete` records.
+            incomplete = true;
             break;
         }
         dirs_visited += 1;
@@ -419,7 +450,11 @@ fn find_model_files(root: &Path) -> Vec<String> {
         }
     }
     found.sort();
-    found
+    ModelScan {
+        files: found,
+        incomplete,
+        more_matches,
+    }
 }
 
 /// Model signing applies only when the repo ships models. If it does, the
@@ -427,13 +462,33 @@ fn find_model_files(root: &Path) -> Vec<String> {
 /// reported as N/A (Info) rather than a false pass or fail.
 pub fn verify_model_signing(ctx: &Ctx) -> VerifyResult {
     let workflow_ok = ctx.root.join(".github/workflows/sign-models.yml").is_file();
-    let models = find_model_files(&ctx.root);
-    if models.is_empty() {
+    let scan = find_model_files(&ctx.root);
+    if scan.files.is_empty() {
         let installed = if workflow_ok {
             "sign-models.yml installed (ready if models are added)"
         } else {
             "sign-models.yml not installed — run `sscsb init`"
         };
+        // "Found nothing" and "stopped looking" are different answers. Saying
+        // N/A off an abandoned search would hide a repo that does ship models
+        // (a FAIL) behind a verdict that reads like a clean bill of health.
+        if scan.incomplete {
+            return VerifyResult::new(
+                "model-signing",
+                Outcome::Degraded,
+                vec![
+                    format!(
+                        "model scan STOPPED after {MODEL_SCAN_DIR_BUDGET} directories with the \
+                         tree unfinished — no models found so far, but whether this repo ships \
+                         models is UNKNOWN, not N/A"
+                    ),
+                    "check the model paths yourself, or narrow the tree (the scan already skips \
+                     .git/target/node_modules/.venv/venv/dist)"
+                        .into(),
+                    installed.into(),
+                ],
+            );
+        }
         return VerifyResult::new(
             "model-signing",
             Outcome::Info,
@@ -444,10 +499,14 @@ pub fn verify_model_signing(ctx: &Ctx) -> VerifyResult {
             ],
         );
     }
+    let count = if scan.more_matches {
+        format!("{}+", scan.files.len())
+    } else {
+        scan.files.len().to_string()
+    };
     let mut messages = vec![format!(
-        "{} model file(s) detected (e.g. {})",
-        models.len(),
-        models[0]
+        "{count} model file(s) detected (e.g. {})",
+        scan.files[0]
     )];
     if !workflow_ok {
         messages.push(".github/workflows/sign-models.yml MISSING — run `sscsb init`".into());
@@ -697,8 +756,9 @@ mod tests {
         std::fs::write(root.join(".git/x.onnx"), b"x").unwrap();
         std::fs::write(root.join("target/y.pt"), b"y").unwrap();
         std::fs::write(root.join("real.gguf"), b"z").unwrap();
-        let found = find_model_files(root);
-        assert_eq!(found, vec!["real.gguf".to_string()]);
+        let scan = find_model_files(root);
+        assert_eq!(scan.files, vec!["real.gguf".to_string()]);
+        assert!(!scan.incomplete, "a small tree is searched to the end");
     }
 
     #[cfg(unix)]
@@ -720,10 +780,93 @@ mod tests {
             root.join("linked.onnx"),
         )
         .unwrap();
-        let found = find_model_files(root);
+        let scan = find_model_files(root);
         // Only the real in-repo file — the scan neither follows the dir symlink
         // (escaping the repo), the cycle (stalling), nor the file symlink.
-        assert_eq!(found, vec!["in-repo.safetensors".to_string()]);
+        assert_eq!(scan.files, vec!["in-repo.safetensors".to_string()]);
+        assert!(!scan.incomplete);
+    }
+
+    /// Regression (M26): the scan stops after `MODEL_SCAN_DIR_BUDGET`
+    /// directories. If it had found nothing by then it reported Info — "N/A for
+    /// this repo" — which is the same verdict a repo that genuinely ships no
+    /// models gets. A repo big enough to truncate the scan could therefore hide
+    /// unsigned models behind what reads as a clean bill of health.
+    #[test]
+    fn model_signing_will_not_call_a_truncated_scan_n_a() {
+        let (_d, ctx) = repo();
+        // One directory more than the budget, none of them holding a model, so
+        // the outcome does not depend on which order the scan happens to pop.
+        for i in 0..=MODEL_SCAN_DIR_BUDGET {
+            std::fs::create_dir(ctx.root.join(format!("d{i:05}"))).unwrap();
+        }
+        std::fs::write(
+            ctx.root.join(".github/workflows/sign-models.yml"),
+            "name: Sign ML Models\non:\n  workflow_dispatch:\n",
+        )
+        .unwrap();
+
+        let r = verify_model_signing(&ctx);
+        assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("UNKNOWN, not N/A")),
+            "{:?}",
+            r.messages
+        );
+        assert!(
+            !r.messages.iter().any(|m| m.contains("N/A for this repo")),
+            "a truncated search must not present as a completed one: {:?}",
+            r.messages
+        );
+    }
+
+    /// The half a whole-tree fixture cannot show deterministically: a model that
+    /// exists but sits past the budget. The scan must report empty AND say so.
+    #[test]
+    fn model_scan_reports_when_the_budget_hid_a_real_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // root + `a` fit in a 2-directory budget; `a/b`, holding the model, does
+        // not. The chain makes the visit order the only possible one.
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/model.safetensors"), b"\x00").unwrap();
+
+        let stopped = scan_model_files(root, 2, MODEL_SCAN_MATCH_CAP);
+        assert!(stopped.files.is_empty(), "{:?}", stopped.files);
+        assert!(
+            stopped.incomplete,
+            "the model was missed because the scan stopped, and that must be recorded"
+        );
+
+        // Given the budget to finish, the same tree yields the model and the
+        // scan reports itself complete.
+        let complete = scan_model_files(root, MODEL_SCAN_DIR_BUDGET, MODEL_SCAN_MATCH_CAP);
+        assert_eq!(complete.files, vec!["a/b/model.safetensors".to_string()]);
+        assert!(!complete.incomplete);
+    }
+
+    /// The match cap is the other truncation: the count reported must not claim
+    /// to be the whole tally when collection stopped early.
+    #[test]
+    fn model_signing_counts_are_marked_when_the_match_cap_stopped_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for i in 0..4 {
+            std::fs::write(root.join(format!("m{i}.safetensors")), b"\x00").unwrap();
+        }
+        let capped = scan_model_files(root, MODEL_SCAN_DIR_BUDGET, 2);
+        // The cap is checked when a directory is popped, so a single directory
+        // yields all four; the flag fires when there is still tree to walk.
+        assert!(!capped.more_matches, "one directory, nothing left to pop");
+
+        std::fs::create_dir(root.join("more")).unwrap();
+        std::fs::write(root.join("more/m4.safetensors"), b"\x00").unwrap();
+        let capped = scan_model_files(root, MODEL_SCAN_DIR_BUDGET, 2);
+        assert!(capped.more_matches, "{:?}", capped.files);
+        assert!(
+            !capped.incomplete,
+            "the budget was not the reason it stopped"
+        );
     }
 
     #[test]
