@@ -10,6 +10,7 @@ use crate::context::Ctx;
 use crate::controls::{Outcome, VerifyResult};
 use anyhow::Result;
 use std::path::Path;
+use yaml_rust2::YamlLoader;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Artifact {
@@ -237,7 +238,187 @@ pub fn install_all(ctx: &Ctx, cfg: &Config) -> Result<Vec<String>> {
     Ok(lines)
 }
 
+// ───────────────────────── artifact shape checks ────────────────────────────
+
+/// What sscsb can honestly assert about an installed artifact BEYOND the fact
+/// that a file exists at the path.
+///
+/// Existence is not function. `install_all` never overwrites, so a pre-existing
+/// file at a destination is kept and then reported — and a file gutted to
+/// `# gutted` is still a file. Each artifact kind therefore gets the strongest
+/// structural claim sscsb can make from the bytes alone, and no stronger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// GitHub Actions workflow: must parse as YAML and declare at least one
+    /// job that actually runs something.
+    Workflow,
+    /// Any other YAML document: must parse into a non-empty mapping.
+    Yaml,
+    /// JSON / JSON5 config: sscsb parses the comment-stripped JSON subset.
+    Json,
+    /// TOML config: must parse into a non-empty table.
+    Toml,
+    /// Prose, shell, Dockerfile, ignore-lists. There is no machine-checkable
+    /// structure here that sscsb could assert without inventing one — the
+    /// substance of a filled-in worksheet is a human judgement. sscsb proves
+    /// only that the file is present and not empty, and says so.
+    Opaque,
+}
+
+fn shape_of(dest: &str) -> Shape {
+    let is_yamlish = dest.ends_with(".yml") || dest.ends_with(".yaml");
+    if is_yamlish && dest.starts_with(".github/workflows/") {
+        Shape::Workflow
+    } else if is_yamlish {
+        Shape::Yaml
+    } else if dest.ends_with(".json") || dest.ends_with(".json5") {
+        Shape::Json
+    } else if dest.ends_with(".toml") {
+        Shape::Toml
+    } else {
+        Shape::Opaque
+    }
+}
+
+/// The verdict on one installed artifact's contents.
+enum ShapeVerdict {
+    /// Structurally sound as far as this artifact kind can be checked.
+    Sound(String),
+    /// Present and non-empty, but sscsb's parser cannot confirm it — reported
+    /// honestly rather than claimed as verified.
+    Unprovable(String),
+    /// Provably not a working artifact: empty, unparseable, or inert.
+    Broken(String),
+}
+
+/// Strip whole-line `//` comments so a JSON5 config can be handed to a strict
+/// JSON parser. Deliberately conservative: it does not attempt to be a JSON5
+/// implementation, and anything it cannot parse is reported as UNPROVABLE, not
+/// as broken.
+fn strip_line_comments(content: &str) -> String {
+    content
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn check_workflow(dest: &str, content: &str) -> ShapeVerdict {
+    let docs = match YamlLoader::load_from_str(content) {
+        Ok(d) => d,
+        Err(err) => {
+            return ShapeVerdict::Broken(format!(
+                "{dest} is NOT valid YAML ({err}) — GitHub Actions cannot run it"
+            ))
+        }
+    };
+    let Some(doc) = docs.first() else {
+        return ShapeVerdict::Broken(format!(
+            "{dest} contains no YAML document — a gutted or comment-only workflow runs NOTHING"
+        ));
+    };
+    let Some(jobs) = doc["jobs"].as_hash().filter(|j| !j.is_empty()) else {
+        return ShapeVerdict::Broken(format!(
+            "{dest} declares no `jobs:` — the workflow runs NOTHING"
+        ));
+    };
+    // A job with neither `steps:` nor `uses:` is not a runnable job; GitHub
+    // rejects it and, until it does, the control it is supposed to enforce is
+    // not being enforced.
+    let inert: Vec<String> = jobs
+        .iter()
+        .filter(|(_, job)| {
+            let has_steps = job["steps"].as_vec().is_some_and(|s| !s.is_empty());
+            let has_uses = job["uses"].as_str().is_some_and(|u| !u.trim().is_empty());
+            !(has_steps || has_uses)
+        })
+        .map(|(id, _)| id.as_str().unwrap_or("<non-string job id>").to_string())
+        .collect();
+    if !inert.is_empty() {
+        return ShapeVerdict::Broken(format!(
+            "{dest}: job(s) {} declare neither `steps:` nor `uses:` — they run NOTHING",
+            inert.join(", ")
+        ));
+    }
+    ShapeVerdict::Sound(format!("{dest} installed ({} job(s))", jobs.len()))
+}
+
+fn check_yaml(dest: &str, content: &str) -> ShapeVerdict {
+    match YamlLoader::load_from_str(content) {
+        Err(err) => ShapeVerdict::Broken(format!("{dest} is NOT valid YAML ({err})")),
+        Ok(docs) => match docs.first().and_then(|d| d.as_hash()) {
+            Some(h) if !h.is_empty() => {
+                ShapeVerdict::Sound(format!("{dest} installed ({} key(s))", h.len()))
+            }
+            _ => ShapeVerdict::Broken(format!(
+                "{dest} holds no YAML mapping — an empty or comment-only config configures NOTHING"
+            )),
+        },
+    }
+}
+
+fn check_json(dest: &str, content: &str) -> ShapeVerdict {
+    let stripped = strip_line_comments(content);
+    if stripped.trim().is_empty() {
+        return ShapeVerdict::Broken(format!(
+            "{dest} is empty once comments are stripped — it configures NOTHING"
+        ));
+    }
+    match serde_json::from_str::<serde_json::Value>(&stripped) {
+        Ok(serde_json::Value::Object(map)) if !map.is_empty() => {
+            ShapeVerdict::Sound(format!("{dest} installed ({} key(s))", map.len()))
+        }
+        Ok(serde_json::Value::Object(_)) => {
+            ShapeVerdict::Broken(format!("{dest} is an empty object — it configures NOTHING"))
+        }
+        Ok(_) => ShapeVerdict::Broken(format!("{dest} is not a JSON object")),
+        // JSON5 is a superset (trailing commas, unquoted keys, single quotes);
+        // sscsb's stripper only handles the subset its own template uses, so a
+        // parse failure here is sscsb's limitation, NOT proof the file is
+        // broken. Say that instead of failing a legitimate hand-written config.
+        Err(err) => ShapeVerdict::Unprovable(format!(
+            "{dest} present and non-empty, but sscsb could not parse it as comment-stripped JSON \
+             ({err}) — JSON5 features beyond that subset are outside what it can check"
+        )),
+    }
+}
+
+fn check_toml(dest: &str, content: &str) -> ShapeVerdict {
+    match content.parse::<toml::Value>() {
+        Err(err) => ShapeVerdict::Broken(format!("{dest} is NOT valid TOML ({err})")),
+        Ok(toml::Value::Table(t)) if !t.is_empty() => {
+            ShapeVerdict::Sound(format!("{dest} installed ({} key(s))", t.len()))
+        }
+        Ok(_) => ShapeVerdict::Broken(format!(
+            "{dest} holds no TOML table — an empty or comment-only config configures NOTHING"
+        )),
+    }
+}
+
+/// Assert whatever this artifact kind permits. The floor, applied to every
+/// kind, is that a zero-byte or whitespace-only artifact is never sound.
+fn check_shape(dest: &str, content: &str) -> ShapeVerdict {
+    if content.trim().is_empty() {
+        return ShapeVerdict::Broken(format!("{dest} is EMPTY — it enforces nothing"));
+    }
+    match shape_of(dest) {
+        Shape::Workflow => check_workflow(dest, content),
+        Shape::Yaml => check_yaml(dest, content),
+        Shape::Json => check_json(dest, content),
+        Shape::Toml => check_toml(dest, content),
+        // Deliberately weak, and labelled as such. See `Shape::Opaque`.
+        Shape::Opaque => ShapeVerdict::Sound(format!(
+            "{dest} installed (present and non-empty; no machine-checkable structure — its \
+             substance is a human judgement sscsb does not assert)"
+        )),
+    }
+}
+
 /// Generic verifier for controls whose deliverable is installed artifacts.
+///
+/// Checks the artifact's CONTENT, not just its inode: `install_all` never
+/// overwrites, so the file sitting at a destination may be a gutted stub or
+/// something else entirely that happens to share the name.
 pub fn verify_template_control(ctx: &Ctx, control: &'static str) -> VerifyResult {
     if control == "harden-runner" {
         return verify_harden_runner(ctx);
@@ -251,19 +432,44 @@ pub fn verify_template_control(ctx: &Ctx, control: &'static str) -> VerifyResult
         );
     }
     let mut messages = Vec::new();
-    let mut missing = 0;
+    let mut broken = 0;
+    let mut unprovable = 0;
     for a in artifacts {
-        if ctx.root.join(a.dest).is_file() {
-            messages.push(format!("{} installed", a.dest));
-        } else {
-            missing += 1;
+        let path = ctx.root.join(a.dest);
+        if !path.is_file() {
+            broken += 1;
             messages.push(format!("{} MISSING — run `sscsb init`", a.dest));
+            continue;
+        }
+        // A non-UTF-8 blob at a template destination is not the artifact.
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            broken += 1;
+            messages.push(format!(
+                "{} is unreadable as text — this is not the installed artifact",
+                a.dest
+            ));
+            continue;
+        };
+        match check_shape(a.dest, &content) {
+            ShapeVerdict::Sound(m) => messages.push(m),
+            ShapeVerdict::Unprovable(m) => {
+                unprovable += 1;
+                messages.push(m);
+            }
+            ShapeVerdict::Broken(m) => {
+                broken += 1;
+                messages.push(format!(
+                    "{m} — run `sscsb init` after deleting it to regenerate"
+                ));
+            }
         }
     }
-    let outcome = if missing == 0 {
-        Outcome::Pass
-    } else {
+    let outcome = if broken > 0 {
         Outcome::Fail
+    } else if unprovable > 0 {
+        Outcome::Degraded
+    } else {
+        Outcome::Pass
     };
     VerifyResult::new(control, outcome, messages)
 }
@@ -491,6 +697,269 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.contains(".github/workflows/scorecard.yml MISSING")));
+    }
+
+    // ─────────────────── artifact shape checks (H1) ────────────────────────
+
+    /// ∀ registered artifacts: the template sscsb SHIPS satisfies the
+    /// structural check sscsb APPLIES. This is the guard against the fix's own
+    /// worst failure mode — a check strict enough to fail every real repo the
+    /// moment `sscsb init` writes the file.
+    #[test]
+    fn every_artifact_template_satisfies_its_own_shape_check() {
+        for a in ARTIFACTS {
+            let rendered = render(a.content, "owner/repo", "main");
+            match check_shape(a.dest, &rendered) {
+                ShapeVerdict::Sound(_) => {}
+                ShapeVerdict::Unprovable(m) => {
+                    panic!("shipped template {} is not verifiable: {m}", a.dest)
+                }
+                ShapeVerdict::Broken(m) => panic!("shipped template {} is broken: {m}", a.dest),
+            }
+        }
+    }
+
+    /// Every control routed through `verify_template_control` must be green on
+    /// a freshly bootstrapped repo. A false FAIL here lands on every user.
+    #[test]
+    fn every_template_control_passes_on_a_freshly_bootstrapped_repo() {
+        let (_d, ctx) = repo();
+        let cfg = ctx.require_config().unwrap();
+        let mut checked = 0;
+        for a in ARTIFACTS {
+            let def = crate::controls::control(a.control).expect("registry");
+            if !cfg
+                .control_enabled(a.control)
+                .unwrap_or(def.default_enabled)
+            {
+                continue;
+            }
+            if a.control == "harden-runner" {
+                continue;
+            }
+            let result = verify_template_control(&ctx, def.id);
+            assert_eq!(
+                result.outcome,
+                Outcome::Pass,
+                "control `{}` regressed on a clean install: {:?}",
+                def.id,
+                result.messages
+            );
+            checked += 1;
+        }
+        assert!(checked > 10, "expected to cover the template controls");
+    }
+
+    /// H1: gutting a workflow to a single comment left the control PASSing,
+    /// because the verifier only asked whether a file existed at the path.
+    #[test]
+    fn a_gutted_workflow_fails_its_template_control() {
+        let (_d, ctx) = repo();
+        std::fs::write(ctx.root.join(".github/workflows/codeql.yml"), "# gutted\n").unwrap();
+        let result = verify_template_control(&ctx, "codeql");
+        assert_eq!(
+            result.outcome,
+            Outcome::Fail,
+            "a workflow that runs nothing must not verify: {:?}",
+            result.messages
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.contains("contains no YAML document")),
+            "{:?}",
+            result.messages
+        );
+    }
+
+    /// The floor that applies to every artifact kind, checked on the one kind
+    /// that has no structure beyond it: a prose worksheet.
+    #[test]
+    fn a_zero_byte_artifact_fails_its_template_control() {
+        let (_d, ctx) = repo();
+        std::fs::write(ctx.root.join(".sscsb/osps-baseline.md"), "").unwrap();
+        let result = verify_template_control(&ctx, "osps-baseline");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(result.messages[0].contains("is EMPTY"));
+
+        // Whitespace-only is the same emptiness wearing a disguise.
+        std::fs::write(ctx.root.join(".sscsb/osps-baseline.md"), "  \n\n\t\n").unwrap();
+        assert_eq!(
+            verify_template_control(&ctx, "osps-baseline").outcome,
+            Outcome::Fail
+        );
+    }
+
+    /// A workflow can parse, declare jobs, and still run nothing.
+    #[test]
+    fn a_workflow_whose_jobs_run_nothing_fails() {
+        let (_d, ctx) = repo();
+        std::fs::write(
+            ctx.root.join(".github/workflows/codeql.yml"),
+            "name: codeql\non: push\njobs:\n  analyze:\n    runs-on: ubuntu-latest\n",
+        )
+        .unwrap();
+        let result = verify_template_control(&ctx, "codeql");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("declare neither `steps:` nor `uses:`")));
+
+        // ...and an empty `jobs:` mapping.
+        std::fs::write(
+            ctx.root.join(".github/workflows/codeql.yml"),
+            "name: codeql\non: push\njobs:\n",
+        )
+        .unwrap();
+        let result = verify_template_control(&ctx, "codeql");
+        assert_eq!(result.outcome, Outcome::Fail);
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("declares no `jobs:`")));
+    }
+
+    #[test]
+    fn an_unparseable_workflow_fails_its_template_control() {
+        let (_d, ctx) = repo();
+        std::fs::write(
+            ctx.root.join(".github/workflows/codeql.yml"),
+            "name: codeql\n  bad: [unclosed\n",
+        )
+        .unwrap();
+        let result = verify_template_control(&ctx, "codeql");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(result.messages[0].contains("NOT valid YAML"));
+    }
+
+    /// A non-UTF-8 blob at a template destination is not the artifact.
+    #[test]
+    fn a_binary_blob_at_an_artifact_path_fails() {
+        let (_d, ctx) = repo();
+        std::fs::write(
+            ctx.root.join(".github/workflows/codeql.yml"),
+            [0xff_u8, 0xfe, 0x00, 0x01],
+        )
+        .unwrap();
+        let result = verify_template_control(&ctx, "codeql");
+        assert_eq!(result.outcome, Outcome::Fail);
+        assert!(result.messages[0].contains("unreadable as text"));
+    }
+
+    /// Non-workflow YAML (octo-sts trust policy) gets the mapping check.
+    #[test]
+    fn a_gutted_yaml_config_fails_its_template_control() {
+        let (_d, ctx) = repo();
+        let dest = ctx
+            .root
+            .join(".github/chainguard/sscsb-automation.sts.yaml");
+        std::fs::write(&dest, "# gutted\n").unwrap();
+        let result = verify_template_control(&ctx, "octo-sts");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("holds no YAML mapping")));
+
+        std::fs::write(&dest, "- just\n- a\n- list\n").unwrap();
+        assert_eq!(
+            verify_template_control(&ctx, "octo-sts").outcome,
+            Outcome::Fail
+        );
+    }
+
+    #[test]
+    fn a_gutted_json_config_fails_its_template_control() {
+        let (_d, ctx) = repo();
+        let dest = ctx.root.join("renovate.json5");
+        std::fs::write(&dest, "// gutted\n").unwrap();
+        let result = verify_template_control(&ctx, "renovate");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(result.messages[0].contains("empty once comments are stripped"));
+
+        std::fs::write(&dest, "{}\n").unwrap();
+        let result = verify_template_control(&ctx, "renovate");
+        assert_eq!(result.outcome, Outcome::Fail);
+        assert!(result.messages[0].contains("empty object"));
+
+        std::fs::write(&dest, "[1, 2]\n").unwrap();
+        let result = verify_template_control(&ctx, "renovate");
+        assert_eq!(result.outcome, Outcome::Fail);
+        assert!(result.messages[0].contains("not a JSON object"));
+    }
+
+    /// JSON5 is a superset of JSON. A file sscsb's stripper cannot parse is
+    /// sscsb's limitation, not proof the config is broken — so it degrades
+    /// (which `verify --strict` still refuses) instead of failing a
+    /// legitimate hand-written renovate config.
+    #[test]
+    fn json5_beyond_the_parseable_subset_degrades_rather_than_failing() {
+        let (_d, ctx) = repo();
+        std::fs::write(
+            ctx.root.join("renovate.json5"),
+            "{\n  extends: ['config:recommended'],\n}\n",
+        )
+        .unwrap();
+        let result = verify_template_control(&ctx, "renovate");
+        assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+        assert!(result.messages[0].contains("could not parse it as comment-stripped JSON"));
+    }
+
+    #[test]
+    fn shape_of_routes_each_artifact_kind() {
+        assert_eq!(
+            shape_of(".github/workflows/codeql.yml"),
+            Shape::Workflow,
+            "workflows are the strongest-checked kind"
+        );
+        assert_eq!(shape_of("security-insights.yml"), Shape::Yaml);
+        assert_eq!(
+            shape_of(".github/chainguard/sscsb-automation.sts.yaml"),
+            Shape::Yaml
+        );
+        assert_eq!(shape_of("renovate.json5"), Shape::Json);
+        assert_eq!(shape_of("deps.json"), Shape::Json);
+        assert_eq!(shape_of(".gitleaks.toml"), Shape::Toml);
+        assert_eq!(shape_of(".sscsb/osps-baseline.md"), Shape::Opaque);
+        assert_eq!(shape_of(".clusterfuzzlite/Dockerfile"), Shape::Opaque);
+        assert_eq!(shape_of(".trivyignore"), Shape::Opaque);
+    }
+
+    #[test]
+    fn toml_configs_are_checked_for_a_non_empty_table() {
+        match check_shape(".gitleaks.toml", "[extend]\nuseDefault = true\n") {
+            ShapeVerdict::Sound(m) => assert!(m.contains("1 key(s)")),
+            other => panic!("expected sound: {}", verdict_text(&other)),
+        }
+        match check_shape(".gitleaks.toml", "# only a comment\n") {
+            ShapeVerdict::Broken(m) => assert!(m.contains("holds no TOML table")),
+            other => panic!("expected broken: {}", verdict_text(&other)),
+        }
+        match check_shape(".gitleaks.toml", "not = [valid toml\n") {
+            ShapeVerdict::Broken(m) => assert!(m.contains("NOT valid TOML")),
+            other => panic!("expected broken: {}", verdict_text(&other)),
+        }
+    }
+
+    /// An opaque artifact that survives the emptiness floor is reported as
+    /// checked-for-presence-only, never as verified.
+    #[test]
+    fn opaque_artifacts_report_the_limit_of_what_was_checked() {
+        match check_shape(".sscsb/osps-baseline.md", "# filled in by a human\n") {
+            ShapeVerdict::Sound(m) => {
+                assert!(m.contains("no machine-checkable structure"), "{m}");
+                assert!(m.contains("human judgement"), "{m}");
+            }
+            other => panic!("expected sound: {}", verdict_text(&other)),
+        }
+    }
+
+    fn verdict_text(v: &ShapeVerdict) -> &str {
+        match v {
+            ShapeVerdict::Sound(m) | ShapeVerdict::Unprovable(m) | ShapeVerdict::Broken(m) => m,
+        }
     }
 
     #[test]
