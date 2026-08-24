@@ -1,14 +1,21 @@
-# sscsb: immutability-compatible release (draft-then-publish). Builds, keyless-
-# signs (Cosign), SBOMs, and attests build-provenance + SBOM to GitHub's OWN
-# attestation store (immutability-safe — the store is separate from release
-# assets), uploads the signed artifacts + SBOM + bundles to a DRAFT release, then
-# publishes ONCE, so nothing is modified after the release becomes immutable.
+# sscsb: immutability-compatible release (draft-then-publish). Builds every
+# published target, keyless-signs (Cosign), SBOMs, and attests build-provenance
+# + SBOM to GitHub's OWN attestation store (immutability-safe — the store is
+# separate from release assets), uploads the signed artifacts + SBOM + bundles to
+# a DRAFT release, then publishes ONCE, so nothing is modified after the release
+# becomes immutable.
 # Enable "release immutability" (Settings -> General -> Releases) alongside this.
 #
 # Trade-off vs release-slsa.yml: the slsa-github-generator ATTACHES SLSA L3
 # provenance to the release, which conflicts with immutability. This path uses
 # the GitHub attestation store (Build L1/L2) so the release stays immutable.
 # Use release-slsa.yml (L3, mutable) OR this (immutable, store-based) — not both.
+#
+# Build fan-out: each target is built on a runner that can produce it, then the
+# single `release` job collects every tarball and performs ALL release writes.
+# Checksums are computed centrally in that job rather than per-runner, so the
+# digests users verify are produced by one tool on one platform (macOS has no
+# `sha256sum`; a per-runner split would mean two implementations).
 name: Release (immutable)
 on:
   push:
@@ -18,7 +25,70 @@ permissions:
   contents: read
 
 jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true # never publish a partial platform set
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      # The runner ships a stable Rust toolchain; --locked pins to the committed
+      # lockfile. `rustup target add` is a no-op for a runner's native target and
+      # supplies the std for the one cross case (x86_64 macOS from an arm64 host,
+      # which Xcode's bundled SDKs support directly).
+      - name: Add target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup target add "$TARGET"
+      - name: Build sscsb release binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "$TARGET"
+          mkdir -p dist
+          tar -C "target/${TARGET}/release" -czf "dist/sscsb-${GITHUB_REF_NAME}-${TARGET}.tar.gz" sscsb
+      - name: Verify the tarball contains a runnable binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          tar -tzf "dist/sscsb-${GITHUB_REF_NAME}-${TARGET}.tar.gz" | grep -qx sscsb \
+            || { echo "::error::tarball for $TARGET has no sscsb entry"; exit 1; }
+          # Only the host-native artifact can be executed here; a cross-built one
+          # is checked structurally above. Never claim more than was proven.
+          if [ "$TARGET" = "$(rustc -vV | awk '/^host:/{print $2}')" ]; then
+            "target/${TARGET}/release/sscsb" --version
+          else
+            echo "::notice::$TARGET is cross-built on this runner; skipping execution check"
+          fi
+      - name: Upload target artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sscsb-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
   release:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write # create/publish the release + upload assets to the draft
@@ -33,26 +103,31 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      # Real build: the release-mode sscsb binary, packed with its checksum. The
-      # runner ships a stable Rust toolchain; --locked pins to the committed lockfile.
-      # (Single-target x86_64 linux for v0.1.0; add a cross-compile matrix later.)
-      - name: Build sscsb release binary
-        run: |
-          set -euo pipefail
-          cargo build --release --locked
-          mkdir -p dist
-          tarball="dist/sscsb-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
-          tar -C target/release -czf "$tarball" sscsb
-          ( cd dist && sha256sum "sscsb-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" > "sscsb-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz.sha256" )
-      - name: Refuse to release nothing
+      - name: Collect built targets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: sscsb-*
+          merge-multiple: true
+      # A partial platform set is a failed release, not a small one: a formula
+      # pinned to a missing asset installs nothing, and `fail-fast` above should
+      # already have stopped us. Assert the exact expected count.
+      - name: Refuse to release an incomplete artifact set
         run: |
           set -uo pipefail
           shopt -s nullglob
           artifacts=(dist/*.tar.gz)
-          if [ ${#artifacts[@]} -eq 0 ]; then
-            echo "::error::no dist/*.tar.gz — nothing to release (did the build run?)"
+          if [ ${#artifacts[@]} -ne 3 ]; then
+            echo "::error::expected 3 platform tarballs, found ${#artifacts[@]}: ${artifacts[*]:-none}"
             exit 1
           fi
+          printf '%s\n' "${artifacts[@]}"
+      - name: Compute checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in *.tar.gz; do sha256sum "$f" > "$f.sha256"; done
+          cat ./*.sha256
       - name: Attest build provenance (attestation store)
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
