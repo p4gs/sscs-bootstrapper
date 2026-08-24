@@ -211,10 +211,7 @@ pub fn create_receipt(ctx: &Ctx, commit: &str, out_dir: &Path) -> Result<std::pa
         &["rev-parse", "--verify", "--end-of-options", commit],
         &ctx.root,
     )?;
-    anyhow::ensure!(
-        is_object_name(&sha),
-        "rev-parse resolved {commit:?} to {sha:?}, which is not a git object name"
-    );
+    let file_name = receipt_file_name(commit, &sha)?;
     let patch = exec::git(&["show", "--format=", "--no-color", &sha], &ctx.root)?;
     let patch_digest = hex::encode(Sha256::digest(patch.as_bytes()));
     let body = exec::git(&["log", "-1", "--format=%B", &sha], &ctx.root)?;
@@ -237,9 +234,36 @@ pub fn create_receipt(ctx: &Ctx, commit: &str, out_dir: &Path) -> Result<std::pa
         }
     });
     std::fs::create_dir_all(out_dir)?;
-    let path = out_dir.join(format!("receipt-{}.json", &sha[..12]));
+    let path = out_dir.join(file_name);
     std::fs::write(&path, serde_json::to_string_pretty(&statement)?)?;
     Ok(path)
+}
+
+/// The receipt filename for a sha that `git rev-parse --verify` resolved.
+///
+/// Reported (M16): `sscsb receipt create -- --raw` exited 101. Before
+/// `--verify`, the resolver was a bare `git rev-parse <commit>`, and rev-parse
+/// ECHOES an unrecognised option back at exit 0 — `git rev-parse --raw` prints
+/// `--raw`, five characters — so this function's twelve-character slice ran off
+/// the end: "end byte index 12 is out of bounds for string of length 5".
+/// A CLI must never abort on its own argument.
+///
+/// `--verify` closed that door; the length check closes the class. `rev-parse
+/// --verify` resolves to a FULL object name — 40 hex under sha1, 64 under
+/// sha256 — while [`is_object_name`] deliberately admits abbreviations from 7
+/// characters, because a RECEIPT may legitimately carry an abbreviated name.
+/// This value did not come from a receipt, so anything shorter than a full oid
+/// means the invocation did not do what the caller believes it did, and the
+/// honest answer is an error rather than a filename built from a slice that
+/// happens not to panic.
+fn receipt_file_name(commit: &str, sha: &str) -> Result<String> {
+    anyhow::ensure!(
+        is_object_name(sha) && matches!(sha.len(), 40 | 64),
+        "rev-parse resolved {commit:?} to {sha:?}, which is not a full git object name"
+    );
+    // Belt and braces: `get` cannot panic even if the guard above is ever
+    // loosened. A filename is not worth a process abort.
+    Ok(format!("receipt-{}.json", sha.get(..12).unwrap_or(sha)))
 }
 
 /// Verify a receipt against the repository: recompute the commit's patch
@@ -700,6 +724,82 @@ mod tests {
         assert!(!is_object_name("HEAD"));
         assert!(!is_object_name("123456")); // too short to be an abbreviation
         assert!(!is_object_name("DEADBEEF1")); // uppercase is not git's output form
+    }
+
+    /// Reported (M16): `sscsb receipt create -- --raw` exited 101.
+    ///
+    /// Before `--verify`, the resolver was `git rev-parse <commit>`, and
+    /// rev-parse ECHOES an unrecognised option back at exit 0 — `git rev-parse
+    /// --raw` prints `--raw`, five characters — so the receipt filename's
+    /// `&sha[..12]` sliced past the end. Reproduced at
+    /// "end byte index 12 is out of bounds for string of length 5".
+    ///
+    /// `--verify` shut that particular door, but the slice was still one
+    /// unexpected short answer away from a crash, because `is_object_name`
+    /// admits a 7-character abbreviation: a resolver answering with one used to
+    /// clear the guard and then abort the process. Asserted directly on the
+    /// filename derivation, which is where the slice lives — shimming `git`
+    /// itself onto PATH would break every other test in this threaded suite.
+    #[test]
+    fn receipt_file_name_errors_rather_than_panicking_on_anything_but_a_full_sha() {
+        // The exact reported payload, five characters, and the abbreviations
+        // `is_object_name` admits — all of them refused, none of them fatal.
+        for bad in [
+            "--raw",           // what `git rev-parse --raw` echoes back at exit 0
+            "-s",              //
+            "deadbee",         // 7 hex: passes is_object_name, too short to slice
+            "deadbeef1234def", // 15 hex: long enough to slice, still not an oid
+            "",
+            "HEAD",
+        ] {
+            let err = receipt_file_name("HEAD", bad)
+                .expect_err("{bad:?} must be an error, never a process abort");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not a full git object name"),
+                "for {bad:?}: {msg}"
+            );
+            assert!(msg.contains(bad), "the message names what it got: {msg}");
+        }
+
+        // Both real widths still work — the guard must not become a false
+        // positive for the answers rev-parse actually gives.
+        assert_eq!(
+            receipt_file_name("HEAD", &"a".repeat(40)).unwrap(),
+            "receipt-aaaaaaaaaaaa.json"
+        );
+        assert_eq!(
+            receipt_file_name("HEAD", &"b".repeat(64)).unwrap(),
+            "receipt-bbbbbbbbbbbb.json"
+        );
+    }
+
+    /// The reported invocation itself, pinned end to end at the library level:
+    /// a leading-dash revision is refused by git under `--end-of-options` and
+    /// surfaces as an ordinary error.
+    #[test]
+    fn create_receipt_refuses_an_option_shaped_revision_without_panicking() {
+        let (_d, ctx) = repo();
+        write(&ctx, "a.txt", "a\n");
+        commit_all(&ctx, "feat: x");
+        let out_dir = ctx.sscsb_dir().join("out").join("receipts");
+
+        let victim = ctx.root.join("victim.txt");
+        std::fs::write(&victim, "ORIGINAL CONTENT\n").unwrap();
+
+        for revision in ["--raw", "-s", &format!("--output={}", victim.display())] {
+            let err = create_receipt(&ctx, revision, &out_dir)
+                .expect_err("an option-shaped revision must be refused, not turned into a receipt");
+            assert!(
+                !format!("{err:#}").is_empty(),
+                "{revision} must produce a real error"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "ORIGINAL CONTENT\n",
+            "creating a receipt must never write to a file on disk"
+        );
     }
 
     #[test]
