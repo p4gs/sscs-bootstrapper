@@ -47,11 +47,14 @@ That wiring is what this is.
 
 Three ideas run through the whole design:
 
-**Humans, CI, and AI never share a key.** Every signing identity is classified.
-Only `human`-class identities may sign a commit that lands on a protected branch,
-and `sscsb` refuses to even emit an AI-class key into the `allowed_signers` file —
-an AI's signature cannot be made verification-valid, no matter how the policy file
-is edited. An AI can draft anything; it cannot sign.
+**Humans, CI, and AI never share a key.** Every signing identity is classified,
+and only `human`-class identities may sign a commit that lands on a protected
+branch. The gate keys on the signer's **class**, not on presence in
+`allowed_signers`: with `agent-signing` off (the default) an AI-class key is not
+emitted into that file at all, and with it on the key *is* emitted — deliberately,
+so an agent's commit verifies as a genuine agent signature on a feature branch.
+Either way the protected-branch answer is the same. An AI can draft anything; it
+cannot land it.
 
 **Every control is toggleable, and off means off.** One `.sscsb/config.toml`,
 generated from the control registry itself, so the config and the code cannot
@@ -157,7 +160,7 @@ Two more docs cover the parts people get wrong:
 
 ## Controls
 
-43 controls, each with an id you can `enable`, `disable`, and `verify`:
+44 controls, each with an id you can `enable`, `disable`, and `verify`:
 
 ```sh
 sscsb status                      # what's on, what's installed
@@ -220,7 +223,7 @@ cargo build --release
 cargo test               # unit + integration + library + tool-orchestration suites
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-cargo llvm-cov --ignore-filename-regex '(main\.rs|cli\.rs)'   # 95% line / 95% fn floor
+cargo llvm-cov --ignore-filename-regex '(main\.rs|cli\.rs)'   # gate: 95% lines / 94% functions (see ci.yml)
 ```
 
 The suites run the **real tools** where they are installed (a real `slsa-verifier`

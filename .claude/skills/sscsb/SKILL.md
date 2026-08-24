@@ -62,7 +62,8 @@ Branch on the **exit code**, never on scraped stdout:
 - `1` — a gate failed; this is a real finding
 - `2` — `sscsb` itself errored (bad args, not a git repo). **Not a security verdict.**
 
-Per-control verdicts are `PASS`, `FAIL`, `DEGRADED`, `DISABLED`, `INFO`.
+Per-control verdicts are `PASS`, `FAIL`, `DEGRADED`, `disabled`, `INFO` — note
+that `disabled` is the one the binary prints in lowercase.
 
 **`DEGRADED` is not `PASS`.** It means a required tool was missing and the check
 did not happen. Never report a repo as secure on the strength of a `DEGRADED`.

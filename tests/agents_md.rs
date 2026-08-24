@@ -159,6 +159,126 @@ fn agents_md_exit_code_table_matches_reality() {
     );
 }
 
+/// The verdict table is the part of this doc an agent parses most literally,
+/// so its spellings must be the binary's own. `Outcome::Disabled` renders as
+/// lowercase `disabled` while every other symbol is uppercase, and the doc
+/// carried `DISABLED` until an evidence pass caught it — an agent
+/// string-matching the table would simply never match that row.
+#[test]
+fn agents_md_verdict_table_uses_the_binary_symbols() {
+    for outcome in [
+        controls::Outcome::Pass,
+        controls::Outcome::Fail,
+        controls::Outcome::Degraded,
+        controls::Outcome::Disabled,
+        controls::Outcome::Info,
+    ] {
+        let symbol = outcome.symbol();
+        assert!(
+            AGENTS_MD.contains(&format!("`{symbol}`")),
+            "AGENTS.md's verdict table is missing the exact symbol `{symbol}` \
+             that the binary prints — an agent matching on the doc's spelling \
+             would never match this outcome"
+        );
+    }
+}
+
+/// The subcommand tests above only compare the FIRST token after `sscsb`, so a
+/// wrong nested command or argument shape sails through. That is not
+/// hypothetical: AGENTS.md documented `sscsb agent-key setup <backend>` for
+/// weeks, while the binary takes `--backend` as a flag — an agent following the
+/// doc got exit 2 and, per this file's own contract, would report that as a
+/// tool error rather than its own bad invocation.
+///
+/// Rather than reimplement clap's grammar, this asks the binary: every fully
+/// specified invocation the doc shows must at least PARSE. `--help` short-
+/// circuits execution, so this checks argument shape without running anything.
+#[test]
+fn agents_md_nested_invocations_actually_parse() {
+    // Read the invocations out of the DOC, so the guard tests whatever the doc
+    // currently claims. An earlier version of this test held a hardcoded list
+    // gated on `AGENTS_MD.contains(shape)`, which made it vacuous in exactly
+    // the case that matters: change the doc to a wrong shape and the check
+    // silently skipped itself.
+    let documented: Vec<Vec<String>> = AGENTS_MD
+        .match_indices("`sscsb ")
+        .filter_map(|(i, pat)| {
+            let rest = &AGENTS_MD[i + pat.len()..];
+            let invocation = rest.split('`').next()?;
+            // Everything from the first `[` on is optional-argument syntax.
+            // Truncate rather than filter token-by-token: a bracketed group can
+            // span several tokens (`[--vex <file>]`), and markdown table cells
+            // escape the alternation pipe (`[--format text\|json]`), so partial
+            // removal leaves fragments that are not arguments at all.
+            let required = invocation.split('[').next()?;
+            let mut argv: Vec<String> = Vec::new();
+            for token in required.split_whitespace() {
+                if token == "..." {
+                    continue;
+                }
+                // Substitute a placeholder with something type-plausible so
+                // clap validates shape rather than rejecting the literal.
+                argv.push(if token.starts_with('<') {
+                    "PLACEHOLDER".to_string()
+                } else {
+                    token.to_string()
+                });
+            }
+            // Skip the generic `sscsb <command> --help` form — its first token
+            // is a stand-in for any subcommand, not an invocation to check.
+            if argv.first().is_some_and(|t| t == "PLACEHOLDER") {
+                return None;
+            }
+            // Only multi-word invocations; single subcommands are already
+            // covered by the two set-difference tests above.
+            (argv.len() >= 2).then_some(argv)
+        })
+        .collect();
+
+    assert!(
+        documented.len() >= 10,
+        "parsed only {} multi-word invocations from AGENTS.md; the extractor is \
+         broken, not the doc",
+        documented.len()
+    );
+
+    let mut broken = Vec::new();
+    for argv in &documented {
+        // Hooks are invoked by git with real operands and have side effects;
+        // shape-check them without executing.
+        let mut probe: Vec<String> = argv.clone();
+        probe.push("--help".to_string());
+
+        let out = Command::cargo_bin("sscsb")
+            .expect("binary builds")
+            .args(&probe)
+            .output()
+            .expect("runs");
+
+        // Exit 2 is clap's usage error: the doc described a shape the CLI does
+        // not accept. A trailing --help does NOT rescue a bad positional, so a
+        // clean parse really is a clean parse.
+        if out.status.code() == Some(2) {
+            broken.push(format!(
+                "`sscsb {}` → {}",
+                argv.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("?")
+            ));
+        }
+    }
+
+    assert!(
+        broken.is_empty(),
+        "AGENTS.md documents invocations the binary rejects as usage errors:\n  {}\n\n\
+         An agent following the doc gets exit 2 and, per this file's own contract, \
+         reports it as a tool error rather than its own bad invocation.",
+        broken.join("\n  ")
+    );
+}
+
 #[test]
 fn agents_md_states_the_ai_cannot_sign_invariant() {
     // This is the single load-bearing safety claim in the file. If a future
