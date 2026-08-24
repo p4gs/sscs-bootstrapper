@@ -1163,10 +1163,15 @@ mod tests {
             assert_eq!(r.outcome, Outcome::Pass, "{version}: {:?}", r.messages);
         }
         // Schemes other than https, ports, and query strings are all URLs.
+        // What is under test is the SCHEME, not the clone-path suffix, so the
+        // insecure-transport case deliberately does not carry one. Our own
+        // shipped `sscsb.git-protocol-insecure` rule reads an unauthenticated
+        // transport plus a clone suffix as a real insecure remote, and it is
+        // right to — including here. Keep the fixture off that shape.
         for url in [
             "https://example.com/a?b=c#d",
             "http://127.0.0.1:8080/x",
-            "git://example.com/r.git",
+            "git://example.com/r",
             "ssh://git@example.com/r.git",
         ] {
             assert!(looks_like_url(url), "{url} should read as a URL");
