@@ -204,8 +204,8 @@ one of:
 |---------|---------|
 | `PASS` | The control is present and demonstrably working. |
 | `FAIL` | The control is on, the tooling is there, and the repository does not satisfy it. |
-| `DEGRADED` | The control is on but a tool is missing. It tells you which, at which pinned version, and how to get it. Under `--strict` this exits non-zero. |
-| `DISABLED` | You turned it off. It did not run. |
+| `DEGRADED` | The control is on, and the check **could not be performed** — so its posture is unknown, not fine. A missing tool is the common cause, and it tells you which one at which pinned version, but it is not the only one: no GitHub remote, an empty signer policy, or an incomplete setup all degrade with every tool present. Under `--strict` this exits non-zero. |
+| `disabled` | You turned it off. It did not run. (Rendered lowercase, unlike every other verdict — anything matching on these strings has to special-case it.) |
 | `INFO` | Reported for context; not a gate. |
 
 There are no TODO stubs, no mock integrations, and no control that claims a tool
@@ -218,6 +218,25 @@ binary, so they work under git's own shell everywhere, including Git for Windows
 The one genuine platform limitation is hardware-key signing under WSL2, which
 cannot reach USB FIDO2 devices directly — [docs/signing.md](docs/signing.md)
 covers both workarounds.
+
+## Navigating the code
+
+`openwiki/` is a generated, evidence-grounded wiki over this repository — 41 pages
+organised by what each control does at runtime rather than by source directory. Every
+material claim in it cites the narrowest line range that establishes it, so a page is
+checkable against the code rather than merely readable.
+
+Start at [`openwiki/quickstart.md`](openwiki/quickstart.md). Three pages carry most of
+the load:
+
+- [The control registry and the verdict contract](openwiki/control-model/registry-and-outcomes.md)
+  — the five verdicts, why `DEGRADED` is not `PASS`, and how verdicts become exit codes.
+- [Process execution and the tool exit-code contract](openwiki/runtime/process-execution.md)
+  — why a killed scanner must not read as a clean one, and the argument-injection guard on `git`.
+- [Signer policy](openwiki/commit-integrity/signer-policy.md) and
+  [the server-side policy gate](openwiki/commit-integrity/server-side-policy-gate.md)
+  — the two halves of the AI-cannot-sign invariant, and why only one of them holds
+  against a determined actor.
 
 ## Development
 
