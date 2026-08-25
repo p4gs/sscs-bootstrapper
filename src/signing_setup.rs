@@ -146,20 +146,196 @@ pub struct EnvStatus {
 
 // ─────────────────────────── low-level readers ──────────────────────────────
 
-/// One `git config --global` value (None when unset or git unavailable).
-fn git_global(key: &str) -> Option<String> {
+/// The result of reading one `git config --global` key.
+///
+/// "Unset" and "git could not read the config at all" are DIFFERENT facts, and
+/// collapsing them into a single `None` is how a security guard fails open: a
+/// malformed `~/.gitconfig` exits 128 for every read, the human's email reads
+/// as empty, and the identity-blur refusal — which is gated on that email being
+/// non-empty — silently never fires. A guard that cannot read the fact it
+/// guards must refuse, not wave the request through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitValue {
+    Set(String),
+    Unset,
+    /// git ran and failed (or could not be run at all); the reason is named.
+    Unreadable(String),
+}
+
+impl GitValue {
+    /// The reason, when this value could not be read at all.
+    fn unreadable_reason(&self) -> Option<&str> {
+        match self {
+            GitValue::Unreadable(why) => Some(why.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// One `git config --global` value, distinguishing unset from unreadable.
+fn git_global_value(key: &str) -> GitValue {
     // --global scope deliberately: the model configures the MACHINE, and this
     // must read the same value in any repo. GIT_CONFIG_* env (an agent
     // session's identity) does not leak into --global reads.
-    let out = std::process::Command::new("git")
+    let out = match std::process::Command::new("git")
         .args(["config", "--global", key])
         .output()
-        .ok()?;
-    if !out.status.success() {
+    {
+        Ok(out) => out,
+        Err(e) => return GitValue::Unreadable(format!("could not run git: {e}")),
+    };
+    match out.status.code() {
+        // git's documented "the key is not set".
+        Some(1) => GitValue::Unset,
+        Some(0) => {
+            let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if v.is_empty() {
+                GitValue::Unset
+            } else {
+                GitValue::Set(v)
+            }
+        }
+        // Anything else — notably exit 128 for a malformed config file, and
+        // `None` for a signal death — is a failure to READ, not an answer.
+        _ => {
+            let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            GitValue::Unreadable(if why.is_empty() {
+                format!("git config --global {key} failed: {}", out.status)
+            } else {
+                why
+            })
+        }
+    }
+}
+
+/// One `git config --global` value (None when unset OR unreadable).
+///
+/// Callers that must tell those two apart — every identity guard — use
+/// [`git_global_value`] instead.
+fn git_global(key: &str) -> Option<String> {
+    match git_global_value(key) {
+        GitValue::Set(v) => Some(v),
+        GitValue::Unset | GitValue::Unreadable(_) => None,
+    }
+}
+
+/// Expand a leading `~/`, `$HOME/` or `${HOME}/` against `home`.
+///
+/// Git expands these when it reads a path-valued config key; `Path::exists`
+/// does not. Without this a perfectly working `user.signingkey` stored as
+/// `~/.ssh/key.pub` reads as pointing at a missing file, dropping the lane to
+/// PARTIAL and inviting the user to "fix" something that was never broken.
+fn expand_home(raw: &str, home: &Path) -> PathBuf {
+    let raw = raw.trim();
+    for prefix in ["~/", "$HOME/", "${HOME}/"] {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            return home.join(rest);
+        }
+    }
+    if matches!(raw, "~" | "$HOME" | "${HOME}") {
+        return home.to_path_buf();
+    }
+    PathBuf::from(raw)
+}
+
+/// The comparable identity of an SSH public key: `"<type> <base64-blob>"`.
+///
+/// The comment is dropped: two files holding one key routinely differ in it.
+/// The blob is base64-decoded rather than merely split out, so that an
+/// arbitrary two-word line — a private-key armour header, a `known_hosts`
+/// entry — cannot masquerade as key material.
+fn ssh_public_key_material(text: &str) -> Option<String> {
+    let mut parts = text.split_whitespace();
+    let kind = parts.next()?;
+    let blob = parts.next()?;
+    if !(kind.starts_with("ssh-") || kind.starts_with("ecdsa-") || kind.starts_with("sk-")) {
         return None;
     }
-    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!v.is_empty()).then_some(v)
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(blob)
+        .ok()?;
+    Some(format!("{kind} {blob}"))
+}
+
+/// The key material behind a `user.signingkey` value, whatever spelling git
+/// was handed.
+///
+/// Resolution is cheapest-first: the file itself when it already IS a public
+/// key, then its `.pub` sibling, and only then `ssh-keygen -y` on the private
+/// half. The `-P ""` is load-bearing — without it ssh-keygen prompts on the
+/// terminal for a passphrase-protected key and would hang a probe; with it,
+/// an encrypted key fails fast and this returns `None`.
+fn signing_key_material(raw: &str, home: &Path) -> Option<String> {
+    let expanded = expand_home(raw, home);
+    // Canonicalize so a symlink and its target resolve to one file.
+    let path = std::fs::canonicalize(&expanded).unwrap_or(expanded);
+
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Some(material) = ssh_public_key_material(&text) {
+            return Some(material);
+        }
+    }
+    let mut sibling = path.clone().into_os_string();
+    sibling.push(".pub");
+    if let Ok(text) = std::fs::read_to_string(PathBuf::from(sibling)) {
+        if let Some(material) = ssh_public_key_material(&text) {
+            return Some(material);
+        }
+    }
+    let out = exec::run("ssh-keygen", &["-y", "-P", "", "-f", path.to_str()?], None).ok()?;
+    if !out.success() {
+        return None;
+    }
+    ssh_public_key_material(&out.stdout)
+}
+
+/// Whether two `user.signingkey` values name the SAME key.
+///
+/// This is the heart of the identity-blur check, and it deliberately compares
+/// key MATERIAL rather than path strings. Git accepts the private-key path and
+/// the `.pub` path interchangeably, so an agent configured with `~/.ssh/k`
+/// while the human's global says `~/.ssh/k.pub` is signing with the human's
+/// own registered key — and a string comparison reports "different". A
+/// symlink, a `~`-versus-absolute spelling, and a copy at a second path all
+/// evade a string comparison identically. Equality of material is blur
+/// however the path is spelled.
+///
+/// Only when NEITHER side yields material does this fall back to comparing
+/// canonicalized paths, so an unreadable pair that is literally one file is
+/// still caught.
+fn same_signing_key(a: &str, b: &str, home: &Path) -> bool {
+    match (signing_key_material(a, home), signing_key_material(b, home)) {
+        (Some(x), Some(y)) => x == y,
+        _ => {
+            let (ea, eb) = (expand_home(a, home), expand_home(b, home));
+            match (std::fs::canonicalize(&ea), std::fs::canonicalize(&eb)) {
+                (Ok(x), Ok(y)) => x == y,
+                _ => ea == eb,
+            }
+        }
+    }
+}
+
+/// Whether two commit addresses denote the same person.
+///
+/// Email domains are case-insensitive and forges attribute accordingly, so
+/// `Human@Example.Invalid` and `human@example.invalid` are one identity — and
+/// a byte-exact comparison let the second impersonate the first.
+fn same_email(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    !a.is_empty() && a.eq_ignore_ascii_case(b)
+}
+
+/// POSIX single-quoting: wrap in `'…'`, closing and reopening the quote around
+/// each embedded `'`.
+///
+/// Naive `'{value}'` wrapping breaks on any name or email containing an
+/// apostrophe — `Pat O'Brien` yields an unmatched quote. git stores whatever
+/// it is given, so the alias is written, success is reported, and the next
+/// `git sign` dies on a syntax error.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// The `GIT_CONFIG_{COUNT,KEY_n,VALUE_n}` map from an agent-harness settings
@@ -196,7 +372,9 @@ pub fn probe_human_local(paths: &SigningPaths) -> EnvStatus {
     }
 
     match git_global("user.signingkey") {
-        Some(key) if Path::new(&key).exists() => {
+        // `~` is git's own spelling for the home directory; expand it the way
+        // git does before asking whether the file is there.
+        Some(key) if expand_home(&key, &paths.home).exists() => {
             details.push(format!("human signing key configured: {key}"));
         }
         Some(key) => {
@@ -217,7 +395,7 @@ pub fn probe_human_local(paths: &SigningPaths) -> EnvStatus {
     }
 
     match git_global("gpg.ssh.allowedsignersfile") {
-        Some(f) if Path::new(&f).exists() => {
+        Some(f) if expand_home(&f, &paths.home).exists() => {
             details.push(format!("allowed_signers wired: {f}"));
         }
         _ => {
@@ -292,12 +470,30 @@ pub fn probe_agent_claude_code(paths: &SigningPaths) -> EnvStatus {
         };
     };
 
-    let human_key = git_global("user.signingkey").unwrap_or_default();
-    let human_email = git_global("user.email").unwrap_or_default();
+    let human_key = git_global_value("user.signingkey");
+    let human_email = git_global_value("user.email");
+
+    // An identity git cannot READ is not an identity that is absent. Say so and
+    // count it as a gap: with the human's own key and email unknown, blur
+    // cannot be ruled out, and a lane that might be blurred is not CONFIGURED.
+    if let Some(why) = human_key
+        .unreadable_reason()
+        .or_else(|| human_email.unreadable_reason())
+    {
+        gaps += 1;
+        details.push(format!(
+            "the human's global git identity could not be read ({why}) — identity blur \
+             cannot be ruled out until `git config --global` is readable"
+        ));
+    }
 
     match git_env.get("user.signingkey") {
-        Some(agent_key) if Path::new(agent_key).exists() => {
-            if !human_key.is_empty() && *agent_key == human_key {
+        Some(agent_key) if expand_home(agent_key, &paths.home).exists() => {
+            let blurred = match &human_key {
+                GitValue::Set(hk) => same_signing_key(agent_key, hk, &paths.home),
+                _ => false,
+            };
+            if blurred {
                 gaps += 1;
                 details.push(
                     "IDENTITY BLUR: agent sessions sign with the HUMAN's key — the agent \
@@ -327,7 +523,11 @@ pub fn probe_agent_claude_code(paths: &SigningPaths) -> EnvStatus {
 
     match git_env.get("user.email") {
         Some(email) if !email.is_empty() => {
-            if !human_email.is_empty() && *email == human_email {
+            let blurred = match &human_email {
+                GitValue::Set(he) => same_email(email, he),
+                _ => false,
+            };
+            if blurred {
                 gaps += 1;
                 details.push("IDENTITY BLUR: agent authors commits with the HUMAN's email".into());
             } else {
@@ -351,6 +551,24 @@ pub fn probe_agent_claude_code(paths: &SigningPaths) -> EnvStatus {
     }
 }
 
+/// Whether a settings document carries a REAL attribution block.
+///
+/// Presence is not configuration. A checked-for-presence test is satisfied by
+/// JSON `null`, by `false`, by `[]` and by a bare string, so the lane reported
+/// CONFIGURED and ATTESTED while nothing actually synced. Worse, it defeated
+/// [`probe_contradiction`], which keys on this lane falling short of
+/// `Configured` in order to stop an attestation papering over a probeable gap:
+/// a single `"attribution": null` bought a clean bill of health on the one
+/// guided lane whose state IS readable. An empty object is rejected for the
+/// same reason — it configures nothing.
+fn has_attribution_block(settings_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(settings_json)
+        .ok()
+        .and_then(|v| v.get("attribution").cloned())
+        .and_then(|a| a.as_object().cloned())
+        .is_some_and(|obj| !obj.is_empty())
+}
+
 /// E3: Claude cloud containers. Repo-side attribution block is probeable;
 /// App installation and signing mode are setup/verify concerns.
 pub fn probe_cloud_claude(ctx: &Ctx) -> EnvStatus {
@@ -359,11 +577,7 @@ pub fn probe_cloud_claude(ctx: &Ctx) -> EnvStatus {
     let mut state = EnvState::GuidedPending;
 
     if let Ok(s) = std::fs::read_to_string(&repo_settings) {
-        if serde_json::from_str::<serde_json::Value>(&s)
-            .ok()
-            .and_then(|v| v.get("attribution").cloned())
-            .is_some()
-        {
+        if has_attribution_block(&s) {
             details.push(".claude/settings.json attribution block present (syncs to cloud)".into());
             state = EnvState::Configured;
         } else {
@@ -530,10 +744,37 @@ fn record_lane_attestation(ctx: &Ctx, env: Environment, today: &str) -> Result<(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut doc = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
-        .unwrap_or_default();
+    // An existing store that will not parse is a HARD ERROR, never a default.
+    //
+    // `.ok().and_then(parse.ok()).unwrap_or_default()` silently yields a BLANK
+    // document, which is then written back holding only the lane just
+    // confirmed — every other lane's attestation destroyed, and the command
+    // reporting success. The policy template ships commented for hand-editing,
+    // so a syntax slip is the expected route in. `merge_git_config_env` is the
+    // right model for this in the same file: it bails on malformed JSON
+    // precisely so it cannot clobber.
+    let mut doc = if path.exists() {
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!(
+                "refusing to overwrite {}: it exists but could not be read ({e})",
+                path.display()
+            )
+        })?;
+        if text.trim().is_empty() {
+            toml_edit::DocumentMut::new()
+        } else {
+            text.parse::<toml_edit::DocumentMut>().map_err(|e| {
+                anyhow::anyhow!(
+                    "refusing to overwrite {}: it is not valid TOML ({e}). Every other \
+                     lane's recorded confirmation lives in this file — fix it by hand, \
+                     then re-run `--confirm`.",
+                    path.display()
+                )
+            })?
+        }
+    } else {
+        toml_edit::DocumentMut::new()
+    };
     let lane = env.id();
     for key in lane_attestation_keys(env) {
         doc[lane][key] = toml_edit::value(today);
@@ -800,6 +1041,32 @@ pub fn merge_git_config_env(existing_json: &str, pairs: &[(&str, &str)]) -> Resu
     Ok(Some(out))
 }
 
+/// Prove a `!`-prefixed git alias can actually be run before storing it.
+///
+/// `sh -n` reads and parses a command without executing it. git hands a `!`
+/// alias to the shell verbatim and `git config` stores whatever it is given —
+/// including an unmatched quote — so without this check a broken alias is
+/// written and reported as success, and only fails at the moment the user
+/// reaches for it. That matters more than it looks: this alias is the
+/// documented protection against a bare `git commit` signing as the agent, so
+/// its silent breakage pushes the user onto the exact footgun it prevents.
+///
+/// A host with no POSIX shell to ask skips the check rather than blocking
+/// setup — the check exists to catch a bad alias, not to require `sh`.
+fn ensure_shell_parseable(alias: &str) -> Result<()> {
+    let body = alias.strip_prefix('!').unwrap_or(alias);
+    let Ok(out) = exec::run("sh", &["-n", "-c", body], None) else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        out.success(),
+        "refusing to write a `git sign` alias the shell cannot parse — your git \
+         identity likely contains a quote character: {}",
+        out.stderr.trim()
+    );
+    Ok(())
+}
+
 /// E1: converge the human's local signing lane. Programmatic where git config
 /// allows; guided for the enclave-key birth and the forge key registration.
 pub fn setup_human_local(paths: &SigningPaths, apply: bool) -> Result<SetupReport> {
@@ -847,9 +1114,13 @@ pub fn setup_human_local(paths: &SigningPaths, apply: bool) -> Result<SetupRepor
         let email = git_global("user.email").unwrap_or_default();
         let name = git_global("user.name").unwrap_or_else(|| "you".into());
         let alias = format!(
-            "!git -c user.name='{name}' -c user.email='{email}' \
-             -c user.signingkey='{key}' -c commit.gpgsign=true commit"
+            "!git -c user.name={} -c user.email={} -c user.signingkey={} \
+             -c commit.gpgsign=true commit",
+            shell_single_quote(&name),
+            shell_single_quote(&email),
+            shell_single_quote(&key),
         );
+        ensure_shell_parseable(&alias)?;
         git_set_global("alias.sign", &alias, apply)?;
         r.note_changed("created env-proof `git sign` alias (human key via -c overrides)");
     } else {
@@ -908,6 +1179,41 @@ pub fn setup_human_local(paths: &SigningPaths, apply: bool) -> Result<SetupRepor
     Ok(r)
 }
 
+/// Fallback slug when an agent name carries no ASCII alphanumerics at all.
+const DEFAULT_AGENT_SLUG: &str = "sscsb";
+
+/// The basename v0.2.0 hard-coded. Retained for ONE purpose: a machine that
+/// already carries this key keeps using it instead of silently rotating to a
+/// freshly generated one. Never used to name a NEW key.
+const LEGACY_AGENT_KEY_BASENAME: &str = "jai_agent_signing_key";
+
+/// The basename of the agent's signing key, derived from the agent's own name.
+///
+/// v0.2.0 hard-coded one person's assistant name here, and it shipped in the
+/// public Homebrew binary — every user of the tool got a key named after
+/// someone else's agent. The name is slugified to ASCII alphanumerics joined
+/// by underscores; a name that slugifies to nothing falls back to a neutral
+/// default rather than producing a leading-underscore path.
+fn agent_key_basename(agent_name: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_separator = false;
+    for ch in agent_name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_separator && !slug.is_empty() {
+                slug.push('_');
+            }
+            pending_separator = false;
+            slug.push(ch.to_ascii_lowercase());
+        } else {
+            pending_separator = true;
+        }
+    }
+    if slug.is_empty() {
+        slug.push_str(DEFAULT_AGENT_SLUG);
+    }
+    format!("{slug}_agent_signing_key")
+}
+
 /// E2: converge the Claude Code agent's lane. Generates/uses a distinct agent
 /// key, merges the identity+signing env into the harness settings (backup +
 /// validate + never-clobber), and refuses on identity blur.
@@ -947,19 +1253,46 @@ pub fn setup_agent_claude_code(
         return Ok(r);
     };
 
-    // Identity-blur guard: refuse if the agent email/name matches the human's.
-    let human_email = git_global("user.email").unwrap_or_default();
-    if !human_email.is_empty() && email == human_email {
-        r.refused = Some(format!(
-            "REFUSED: agent email '{email}' equals your human git email — that would forge \
-             your identity onto AI commits. Choose a distinct --agent-email."
-        ));
-        return Ok(r);
+    // Identity-blur guard: refuse if the agent email matches the human's.
+    match git_global_value("user.email") {
+        // Fail CLOSED. If the human's identity cannot be read, this guard
+        // cannot know whether the requested agent email collides with it —
+        // and the whole model rests on it not colliding.
+        GitValue::Unreadable(why) => {
+            r.refused = Some(format!(
+                "REFUSED: your global git config could not be read ({why}), so sscsb cannot \
+                 tell whether agent email '{email}' collides with your own. A guard that \
+                 cannot read the fact it guards must refuse — repair `git config --global` \
+                 and re-run."
+            ));
+            return Ok(r);
+        }
+        // Case-insensitively: forges attribute `Human@Example.Invalid` and
+        // `human@example.invalid` to one person, so byte-equality is the
+        // wrong test.
+        GitValue::Set(human_email) if same_email(&email, &human_email) => {
+            r.refused = Some(format!(
+                "REFUSED: agent email '{email}' is your human git email — that would forge \
+                 your identity onto AI commits. Choose a distinct --agent-email."
+            ));
+            return Ok(r);
+        }
+        _ => {}
     }
 
-    // Agent key: generate an ed25519 file-backed key if absent.
-    let key_path = paths.home.join(".ssh/jai_agent_signing_key");
-    let pub_path = paths.home.join(".ssh/jai_agent_signing_key.pub");
+    // Agent key: generate an ed25519 file-backed key if absent. The basename
+    // comes from the agent's OWN identity — see `agent_key_basename`.
+    let derived = paths.home.join(".ssh").join(agent_key_basename(&name));
+    let legacy = paths.home.join(".ssh").join(LEGACY_AGENT_KEY_BASENAME);
+    // Migration safety: a machine set up by v0.2.0 keeps the key it already
+    // has rather than silently rotating to a freshly generated one and
+    // orphaning the key its past commits were signed with.
+    let key_path = if !derived.exists() && legacy.exists() {
+        legacy
+    } else {
+        derived
+    };
+    let pub_path = key_path.with_extension("pub");
     if key_path.exists() {
         r.note_already(format!("agent key already present: {}", key_path.display()));
     } else if apply {
@@ -1207,11 +1540,7 @@ pub fn setup_cloud_claude(ctx: &Ctx, apply: bool) -> Result<SetupReport> {
     let mut r = SetupReport::default();
     let repo_settings = ctx.root.join(".claude/settings.json");
     let existing = std::fs::read_to_string(&repo_settings).unwrap_or_default();
-    let has_attr = serde_json::from_str::<serde_json::Value>(&existing)
-        .ok()
-        .and_then(|v| v.get("attribution").cloned())
-        .is_some();
-    if has_attr {
+    if has_attribution_block(&existing) {
         r.note_already(".claude/settings.json already has an attribution block");
     } else if apply {
         let mut root: serde_json::Value = if existing.trim().is_empty() {
@@ -1644,8 +1973,18 @@ mod tests {
 
         /// The inputs a human brings to the lane before `setup` runs: a signing
         /// key on disk, an allowed_signers file, and a git identity.
+        ///
+        /// Both halves are written, with key material distinct from the agent
+        /// fixture's. Before identity blur compared key MATERIAL, this fixture
+        /// and `fully_configured_machine`'s "agent" key carried the SAME blob
+        /// (`ssh-ed25519 AAAAC3Nz`) under two filenames and nothing noticed —
+        /// which is the shipped defect in miniature.
         fn with_human_identity(&self) -> PathBuf {
             let key = self.touch(".ssh/git_signing_key.pub", "ssh-ed25519 AAAAC3Nz human\n");
+            self.touch(
+                ".ssh/git_signing_key",
+                "opaque non-public-key bytes (fixture placeholder for the human half)\n",
+            );
             self.touch(
                 ".ssh/allowed_signers",
                 "me@example.invalid ssh-ed25519 AAAAC3Nz\n",
@@ -1950,7 +2289,11 @@ mod tests {
         assert!(r.refused.is_none());
         assert!(!paths.agent_settings.exists(), "dry-run wrote settings");
         assert!(
-            !paths.home.join(".ssh/jai_agent_signing_key").exists(),
+            !paths
+                .home
+                .join(".ssh")
+                .join(agent_key_basename("Agent"))
+                .exists(),
             "dry-run generated a key"
         );
         assert!(r.changed.iter().any(|c| c.contains("[dry-run]")));
@@ -2686,8 +3029,16 @@ mod tests {
         m.set("alias.sign", "commit -S");
 
         // Agent lane: its OWN key and its OWN email.
-        let agent_key = m.touch(".ssh/agent_signing_key.pub", "ssh-ed25519 AAAAC3Nz agent\n");
+        // A genuinely DIFFERENT key: distinct material, not merely a distinct
+        // filename. The two used to share one blob, which only a path
+        // comparison could mistake for separate identities.
+        let agent_key = m.touch(".ssh/agent_signing_key.pub", "ssh-ed25519 BBBBD4Oz agent\n");
         assert_ne!(agent_key, human_key);
+        assert_ne!(
+            signing_key_material(agent_key.to_str().unwrap(), m.home()),
+            signing_key_material(human_key.to_str().unwrap(), m.home()),
+            "a 'fully configured' machine must not have the agent holding the human's key"
+        );
         m.touch(
             ".claude/settings.json",
             &serde_json::json!({
@@ -2805,6 +3156,670 @@ mod tests {
                 .any(|m| m.contains("cloud-claude") && m.contains("attribution is probeable")),
             "{:?}",
             r.messages
+        );
+    }
+
+    // ══════════════════ adversarial-review regressions (8 findings) ══════════
+    //
+    // Every test below reproduces a defect that shipped in v0.2.0 and was
+    // confirmed against that tree before the fix landed. They are grouped by
+    // finding so a future regression names itself.
+
+    // ───────── F1: identity blur compared PATH STRINGS, not key material ─────
+
+    /// Generate a real ed25519 keypair named `name` under the fixture's `.ssh`.
+    ///
+    /// Real keys, not plausible-looking strings: the whole point of this group
+    /// is that two spellings of ONE key must compare equal, which is only
+    /// meaningful when the bytes behind them are genuinely the same.
+    fn keypair(m: &FakeMachine, name: &str) -> (PathBuf, PathBuf) {
+        let priv_path = m.home().join(".ssh").join(name);
+        let out = exec::run(
+            "ssh-keygen",
+            &[
+                "-t",
+                "ed25519",
+                "-f",
+                priv_path.to_str().unwrap(),
+                "-N",
+                "",
+                "-C",
+                name,
+                "-q",
+            ],
+            None,
+        )
+        .unwrap();
+        assert!(out.success(), "fixture ssh-keygen: {}", out.stderr);
+        let pub_path = m.home().join(".ssh").join(format!("{name}.pub"));
+        assert!(pub_path.is_file(), "ssh-keygen produced no .pub");
+        (priv_path, pub_path)
+    }
+
+    /// Write the agent harness settings naming `agent_key` and `agent_email`.
+    fn write_agent_settings(m: &FakeMachine, agent_key: &str, agent_email: &str) {
+        m.touch(
+            ".claude/settings.json",
+            &serde_json::json!({
+                "env": {
+                    "GIT_CONFIG_COUNT": "3",
+                    "GIT_CONFIG_KEY_0": "user.signingkey",
+                    "GIT_CONFIG_VALUE_0": agent_key,
+                    "GIT_CONFIG_KEY_1": "commit.gpgsign",
+                    "GIT_CONFIG_VALUE_1": "true",
+                    "GIT_CONFIG_KEY_2": "user.email",
+                    "GIT_CONFIG_VALUE_2": agent_email,
+                }
+            })
+            .to_string(),
+        );
+    }
+
+    fn is_blurred(st: &EnvStatus) -> bool {
+        st.details.iter().any(|d| d.contains("IDENTITY BLUR"))
+    }
+
+    /// A machine whose human global identity signs with a real key, returning
+    /// the fixture and that key's (private, public) halves.
+    fn machine_signing_with_a_real_human_key() -> (FakeMachine, PathBuf, PathBuf) {
+        let m = FakeMachine::new();
+        let (priv_path, pub_path) = keypair(&m, "human_key");
+        m.set("user.signingkey", pub_path.to_str().unwrap());
+        m.set("user.email", "human@example.invalid");
+        m.set("user.name", "Human Example");
+        (m, priv_path, pub_path)
+    }
+
+    /// Git accepts the private-key path and the `.pub` path interchangeably, so
+    /// an agent pointed at `~/.ssh/k` while the human's global says
+    /// `~/.ssh/k.pub` signs with THE HUMAN'S KEY. Comparing the two strings
+    /// says "different"; comparing the key material says "identical".
+    #[test]
+    fn agent_probe_flags_blur_when_the_agent_names_the_private_half_of_the_human_key() {
+        let (m, priv_path, pub_path) = machine_signing_with_a_real_human_key();
+        assert_ne!(
+            priv_path.to_str().unwrap(),
+            pub_path.to_str().unwrap(),
+            "the two spellings must differ as strings, or this proves nothing"
+        );
+        write_agent_settings(
+            &m,
+            priv_path.to_str().unwrap(),
+            "agent@example.invalid", // distinct email: the KEY is the only blur
+        );
+
+        let st = probe_agent_claude_code(&m.paths());
+        assert!(
+            is_blurred(&st),
+            "the agent is signing with the human's own key: {:?}",
+            st.details
+        );
+        assert_eq!(st.state, EnvState::Partial, "blur is never CONFIGURED");
+    }
+
+    /// A symlink is a second name for one file. Comparing names cannot see that.
+    #[test]
+    fn agent_probe_flags_blur_through_a_symlink_to_the_human_key() {
+        let (m, _priv_path, pub_path) = machine_signing_with_a_real_human_key();
+        let link = m.home().join(".ssh/agent_key.pub");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&pub_path, &link).unwrap();
+        write_agent_settings(&m, link.to_str().unwrap(), "agent@example.invalid");
+
+        let st = probe_agent_claude_code(&m.paths());
+        assert!(
+            is_blurred(&st),
+            "the agent's key is a symlink to the human's: {:?}",
+            st.details
+        );
+    }
+
+    /// Git expands a leading `~`; a string comparison does not. Spelling the
+    /// human's own key with a tilde therefore evaded the check entirely — and
+    /// evaded the on-disk existence check with it, so the lane reported a
+    /// missing file rather than the blur that was actually there.
+    #[test]
+    fn agent_probe_flags_blur_when_the_agent_spells_the_human_key_with_a_tilde() {
+        let (m, _priv_path, _pub_path) = machine_signing_with_a_real_human_key();
+        write_agent_settings(&m, "~/.ssh/human_key.pub", "agent@example.invalid");
+
+        let st = probe_agent_claude_code(&m.paths());
+        assert!(
+            is_blurred(&st),
+            "`~/.ssh/human_key.pub` IS the human's key: {:?}",
+            st.details
+        );
+        assert!(
+            !st.details.iter().any(|d| d.contains("missing on disk")),
+            "a tilde path is not a missing file: {:?}",
+            st.details
+        );
+    }
+
+    /// The same public key copied to a second path is still the same key.
+    #[test]
+    fn agent_probe_flags_blur_on_a_copy_of_the_human_key_at_a_second_path() {
+        let (m, _priv_path, pub_path) = machine_signing_with_a_real_human_key();
+        let copy = m.home().join(".ssh/agent_copy.pub");
+        std::fs::copy(&pub_path, &copy).unwrap();
+        write_agent_settings(&m, copy.to_str().unwrap(), "agent@example.invalid");
+
+        let st = probe_agent_claude_code(&m.paths());
+        assert!(
+            is_blurred(&st),
+            "a copy of the human's key is the human's key: {:?}",
+            st.details
+        );
+    }
+
+    /// Key material must be derivable from a private key that has no `.pub`
+    /// sibling — otherwise the check is blind exactly where an agent is most
+    /// likely to be pointed at a bare private key.
+    #[test]
+    fn blur_is_detected_from_a_private_key_with_no_pub_sibling() {
+        let (m, priv_path, pub_path) = machine_signing_with_a_real_human_key();
+        // Remove the sibling so the only way to learn the material is to
+        // derive it from the private half.
+        std::fs::remove_file(&pub_path).unwrap();
+        // The human's global still names the .pub path, so re-point it at the
+        // private half the same way git would accept.
+        m.set("user.signingkey", priv_path.to_str().unwrap());
+        let copy = m.home().join(".ssh/agent_priv_copy");
+        std::fs::copy(&priv_path, &copy).unwrap();
+        write_agent_settings(&m, copy.to_str().unwrap(), "agent@example.invalid");
+
+        let st = probe_agent_claude_code(&m.paths());
+        assert!(
+            is_blurred(&st),
+            "same private key material under two names: {:?}",
+            st.details
+        );
+    }
+
+    /// The blur check must stay a *check*, not a blanket accusation: two
+    /// genuinely different keys must still read as a correctly separated lane.
+    #[test]
+    fn agent_probe_does_not_flag_blur_for_a_genuinely_distinct_agent_key() {
+        let (m, _priv_path, _pub_path) = machine_signing_with_a_real_human_key();
+        let (_agent_priv, agent_pub) = keypair(&m, "agent_key");
+        write_agent_settings(&m, agent_pub.to_str().unwrap(), "agent@example.invalid");
+
+        let st = probe_agent_claude_code(&m.paths());
+        assert!(
+            !is_blurred(&st),
+            "distinct keys are the designed state: {:?}",
+            st.details
+        );
+        assert_eq!(st.state, EnvState::Configured, "{:?}", st.details);
+    }
+
+    /// The finding at the level that matters: the control's verdict. A lane
+    /// that silently signs as the human must FAIL the control, not pass it.
+    #[test]
+    fn signing_model_control_fails_when_the_agent_key_is_the_human_key_under_another_name() {
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let (m, repo) = fully_configured_machine(&today);
+        // Re-point the agent at the human's own key, spelled as its private
+        // half — everything else about this machine stays fully configured.
+        let human_key = git_global("user.signingkey").expect("fixture sets a human key");
+        let private_half = human_key.trim_end_matches(".pub").to_string();
+        assert!(
+            Path::new(&private_half).exists(),
+            "fixture must have both halves on disk"
+        );
+        write_agent_settings(&m, &private_half, "agent@example.invalid");
+
+        let ctx = scratch_ctx(repo.path());
+        let cfg = scratch_config(repo.path());
+        let r = verify_signing_model_control(&ctx, &cfg);
+        assert_eq!(
+            r.outcome,
+            Outcome::Fail,
+            "agent signing as the human is a breach: {:?}",
+            r.messages
+        );
+        assert!(
+            r.messages.iter().any(|msg| msg.contains("IDENTITY BLUR")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    // ───────── F2: an agent email differing only in CASE was not blur ────────
+
+    /// Email domains are case-insensitive and forges attribute accordingly, so
+    /// `Human@Example.Invalid` is the same person as `human@example.invalid`.
+    #[test]
+    fn agent_probe_flags_blur_when_the_agent_email_differs_from_the_human_only_in_case() {
+        let (m, _priv_path, _pub_path) = machine_signing_with_a_real_human_key();
+        let (_agent_priv, agent_pub) = keypair(&m, "agent_key");
+        write_agent_settings(
+            &m,
+            agent_pub.to_str().unwrap(),
+            "Human@Example.Invalid", // same address, different case
+        );
+
+        let st = probe_agent_claude_code(&m.paths());
+        assert!(
+            is_blurred(&st),
+            "`Human@Example.Invalid` is the human's address: {:?}",
+            st.details
+        );
+    }
+
+    /// The refusal in `setup` has the same defect and must close the same way —
+    /// this is the one place the tool declines to do what it was asked.
+    #[test]
+    fn setup_agent_refuses_an_agent_email_differing_from_the_human_only_in_case() {
+        let (m, _priv_path, _pub_path) = machine_signing_with_a_real_human_key();
+        let paths = m.paths();
+        let r = setup_agent_claude_code(
+            &paths,
+            Some("Agent"),
+            Some("HUMAN@EXAMPLE.INVALID"),
+            false, // dry-run — must refuse before doing anything either way
+        )
+        .unwrap();
+        assert!(
+            r.refused.is_some(),
+            "case-folded equality is still identity blur: {r:?}"
+        );
+        assert!(r.changed.is_empty(), "a refusal changes nothing");
+        assert!(!paths.agent_settings.exists());
+    }
+
+    // ───────── F3: `--confirm` blanked the whole attestation store ───────────
+
+    /// The policy template ships commented for hand-editing, so a syntax slip
+    /// is the *expected* route into this. Parsing to a blank document and
+    /// writing it back destroyed every other lane's attestation and reported
+    /// success. `merge_git_config_env` already models the right contract for
+    /// the JSON twin: bail rather than clobber.
+    #[test]
+    fn confirm_refuses_to_clobber_a_malformed_attestation_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = scratch_ctx(tmp.path());
+        let path = signing_model_policy_path(&ctx);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // A plausible hand-edit slip: an unterminated string.
+        let malformed = "[github-web]\nvigilant_mode = \"2026-01-01\n\n[codespaces]\ngpg_verification = \"2026-02-02\"\n";
+        std::fs::write(&path, malformed).unwrap();
+
+        let err = record_lane_attestation(&ctx, Environment::GithubWeb, "2026-08-25")
+            .expect_err("a malformed store must be a hard error, never a default");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("signing-model.toml") || msg.contains("attestation"),
+            "the error must name the file it refused to overwrite: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            malformed,
+            "the operator's file must be left exactly as it was"
+        );
+    }
+
+    /// The same write path must still work on an absent or empty store —
+    /// refusing everything would be its own bug.
+    #[test]
+    fn confirm_still_creates_an_absent_or_empty_attestation_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = scratch_ctx(tmp.path());
+        record_lane_attestation(&ctx, Environment::Codespaces, "2026-08-25").unwrap();
+
+        let path = signing_model_policy_path(&ctx);
+        std::fs::write(&path, "   \n").unwrap();
+        record_lane_attestation(&ctx, Environment::Codespaces, "2026-08-26").unwrap();
+        let policy = read_signing_policy(&ctx);
+        assert_eq!(
+            policy
+                .get("codespaces")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("gpg_verification"))
+                .and_then(|v| v.as_str()),
+            Some("2026-08-26")
+        );
+    }
+
+    // ───────── F4: `attribution: null` read as a configured cloud lane ───────
+
+    /// Presence is not configuration. A `null`, a string, a `false` or an `[]`
+    /// satisfied the old check, so the lane reported CONFIGURED and ATTESTED
+    /// while nothing real synced — and, worse, `probe_contradiction` was
+    /// defeated, because it keys on the lane being short of `Configured`.
+    #[test]
+    fn cloud_probe_rejects_an_attribution_that_is_not_a_populated_object() {
+        for body in [
+            r#"{"attribution": null}"#,
+            r#"{"attribution": false}"#,
+            r#"{"attribution": []}"#,
+            r#"{"attribution": "yes"}"#,
+            r#"{"attribution": {}}"#,
+        ] {
+            let repo = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(repo.path().join(".claude")).unwrap();
+            std::fs::write(repo.path().join(".claude/settings.json"), body).unwrap();
+            let st = probe_cloud_claude(&scratch_ctx(repo.path()));
+            assert_eq!(
+                st.state,
+                EnvState::Partial,
+                "`{body}` is not an attribution block: {:?}",
+                st.details
+            );
+        }
+    }
+
+    /// And the control must agree: a null attribution cannot be attested past.
+    #[test]
+    fn an_attestation_cannot_paper_over_a_null_attribution_block() {
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let (_m, repo) = fully_configured_machine(&today);
+        std::fs::write(
+            repo.path().join(".claude/settings.json"),
+            r#"{"attribution": null}"#,
+        )
+        .unwrap();
+        let ctx = scratch_ctx(repo.path());
+        let cfg = scratch_config(repo.path());
+
+        let r = verify_signing_model_control(&ctx, &cfg);
+        assert_eq!(
+            r.outcome,
+            Outcome::Degraded,
+            "a null attribution is a real gap: {:?}",
+            r.messages
+        );
+        assert!(
+            r.messages
+                .iter()
+                .any(|msg| msg.contains("cloud-claude") && msg.contains("attribution is probeable")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// Setup must treat it as absent and write a real block, not report the
+    /// lane already done.
+    #[test]
+    fn setup_cloud_claude_replaces_a_null_attribution_instead_of_accepting_it() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".claude")).unwrap();
+        std::fs::write(
+            repo.path().join(".claude/settings.json"),
+            r#"{"attribution": null, "permissions": {"allow": []}}"#,
+        )
+        .unwrap();
+        let ctx = scratch_ctx(repo.path());
+
+        let r = setup_cloud_claude(&ctx, true).unwrap();
+        assert!(
+            r.changed.iter().any(|c| c.contains("wrote attribution")),
+            "{r:?}"
+        );
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["attribution"]["sessionUrl"], true);
+        assert!(
+            v.get("permissions").is_some(),
+            "unrelated keys must survive"
+        );
+    }
+
+    // ───────── F5: the `git sign` alias broke on an apostrophe ──────────────
+
+    /// The alias is the documented protection against a bare `git commit`
+    /// signing as the agent, so breaking it silently pushes the user onto the
+    /// exact footgun it exists to prevent. A name with an apostrophe produced
+    /// an unmatched quote; setup still reported success.
+    #[test]
+    fn the_git_sign_alias_survives_an_apostrophe_in_the_human_identity() {
+        let m = FakeMachine::new();
+        m.with_human_identity();
+        m.set("user.name", "Pat O'Brien");
+
+        let r = setup_human_local(&m.paths(), true).unwrap();
+        assert!(
+            r.changed.iter().any(|c| c.contains("`git sign` alias")),
+            "{:?}",
+            r.changed
+        );
+
+        let alias = git_global("alias.sign").expect("setup reported writing the alias");
+        let body = alias
+            .strip_prefix('!')
+            .expect("a `!` alias is handed to the shell");
+        // `sh -n` parses without executing: exactly the check that the shell
+        // git hands this to will not choke on it.
+        let parsed = exec::run("sh", &["-n", "-c", body], None).unwrap();
+        assert!(
+            parsed.success(),
+            "`git sign` is not shell-parseable, so the alias git wrote cannot run:\n\
+             alias: {body}\n{}",
+            parsed.stderr
+        );
+    }
+
+    /// Quoting must not corrupt the value either — the alias has to still pin
+    /// the identity it was built from.
+    #[test]
+    fn the_git_sign_alias_still_pins_the_exact_identity_after_escaping() {
+        let m = FakeMachine::new();
+        m.with_human_identity();
+        m.set("user.name", "Pat O'Brien");
+        setup_human_local(&m.paths(), true).unwrap();
+
+        let alias = git_global("alias.sign").unwrap();
+        let body = alias.strip_prefix('!').unwrap();
+        // Ask the shell itself what the argument words come out as, rather
+        // than pattern-matching the escaping we happened to choose.
+        // Word 1 is `-c`, word 2 is the `user.name=…` it introduces.
+        let echoed = exec::run(
+            "sh",
+            &[
+                "-c",
+                &format!("set -- {}; echo \"$2\"", &body["git ".len()..]),
+            ],
+            None,
+        )
+        .unwrap();
+        assert!(echoed.success(), "{}", echoed.stderr);
+        assert_eq!(
+            echoed.stdout.trim(),
+            "user.name=Pat O'Brien",
+            "the alias must carry the apostrophe through the shell intact"
+        );
+    }
+
+    // ───────── F6: a `~`-prefixed path read as a missing file ───────────────
+
+    /// Git expands `~`; `Path::exists` does not. A working configuration stored
+    /// as `~/.ssh/key.pub` was reported as pointing at a missing file, dropping
+    /// the lane to PARTIAL and inviting the user to "fix" what was never broken.
+    #[test]
+    fn human_probe_expands_a_tilde_in_the_signing_key_and_allowed_signers_paths() {
+        let m = FakeMachine::new();
+        m.touch(".ssh/git_signing_key.pub", "ssh-ed25519 AAAAC3Nz human\n");
+        m.touch(".ssh/allowed_signers", "me@example.invalid ssh-ed25519 A\n");
+        m.set("user.signingkey", "~/.ssh/git_signing_key.pub");
+        m.set("gpg.ssh.allowedSignersFile", "~/.ssh/allowed_signers");
+
+        let st = probe_human_local(&m.paths());
+        let all = st.details.join("\n");
+        assert!(
+            !all.contains("points at missing file"),
+            "the key is on disk; `~` is git's own spelling for it:\n{all}"
+        );
+        assert!(all.contains("human signing key configured"), "{all}");
+        assert!(
+            !all.contains("allowedSignersFile unset or missing"),
+            "the allowed_signers file is on disk too:\n{all}"
+        );
+    }
+
+    /// The expansion must not paper over a genuinely absent file.
+    #[test]
+    fn human_probe_still_reports_a_tilde_path_that_really_is_missing() {
+        let m = FakeMachine::new();
+        m.set("user.signingkey", "~/.ssh/not_there.pub");
+        let st = probe_human_local(&m.paths());
+        assert!(
+            st.details
+                .iter()
+                .any(|d| d.contains("points at missing file")),
+            "{:?}",
+            st.details
+        );
+    }
+
+    // ───────── F7: a personal name hard-coded into a public binary ──────────
+
+    /// A personal assistant's name shipped as the agent key basename in the
+    /// v0.2.0 Homebrew binary, so every user of this public tool got a key
+    /// named after someone else's assistant. The basename must come from the
+    /// resolved agent identity instead.
+    #[test]
+    fn the_agent_key_basename_comes_from_the_agent_identity_not_a_personal_name() {
+        let m = FakeMachine::new();
+        let paths = m.paths();
+        let r =
+            setup_agent_claude_code(&paths, Some("Codex"), Some("codex@example.invalid"), false)
+                .unwrap();
+        let said = format!("{:?}", r.changed);
+        assert!(
+            said.contains("codex_agent_signing_key"),
+            "the key must be named for the agent that owns it: {said}"
+        );
+        assert!(
+            !said.contains("jai"),
+            "no other user's assistant belongs in this path: {said}"
+        );
+    }
+
+    /// A name that slugifies to nothing must still produce a usable, neutral
+    /// path rather than `_agent_signing_key` or a panic.
+    #[test]
+    fn an_unslugifiable_agent_name_falls_back_to_a_neutral_key_basename() {
+        let m = FakeMachine::new();
+        let paths = m.paths();
+        let r =
+            setup_agent_claude_code(&paths, Some("***"), Some("a@example.invalid"), false).unwrap();
+        let said = format!("{:?}", r.changed);
+        assert!(said.contains("sscsb_agent_signing_key"), "{said}");
+    }
+
+    /// A source lint, in the spirit of `testutil`'s invariants: a personal
+    /// identifier cannot come back into a file that is compiled into a public
+    /// binary just because someone re-typed it.
+    #[test]
+    fn no_personal_assistant_name_is_baked_into_this_module() {
+        let src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/signing_setup.rs"),
+        )
+        .unwrap();
+        // Assembled at runtime so this lint does not trip over its own source.
+        let needle = format!("{}_agent_signing_key", "jai");
+        let offenders: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .map(|(i, l)| (i + 1, l))
+            .filter(|(_, l)| l.contains(&needle))
+            // One declaration is allowed: the migration constant that keeps an
+            // already-generated key from being orphaned.
+            .filter(|(_, l)| !l.contains("LEGACY_AGENT_KEY_BASENAME"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a personal agent-key name is compiled into the shipped binary \
+             (it was found in the v0.2.0 Homebrew build). Derive the basename \
+             from the resolved agent identity instead:\n{offenders:?}"
+        );
+    }
+
+    /// Migration safety: a machine already carrying the v0.2.0 key must keep
+    /// using it rather than silently rotating to a freshly generated one.
+    #[test]
+    fn an_existing_legacy_agent_key_is_reused_rather_than_orphaned() {
+        let m = FakeMachine::new();
+        let legacy = m.touch(
+            &format!(".ssh/{LEGACY_AGENT_KEY_BASENAME}"),
+            "opaque non-public-key bytes (fixture placeholder for the legacy key)\n",
+        );
+        let paths = m.paths();
+        let r =
+            setup_agent_claude_code(&paths, Some("Codex"), Some("codex@example.invalid"), false)
+                .unwrap();
+        assert!(
+            r.already
+                .iter()
+                .chain(r.changed.iter())
+                .any(|s| s.contains(legacy.to_str().unwrap())),
+            "an existing agent key must not be abandoned: {r:?}"
+        );
+    }
+
+    // ───────── F8: a corrupt global gitconfig disabled the refusal ──────────
+
+    /// `git_global` returned `None` for *any* git failure, so a malformed
+    /// `~/.gitconfig` (exit 128) was indistinguishable from "unset". The blur
+    /// refusal is gated on the human email being non-empty, so it never fired:
+    /// a security guard failing OPEN.
+    #[test]
+    fn an_unreadable_global_gitconfig_does_not_silently_disable_the_blur_refusal() {
+        let m = FakeMachine::new();
+        std::fs::write(&m.gitconfig, "[user\n  email = human@example.invalid\n").unwrap();
+        // Pin the premise: git must be FAILING here, not reporting "unset".
+        let out = exec::run("git", &["config", "--global", "user.email"], None).unwrap();
+        assert_eq!(
+            out.exit_code(),
+            Some(128),
+            "fixture must produce a git error, not an unset value: {out:?}"
+        );
+
+        let paths = m.paths();
+        let r =
+            setup_agent_claude_code(&paths, Some("Agent"), Some("human@example.invalid"), false)
+                .unwrap();
+        assert!(
+            r.refused.is_some(),
+            "an unreadable human identity must fail CLOSED — the guard cannot \
+             know the email does not collide: {r:?}"
+        );
+        assert!(
+            r.refused.as_deref().unwrap_or_default().contains("git"),
+            "the refusal must name the unreadable config: {r:?}"
+        );
+    }
+
+    /// And the probe must say so rather than quietly reporting a clean lane.
+    #[test]
+    fn an_unreadable_global_gitconfig_is_named_by_the_agent_probe() {
+        let m = FakeMachine::new();
+        let (_agent_priv, agent_pub) = keypair(&m, "agent_key");
+        write_agent_settings(&m, agent_pub.to_str().unwrap(), "agent@example.invalid");
+        std::fs::write(&m.gitconfig, "[user\n  email = human@example.invalid\n").unwrap();
+
+        let st = probe_agent_claude_code(&m.paths());
+        assert_ne!(
+            st.state,
+            EnvState::Configured,
+            "the human identity could not be read, so blur cannot be ruled out: {:?}",
+            st.details
+        );
+        assert!(
+            st.details
+                .iter()
+                .any(|d| d.contains("could not be read") || d.contains("unreadable")),
+            "{:?}",
+            st.details
         );
     }
 }

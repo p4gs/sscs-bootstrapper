@@ -1278,8 +1278,15 @@ fn signing_setup_agent_provisions_a_distinct_identity_without_clobbering_setting
     );
 
     // A real, distinct agent key was generated, and it is NOT the human's.
-    let agent_key = machine.home().join(".ssh/jai_agent_signing_key");
+    // The basename is derived from the agent's OWN name: v0.2.0 hard-coded one
+    // contributor's personal assistant name here and shipped it in the public
+    // binary, so every user got a key named after someone else's agent.
+    let agent_key = machine.home().join(".ssh/test_agent_agent_signing_key");
     assert!(agent_key.exists(), "agent key was not generated");
+    assert!(
+        !machine.home().join(".ssh/jai_agent_signing_key").exists(),
+        "a personal assistant name must never name another user's key"
+    );
     assert_ne!(
         machine.get("user.signingkey").unwrap(),
         agent_key.to_string_lossy(),
@@ -1330,6 +1337,11 @@ fn signing_setup_agent_refuses_to_forge_the_humans_identity() {
         !machine.home().join(".claude/settings.json").exists(),
         "a refused setup must not create agent settings"
     );
+    // No key under EITHER the derived basename or the legacy personal one.
+    assert!(!machine
+        .home()
+        .join(".ssh/impostor_agent_signing_key")
+        .exists());
     assert!(!machine.home().join(".ssh/jai_agent_signing_key").exists());
 }
 
