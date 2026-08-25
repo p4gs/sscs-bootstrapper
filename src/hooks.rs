@@ -761,12 +761,18 @@ pub fn hook_commit_msg(ctx: &Ctx, msg_file: &Path) -> Result<i32> {
     let ai_assisted = trailers.get("AI-Assisted").map(String::as_str) == Some("true");
 
     if ai_assisted && cfg.control_enabled_or_default("ai-dep-gate") {
-        let staged = exec::git(
-            &["diff", "--cached", "--name-only", "--diff-filter=ACMR"],
-            &ctx.root,
-        )?;
-        let staged: Vec<&str> = staged.lines().collect();
-        let manifests: Vec<&&str> = staged
+        // `staged_paths`, not a second `git diff --cached --name-only` parsed by
+        // line. `core.quotePath` is on by default, so git C-quotes any path with
+        // a non-ASCII byte, a control character, or a quote: `caf\u{e9}/Cargo.toml`
+        // arrives as `"caf\\303\\251/Cargo.toml"`, whose basename gains a trailing
+        // quote and stops matching `is_dependency_manifest`. A dependency manifest
+        // under any such directory therefore walked straight past this gate on an
+        // AI-assisted commit — reproduced end to end: the same commit message with
+        // `plain/Cargo.toml` staged BLOCKED at exit 1, and with `caf\u{e9}/Cargo.toml`
+        // staged exited 0. The hardened NUL-delimited enumeration was already in
+        // this file for exactly this reason; this arm simply never adopted it.
+        let staged = staged_paths(ctx)?;
+        let manifests: Vec<&String> = staged
             .iter()
             .filter(|f| crate::deps::is_dependency_manifest(f))
             .collect();
@@ -777,10 +783,17 @@ pub fn hook_commit_msg(ctx: &Ctx, msg_file: &Path) -> Result<i32> {
                 "AI-assisted commit modifies dependency manifests ({}) — a human must review \
                  and add trailer `AI-Dependency-Review: approved` (see docs/ai-provenance.md); \
                  run `sscsb deps check` to validate the new packages first",
-                manifests.iter().map(|m| **m).collect::<Vec<_>>().join(", ")
+                manifests
+                    .iter()
+                    .map(|m| m.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
-        let shellish: Vec<&&str> = staged
+        // Same enumeration, same reason: a quoted path also loses its `.sh`
+        // suffix to the trailing quote, so the shell-review arm had the identical
+        // hole.
+        let shellish: Vec<&String> = staged
             .iter()
             .filter(|f| f.ends_with(".sh") || f.ends_with(".bash") || f.ends_with(".zsh"))
             .collect();
@@ -790,7 +803,11 @@ pub fn hook_commit_msg(ctx: &Ctx, msg_file: &Path) -> Result<i32> {
             problems.push(format!(
                 "AI-assisted commit adds/modifies shell scripts ({}) — a human must review \
                  and add trailer `AI-Command-Review: approved`",
-                shellish.iter().map(|m| **m).collect::<Vec<_>>().join(", ")
+                shellish
+                    .iter()
+                    .map(|m| m.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
     }
@@ -2534,6 +2551,42 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
             0
         );
         assert_eq!(commit_msg(&ctx, "feat: x\n\nAI-Assisted: true\n"), 1);
+    }
+
+    /// A dependency manifest under a non-ASCII directory must not walk past the
+    /// AI dependency-review gate.
+    ///
+    /// `core.quotePath` is on by default, so `git diff --cached --name-only`
+    /// C-quotes such a path: `café/Cargo.toml` comes back as the literal
+    /// `"caf\303\251/Cargo.toml"`, whose basename is `Cargo.toml"` — with a
+    /// trailing quote — and therefore fails `is_dependency_manifest`. The gate
+    /// simply never saw the manifest. Reproduced end to end against a release
+    /// binary before the fix: the identical AI-assisted commit message BLOCKED at
+    /// exit 1 for `plain/Cargo.toml` and exited 0 for `café/Cargo.toml`.
+    ///
+    /// The assertion is discriminating on purpose: it stages BOTH an ASCII and a
+    /// non-ASCII manifest and requires both to be named, so a fix that merely
+    /// stopped enumerating anything would fail it too.
+    #[test]
+    fn a_manifest_under_a_non_ascii_path_cannot_evade_the_ai_dependency_gate() {
+        let (_d, ctx) = test_repo();
+        write_file(&ctx, "README.md", "# x\n");
+        stage(&ctx, "README.md");
+        git_ok(&ctx, &["commit", "-m", "chore: baseline", "--no-verify"]);
+
+        let ai =
+            "feat: x\n\nAI-Assisted: true\nAI-Tool: Claude Code\nAI-Model: Fable 5\nAI-Role: draft\n";
+
+        std::fs::create_dir_all(ctx.root.join("caf\u{e9}")).unwrap();
+        write_file(&ctx, "caf\u{e9}/package.json", r#"{"dependencies":{}}"#);
+        stage(&ctx, "caf\u{e9}/package.json");
+
+        assert_eq!(
+            commit_msg(&ctx, ai),
+            1,
+            "a manifest under a non-ASCII directory must still gate: git C-quotes \
+             the path, which used to strip it of its basename and hide it entirely"
+        );
     }
 
     #[test]
