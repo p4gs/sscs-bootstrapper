@@ -8,6 +8,8 @@ versions.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-25
+
 ### Fixed
 
 - **A typo'd control id read as a clean run.** `sscsb verify not-a-real-control`
