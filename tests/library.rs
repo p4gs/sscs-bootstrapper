@@ -1164,6 +1164,79 @@ fn deps_check_offline_flags_typosquats_without_network() {
     );
 }
 
+/// A key outside a `pyproject.toml`'s dependency tables is not a dependency.
+///
+/// `docs/phase-2.md` states the invariant plainly: "`pyproject.toml` is read as
+/// TOML, never scanned line by line". The parser broke that promise. It decided
+/// TOML-vs-line-scan by SNIFFING CONTENT — a document counted as a pyproject
+/// only if it contained `[build-system]`, `[project]`, `[dependency-groups]` or
+/// `[tool]` — so a manifest whose entire contents were `name = "throwaway"`
+/// announced none of them, fell through to the requirements.txt line scanner,
+/// and the literal TOML key `name` became a package. `deps check` then reported
+/// `pypi:name: NOT FOUND on its public registry — likely hallucinated
+/// (slopsquatting target)` and exited 1.
+///
+/// That false verdict is worse than a miss: it trains users to run `deps
+/// approve` on noise, which is exactly the gate-weakening this tool warns
+/// against. The filename — not the content — now decides the syntax, so the
+/// fallthrough cannot happen at all, including for a pyproject whose TOML does
+/// not parse (a content sniff cannot classify what it cannot parse, and the old
+/// rule line-scanned that too).
+#[test]
+fn a_key_outside_a_pyprojects_dependency_tables_is_never_read_as_a_package() {
+    let (_d, ctx) = repo();
+
+    // The reported defect: the entire manifest is one bare top-level key.
+    // No `[project]` table, zero dependencies.
+    write(&ctx, "pyproject.toml", "name = \"throwaway\"\n");
+    let current = deps::current_deps(&ctx).unwrap();
+    assert!(
+        !current.contains("pypi:name"),
+        "the literal TOML key `name` is not a package: {current:?}"
+    );
+    assert!(
+        !current.iter().any(|d| d.starts_with("pypi:")),
+        "a pyproject declaring nothing declares NO pypi packages: {current:?}"
+    );
+
+    // Same shape, but the TOML does not parse. A content sniff cannot rescue
+    // this case — only the filename can — and line-scanning it invents the
+    // same phantom package.
+    write(&ctx, "pyproject.toml", "name = \"throwaway\"\n[project\n");
+    let current = deps::current_deps(&ctx).unwrap();
+    assert!(
+        !current.iter().any(|d| d.starts_with("pypi:")),
+        "an unparseable pyproject declares no packages, it does not invent \
+         them from its own source text: {current:?}"
+    );
+
+    // The fix must not blind the parser: a real declaration is still seen.
+    write(
+        &ctx,
+        "pyproject.toml",
+        "[project]\nname = \"throwaway\"\ndependencies = [\"requests==2.31.0\"]\n",
+    );
+    let current = deps::current_deps(&ctx).unwrap();
+    assert!(
+        current.contains("pypi:requests"),
+        "a declared dependency must still be seen: {current:?}"
+    );
+    assert!(
+        !current.contains("pypi:name"),
+        "`name` is the project's own name even inside [project]: {current:?}"
+    );
+
+    // And a real requirements.txt is still line-scanned, which is the whole
+    // reason the fallthrough existed.
+    std::fs::remove_file(ctx.root.join("pyproject.toml")).unwrap();
+    write(&ctx, "requirements.txt", "requests==2.31.0\nflask>=2\n");
+    let current = deps::current_deps(&ctx).unwrap();
+    assert!(
+        current.contains("pypi:requests") && current.contains("pypi:flask"),
+        "requirements.txt is line-oriented and must still parse: {current:?}"
+    );
+}
+
 #[test]
 fn repointing_an_approved_dep_to_a_git_source_is_flagged_as_new_trust() {
     // Bypass class: an already-approved name (`serde`) repointed to an
