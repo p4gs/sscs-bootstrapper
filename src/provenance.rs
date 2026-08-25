@@ -1139,12 +1139,25 @@ mod tests {
         // With an identity, the bogus bundle is actually put to cosign, and
         // fails. (When cosign is absent the degrade message is the failure —
         // either way it must not be an Ok.)
-        let err = verify_receipt(
-            &ctx,
-            &receipt,
-            Some("https://github.com/example/repo/.github/workflows/release.yml@refs/heads/main"),
-            None,
-        )
+        //
+        // `serialized` because THIS call resolves `cosign` by name off the real
+        // PATH, and a sibling test three functions below installs a fake cosign
+        // that answers "Verified OK" and exits 0 for anything. Without the lock
+        // the two interleave and the bogus bundle "verifies" — the exact Ok this
+        // assertion exists to forbid. It failed that way on Linux CI twice while
+        // passing on macOS, because the race turns on thread scheduling rather
+        // than on anything about the receipt. The first two calls above return
+        // before any tool is spawned, so they need no lock.
+        let err = serialized(|| {
+            verify_receipt(
+                &ctx,
+                &receipt,
+                Some(
+                    "https://github.com/example/repo/.github/workflows/release.yml@refs/heads/main",
+                ),
+                None,
+            )
+        })
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
