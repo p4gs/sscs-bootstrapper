@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:455cb9930f9f4c54c0defb01b66249bb788155298a637db8cbf3f709e49a0d6e",
+  "claims": [
+    {
+      "id": "claim_6a29e7569ac9484c90884f46bd4af133",
+      "statement": "The command surface splits into bootstrap and inspection, per-control verification, hook entry points, and per-subsystem command groups for dependencies, receipts, provenance, signers, signing and optional services.",
+      "evidence": [
+        {
+          "resource": "repo://src/cli.rs#L30-L140",
+          "version": "repo-lines-v1:sha256:0badba30f10b12fccd2087beaf13a8049a4e6ccf232aa29a5bb691d01ce1a7bf:eyJzZWxlY3RlZExpbmVDb3VudCI6MTExLCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiI5ODVmZGJkMTA5ZjRkMDQ2ZTBlMzI4ZTlmNjNmMjAwN2U2ZjFhYWM1NjA5ZTg1ODA3MGJkODU5MjBkOWU2MmQxIiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiIwMWJhNDcxOWM4MGI2ZmU5MTFiMDkxYTdjMDUxMjRiNjRlZWVjZTk2NGUwOWMwNThlZjhmOTgwNWRhY2E1NDZiIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiIwNTAxMGY0ODQ0YWVlOTFlMTZmNWYwNzA1M2NmZjM2ZTVlNWIxYjg3NDE2YzM0NDM0NjY4MjIxMTU1YWJkOGE0IiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiI2YzcyN2NmYTJiZmMzMDQwYjI3MDkwOTc3MGU1YTQ5MDBjNDZjMTkwZGZkOWY2ZmFkMGNmMTQ2Zjc4ZjhiMzMxIn0"
+        }
+      ]
+    },
+    {
+      "id": "claim_5cedc415bd3a48a5b0ae916652c815b5",
+      "statement": "The three hook subcommands exist so the installed shell shims can delegate all policy to the binary rather than implementing any of it themselves.",
+      "evidence": [
+        {
+          "resource": "repo://src/cli.rs#L225-L227",
+          "version": "repo-lines-v1:sha256:aa206a303920f685fff17d67c499c05393dfadff7d28e1e50d562c98e196f271:eyJzZWxlY3RlZExpbmVDb3VudCI6MywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNWE4NjMyNWI1ZjcwMmNlYmRjNzBiNjM1YWE2MzkyOGRlODhhNjhiMjM4MTRjMDc3N2Q4Y2NmNjZjMzE0ZjMzOCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiMTY3YzBkZGFiMzdlMWM1MWYyZTM5MTNlNDYwZWRiNDNhNmU1ODUxMTI4YTUyMjJiYTMzYzA4ZDg2MzFkNWUyZiIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNjhkYzc0NGExMDk3MzM2MDJhN2NhZDY2ZWIyYmMxMzE3NjlkMzg3N2YyYmJiMjc1MzUxM2EyMjkwMjkxYzhjNiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiMDUwMTBmNDg0NGFlZTkxZTE2ZjVmMDcwNTNjZmYzNmU1ZTViMWI4NzQxNmMzNDQzNDY2ODIyMTE1NWFiZDhhNCJ9"
+        },
+        {
+          "resource": "repo://src/hooks.rs#L30-L48",
+          "version": "repo-lines-v1:sha256:f4125fc1ed137986e5acadf1533e7e91fa4e41015e98f3039a762a557754ccca:eyJzZWxlY3RlZExpbmVDb3VudCI6MTksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ1YzEzOTkwZGYzYzdkZTEyMmEyNWE5NTcwMDI2ODNlYTY1OTI5ZWZkZWNhY2QwMDcxZmVlZGQ5ZmM1NzU3MTMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjRjMTUxYzVjNzBmZDcyYjVkNjY1ODE3ZmJmMWY4MTBjNzhmZGZkMmY5NGJiNTMxOGQ5NDEwYmNiNTQyMjU2MzkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjZiNTQ5MTdjYzM2MTk0NGY5OGU5NjZjZDQ0OWFlZDQ4MWQzMmM4YjU2OGNjNDkwOWZhZjQ3NGRkMDk5OTIxMTIifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_0ae1b6cfdede4411a8d83b036e35ac91",
+      "statement": "Two commands never discover a repository at all, while verification, hardening, SBOM, scanning and SAST all require a config and exit with a usage error without one.",
+      "evidence": [
+        {
+          "resource": "repo://src/cli.rs#L382-L384",
+          "version": "repo-lines-v1:sha256:f73171e1bf50ceb56061251d9fbce7777a3ea3364c1273e7791118f139b94e78:eyJzZWxlY3RlZExpbmVDb3VudCI6MywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiYzJhMGIzNjE1MWQxMTFmM2NlOWY4M2Y5ZTBmNDgzYjhhNWJmM2YwMzAyY2QzYjllYzQ0MDM1NmQ0MTdkM2ExYiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiYmYyYTExYTI1YmZhNTQzMzQ0MjMxZTMyZmFlOWJjMjg3YjgyZjI5ZmE4Y2RlZDlmMTZiMWY2M2VlNWFmNGI2OCIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiZDk2ZmU5NWRjN2YyMmZjYTQ2ODEyZGQxN2M4ZTg0YmMxZWE3N2Y2Y2NmN2Y5ZDAyMjFhMzE1Yzc3ZDhmY2JlZiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiMTllNzYzNTVjZjExOTk0ODBjM2Y5OTgzNmIxNDg2Yzg0MWQ4OTFmYWFkOTA0YzYwOGUwOTMwMjJkMzc1N2FlZSJ9"
+        },
+        {
+          "resource": "repo://src/context.rs#L40-L45",
+          "version": "repo-lines-v1:sha256:2c56b4055d6a15af7bd1fcdc074d5638238fe45076024165324e02e3e70b061c:eyJzZWxlY3RlZExpbmVDb3VudCI6NiwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNDcyZDE3MzdiNjEzNDRkYmJmYWNmODQyNzQxYTlkNjA4MzkwOWY4YWZjZjQzYWM5NGM2ZDc2M2FjNDgxMGU0YyIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNDg5M2Y0MGUzNzgxZWI4OTZjODJkMDQ2YTA4MDY3YTExZTM1Y2RmMmYxZGZhZjI2ZmVhOTBiOGRiNjY3NjQxMyIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiMWNkN2ViYzk5ZWUyYmVkNWU0MDc1NDM3MmNmZTc4ODMxOWNlNTgzMmViYWRhYWQwNTA5Y2MzZjk2OTkwOWE2OSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiMTlkZmFkZTY4NDI5ZTJlNDNjOTYzYmU2Y2EzYjAwMGM2OWYzYWZjYmZlZjU1ZTQxYWE4YmU5M2U4YmFkYjZmMiJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_ced33e2ba7dd45b09cca4c73c4996546",
+      "statement": "Enabling or disabling an unregistered control is rejected before the config file is touched, with every valid id listed.",
+      "evidence": [
+        {
+          "resource": "repo://src/config.rs#L306-L312",
+          "version": "repo-lines-v1:sha256:52ccf689616eb805413568108ac14e64cf4fed7bab90031cea5f0836d8780ecc:eyJzZWxlY3RlZExpbmVDb3VudCI6NywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiYTRmZDlmOTljNTdmMmJiMzA1MDI1MjFhN2M3MDFjYmFiZGY5Zjc1NjhkZTgyMjU0ZjQ2YjI3OWVjZDEwODAxMSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiOTQzNmViYjlmNDQ5ZGJiZjNkZWExZmJhNGNjNDk0NmRiOGY4NjU0OGFjYjQzM2U1NDJmYmM3ODI1MGUxOWJjMyIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiMTllNzYzNTVjZjExOTk0ODBjM2Y5OTgzNmIxNDg2Yzg0MWQ4OTFmYWFkOTA0YzYwOGUwOTMwMjJkMzc1N2FlZSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiMTEyYzI0MjkzZmRlNjBiODFkZWYyNGM2NGUwYmE4Y2JlZmNlOTIzOTE4OTc0ODIzMzAxNDk5YTIwMzFhOGU3MCJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_f3be56dbd7bd46d98e75b23da6ff5f43",
+      "statement": "The agent-facing contract is pinned to the binary by tests asserting every documented subcommand exists, that no subcommand is invented, that the exit-code and verdict tables match reality, and that every documented invocation actually parses.",
+      "evidence": [
+        {
+          "resource": "repo://tests/agents_md.rs",
+          "version": "repo-file-v1:sha256:c1491b3d7a752bd8fb28845c92bcfb175490fb6703d38ce438e5c61265bc76e1"
+        }
+      ]
+    },
+    {
+      "id": "claim_d39376bd262142ff87d957ff1b7b322c",
+      "statement": "The shipped agent skill is not pinned by those tests, so only the agent-facing document is guarded against drifting from the binary.",
+      "evidence": [
+        {
+          "resource": "repo://tests/agents_md.rs",
+          "version": "repo-file-v1:sha256:c1491b3d7a752bd8fb28845c92bcfb175490fb6703d38ce438e5c61265bc76e1"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.3.3",
+    "at": "2026-08-25T03:42:40.117Z"
+  }
+}

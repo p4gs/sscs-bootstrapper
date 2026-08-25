@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:c68071c7bb69225e56479de8c72694f74be305fa58c94305d3c4e4fe4bcb7767",
+  "claims": [
+    {
+      "id": "claim_0ea8dadde1394d9ca89b1e8d6b88d076",
+      "statement": "sscsb is a policy engine over external tools: it decides which supply-chain controls apply, invokes the tools, parses what comes back, and turns that into a verdict.",
+      "evidence": [
+        {
+          "resource": "repo://src/exec.rs#L1-L4",
+          "version": "repo-lines-v1:sha256:ddd60d9123b56f0eb3efb4b6861da4b89f5dccc78e378ab5ae7cb6fa133ff254:eyJzZWxlY3RlZExpbmVDb3VudCI6NCwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNjM3MmRhYTFlNjI0YmI5ZmNiZjljZjI4OGNkMzVmMGE5Mzg0NGYxMDI4NDMzMjNlMmJiNmZmZDU3M2Q5NzI5MCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiN2I0MjM3MmNlMDg4N2M4Mjc5MWRjMjRkZDlmODE5YzU2MTk4ZDIwZjRmYWNmYjhhOTMzNTZhN2Y3ZWM0MDU3ZiIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjAsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZTEwMWU0NzdmNDgwZTIyZjg1N2Y1MDM2ODVlMGY0N2FlNzZhYTYyMWY0YmRiNjlkZWE4ZTVkOWYxYzZmYjRkZCJ9"
+        },
+        {
+          "resource": "repo://src/controls.rs#L555-L621",
+          "version": "repo-lines-v1:sha256:e68729c7bef1caab7019f2c1635466d639b0959d8f9399e1d6fc5623ec28cee8:eyJzZWxlY3RlZExpbmVDb3VudCI6NjcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU1MjJjNDJjZDE5YzZkMDNkODA4YzQ1MjcyMDU1MjgyNWI3ZWExYzViNDkxYjIxODUxMWNhYzc0MTVjZjlkOWIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZhMWYwY2MyMzhmY2FkY2U2MjI2MzJmMWM1OGVkZmVhODI5MzRmNDEzOTdhNWI3MGUwZWIyNDg3ZWExMGE5MTgiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImE4NGUzMDllNTQwOGU1ZjA3Yzk4Y2ViYjM0YTViYWZkMzJiMjFjYmNhNmFmODgwMTBkODJmZTViZTU5NjI2YTQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImE0NjFjZmI5MmNjMzg5MTkxZTg5MjgwNWNlZmJlYmQ1N2I2ZmM2NmExNDg5ODU2MDRjNGY3MTI2MGExMzc2OGYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_52f341f657044d8cae338d42c702eb03",
+      "statement": "The registry holds forty-four controls banded into five phases, and the generated config, the compliance map, the status view and the report are all derived from it rather than maintained beside it.",
+      "evidence": [
+        {
+          "resource": "repo://src/controls.rs#L9-L23",
+          "version": "repo-lines-v1:sha256:50e9cf17ed7637f5ad479b41caa2541ee3c51a505d7aee12a6d9cb6e083f38d4:eyJzZWxlY3RlZExpbmVDb3VudCI6MTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjYyNDBlOTRiYTgxODRkNGI3YzA0ODJhYmI2ZTU1NDg5YzRhZmQwNjA3OGI0NDg5ZWNjMTViMWU0ZTNlMjRmOTAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImJjMjQ0OGZkMjQzOThmNmFmNjk3YzhhYjAwMTQyNWUzM2YxYmJhOTIxZDdlYjc4MTllYmQ1MjE3N2E1MDI1ZWQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjM0YzA4ZWI0YzQwMGMyZDA3NGJlM2U4ZTA2MGMxZDM0MzQ1OGQ5MzYzMTQ2ZTc0ZTlkYzRiMzU4YjhlMDExYjYifQ"
+        },
+        {
+          "resource": "repo://src/config.rs#L335-L384",
+          "version": "repo-lines-v1:sha256:c56bce247581ace9e472a234cfd7ba14c022909b86af098ae153c1a122c366c0:eyJzZWxlY3RlZExpbmVDb3VudCI6NTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjYyZTUzMmIwM2ZmYzQ2MzBlYTk5YWIzYzJjYjQ2OWZlMGQ5OTM3ZTE4YmQ5NDRkMmVmZmEwNTFjNDM0MzBlMzkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjAxYmE0NzE5YzgwYjZmZTkxMWIwOTFhN2MwNTEyNGI2NGVlZWNlOTY0ZTA5YzA1OGVmOGY5ODA1ZGFjYTU0NmIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjlmMjNmOWM3Mjg1ODQ1NjhlYjBhNzgxZGI5NDkzMjRkMjg1N2U1MmM2MmRiZWY0ZTZiNTdmMWEwNThiODVmMDQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQxMzYwZTc4OTM3Mjc0OTA3NjlhYzM4ZTYxMjRhNzZhMGIyOGZkZGJiZjFlYTM1ZDJiOTk4MDYzMjNiMWZjODUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_cf90cd8be09447e8b03137e4359d4c48",
+      "statement": "The core loop is bootstrap, inspect, verify, report — and the bootstrap step's own closing output names baselining dependencies as the next action.",
+      "evidence": [
+        {
+          "resource": "repo://src/init.rs#L180-L186",
+          "version": "repo-lines-v1:sha256:29ccf961dbe3bf31542ba2185161e2a019835cb2d950e880b8223a6cc7ee9c6e:eyJzZWxlY3RlZExpbmVDb3VudCI6NywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiZjg5YTQ2NDE4N2RkMjViZDUyOGE4M2ZmZDNkZmI2MmE3ZmNjYzU0MjYyYmExNzk4MDY2YTljYjY2MDczNTA1YSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiYjAyZDJjMGQ2ZGM1ZTc0ZDkyZmExNGI5MWRiZWEyNjQwOTBiZWIzNWZkYjkxODhkOWIzNDExODFkY2U5ZjRjZSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNTdhMDkwNDNmNTczZTZjMmU4OWZjOTE5ZTVlY2E0OThkNTFmZTUyMzM5MTRlNzE1YWU4M2Y0NDg1MmM0ZDAyNCIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiN2JjOThkNmIwZGM0OTJjNTAxNmRmMTA4MDVhM2E1NGViOWMxODRhNWE2MTM3ZTdmNGJlY2ZhMGMyMjA1NTBkMCJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_fab575054a914a20a9290792478207a6",
+      "statement": "Exit zero means nothing that ran failed rather than everything was verified, because a degraded control contributes to the exit code only under strict mode.",
+      "evidence": [
+        {
+          "resource": "repo://src/cli.rs#L504-L531",
+          "version": "repo-lines-v1:sha256:d7f9af625af790f7bb887d03c883dcbc4bb97bd1c008c8c97e524bfb312cefb8:eyJzZWxlY3RlZExpbmVDb3VudCI6MjgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU4YWUzOTE3NmU5MGZlOGNmYmNlZWU4ZGM0ZjI3Y2RiZTZmNGY0MTUzYjkxOTE1NmFlZmE3YWNjMTBjMTBlMDAiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjgxZjZhZDA2ZjMwYmZjZDJhMTBlNmQ4NjJjYjkwOTBlOWE0MTk1OGE0MzI2YmJlMzY2ZWZhMzRhMTM3ZjEwODEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImE3NGZhNThlMzA4YWQ1NDU1YTAyN2UzMzFkZjU2MmZjYzRlYTJmMTIwMDA1NjBjNDNkMTE4MDZiZWIxMGEyMjgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijk4NjBkMTVlZDY1NDdlZmEwOTJkMDI1NjU4ZmI2OWI2OTE2MTkxMTMxZDA1MTdkZjE2ZWZmM2Q0YzU4NDA3ZDYifQ"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.3.3",
+    "at": "2026-08-25T03:42:40.117Z"
+  }
+}
