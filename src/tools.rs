@@ -312,18 +312,53 @@ fn unusable_message(s: &ToolSpec, platform: Platform, found_at: Option<&Path>) -
 }
 
 /// Extract the first `X.Y.Z`-shaped version from arbitrary tool output.
+///
+/// Every call site (`detect` → `ToolStatus::Found.version`) only ever
+/// DISPLAYS the result next to `ToolSpec::pinned_version` for a human to
+/// compare (`sscsb tools`, `sscsb verify` messages, degrade text) — nothing
+/// in this codebase parses it back into a semver and compares it
+/// programmatically against the pin. That is what decides the pre-release
+/// question below: the reader is a person, not a comparator.
+///
+/// A semver pre-release or build-metadata suffix (`-rc1`, `+build.5`,
+/// `-alpha.1+exp.sha.5114f85`) is kept in full, not trimmed to the bare
+/// `X.Y.Z` core. An `rc` or `+build` artifact is not the same thing that got
+/// pinned — silently reporting it as plain `X.Y.Z` would make a pre-release
+/// look identical to the pin in that side-by-side display, which is a lie by
+/// omission a human reading `sscsb tools` output would have no way to catch.
+/// The suffix is only trusted when it is glued directly onto the patch
+/// number by `-` or `+` (real semver syntax); anything else trailing after a
+/// valid `X.Y.Z` core — a stray 4th dotted segment, other junk — is dropped
+/// rather than appended, since it was never part of the version to begin
+/// with (see `extract_version_drops_trailing_garbage_instead_of_returning_it`).
 pub fn extract_version(text: &str) -> Option<String> {
     for token in text.split(|c: char| c.is_whitespace() || c == ',') {
         let t = token.trim_start_matches('v').trim_matches('"');
-        let parts: Vec<&str> = t.split('.').collect();
-        if parts.len() >= 3
-            && parts
-                .iter()
-                .take(3)
-                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-        {
-            return Some(parts.join("."));
+        // splitn(3, '.') rather than a full split: the third piece is
+        // "everything after the second dot", so a pre-release/build suffix
+        // that itself contains dots (`+build.5`) stays intact in `rest`
+        // instead of being chopped into separate, indistinguishable parts.
+        let mut components = t.splitn(3, '.');
+        let major = components.next().unwrap_or("");
+        let minor = components.next().unwrap_or("");
+        let rest = components.next().unwrap_or("");
+
+        let is_digits = |p: &str| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit());
+        if !is_digits(major) || !is_digits(minor) {
+            continue;
         }
+
+        let patch_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if patch_len == 0 {
+            continue; // no numeric patch component at all — not X.Y.Z-shaped
+        }
+        let (patch, suffix) = rest.split_at(patch_len);
+
+        return Some(if suffix.starts_with('-') || suffix.starts_with('+') {
+            format!("{major}.{minor}.{patch}{suffix}") // real semver suffix — keep verbatim
+        } else {
+            format!("{major}.{minor}.{patch}") // no marker: drop the trailing junk
+        });
     }
     None
 }
@@ -362,6 +397,93 @@ mod tests {
         assert_eq!(extract_version("Version: 0.72.0"), Some("0.72.0".into()));
         assert_eq!(extract_version("v2.4.0 (go1.24)"), Some("2.4.0".into()));
         assert_eq!(extract_version("no version here"), None);
+    }
+
+    #[test]
+    fn extract_version_keeps_prerelease_and_build_metadata_suffixes() {
+        // A pre-release or build-metadata suffix is semver syntax attached
+        // directly to the patch number (no dot in between: `3-rc1`, not
+        // `3.rc1`). It denotes a DIFFERENT artifact from the plain release —
+        // an `rc` build must never be reported in a way that makes it look
+        // identical to the pin — so the full suffix is kept, not stripped.
+        assert_eq!(
+            extract_version("gitleaks version 2.4.0-rc1"),
+            Some("2.4.0-rc1".into())
+        );
+        // Build metadata may itself contain dots (semver: `+build.5`); those
+        // dots belong to the suffix, not to a 4th version component, and
+        // must be preserved rather than truncated at the first dot.
+        assert_eq!(
+            extract_version("trivy 1.2.3+build.5"),
+            Some("1.2.3+build.5".into())
+        );
+        // Combined pre-release + build metadata (real semver example).
+        assert_eq!(
+            extract_version("tool 1.0.0-alpha.1+exp.sha.5114f85"),
+            Some("1.0.0-alpha.1+exp.sha.5114f85".into())
+        );
+    }
+
+    #[test]
+    fn extract_version_drops_trailing_garbage_instead_of_returning_it() {
+        // `1.2.3.abc` is not `1.2.3` with build metadata (no `-`/`+`
+        // marker) — `.abc` is an unrelated 4th dotted segment. The valid
+        // `X.Y.Z` core is real and should still be reported; the garbage
+        // must not be tacked onto the returned string as if it were part of
+        // the version.
+        assert_eq!(extract_version("tool 1.2.3.abc"), Some("1.2.3".into()));
+        assert_eq!(
+            extract_version("osv-scanner version: 2.4.0.20260101"),
+            Some("2.4.0".into())
+        );
+    }
+
+    #[test]
+    fn extract_version_matches_real_installed_tool_output() {
+        // Captured verbatim from `<tool> --version` / `<tool> version` run on
+        // this machine 2026-08-24 — real output, not invented fixtures. None
+        // of these happen to carry a pre-release/build suffix today, but
+        // they exercise the same first-token-wins scan the fix runs through,
+        // including cosign's multi-line ASCII-art banner and trivy's
+        // multi-line vulnerability-DB block, neither of which may parse as
+        // an earlier false match.
+        assert_eq!(extract_version("8.30.1\n"), Some("8.30.1".into())); // gitleaks version
+        assert_eq!(
+            extract_version("trufflehog 3.96.0\n"),
+            Some("3.96.0".into())
+        );
+        assert_eq!(extract_version("syft 1.51.0\n"), Some("1.51.0".into()));
+        assert_eq!(
+            extract_version(
+                "Version: 0.74.0\n\
+                 Vulnerability DB:\n\
+                 \x20 Version: 2\n\
+                 \x20 UpdatedAt: 2026-08-24 13:01:06.952742724 +0000 UTC\n"
+            ),
+            Some("0.74.0".into())
+        );
+        assert_eq!(
+            extract_version(
+                "osv-scanner version: 2.5.1\n\
+                 osv-scalibr version: 0.5.2\n\
+                 commit: n/a\n\
+                 built at: n/a\n"
+            ),
+            Some("2.5.1".into())
+        );
+        assert_eq!(
+            extract_version(
+                "  ______   ______        _______. __    _______ .__   __.\n\
+                 \x20/      | /  __  \\      /       ||  |  /  _____||  \\ |  |\n\
+                 cosign: A tool for Container Signing, Verification and Storage in an OCI registry\n\
+                 \n\
+                 GitVersion:    v3.1.3\n\
+                 GitCommit:     11926fa5bbbbde47e88fc006b625a17769b743b2\n\
+                 GoVersion:     go1.26.5\n"
+            ),
+            Some("3.1.3".into())
+        );
+        assert_eq!(extract_version("1.25.0\n"), Some("1.25.0".into())); // opengrep --version
     }
 
     #[test]

@@ -24,3 +24,11 @@ GIT_CONFIG_COUNT=0 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null cargo
 Follow-up worth doing properly: have the test helpers (`test_repo()` /
 `exec::git` under `cfg(test)`) set this isolation themselves so the suite is
 hermetic by construction rather than by invocation discipline.
+
+<!-- OPENWIKI:START -->
+
+## OpenWiki
+
+See [AGENTS.md](AGENTS.md) for OpenWiki agent instructions.
+
+<!-- OPENWIKI:END -->
