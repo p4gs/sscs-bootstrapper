@@ -427,72 +427,42 @@ pub(crate) mod tests {
     // module in one process across multiple threads, so every test in this
     // crate that depends on a specific tool-detection outcome for opengrep,
     // semgrep, cosign, slsa-verifier, oras, guacone, vexctl, witness, or
-    // sighthound serializes on `PATH_MUTEX` — including tests that rely on a
-    // tool's *natural* presence/absence and never mutate PATH themselves,
-    // via `serialized`.
+    // sighthound must hold the crate's one environment lock — including tests
+    // that rely on a tool's *natural* presence/absence and never mutate PATH
+    // themselves, via `serialized`.
     //
-    // `PATH_MUTEX` IS `testutil::PATH_LOCK`: PATH is not the only process-global
-    // the suite fixtures (HOME and GIT_CONFIG_* are too, for the signing
-    // lanes), and a per-module lock only serializes that module against itself.
-    // One lock for all of it, or the modules race each other.
-    pub(crate) use crate::testutil::PATH_LOCK as PATH_MUTEX;
+    // These are thin wrappers over `testutil::EnvLock`, which owns both the
+    // lock and the restore. They acquire the lock themselves, so none of them
+    // may be called from a scope that already holds one; use the `EnvLock`
+    // methods directly there. See the composition rules in src/testutil.rs.
+    use crate::testutil::with_env;
 
-    struct PathGuard(Option<std::ffi::OsString>);
-    impl Drop for PathGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-    }
-
-    /// Hold `PATH_MUTEX` for the duration of `f` without changing PATH —
-    /// for tests that rely on a tool's real, natural PATH presence/absence
-    /// and must not race a sibling test that masks or shims PATH.
+    /// Hold the environment lock for the duration of `f` without changing the
+    /// environment — for tests that rely on a tool's real, natural PATH
+    /// presence/absence and must not race a sibling test that masks or shims
+    /// PATH.
     pub(crate) fn serialized<T>(f: impl FnOnce() -> T) -> T {
-        let _lock = PATH_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        f()
+        with_env(|_lock| f())
     }
 
     /// Make `tool_name` resolve on PATH to a throwaway executable shell
     /// script (shadowing any real binary of the same name) for the duration
     /// of `f`, then restore PATH exactly.
     pub(crate) fn with_fake_tool<T>(tool_name: &str, script: &str, f: impl FnOnce() -> T) -> T {
-        let _lock = PATH_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join(tool_name);
-        std::fs::write(&bin, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let original = std::env::var_os("PATH");
-        let mut new_path = std::ffi::OsString::from(dir.path());
-        new_path.push(":");
-        if let Some(o) = &original {
-            new_path.push(o);
-        }
-        let _restore = PathGuard(original);
-        std::env::set_var("PATH", &new_path);
-        f()
+        with_env(|lock| {
+            lock.fake_tool(tool_name, script);
+            f()
+        })
     }
 
     /// Mask PATH down to just `git`'s directory, so every orchestrated tool
     /// this crate detects reports Missing — the in-process equivalent of
     /// `tests/tool_orchestration.rs`'s `sscsb_without_tools`.
     pub(crate) fn with_only_git_on_path<T>(f: impl FnOnce() -> T) -> T {
-        let _lock = PATH_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let git_dir = exec::find_in_path("git")
-            .expect("git must be on PATH")
-            .parent()
-            .expect("git binary has a parent dir")
-            .to_path_buf();
-        let original = std::env::var_os("PATH");
-        let _restore = PathGuard(original);
-        std::env::set_var("PATH", &git_dir);
-        f()
+        with_env(|lock| {
+            lock.only_git_on_path();
+            f()
+        })
     }
 
     /// A repo bootstrapped through the real `sscsb init` path (rules dir,

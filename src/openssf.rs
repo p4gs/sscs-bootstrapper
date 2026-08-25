@@ -594,26 +594,22 @@ pub fn verify_gittuf(ctx: &Ctx) -> VerifyResult {
 mod tests {
     use super::*;
     use crate::context::Ctx;
-    use crate::testutil::{env_lock, path_without, EnvGuard};
+    use crate::testutil::{env_lock, EnvLock};
 
     /// Make tool presence deterministic in both directions without disturbing
     /// any other tool the concurrently-running suite needs: the real PATH minus
-    /// `hidden`, with a scratch dir of stub executables prepended.
-    fn path_fixture(stubs: &[&str], hidden: &[&str]) -> (Vec<tempfile::TempDir>, String) {
-        let stub_dir = tempfile::tempdir().unwrap();
+    /// `hidden`, with stub executables for `stubs` prepended.
+    ///
+    /// Takes the `&EnvLock` rather than acquiring one, so a caller that already
+    /// holds the lock composes instead of deadlocking. Everything installed here
+    /// is unwound when that lock drops.
+    fn path_fixture(lock: &EnvLock, stubs: &[&str], hidden: &[&str]) {
+        // Order matters: mask first, then shadow, so the stubs sit in front of
+        // the already-narrowed PATH rather than being masked away themselves.
+        lock.hide_from_path(hidden);
         for name in stubs {
-            let path = stub_dir.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\necho '{name} 9.9.9'\nexit 0\n")).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
+            lock.fake_tool(name, &format!("#!/bin/sh\necho '{name} 9.9.9'\nexit 0\n"));
         }
-        let (mut keep, rest) = path_without(hidden);
-        let joined = format!("{}:{}", stub_dir.path().display(), rest.to_string_lossy());
-        keep.push(stub_dir);
-        (keep, joined)
     }
 
     fn repo() -> (tempfile::TempDir, Ctx) {
@@ -682,12 +678,11 @@ mod tests {
 
     #[test]
     fn model_signing_is_info_without_models_and_pass_with_a_model() {
-        let _g = env_lock();
+        let lock = env_lock();
         let (_d, ctx) = repo();
         // The declared CLI must be present, or the Pass assertion below is
         // testing the new degrade path instead.
-        let (_stubs, path) = path_fixture(&["model_signing"], &[]);
-        let _env = EnvGuard::new(&[("PATH", Some(&path))]);
+        path_fixture(&lock, &["model_signing"], &[]);
 
         // Fresh repo has no models → Info, N/A, workflow present.
         let na = verify_model_signing(&ctx);
@@ -716,10 +711,9 @@ mod tests {
     /// the declared CLI nothing about these models was verified.
     #[test]
     fn model_signing_degrades_when_the_declared_cli_is_absent() {
-        let _g = env_lock();
+        let lock = env_lock();
         let (_d, ctx) = repo();
-        let (_stubs, path) = path_fixture(&[], &["model_signing"]);
-        let _env = EnvGuard::new(&[("PATH", Some(&path))]);
+        path_fixture(&lock, &[], &["model_signing"]);
         assert!(
             !crate::tools::is_available("model-signing"),
             "fixture must hide the model-signing CLI"
@@ -925,12 +919,11 @@ mod tests {
 
     #[test]
     fn gittuf_passes_once_a_policy_ref_exists() {
-        let _g = env_lock();
+        let lock = env_lock();
         let (_d, ctx) = repo();
         // The Pass path is gated on the declared CLI being present; stub it so
         // this test still exercises Pass and not the degrade path.
-        let (_stubs, path) = path_fixture(&["gittuf"], &[]);
-        let _env = EnvGuard::new(&[("PATH", Some(&path))]);
+        path_fixture(&lock, &["gittuf"], &[]);
         std::fs::write(
             ctx.root.join(".github/workflows/gittuf-verify.yml"),
             "name: gittuf verify\non:\n  workflow_dispatch:\n",
@@ -964,10 +957,9 @@ mod tests {
     /// claim it could not support.
     #[test]
     fn gittuf_degrades_when_the_declared_cli_is_absent() {
-        let _g = env_lock();
+        let lock = env_lock();
         let (_d, ctx) = repo();
-        let (_stubs, path) = path_fixture(&[], &["gittuf"]);
-        let _env = EnvGuard::new(&[("PATH", Some(&path))]);
+        path_fixture(&lock, &[], &["gittuf"]);
         assert!(
             !crate::tools::is_available("gittuf"),
             "fixture must hide the gittuf CLI"

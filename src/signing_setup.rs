@@ -1537,7 +1537,7 @@ pub fn verify_signing_model_control(ctx: &Ctx, _cfg: &Config) -> VerifyResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{env_lock, fake_gh, EnvGuard, PathPrepend};
+    use crate::testutil::{env_lock, EnvLock};
 
     fn fixture_home(dir: &Path) -> SigningPaths {
         SigningPaths::from_home(dir)
@@ -1554,74 +1554,64 @@ mod tests {
     /// host `/etc/gitconfig` or an agent harness's injected identity cannot
     /// leak in: the fixture is hermetic by construction, not by invocation.
     struct FakeMachine {
-        // FIELD ORDER IS LOAD-BEARING. Fields drop in declaration order, and
-        // `EnvGuard` points GIT_CONFIG_GLOBAL at a file inside `dir`. With `dir`
-        // declared first it was deleted BEFORE the env was restored, so for the
-        // width of that window GIT_CONFIG_GLOBAL named a path that no longer
-        // existed. Env is process-global and these tests run on threads, so any
-        // concurrently-running test that shelled out to git in that window died
-        // with `fatal: unknown error occurred while reading the configuration
-        // files` — which reads like a bug in whichever test caught it rather
-        // than a teardown race here. Observed in CI on
-        // `signers::tests::verify_policy_changes_*`, which touches no
-        // environment of its own and holds no lock.
-        //
-        // Now `_env` restores first, then `dir` is deleted, and `_lock` releases
-        // last so no lock-taking test can observe either transition.
-        _env: EnvGuard,
-        dir: tempfile::TempDir,
+        /// Owns the environment lock, every variable set through it, AND the
+        /// temp dir those variables point at.
+        ///
+        /// That single ownership is what makes teardown safe. This fixture used
+        /// to hold a separate `EnvGuard`, a `TempDir` and a `MutexGuard` as
+        /// three fields whose declaration order was load-bearing: with `dir`
+        /// declared first it was deleted BEFORE the env was restored, so for the
+        /// width of that window `GIT_CONFIG_GLOBAL` named a path that no longer
+        /// existed. Env is process-global and these tests run on threads, so any
+        /// concurrently-running test that shelled out to git in that window died
+        /// with `fatal: unknown error occurred while reading the configuration
+        /// files` — which reads like a bug in whichever test caught it rather
+        /// than a teardown race here. Observed in CI on
+        /// `signers::tests::verify_policy_changes_*`, which touches no
+        /// environment of its own and holds no lock.
+        ///
+        /// `EnvLock` now sequences all three itself — restore, then delete, then
+        /// release — so the ordering cannot be got wrong by a future edit.
+        _lock: EnvLock,
+        home: PathBuf,
         gitconfig: PathBuf,
-        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl FakeMachine {
         fn new() -> Self {
             let lock = env_lock();
             let dir = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(dir.path().join(".ssh")).unwrap();
-            let gitconfig = dir.path().join("gitconfig");
+            let home = dir.path().to_path_buf();
+            std::fs::create_dir_all(home.join(".ssh")).unwrap();
+            let gitconfig = home.join("gitconfig");
             std::fs::write(&gitconfig, "").unwrap();
 
-            // A deterministic, offline `gh`. The lane probes shell out to it,
-            // and a developer machine with a real authenticated gh would
-            // otherwise make these tests hit the live GitHub API.
-            let bin = dir.path().join("bin");
-            std::fs::create_dir_all(&bin).unwrap();
-            let gh = bin.join("gh");
-            std::fs::write(
-                &gh,
-                "#!/bin/sh\ncase \"$2\" in\n  user) echo '{\"two_factor_authentication\": true}' ;;\n  \
-                 repos/*) printf 'human@example.invalid\\ttrue\\tvalid\\n' ;;\n  *) exit 1 ;;\nesac\n",
-            )
-            .unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-            let path = format!(
-                "{}:{}",
-                bin.display(),
-                std::env::var("PATH").unwrap_or_default()
-            );
-
-            let env = EnvGuard::new(&[
-                ("HOME", Some(dir.path().to_str().unwrap())),
+            lock.set(&[
+                ("HOME", Some(home.to_str().unwrap())),
                 ("GIT_CONFIG_GLOBAL", Some(gitconfig.to_str().unwrap())),
                 ("GIT_CONFIG_SYSTEM", Some("/dev/null")),
                 ("GIT_CONFIG_COUNT", Some("0")),
-                ("PATH", Some(&path)),
             ]);
+            // A deterministic, offline `gh`. The lane probes shell out to it,
+            // and a developer machine with a real authenticated gh would
+            // otherwise make these tests hit the live GitHub API.
+            lock.fake_tool(
+                "gh",
+                "#!/bin/sh\ncase \"$2\" in\n  user) echo '{\"two_factor_authentication\": true}' ;;\n  \
+                 repos/*) printf 'human@example.invalid\\ttrue\\tvalid\\n' ;;\n  *) exit 1 ;;\nesac\n",
+            );
+            // Handing the dir to the lock is what guarantees it outlives the
+            // variables naming it.
+            lock.keep_alive(dir);
             FakeMachine {
-                dir,
-                gitconfig,
-                _env: env,
                 _lock: lock,
+                home,
+                gitconfig,
             }
         }
 
         fn home(&self) -> &Path {
-            self.dir.path()
+            &self.home
         }
 
         /// `git config --global <key> <value>` against the fixture config.
@@ -2201,13 +2191,12 @@ mod tests {
     /// lane of this same function, and one detection now (correctly) treats as
     /// the tool being unusable.
     fn probe_web_with_gh(body: &str, exit: i32) -> EnvStatus {
-        let _lock = env_lock();
+        let lock = env_lock();
         let script = format!(
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'gh version 2.96.0 (test shim)'; \
              exit 0; fi\ncat <<'EOF'\n{body}\nEOF\nexit {exit}\n"
         );
-        let bin = fake_gh(&script);
-        let _path = PathPrepend::new(bin.path());
+        lock.fake_tool("gh", &script);
         let tmp = tempfile::tempdir().unwrap();
         probe_github_web(&scratch_ctx(tmp.path()))
     }
@@ -2252,9 +2241,11 @@ mod tests {
 
     #[test]
     fn github_web_probe_degrades_with_install_guidance_when_gh_is_absent() {
-        let _lock = env_lock();
-        let empty = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::new(&[("PATH", Some(empty.path().to_str().unwrap()))]);
+        let lock = env_lock();
+        // Hide ONLY gh. Pointing PATH at an empty dir would also hide `git`
+        // from every concurrently-running test that holds no lock — the
+        // sharpest version of the race this fixture is meant to avoid.
+        lock.hide_from_path(&["gh"]);
         let tmp = tempfile::tempdir().unwrap();
 
         let st = probe_github_web(&scratch_ctx(tmp.path()));
@@ -2302,8 +2293,8 @@ mod tests {
     fn verify_control_degrades_with_a_named_reason_when_home_is_unavailable() {
         // A daemon/CI context with no HOME cannot locate user config; the
         // control must degrade with the reason rather than panic.
-        let _lock = env_lock();
-        let _env = EnvGuard::new(&[("HOME", None)]);
+        let lock = env_lock();
+        lock.set(&[("HOME", None)]);
         let tmp = tempfile::tempdir().unwrap();
         let cfg = scratch_config(tmp.path());
 
@@ -2322,7 +2313,7 @@ mod tests {
         // `signing verify`'s history section exists to say what each state
         // MEANS: unknown_key is expected for the agent, unsigned is expected
         // only for cloud drafts, verified is expected for the human lanes.
-        let _lock = env_lock();
+        let lock = env_lock();
         let (_dir, ctx) = crate::testutil::repo_with_gh_repo("p4gs/sscs-bootstrapper", "main");
         let rows = [
             "human@example.invalid\ttrue\tvalid",
@@ -2332,8 +2323,7 @@ mod tests {
             "malformed-row-without-tabs",
         ]
         .join("\n");
-        let bin = fake_gh(&format!("#!/bin/sh\ncat <<'EOF'\n{rows}\nEOF\n"));
-        let _path = PathPrepend::new(bin.path());
+        lock.fake_tool("gh", &format!("#!/bin/sh\ncat <<'EOF'\n{rows}\nEOF\n"));
 
         let lines = classify_recent_commits(&ctx).unwrap();
         assert_eq!(
@@ -2349,10 +2339,11 @@ mod tests {
 
     #[test]
     fn recent_commit_classification_is_skipped_rather_than_failed_without_gh() {
-        let _lock = env_lock();
+        let lock = env_lock();
         let (_dir, ctx) = crate::testutil::repo_with_gh_repo("p4gs/sscs-bootstrapper", "main");
-        let empty = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::new(&[("PATH", Some(empty.path().to_str().unwrap()))]);
+        // Hide ONLY gh — blanking PATH would take `git` away from every
+        // concurrently-running test that holds no lock.
+        lock.hide_from_path(&["gh"]);
 
         assert!(classify_recent_commits(&ctx).unwrap().is_empty());
     }

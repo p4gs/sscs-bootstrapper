@@ -323,9 +323,7 @@ mod tests {
     }
 
     // --- live-scan path via a stubbed `gh` on PATH ---
-    use crate::testutil::{
-        env_lock, fake_gh, path_without, repo_with_gh_repo, EnvGuard, PathPrepend, PATH_LOCK,
-    };
+    use crate::testutil::{env_lock, repo_with_gh_repo};
 
     /// A bootstrapped repo with NO `github_repo` in config and no origin
     /// remote, so `verify_scorecard_control` cannot resolve a slug.
@@ -346,14 +344,13 @@ mod tests {
     /// gh-dependent control in the same run correctly said DEGRADED.
     #[test]
     fn scorecard_degrades_when_gh_is_absent() {
-        let _g = env_lock();
+        let lock = env_lock();
         let (_d, ctx) = repo_with_gh_repo("acme/demo", "main");
         let cfg_owned = crate::config::Config::load(&ctx.root).unwrap().unwrap();
 
         // Hide ONLY gh: PATH is process-global, so blanking it would break
         // whichever tool a concurrently-running test happens to need.
-        let (_mirrors, path) = path_without(&["gh"]);
-        let _env = EnvGuard::new(&[("PATH", Some(&path.to_string_lossy()))]);
+        lock.hide_from_path(&["gh"]);
         assert!(exec::find_in_path("gh").is_none(), "fixture must hide gh");
 
         let r = verify_scorecard_control(&ctx, &cfg_owned);
@@ -376,9 +373,8 @@ mod tests {
     /// is never queried, so nothing about Scorecard's view was read.
     #[test]
     fn scorecard_degrades_without_a_github_slug() {
-        let _g = env_lock();
-        let gh = fake_gh("#!/bin/sh\necho '[]'\nexit 0\n");
-        let _p = PathPrepend::new(gh.path());
+        let lock = env_lock();
+        lock.fake_tool("gh", "#!/bin/sh\necho '[]'\nexit 0\n");
         let (_d, ctx) = repo_without_slug();
         let cfg = ctx.require_config().unwrap();
 
@@ -394,9 +390,11 @@ mod tests {
     /// live findings still were not read, so this is not a PASS either.
     #[test]
     fn scorecard_degrades_when_live_results_cannot_be_read() {
-        let _g = env_lock();
-        let gh = fake_gh("#!/bin/sh\necho 'HTTP 403: Resource not accessible' 1>&2\nexit 1\n");
-        let _p = PathPrepend::new(gh.path());
+        let lock = env_lock();
+        lock.fake_tool(
+            "gh",
+            "#!/bin/sh\necho 'HTTP 403: Resource not accessible' 1>&2\nexit 1\n",
+        );
         let (_d, ctx) = repo_with_gh_repo("acme/demo", "main");
         let cfg = ctx.require_config().unwrap();
 
@@ -420,7 +418,7 @@ mod tests {
 
     #[test]
     fn verify_scorecard_live_scan_maps_findings() {
-        let _g = PATH_LOCK.lock().unwrap();
+        let lock = env_lock();
         let script = r#"#!/bin/sh
 case "$2" in
   *code-scanning/alerts*)
@@ -429,9 +427,8 @@ case "$2" in
   *) echo '[]'; exit 0;;
 esac
 "#;
-        let gh = fake_gh(script);
+        lock.fake_tool("gh", script);
         let (_d, ctx) = repo_with_gh_repo("acme/demo", "main");
-        let _p = PathPrepend::new(gh.path());
         let cfg = ctx.require_config().unwrap();
 
         let r = verify_scorecard_control(&ctx, cfg);
@@ -462,10 +459,9 @@ esac
 
     #[test]
     fn verify_scorecard_reports_no_findings_cleanly() {
-        let _g = PATH_LOCK.lock().unwrap();
-        let gh = fake_gh("#!/bin/sh\necho '[]'\nexit 0\n");
+        let lock = env_lock();
+        lock.fake_tool("gh", "#!/bin/sh\necho '[]'\nexit 0\n");
         let (_d, ctx) = repo_with_gh_repo("acme/demo", "main");
-        let _p = PathPrepend::new(gh.path());
         let cfg = ctx.require_config().unwrap();
         let r = verify_scorecard_control(&ctx, cfg);
         assert_eq!(r.outcome, Outcome::Pass);

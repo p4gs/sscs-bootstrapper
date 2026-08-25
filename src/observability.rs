@@ -418,13 +418,21 @@ pub fn verify_oras_control(ctx: &Ctx) -> VerifyResult {
 mod tests {
     use super::*;
     use crate::init;
+    use crate::testutil::env_lock;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
-    use std::sync::Mutex;
 
-    /// `DTRACK_API_KEY` is process-global, so the tests that set or clear it must
-    /// not run concurrently with each other.
-    static ENV: Mutex<()> = Mutex::new(());
+    // `DTRACK_API_KEY` is process-global, so the tests that set or clear it take
+    // the crate's environment lock.
+    //
+    // This module used to serialize on a private `static ENV: Mutex<()>` of its
+    // own. That excluded these tests from each other and from nothing else —
+    // while thirty-odd tests elsewhere serialized on `testutil`'s lock, so the
+    // two sets ran concurrently over one environment. `setenv(3)` is not
+    // thread-safe even across different variable names (it may reallocate
+    // `environ`), which is how `provenance::tests::cosign_sign_blob_degrades…`
+    // came to fail in CI reporting its OWN fake `cosign` as broken despite
+    // correctly holding `with_fake_tool`'s lock. One lock, or no lock.
 
     fn repo() -> (tempfile::TempDir, Ctx) {
         let dir = tempfile::tempdir().unwrap();
@@ -492,7 +500,7 @@ mod tests {
 
     #[test]
     fn dtrack_upload_sends_the_documented_api_contract() {
-        let _guard = ENV.lock().unwrap();
+        let lock = env_lock();
         let (_d, ctx) = repo();
         let stub = stub_dtrack();
         set_url(&ctx, &stub.url);
@@ -501,7 +509,7 @@ mod tests {
 
         let bom = ctx.root.join("bom.json");
         std::fs::write(&bom, r#"{"bomFormat":"CycloneDX","specVersion":"1.6"}"#).unwrap();
-        std::env::set_var("DTRACK_API_KEY", "test-key-not-a-real-credential");
+        lock.set(&[("DTRACK_API_KEY", Some("test-key-not-a-real-credential"))]);
 
         let msg = dtrack_upload(&ctx, cfg, &bom).unwrap();
         assert!(msg.contains("/api/v1/bom"));
@@ -528,25 +536,24 @@ mod tests {
             r#"{"bomFormat":"CycloneDX","specVersion":"1.6"}"#,
             "the BOM must arrive base64-encoded and byte-identical"
         );
-        std::env::remove_var("DTRACK_API_KEY");
     }
 
     #[test]
     fn dtrack_upload_refuses_without_url_or_api_key() {
-        let _guard = ENV.lock().unwrap();
+        let lock = env_lock();
         let (_d, ctx) = repo();
         let cfg = ctx.require_config().unwrap();
         let bom = ctx.root.join("bom.json");
         std::fs::write(&bom, "{}").unwrap();
 
         // No server configured.
-        std::env::set_var("DTRACK_API_KEY", "test-key-not-a-real-credential");
+        lock.set(&[("DTRACK_API_KEY", Some("test-key-not-a-real-credential"))]);
         let err = dtrack_upload(&ctx, cfg, &bom).unwrap_err();
         assert!(format!("{err:#}").contains("dependency-track.url not configured"));
 
         // Server configured, but no key in the environment. The key is NEVER
         // read from the config file, so this must fail rather than fall back.
-        std::env::remove_var("DTRACK_API_KEY");
+        lock.set(&[("DTRACK_API_KEY", None)]);
         set_url(&ctx, "http://127.0.0.1:1");
         let ctx = Ctx::discover(&ctx.root).unwrap();
         let cfg = ctx.require_config().unwrap();
@@ -556,7 +563,7 @@ mod tests {
 
     #[test]
     fn dtrack_upload_surfaces_an_unreachable_server() {
-        let _guard = ENV.lock().unwrap();
+        let lock = env_lock();
         let (_d, ctx) = repo();
         // Port 1 refuses connections — a down server must be reported, not swallowed.
         set_url(&ctx, "http://127.0.0.1:1");
@@ -564,7 +571,7 @@ mod tests {
         let cfg = ctx.require_config().unwrap();
         let bom = ctx.root.join("bom.json");
         std::fs::write(&bom, "{}").unwrap();
-        std::env::set_var("DTRACK_API_KEY", "test-key-not-a-real-credential");
+        lock.set(&[("DTRACK_API_KEY", Some("test-key-not-a-real-credential"))]);
 
         let err = dtrack_upload(&ctx, cfg, &bom).unwrap_err();
         assert!(format!("{err:#}").contains("Dependency-Track upload failed"));
@@ -572,7 +579,6 @@ mod tests {
         // A missing BOM file is likewise an error, not an empty upload.
         let err = dtrack_upload(&ctx, cfg, &ctx.root.join("nope.json")).unwrap_err();
         assert!(format!("{err:#}").contains("reading BOM"));
-        std::env::remove_var("DTRACK_API_KEY");
     }
 
     /// A one-shot HTTP server that answers the next connection with
@@ -613,7 +619,7 @@ mod tests {
 
     #[test]
     fn dtrack_verify_reports_url_and_key_state_separately() {
-        let _guard = ENV.lock().unwrap();
+        let lock = env_lock();
         let (_d, ctx) = repo();
         let cfg = ctx.require_config().unwrap();
 
@@ -630,14 +636,13 @@ mod tests {
         let cfg = ctx.require_config().unwrap();
 
         // URL but no key → degraded, naming the missing key.
-        std::env::remove_var("DTRACK_API_KEY");
+        lock.set(&[("DTRACK_API_KEY", None)]);
         let r = verify_dtrack_control(&ctx, cfg);
         assert_eq!(r.outcome, Outcome::Degraded);
         assert!(r
             .messages
             .iter()
             .any(|m| m.contains("DTRACK_API_KEY not set")));
-        std::env::remove_var("DTRACK_API_KEY");
     }
 
     /// Regression (H10): PASS required only a non-empty `url` STRING and
@@ -647,13 +652,13 @@ mod tests {
     /// not verification.
     #[test]
     fn dtrack_verify_degrades_when_the_configured_server_is_unreachable() {
-        let _guard = ENV.lock().unwrap();
+        let lock = env_lock();
         let (_d, ctx) = repo();
         // Port 1 refuses connections.
         set_url(&ctx, "http://127.0.0.1:1");
         let ctx = Ctx::discover(&ctx.root).unwrap();
         let cfg = ctx.require_config().unwrap();
-        std::env::set_var("DTRACK_API_KEY", "test-key-not-a-real-credential");
+        lock.set(&[("DTRACK_API_KEY", Some("test-key-not-a-real-credential"))]);
 
         let r = verify_dtrack_control(&ctx, cfg);
         assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
@@ -666,19 +671,18 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.contains("integration is UNVERIFIED")));
-        std::env::remove_var("DTRACK_API_KEY");
     }
 
     /// A server that rejects the key is likewise not a working integration.
     #[test]
     fn dtrack_verify_degrades_when_the_server_rejects_the_api_key() {
-        let _guard = ENV.lock().unwrap();
+        let lock = env_lock();
         let (_d, ctx) = repo();
         let (url, handle) = stub_http_once("HTTP/1.1 401 Unauthorized", "{}");
         set_url(&ctx, &url);
         let ctx = Ctx::discover(&ctx.root).unwrap();
         let cfg = ctx.require_config().unwrap();
-        std::env::set_var("DTRACK_API_KEY", "wrong-key-not-a-real-credential");
+        lock.set(&[("DTRACK_API_KEY", Some("wrong-key-not-a-real-credential"))]);
 
         let r = verify_dtrack_control(&ctx, cfg);
         assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
@@ -690,20 +694,19 @@ mod tests {
             r.messages
         );
         handle.join().unwrap();
-        std::env::remove_var("DTRACK_API_KEY");
     }
 
     /// …and a live server that answers earns the PASS it used to get for free.
     /// The key travels in a header, never in the URL.
     #[test]
     fn dtrack_verify_passes_against_a_live_server() {
-        let _guard = ENV.lock().unwrap();
+        let lock = env_lock();
         let (_d, ctx) = repo();
         let (url, handle) = stub_http_once("HTTP/1.1 200 OK", "{\"version\":\"5.0.2\"}");
         set_url(&ctx, &url);
         let ctx = Ctx::discover(&ctx.root).unwrap();
         let cfg = ctx.require_config().unwrap();
-        std::env::set_var("DTRACK_API_KEY", "good-key-not-a-real-credential");
+        lock.set(&[("DTRACK_API_KEY", Some("good-key-not-a-real-credential"))]);
 
         let r = verify_dtrack_control(&ctx, cfg);
         assert_eq!(r.outcome, Outcome::Pass, "{:?}", r.messages);
@@ -727,7 +730,6 @@ mod tests {
                 .any(|m| m.contains("good-key-not-a-real-credential")),
             "the key must never be echoed into the verdict"
         );
-        std::env::remove_var("DTRACK_API_KEY");
     }
 
     /// Reported (M18): `guac` and `oras` PASSED on a three-line shell script
