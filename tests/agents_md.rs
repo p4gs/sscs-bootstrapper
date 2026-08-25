@@ -279,6 +279,345 @@ fn agents_md_nested_invocations_actually_parse() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Behavioural guards.
+//
+// Everything above pins the doc's *vocabulary* to the binary — command names,
+// symbols, argument shapes. That caught renames but not lies: a documented
+// sentence about what a command DOES could be flatly false and every test
+// above still passed. An agent given only AGENTS.md and the binary found four
+// such sentences in one bootstrap run. The tests below run the binary and
+// compare its behaviour to what the doc claims about it.
+// ---------------------------------------------------------------------------
+
+/// A throwaway repo with `sscsb init` already run in it.
+fn bootstrapped_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.name", "SSCSB Doc Guard"],
+        vec!["config", "user.email", "doc-guard@example.com"],
+        vec!["config", "commit.gpgsign", "false"],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(repo)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+    Command::cargo_bin("sscsb")
+        .expect("binary builds")
+        .arg("init")
+        .current_dir(repo)
+        .assert()
+        .success();
+    dir
+}
+
+fn sscsb_in(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::cargo_bin("sscsb")
+        .expect("binary builds")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("runs")
+}
+
+/// Every file under `.sscsb/`, plus the repo's `.gitignore`, relative to root.
+fn generated_files(root: &std::path::Path) -> Vec<String> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, root, out);
+            } else if let Ok(rel) = p.strip_prefix(root) {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&root.join(".sscsb"), root, &mut out);
+    if root.join(".gitignore").is_file() {
+        out.push(".gitignore".to_string());
+    }
+    out.sort();
+    out
+}
+
+/// The paths AGENTS.md lists as rewritten on every `init`.
+fn documented_as_rewritten() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_list = false;
+    for line in AGENTS_MD.lines() {
+        let t = line.trim();
+        if !in_list {
+            in_list = t.contains("Rewritten every run");
+            continue;
+        }
+        if t.is_empty() {
+            if out.is_empty() {
+                continue; // blank line between the lead-in and the list
+            }
+            break;
+        }
+        let Some(path) = t.strip_prefix("- `").and_then(|r| r.split('`').next()) else {
+            break;
+        };
+        out.push(path.to_string());
+    }
+    out.sort();
+    out
+}
+
+/// AGENTS.md said `init` "will not clobber edits". It preserves config and CI
+/// templates, but unconditionally rewrites the three hook shims and
+/// `allowed_signers` — so an agent that put local logic in a shim lost it
+/// silently on the next `init`. `src/init.rs`'s own module doc had the truth
+/// all along; only the agent-facing file was wrong.
+///
+/// This pins the doc's list to what init MEASURABLY rewrites, in both
+/// directions: a file that starts being regenerated, or stops, fails here.
+#[test]
+fn agents_md_lists_exactly_what_init_rewrites() {
+    const MARKER: &str = "# SSCSB-DOC-GUARD-MARKER";
+    let dir = bootstrapped_repo();
+    let repo = dir.path();
+
+    let files = generated_files(repo);
+    assert!(
+        files.len() > 5,
+        "expected init to generate several files, found {files:?}"
+    );
+    for rel in &files {
+        let p = repo.join(rel);
+        let mut body = std::fs::read_to_string(&p).unwrap_or_default();
+        body.push('\n');
+        body.push_str(MARKER);
+        body.push('\n');
+        std::fs::write(&p, body).expect("marker written");
+    }
+
+    Command::cargo_bin("sscsb")
+        .expect("binary builds")
+        .arg("init")
+        .current_dir(repo)
+        .assert()
+        .success();
+
+    let mut clobbered: Vec<String> = files
+        .into_iter()
+        .filter(|rel| {
+            !std::fs::read_to_string(repo.join(rel))
+                .unwrap_or_default()
+                .contains(MARKER)
+        })
+        .collect();
+    clobbered.sort();
+
+    assert!(
+        !clobbered.is_empty(),
+        "no file was regenerated — this guard has gone vacuous, or init changed"
+    );
+    assert_eq!(
+        clobbered,
+        documented_as_rewritten(),
+        "AGENTS.md's `Rewritten every run` list does not match what `sscsb init` \
+         actually overwrites.\n  actually clobbered: {clobbered:?}\n  documented:         {:?}\n\n\
+         An agent trusting the doc either loses an edit it was told would survive, \
+         or is warned off editing a file that is in fact preserved.",
+        documented_as_rewritten()
+    );
+}
+
+/// AGENTS.md called `.sscsb/out/` "gitignored" while `init` wrote no
+/// `.gitignore` at all, so `git add .` after `sscsb sbom` committed a
+/// regenerated SBOM into policy history. Ask git, not the file text.
+#[test]
+fn agents_md_generated_output_really_is_ignored() {
+    let dir = bootstrapped_repo();
+    let repo = dir.path();
+
+    let ignored = |rel: &str| {
+        std::process::Command::new("git")
+            .args(["check-ignore", "-q", "--no-index", rel])
+            .current_dir(repo)
+            .output()
+            .expect("git runs")
+            .status
+            .code()
+            == Some(0)
+    };
+
+    assert!(
+        ignored(".sscsb/out/sbom.cdx.json"),
+        "AGENTS.md tells agents `.sscsb/out/` is ignored; git disagrees, so an \
+         agent running `git add .` commits generated SBOMs as policy"
+    );
+    assert!(
+        !ignored(".sscsb/policy/signers.toml"),
+        "policy must stay committable — AGENTS.md says everything outside \
+         `.sscsb/out/` IS committed"
+    );
+    assert!(
+        AGENTS_MD.contains(sscsb::init::OUT_IGNORE_RULE),
+        "AGENTS.md must name the ignore rule `{}` that init installs",
+        sscsb::init::OUT_IGNORE_RULE
+    );
+}
+
+/// The doc defined `DEGRADED` as "a required tool is missing" and told agents
+/// to "install the named tool". In a real bootstrap, all four DEGRADED
+/// controls were missing config, a remote, or a policy — no tool was missing
+/// and none was named, sending the agent hunting for installed binaries.
+///
+/// This proves the tool-independent DEGRADED state is real, so the doc's
+/// broader definition is not editorial preference.
+#[test]
+fn agents_md_degraded_does_not_require_a_missing_tool() {
+    let dir = bootstrapped_repo();
+    let out = sscsb_in(dir.path(), &["verify", "commit-signing"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        text.contains("[DEGRADED]"),
+        "fixture drifted: a freshly bootstrapped repo with no signers should \
+         degrade `commit-signing`. Got:\n{text}"
+    );
+    // `tools::degrade_message` is the only thing that emits this phrase, so its
+    // absence proves nothing was missing from PATH.
+    assert!(
+        !text.contains("not found on PATH"),
+        "this control degraded because of a MISSING TOOL, which would make the \
+         doc's old definition correct and this guard meaningless:\n{text}"
+    );
+    assert!(
+        AGENTS_MD.contains("could not be performed"),
+        "AGENTS.md's DEGRADED row must define the outcome as the check not \
+         happening, not narrowly as a missing tool"
+    );
+}
+
+/// `init` takes no flags — no `--force`, no `--dry-run`. The doc never said
+/// so, and an agent that wanted to regenerate a CI template had no way to
+/// learn that deleting the file is the only route.
+#[test]
+fn agents_md_init_flag_claim_matches_the_binary() {
+    let out = Command::cargo_bin("sscsb")
+        .expect("binary builds")
+        .args(["init", "--help"])
+        .output()
+        .expect("runs");
+    let help = String::from_utf8(out.stdout).expect("utf-8");
+
+    let flags: Vec<String> = help
+        .lines()
+        .skip_while(|l| !l.starts_with("Options:"))
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .filter_map(|l| l.split_whitespace().find(|w| w.starts_with("--")))
+        .map(str::to_string)
+        .collect();
+
+    assert_eq!(
+        flags,
+        vec!["--help".to_string()],
+        "`sscsb init` grew a flag. That is fine — but AGENTS.md states it takes \
+         none, so update the doc's init section and this guard together."
+    );
+    assert!(
+        AGENTS_MD.contains("takes no flags"),
+        "AGENTS.md must say `init` takes no flags, and that deleting a file is \
+         the only way to regenerate it"
+    );
+}
+
+/// `harden` is not a gate and does not fit the exit-code table: its documented
+/// dry-run exits 1 when it cannot find a GitHub repo, which against that table
+/// reads as "a gate failed". The doc must describe harden's own codes.
+#[test]
+fn agents_md_documents_harden_exit_codes() {
+    let dir = bootstrapped_repo();
+    let repo = dir.path();
+
+    // No origin remote and no `github_repo` in config: harden cannot inspect
+    // anything. This is the invocation the doc shows.
+    assert_eq!(
+        sscsb_in(repo, &["harden"]).status.code(),
+        Some(1),
+        "a harden dry-run that cannot resolve a repo must exit 1 — the fact the \
+         doc has to explain, because the exit-code table reads it as a failed gate"
+    );
+    assert_eq!(
+        sscsb_in(repo, &["harden", "definitely-not-a-control"])
+            .status
+            .code(),
+        Some(2),
+        "harden rejects an unsupported control with 2"
+    );
+
+    let section = AGENTS_MD
+        .split("## `sscsb harden`")
+        .nth(1)
+        .expect("AGENTS.md needs a `sscsb harden` section documenting its codes");
+    for code in ["`0`", "`1`", "`2`"] {
+        assert!(
+            section.contains(code),
+            "harden's section must document exit {code}; agents branch on it"
+        );
+    }
+}
+
+/// `init` prints its own next steps, and step 2 is `sscsb deps baseline` — a
+/// command the doc's core loop omitted entirely. An agent following only
+/// AGENTS.md declared a repo bootstrapped without ever running it.
+///
+/// Reads the steps from `init::NEXT_STEPS`, so changing the guidance without
+/// changing the doc fails here.
+#[test]
+fn agents_md_core_loop_covers_the_bootstrap_next_steps() {
+    let commands: Vec<String> = sscsb::init::NEXT_STEPS
+        .iter()
+        .flat_map(|step| {
+            step.match_indices("sscsb ").map(|(i, _)| {
+                step[i..]
+                    .split("&&")
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_end_matches(['.', ')'])
+                    .to_string()
+            })
+        })
+        .collect();
+
+    assert!(
+        commands.iter().any(|c| c == "sscsb deps baseline"),
+        "fixture drifted: NEXT_STEPS no longer names `sscsb deps baseline`; got {commands:?}"
+    );
+
+    let loop_block = AGENTS_MD
+        .split("## The core loop")
+        .nth(1)
+        .and_then(|s| s.split("## ").next())
+        .expect("AGENTS.md needs a `The core loop` section");
+
+    let missing: Vec<&String> = commands
+        .iter()
+        .filter(|c| !loop_block.contains(c.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "`sscsb init` tells the user to run {missing:?}, but AGENTS.md's core loop \
+         never mentions them. An agent following only the doc reports the repo \
+         bootstrapped with a step skipped."
+    );
+}
+
 #[test]
 fn agents_md_states_the_ai_cannot_sign_invariant() {
     // This is the single load-bearing safety claim in the file. If a future
