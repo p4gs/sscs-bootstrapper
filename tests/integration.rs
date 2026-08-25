@@ -1507,3 +1507,62 @@ fn signing_verify_fails_only_when_the_agent_wears_the_humans_identity() {
     assert!(stdout.contains("[FAIL     ] agent-claude-code"), "{stdout}");
     assert!(stdout.contains("IDENTITY BLUR"), "{stdout}");
 }
+
+// ────────────────── Foreign-repository shapes (from the QA corpus) ──────────
+
+/// The two repository shapes that produced real findings when `sscsb` was first
+/// run against twenty repositories other than its own, pinned so CI exercises
+/// them on every push rather than only a corpus run on someone's laptop.
+///
+/// **Docs-only.** A repository whose entire tracked content is a `README.md` has
+/// no dependency manifest and nothing to release. Every dependency-facing
+/// command must answer cleanly rather than inventing a finding, and — the part
+/// that actually bit — `init` must not be the thing that decides such a
+/// repository needs a release stack.
+///
+/// **No remote.** The controls that ask a forge about itself cannot answer
+/// without one. The contract is that they DEGRADE, because "I could not check"
+/// and "this is fine" are different answers; a bare `verify` still exits 0
+/// because nothing failed, while `--strict` refuses on the unknowns. That
+/// asymmetry is the whole point of the verdict model and is worth a test that
+/// fails loudly if either half drifts.
+#[test]
+fn a_docs_only_repository_with_no_remote_is_answered_honestly() {
+    let dir = throwaway_repo();
+    let repo = dir.path();
+
+    // Deliberately the entire tracked content: no manifest, no source, no remote.
+    write(repo, "README.md", "# docs only\n");
+    git_ok(repo, &["add", "README.md"]);
+    assert!(commit_with_message(repo, "docs: readme").status.success());
+
+    init_sscsb(repo);
+
+    // Dependency-facing commands: nothing to find is not a finding.
+    sscsb(repo).arg("deps").arg("list").assert().success();
+    sscsb(repo)
+        .args(["deps", "check", "--offline"])
+        .assert()
+        .success();
+
+    // `verify` exits 0 — nothing FAILED — but must report unknowns rather than
+    // claiming forge-side posture it never checked.
+    let out = sscsb(repo)
+        .arg("verify")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        text.contains("DEGRADED"),
+        "a repo with no remote must report DEGRADED controls, not silent success:\n{text}"
+    );
+
+    // The exit-code half of the same contract: --strict refuses the unknowns.
+    sscsb(repo).args(["verify", "--strict"]).assert().failure();
+
+    // `report` and `status` must work without a config-dependent forge answer.
+    sscsb(repo).arg("status").assert().success();
+    sscsb(repo).arg("report").assert().success();
+}

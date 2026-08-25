@@ -5,7 +5,7 @@ provenance, the release — describes code that got in through a commit. If a
 credential, an unreviewed dependency, or an unattributed AI change can walk
 through that boundary, nothing further down the chain can undo it.
 
-Phase 1 puts eight controls on that boundary.
+Phase 1 puts eleven controls on that boundary; the ten with a backing tool or template are listed below.
 
 | Control | What it does | Backing tool | Default |
 |---------|--------------|--------------|---------|
@@ -111,13 +111,24 @@ From that, `sscsb` **generates** `.sscsb/policy/allowed_signers` — the file gi
 uses to decide whether a signature is valid — and points `gpg.ssh.allowedSignersFile`
 at it. The generator has one rule that cannot be configured away:
 
-> **An `ai`-class key is never written to `allowed_signers`.**
+> **The protected-branch gate keys on the signer's CLASS, not on presence in
+> `allowed_signers`.**
 
-Not "is written and then rejected." Not written at all. An AI's signature cannot be
-verification-valid in this repository, because the material needed to verify it is
-not there. You cannot misconfigure your way into an AI-signed commit, and an AI
-with write access to the policy file cannot promote itself, because the class it
-would have to claim is the one that gets stripped.
+Be precise here, because there are two separate mechanisms and only one of them is
+absolute.
+
+**Conditional.** While the `agent-signing` control is off — the default — an
+`ai`-class key is not written into `allowed_signers` at all, so an AI signature
+cannot be verification-valid anywhere: the material needed to verify it is not
+there. Switch that control on and the key *is* written, deliberately, so an agent's
+commit verifies as a genuine agent signature on a feature branch.
+
+**Absolute.** The protected-branch check resolves the principal git reports back to
+`signers.toml` and refuses anything whose class is not `human`. That holds whichever
+way the first mechanism is set, and no configuration key changes it. An AI with
+write access to the policy file still cannot promote itself in the same push,
+because the server-side gate reads the trusted policy from the base revision rather
+than from the tree the pusher controls.
 
 On a **protected branch** (`main` and `master` by default; configurable), pre-push then requires
 that every commit in the range is:
