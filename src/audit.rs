@@ -1021,53 +1021,13 @@ mod tests {
     /// own PATH-touching tests from racing each other.
     // Shared across modules (audit/harden/scorecard) so PATH-touching gh-stub
     // tests never run concurrently and race on $PATH.
-    use crate::testutil::PATH_LOCK;
+    use crate::testutil::env_lock;
 
-    /// RAII guard that prepends `dir` onto PATH and restores the original
-    /// value on drop (including on panic, so a failing assertion never
-    /// leaves the test process with a mutated PATH).
-    struct PathPrepend {
-        original: Option<std::ffi::OsString>,
-    }
-
-    impl PathPrepend {
-        fn new(dir: &std::path::Path) -> Self {
-            let original = std::env::var_os("PATH");
-            let mut joined = std::ffi::OsString::from(dir.as_os_str());
-            if let Some(orig) = &original {
-                joined.push(":");
-                joined.push(orig);
-            }
-            std::env::set_var("PATH", joined);
-            PathPrepend { original }
-        }
-    }
-
-    impl Drop for PathPrepend {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-    }
-
-    /// Writes a fake, executable `gh` POSIX shim into a fresh temp dir that
-    /// understands exactly `gh api repos/*/rules/branches/<branch>` and
-    /// returns deterministic, scripted responses keyed on the branch name —
-    /// so the branch-protection matrix logic can be exercised without any
-    /// real network call.
-    fn fake_gh(script: &str) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("gh");
-        std::fs::write(&path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        dir
-    }
+    // The `gh` shims below are installed with `EnvLock::fake_tool`, which writes
+    // an executable POSIX script, puts it first on PATH, and — importantly —
+    // keeps the temp dir alive inside the lock. Written as a plain local, the
+    // dir dropped BEFORE the lock restored PATH, leaving a window in which PATH
+    // named a directory that no longer existed.
 
     const PINNED_OK: &str = r#"
 name: ok
@@ -1288,9 +1248,11 @@ jobs:
     /// check" must report DEGRADED.
     #[test]
     fn branch_protection_degrades_when_not_one_branch_could_be_queried() {
-        let _guard = PATH_LOCK.lock().unwrap();
-        let gh_dir = fake_gh("#!/bin/sh\necho 'gh: Not Found (HTTP 404)' 1>&2\nexit 1\n");
-        let _path = PathPrepend::new(gh_dir.path());
+        let lock = env_lock();
+        lock.fake_tool(
+            "gh",
+            "#!/bin/sh\necho 'gh: Not Found (HTTP 404)' 1>&2\nexit 1\n",
+        );
 
         let (_d, ctx) = crate::testutil::repo_with_gh_repo("acme/does-not-exist", "main");
         let cfg = ctx.require_config().unwrap();
@@ -1320,10 +1282,9 @@ jobs:
     /// is likewise "nothing verified" rather than "all clear".
     #[test]
     fn branch_protection_degrades_when_no_protected_branches_are_configured() {
-        let _guard = PATH_LOCK.lock().unwrap();
+        let lock = env_lock();
         // `gh` must resolve for the check under test to be reached at all.
-        let gh_dir = fake_gh("#!/bin/sh\necho '[]'\nexit 0\n");
-        let _path = PathPrepend::new(gh_dir.path());
+        lock.fake_tool("gh", "#!/bin/sh\necho '[]'\nexit 0\n");
 
         let (_d, ctx) = crate::testutil::repo_with_gh_repo("acme/demo", "main");
         let cfg_text = std::fs::read_to_string(ctx.config_path())
@@ -1345,7 +1306,7 @@ jobs:
     /// deterministic and don't depend on live GitHub state.
     #[test]
     fn branch_protection_full_matrix_via_stubbed_gh() {
-        let _guard = PATH_LOCK.lock().unwrap();
+        let lock = env_lock();
         let script = r#"#!/bin/sh
 case "$2" in
     */rules/branches/full)
@@ -1366,8 +1327,7 @@ case "$2" in
         ;;
 esac
 "#;
-        let gh_dir = fake_gh(script);
-        let _path = PathPrepend::new(gh_dir.path());
+        lock.fake_tool("gh", script);
 
         let (_d, ctx) = repo();
         let cfg_text = std::fs::read_to_string(ctx.config_path())
@@ -1424,7 +1384,7 @@ esac
 
     #[test]
     fn branch_protection_reports_scorecard_granular_fields() {
-        let _guard = PATH_LOCK.lock().unwrap();
+        let lock = env_lock();
         // "aligned": every Scorecard knob set. "gaps2": all off.
         let script = r#"#!/bin/sh
 case "$2" in
@@ -1442,8 +1402,7 @@ case "$2" in
         ;;
 esac
 "#;
-        let gh_dir = fake_gh(script);
-        let _path = PathPrepend::new(gh_dir.path());
+        lock.fake_tool("gh", script);
 
         let (_d, ctx) = repo();
         let cfg_text = std::fs::read_to_string(ctx.config_path())

@@ -1262,49 +1262,16 @@ mod tests {
     /// the crate that fixtures a process-global (PATH, HOME, GIT_CONFIG_*) —
     /// this is the one crate-wide lock, not a private one that would only
     /// serialize this module against itself.
-    use crate::testutil::PATH_LOCK;
-
-    struct PathPrepend {
-        original: Option<std::ffi::OsString>,
-    }
-    impl PathPrepend {
-        fn new(dir: &Path) -> Self {
-            let original = std::env::var_os("PATH");
-            let mut joined = std::ffi::OsString::from(dir.as_os_str());
-            if let Some(orig) = &original {
-                joined.push(":");
-                joined.push(orig);
-            }
-            std::env::set_var("PATH", joined);
-            PathPrepend { original }
-        }
-    }
-    impl Drop for PathPrepend {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-    }
+    use crate::testutil::env_lock;
 
     #[test]
     fn verify_github_app_commits_reports_verified_and_mismatched_via_stubbed_gh() {
-        let _guard = PATH_LOCK.lock().unwrap();
+        let lock = env_lock();
         // A fake gh that returns a Verified commit committed by the app bot.
-        let ghdir = tempfile::tempdir().unwrap();
-        let ghpath = ghdir.path().join("gh");
-        std::fs::write(
-            &ghpath,
+        lock.fake_tool(
+            "gh",
             "#!/bin/sh\necho '{\"sha\":\"1111111111111111\",\"commit\":{\"verification\":{\"verified\":true,\"reason\":\"valid\"},\"committer\":{\"email\":\"x@x\"}},\"committer\":{\"login\":\"my-app[bot]\"}}'\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&ghpath, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let _path = PathPrepend::new(ghdir.path());
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

@@ -673,7 +673,7 @@ mod tests {
     }
 
     // --- network-boundary tests via a stubbed `gh` on PATH ---
-    use crate::testutil::{fake_gh, repo_with_gh_repo, PathPrepend, PATH_LOCK};
+    use crate::testutil::{env_lock, repo_with_gh_repo};
 
     const RULESET_STUB: &str = r#"#!/bin/sh
 case "$1 $2 $3" in
@@ -689,10 +689,9 @@ esac
 
     #[test]
     fn harden_branch_protection_dry_run_then_apply() {
-        let _g = PATH_LOCK.lock().unwrap();
-        let gh = fake_gh(RULESET_STUB);
+        let lock = env_lock();
+        lock.fake_tool("gh", RULESET_STUB);
         let (_d, ctx) = repo_with_gh_repo("acme/demo", "main");
-        let _p = PathPrepend::new(gh.path());
         let cfg = ctx.require_config().unwrap();
 
         let dry = harden_branch_protection(&ctx, cfg, false, false);
@@ -710,10 +709,9 @@ esac
 
     #[test]
     fn harden_reports_missing_ruleset() {
-        let _g = PATH_LOCK.lock().unwrap();
-        let gh = fake_gh("#!/bin/sh\necho '[]'\nexit 0\n");
+        let lock = env_lock();
+        lock.fake_tool("gh", "#!/bin/sh\necho '[]'\nexit 0\n");
         let (_d, ctx) = repo_with_gh_repo("acme/demo", "main");
-        let _p = PathPrepend::new(gh.path());
         let cfg = ctx.require_config().unwrap();
         let r = harden_branch_protection(&ctx, cfg, false, false);
         assert!(!r.ok);
