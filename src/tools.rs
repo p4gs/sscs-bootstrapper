@@ -547,11 +547,11 @@ mod tests {
     #[test]
     fn detect_refuses_a_decoy_that_is_not_executable_or_cannot_answer_its_probe() {
         use std::os::unix::fs::PermissionsExt;
-        let _lock = crate::testutil::env_lock();
+        let lock = crate::testutil::env_lock();
         let dir = tempfile::tempdir().unwrap();
         // Prepend only — nothing on the real PATH is hidden, so a
         // concurrently-running test can still find and spawn its own tools.
-        let _path = crate::testutil::PathPrepend::new(dir.path());
+        lock.prepend_path(dir.path());
         let decoy = dir.path().join("sscsb-probe-decoy");
 
         // The reported shape: a three-line shell script nobody chmod'd.
