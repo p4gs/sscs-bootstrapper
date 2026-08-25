@@ -109,12 +109,9 @@ fn class_label(class: &SignerClass) -> &'static str {
 /// backend, expiry, and attestation state, and FAILs on policy collisions
 /// (unknown/disallowed backend, expired or malformed key, missing attestation).
 pub fn verify_agent_signing_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
-    if !hooks::hooks_installed(ctx) {
-        return VerifyResult::new(
-            CONTROL,
-            Outcome::Fail,
-            vec!["hooks not installed — run `sscsb init`".into()],
-        );
+    let hook_state = hooks::hook_integrity(ctx);
+    if let Some(blocked) = hook_state.blocking(CONTROL) {
+        return blocked;
     }
     // A parse error (bad class, duplicate principal, non-table) is a hard fail:
     // the policy that gates agent identities must itself be well-formed.
@@ -145,7 +142,8 @@ pub fn verify_agent_signing_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
         format!("policy: agent signatures required = {require_sigs}"),
         format!("policy: rotate agent keys within {max_age} day(s)"),
     ];
-    let mut outcome = Outcome::Pass;
+    messages.extend(hook_state.messages.iter().cloned());
+    let mut outcome = Outcome::Pass.weakest(hook_state.outcome);
     let fail = |m: String, out: &mut Outcome, msgs: &mut Vec<String>| {
         *out = Outcome::Fail;
         msgs.push(m);
@@ -927,7 +925,10 @@ mod tests {
         std::fs::remove_dir_all(ctx.root.join(".sscsb/hooks")).unwrap();
         let r = verify_agent_signing_control(&ctx, cfg);
         assert_eq!(r.outcome, Outcome::Fail);
-        assert!(r.messages.iter().any(|m| m.contains("hooks not installed")));
+        assert!(r
+            .messages
+            .iter()
+            .any(|m| m.contains("is missing or unreadable")));
     }
 
     #[test]

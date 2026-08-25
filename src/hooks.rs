@@ -171,7 +171,21 @@ pub fn parse_signers(text: &str) -> Result<Vec<Signer>> {
     // twice — especially across classes — is the exact shape that would let an
     // `ai` entry ride in on a `human` principal, so it is a hard parse error
     // (ISC-A2), matched case-insensitively so casing can't smuggle a duplicate.
+    //
+    // Deduping the PRINCIPAL alone was not sufficient, and the gap was
+    // exploitable end to end. Git resolves `%GS` — the principal the
+    // protected-branch gate matches on — to the FIRST line in `allowed_signers`
+    // whose key verifies the signature. Register ONE key twice, once under a
+    // `human` principal and once under an `ai` principal, and an agent's
+    // signature resolves to the human and passes the gate. With `agent-signing`
+    // off (the default) it is worse: the `ai` line is never emitted at all, so
+    // only the human twin exists and the bypass does not even depend on
+    // ordering.
+    //
+    // Key material is an identity too. A key belongs to exactly one signer, or
+    // the class gate means nothing.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (i, item) in items.iter().enumerate() {
         let t = item
             .as_table()
@@ -186,6 +200,39 @@ pub fn parse_signers(text: &str) -> Result<Vec<Signer>> {
                 "signer `{principal}` is listed more than once — each principal must map to a \
                  single signer/class (humans, CI, and AI never share an identity)"
             );
+        }
+        // Compare the key's TYPE and BASE64 BODY, ignoring the trailing comment:
+        // `ssh-ed25519 AAAA… alice@host` and `ssh-ed25519 AAAA… bot@ci` are the
+        // same key wearing two names, which is precisely the attack.
+        for (field, raw) in [
+            (
+                "ssh_public_key",
+                t.get("ssh_public_key").and_then(|v| v.as_str()),
+            ),
+            (
+                "gpg_fingerprint",
+                t.get("gpg_fingerprint").and_then(|v| v.as_str()),
+            ),
+        ] {
+            let Some(raw) = raw else { continue };
+            let fingerprint = if field == "ssh_public_key" {
+                let mut parts = raw.split_whitespace();
+                match (parts.next(), parts.next()) {
+                    (Some(kind), Some(body)) => format!("{kind} {body}"),
+                    _ => raw.trim().to_string(),
+                }
+            } else {
+                // GPG fingerprints are case- and space-insensitive in practice.
+                raw.replace(char::is_whitespace, "").to_ascii_lowercase()
+            };
+            if let Some(other) = seen_keys.insert(fingerprint, principal.clone()) {
+                anyhow::bail!(
+                    "signer `{principal}` reuses the {field} already registered to `{other}` — \
+                     one key must map to exactly one signer. Sharing key material across \
+                     principals defeats the class gate: git resolves a signature to the FIRST \
+                     matching principal, so an agent's signature would verify as the human's."
+                );
+            }
         }
         let class = match t.get("class").and_then(|v| v.as_str()) {
             Some("human") => SignerClass::Human,
@@ -274,7 +321,7 @@ pub fn regenerate_allowed_signers(ctx: &Ctx, include_agents: bool) -> Result<()>
 
 /// Whether the (default-off) `agent-signing` control is enabled.
 pub fn agent_signing_enabled(cfg: &Config) -> bool {
-    cfg.control_enabled("agent-signing").unwrap_or(false)
+    cfg.control_enabled_or_default("agent-signing")
 }
 
 // ─────────────────────────────── Trailers ───────────────────────────────────
@@ -393,6 +440,12 @@ fn staged_submodules(ctx: &Ctx) -> Result<std::collections::HashSet<String>> {
 ///
 /// Shared by the secret scanner and the pre-commit SAST scanner so both get the
 /// same fail-closed, quote-safe materialization.
+///
+/// The blob is carried as BYTES end to end. `CmdOutput.stdout` is
+/// `from_utf8_lossy`, so routing a staged PNG, zip, or any other non-UTF-8 file
+/// through it would rewrite every invalid sequence as U+FFFD before the
+/// scanners ever saw it: the scan would read the wrong bytes, and anything
+/// downstream reading this directory would too.
 pub fn stage_to_tempdir(ctx: &Ctx) -> Result<(tempfile::TempDir, Vec<String>)> {
     let dir = tempfile::tempdir()?;
     let files = staged_paths(ctx)?;
@@ -400,7 +453,7 @@ pub fn stage_to_tempdir(ctx: &Ctx) -> Result<(tempfile::TempDir, Vec<String>)> {
     for file in &files {
         // `--` guards against a path that begins with a dash, and the raw path
         // is passed as a single argument (never shell-interpolated).
-        let out = exec::git_raw(&["show", &format!(":{file}")], &ctx.root)?;
+        let out = exec::git_bytes(&["show", &format!(":{file}")], &ctx.root)?;
         if !out.success() {
             if submodules.contains(file) {
                 continue; // gitlink: no blob to scan, correctly skipped
@@ -416,7 +469,7 @@ pub fn stage_to_tempdir(ctx: &Ctx) -> Result<(tempfile::TempDir, Vec<String>)> {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&dest, out.stdout.as_bytes())?;
+        std::fs::write(&dest, &out.stdout)?;
     }
     Ok((dir, files))
 }
@@ -428,7 +481,7 @@ pub fn hook_pre_commit(ctx: &Ctx) -> Result<i32> {
     };
     let mut blocked = false;
 
-    if cfg.control_enabled("secrets").unwrap_or(true) {
+    if cfg.control_enabled_or_default("secrets") {
         match run_secret_scan_staged(ctx, cfg) {
             Ok(problems) if problems.is_empty() => {
                 eprintln!("sscsb: secrets — staged changes clean");
@@ -452,7 +505,7 @@ pub fn hook_pre_commit(ctx: &Ctx) -> Result<i32> {
         }
     }
 
-    if cfg.control_enabled("sast").unwrap_or(false)
+    if cfg.control_enabled_or_default("sast")
         && cfg.control_opt_bool("sast", "pre_commit").unwrap_or(false)
     {
         match crate::sast::scan_staged(ctx, cfg) {
@@ -467,8 +520,28 @@ pub fn hook_pre_commit(ctx: &Ctx) -> Result<i32> {
                 }
             }
             Err(err) => {
-                // SAST pre-commit is opt-in advisory; degrade open with notice.
-                eprintln!("sscsb: sast pre-commit unavailable: {err:#}");
+                // This arm used to degrade open unconditionally, on the grounds
+                // that pre-commit SAST is opt-in and advisory. Being opt-in is
+                // the argument AGAINST that: a user who turned this gate on had
+                // no way to make it hold — `fail_open = false` did not apply to
+                // it, so a missing engine or a mistyped `engine =` name silently
+                // removed the gate they asked for. `fail_open` is documented as
+                // the single opt-out for every hook ("would let hooks pass when
+                // scanners are missing"), and it governs this arm too.
+                if cfg.fail_open() {
+                    eprintln!(
+                        "sscsb: WARNING (fail_open=true): sast pre-commit could not run: {err:#}"
+                    );
+                } else {
+                    blocked = true;
+                    eprintln!(
+                        "sscsb: BLOCKED (fail-closed): sast pre-commit could not run: {err:#}"
+                    );
+                    eprintln!(
+                        "sscsb: install the engine, fix `[controls.sast] engine`, or disable the \
+                         control — `sscsb verify` names which."
+                    );
+                }
             }
         }
     }
@@ -626,6 +699,52 @@ pub fn parse_gitleaks_findings(stdout: &str) -> Vec<String> {
 
 // ─────────────────────────────── commit-msg ─────────────────────────────────
 
+/// The name-proximity annotation the commit gate adds ON TOP of
+/// [`crate::deps::NewDep::explain`], for a new dependency it is already
+/// blocking.
+///
+/// Extracted from the loop and RETURNED rather than printed because two
+/// independent conditions suppress it, and neither was testable while it lived
+/// inline behind an `eprintln!`:
+///
+/// 1. **Correctness, unconditional.** A `path`/`git`/`url` dependency named one
+///    edit from `serde` fetches nothing from crates.io, so the heuristic is
+///    asking about a name that does not resolve the code. `explain()` has
+///    already said the true thing — that its source needs review. No
+///    configuration re-enables this; it is not a check the user elected to run.
+/// 2. **Policy, configurable.** `typosquat_check = false` switches the heuristic
+///    off. The commit gate is the THIRD place it runs, after `deps check` and
+///    approval, and a toggle reaching only the advisory two is the exact defect
+///    the key was fixed to close: the user turns it off because their dependency
+///    is legitimately one edit from a popular name, and it still blocks their
+///    commit.
+///
+/// Suppressing the annotation never lets the PACKAGE through: `explain()` is
+/// pushed unconditionally by the caller and still blocks the commit. Only the
+/// proximity note is withheld.
+fn typosquat_annotation(
+    d: &crate::deps::NewDep,
+    checks: crate::deps::TrustChecks,
+) -> Option<String> {
+    if d.source
+        .as_ref()
+        .is_some_and(|s| !s.is_registry_resolvable())
+    {
+        return None;
+    }
+    if !checks.typosquat {
+        return None;
+    }
+    let (eco_label, name) = d.qualified.split_once(':')?;
+    let eco = crate::deps::Ecosystem::from_label(eco_label)?;
+    let shadowed = crate::deps::typosquat_suspect(eco, name)?;
+    Some(format!(
+        "`{}` is one edit from popular package `{shadowed}` — likely \
+         typosquat/slopsquat; verify before approving",
+        d.qualified
+    ))
+}
+
 pub fn hook_commit_msg(ctx: &Ctx, msg_file: &Path) -> Result<i32> {
     let Some(cfg) = ctx.config.as_ref() else {
         return Ok(0);
@@ -635,13 +754,13 @@ pub fn hook_commit_msg(ctx: &Ctx, msg_file: &Path) -> Result<i32> {
     let trailers = parse_trailers(&message);
     let mut problems: Vec<String> = Vec::new();
 
-    if cfg.control_enabled("ai-trailers").unwrap_or(true) {
+    if cfg.control_enabled_or_default("ai-trailers") {
         problems.extend(validate_ai_trailers(&trailers));
     }
 
     let ai_assisted = trailers.get("AI-Assisted").map(String::as_str) == Some("true");
 
-    if ai_assisted && cfg.control_enabled("ai-dep-gate").unwrap_or(true) {
+    if ai_assisted && cfg.control_enabled_or_default("ai-dep-gate") {
         let staged = exec::git(
             &["diff", "--cached", "--name-only", "--diff-filter=ACMR"],
             &ctx.root,
@@ -676,29 +795,45 @@ pub fn hook_commit_msg(ctx: &Ctx, msg_file: &Path) -> Result<i32> {
         }
     }
 
-    if cfg.control_enabled("package-trust").unwrap_or(true) {
+    if cfg.control_enabled_or_default("package-trust") {
+        // The commit gate is the THIRD place the typosquat heuristic runs, after
+        // `deps check` and approval. A toggle that reaches only the advisory two
+        // is the defect it was written to fix: the user switched the heuristic
+        // off because their dependency is legitimately one edit from a popular
+        // name, and it still blocks their commit — the config contradicting
+        // itself at the one gate that actually stops work.
+        //
+        // The package itself is NOT let through by this: `d.explain()` above
+        // still reports it as a new unapproved dependency and still blocks. Only
+        // the name-proximity annotation is suppressed.
+        let checks = crate::deps::TrustChecks::from_config(Some(cfg));
         match crate::deps::new_unapproved_deps(ctx) {
             Ok(new_deps) if !new_deps.is_empty() => {
                 for d in &new_deps {
                     problems.push(d.explain());
-                    // Enforce the anti-slopsquat heuristic HERE, not only in the
-                    // advisory `deps check`: a new package one edit from a popular
-                    // name is called out at the gate that actually blocks.
-                    if let Some((eco_label, name)) = d.qualified.split_once(':') {
-                        if let Some(eco) = crate::deps::Ecosystem::from_label(eco_label) {
-                            if let Some(shadowed) = crate::deps::typosquat_suspect(eco, name) {
-                                problems.push(format!(
-                                    "`{}` is one edit from popular package `{shadowed}` — likely \
-                                     typosquat/slopsquat; verify before approving",
-                                    d.qualified
-                                ));
-                            }
-                        }
-                    }
+                    problems.extend(typosquat_annotation(d, checks));
                 }
             }
             Ok(_) => {}
-            Err(err) => eprintln!("sscsb: package-trust check skipped: {err:#}"),
+            // The gate could not evaluate — an unreadable or unparseable
+            // `.sscsb/policy/packages.toml` is the common case, and a one-line
+            // append to that file must not be a way to switch the new-package
+            // gate off. Deleting the baseline already fails CLOSED (every new
+            // package reads as unapproved); corrupting it has to fail closed
+            // too, or that asymmetry IS the bypass. `fail_open = true` stays
+            // the single explicit opt-out — the same shape the secret-scan and
+            // SAST arms of these hooks already use.
+            Err(err) => {
+                if cfg.fail_open() {
+                    eprintln!(
+                        "sscsb: WARNING (fail_open=true): package-trust check could not run: {err:#}"
+                    );
+                } else {
+                    problems.push(format!(
+                        "package-trust check could not run (fail-closed): {err:#}"
+                    ));
+                }
+            }
         }
     }
 
@@ -759,11 +894,11 @@ pub fn hook_pre_push(ctx: &Ctx, _remote: &str, stdin: &str) -> Result<i32> {
         let branch = branch_of_ref(&u.remote_ref).unwrap_or("");
         let is_protected = protected.iter().any(|p| p == branch);
 
-        if is_protected && cfg.control_enabled("commit-signing").unwrap_or(true) {
+        if is_protected && cfg.control_enabled_or_default("commit-signing") {
             problems.extend(check_signing_for_range(ctx, cfg, u, branch)?);
         }
 
-        if cfg.control_enabled("secrets").unwrap_or(true)
+        if cfg.control_enabled_or_default("secrets")
             && cfg
                 .control_opt_bool("secrets", "pre_push_range_scan")
                 .unwrap_or(true)
@@ -1176,27 +1311,149 @@ fn range_secret_scan(ctx: &Ctx, u: &RefUpdate) -> Result<Vec<String>> {
 
 // ─────────────────────────────── verify ─────────────────────────────────────
 
-pub fn hooks_installed(ctx: &Ctx) -> bool {
+/// What sscsb can actually prove about the installed hook shims.
+///
+/// Presence is not enforcement. Three files named `pre-commit`, `commit-msg`
+/// and `pre-push` can exist, be executable, and be pointed at by
+/// `core.hooksPath` while containing nothing but `exit 0` — in which case
+/// every control that says "enforced by the hook" is enforcing nothing. The
+/// shims are generated by [`shim_script`], so their correct content is known
+/// exactly; that is the evidence this check uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookIntegrity {
+    /// `Pass` only when every shim is byte-identical to the generated one.
+    pub outcome: Outcome,
+    pub messages: Vec<String>,
+}
+
+impl HookIntegrity {
+    /// `Some(result)` when the hooks provably enforce nothing and the calling
+    /// verifier must stop; `None` when it should carry on and fold
+    /// [`Self::outcome`] into its own.
+    pub fn blocking(&self, control: &'static str) -> Option<VerifyResult> {
+        (self.outcome == Outcome::Fail)
+            .then(|| VerifyResult::new(control, Outcome::Fail, self.messages.clone()))
+    }
+}
+
+/// A CRLF checkout of a committed shim (`.sscsb/hooks/` is versioned) is the
+/// same script; comparing normalised text keeps the identity check about the
+/// shim's content rather than about the user's `core.autocrlf` setting.
+fn normalize_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> bool {
+    // Git for Windows runs hooks through its own sh; there is no exec bit to
+    // read, so there is nothing to assert here (see `make_executable`).
+    true
+}
+
+/// Verify that git is pointed at sscsb's hooks AND that each shim still
+/// delegates to the policy engine.
+///
+/// Three outcomes, because there are three genuinely different states:
+///
+/// * `Pass` — every shim is byte-identical to what `sscsb init` writes, so
+///   sscsb knows exactly what runs.
+/// * `Degraded` — a shim was edited but still names `sscsb hook <event>`.
+///   sscsb cannot prove a hand-edited shell script still reaches that line, so
+///   it refuses to call the control verified. `sscsb init` restores it.
+/// * `Fail` — `core.hooksPath` is elsewhere, a shim is missing, a shim is not
+///   executable (git silently ignores those), or a shim no longer mentions the
+///   delegation at all. The control is provably not enforced.
+pub fn hook_integrity(ctx: &Ctx) -> HookIntegrity {
     let hooks_path = exec::git(&["config", "core.hooksPath"], &ctx.root).unwrap_or_default();
     if hooks_path != ".sscsb/hooks" {
-        return false;
+        let seen = if hooks_path.is_empty() {
+            "unset".to_string()
+        } else {
+            format!("`{hooks_path}`")
+        };
+        return HookIntegrity {
+            outcome: Outcome::Fail,
+            messages: vec![format!(
+                "core.hooksPath is {seen}, not `.sscsb/hooks` — git is not running sscsb's hooks; \
+                 run `sscsb init`"
+            )],
+        };
     }
-    HOOK_EVENTS
-        .iter()
-        .all(|e| ctx.sscsb_dir().join("hooks").join(e).is_file())
+
+    let dir = ctx.sscsb_dir().join("hooks");
+    let mut broken = Vec::new();
+    let mut drifted = Vec::new();
+    for event in HOOK_EVENTS {
+        let path = dir.join(event);
+        let Ok(found) = std::fs::read_to_string(&path) else {
+            broken.push(format!(
+                ".sscsb/hooks/{event} is missing or unreadable — nothing enforces this event"
+            ));
+            continue;
+        };
+        if !is_executable(&path) {
+            broken.push(format!(
+                ".sscsb/hooks/{event} is not executable — git silently SKIPS non-executable \
+                 hooks, so the control never runs"
+            ));
+            continue;
+        }
+        if normalize_newlines(&found) == normalize_newlines(&shim_script(event)) {
+            continue;
+        }
+        if found.contains(&format!("sscsb hook {event}")) {
+            drifted.push(format!(
+                ".sscsb/hooks/{event} differs from the shim `sscsb init` generates — it still \
+                 names `sscsb hook {event}`, but sscsb cannot prove an edited shell script still \
+                 reaches it; re-run `sscsb init` to restore the generated shim"
+            ));
+        } else {
+            broken.push(format!(
+                ".sscsb/hooks/{event} never invokes `sscsb hook {event}` — the shim has been \
+                 replaced by one that enforces NOTHING; re-run `sscsb init`"
+            ));
+        }
+    }
+
+    if !broken.is_empty() {
+        broken.extend(drifted);
+        return HookIntegrity {
+            outcome: Outcome::Fail,
+            messages: broken,
+        };
+    }
+    if !drifted.is_empty() {
+        return HookIntegrity {
+            outcome: Outcome::Degraded,
+            messages: drifted,
+        };
+    }
+    HookIntegrity {
+        outcome: Outcome::Pass,
+        messages: vec![
+            "pre-commit + commit-msg + pre-push shims installed, executable, and unmodified \
+             (core.hooksPath=.sscsb/hooks)"
+                .into(),
+        ],
+    }
 }
 
 pub fn verify_secrets_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     let mut messages = Vec::new();
-    let mut outcome = Outcome::Pass;
-    if !hooks_installed(ctx) {
-        return VerifyResult::new(
-            "secrets",
-            Outcome::Fail,
-            vec!["hooks not installed — run `sscsb init`".into()],
-        );
+    let hooks = hook_integrity(ctx);
+    if let Some(blocked) = hooks.blocking("secrets") {
+        return blocked;
     }
-    messages.push("pre-commit + pre-push hooks installed (core.hooksPath=.sscsb/hooks)".into());
+    let mut outcome = Outcome::Pass.weakest(hooks.outcome);
+    messages.extend(hooks.messages);
     for (tool, wanted) in [
         (
             "trufflehog",
@@ -1228,14 +1485,12 @@ pub fn verify_secrets_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
 
 pub fn verify_signing_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     let mut messages = Vec::new();
-    let mut outcome = Outcome::Pass;
-    if !hooks_installed(ctx) {
-        return VerifyResult::new(
-            "commit-signing",
-            Outcome::Fail,
-            vec!["hooks not installed — run `sscsb init`".into()],
-        );
+    let hooks = hook_integrity(ctx);
+    if let Some(blocked) = hooks.blocking("commit-signing") {
+        return blocked;
     }
+    let mut outcome = Outcome::Pass.weakest(hooks.outcome);
+    messages.extend(hooks.messages);
     let signers = match load_signers(&signers_path(ctx)) {
         Ok(s) => s,
         Err(err) => {
@@ -1295,24 +1550,38 @@ pub fn verify_signing_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
 }
 
 pub fn verify_hook_installed(ctx: &Ctx, control: &'static str) -> VerifyResult {
-    if hooks_installed(ctx) {
-        VerifyResult::new(
-            control,
-            Outcome::Pass,
-            vec!["enforced by commit-msg hook (installed)".into()],
-        )
-    } else {
-        VerifyResult::new(
-            control,
-            Outcome::Fail,
-            vec!["hooks not installed — run `sscsb init`".into()],
-        )
+    let hooks = hook_integrity(ctx);
+    let mut messages = Vec::new();
+    if hooks.outcome == Outcome::Pass {
+        messages.push("enforced by the commit-msg hook".into());
     }
+    messages.extend(hooks.messages);
+    VerifyResult::new(control, hooks.outcome, messages)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `hook_pre_commit` and `hook_pre_push` shell out to whatever scanners are
+    // naturally on PATH — trufflehog, gitleaks, opengrep. PATH is
+    // process-global and the harness runs the whole crate's tests in ONE
+    // multi-threaded process, so these calls must not run while a sibling test
+    // is masking or shimming PATH: the scan asks `tools::is_available(x)` and
+    // then spawns `x`, and a PATH that changes in between turns a clean run
+    // into "failed to spawn `trufflehog`" and a passing assertion into a
+    // failing one. Observed intermittently across full-suite runs before these
+    // wrappers existed. This is the discipline `sast::tests` already documents
+    // for every test that depends on a tool-detection outcome, applied to the
+    // hook lane that had been missing it.
+
+    fn pre_commit(ctx: &Ctx) -> i32 {
+        crate::sast::tests::serialized(|| hook_pre_commit(ctx).unwrap())
+    }
+
+    fn pre_push(ctx: &Ctx, stdin: &str) -> i32 {
+        crate::sast::tests::serialized(|| hook_pre_push(ctx, "origin", stdin).unwrap())
+    }
 
     #[test]
     fn shims_are_posix_and_fail_closed() {
@@ -1403,6 +1672,132 @@ not-json-noise
         assert!(paths.iter().any(|p| p == "café.txt"), "{paths:?}");
         assert!(paths.iter().any(|p| p == "plain.txt"));
         assert!(!paths.iter().any(|p| p.contains('\\')));
+    }
+
+    /// CRC-32/IEEE, so the test can build (and then validate) a REAL archive
+    /// rather than trust a hand-waved one. Bit-reversed polynomial 0xEDB88320.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// A real ZIP archive holding one STORED (uncompressed) entry, assembled
+    /// here at runtime — no binary fixture lives in this tree.
+    fn zip_with_stored_entry(name: &str, payload: &[u8]) -> Vec<u8> {
+        let crc = crc32(payload);
+        let size = payload.len() as u32;
+        let n = name.len() as u16;
+        let mut z = Vec::new();
+        // Local file header.
+        z.extend(b"PK\x03\x04");
+        z.extend(20u16.to_le_bytes()); // version needed
+        z.extend(0u16.to_le_bytes()); // flags
+        z.extend(0u16.to_le_bytes()); // method: stored
+        z.extend(0u16.to_le_bytes()); // mod time
+        z.extend(0u16.to_le_bytes()); // mod date
+        z.extend(crc.to_le_bytes());
+        z.extend(size.to_le_bytes()); // compressed size
+        z.extend(size.to_le_bytes()); // uncompressed size
+        z.extend(n.to_le_bytes());
+        z.extend(0u16.to_le_bytes()); // extra len
+        z.extend(name.as_bytes());
+        z.extend(payload);
+        // Central directory.
+        let cd_offset = z.len() as u32;
+        z.extend(b"PK\x01\x02");
+        z.extend(20u16.to_le_bytes()); // version made by
+        z.extend(20u16.to_le_bytes()); // version needed
+        z.extend(0u16.to_le_bytes()); // flags
+        z.extend(0u16.to_le_bytes()); // method
+        z.extend(0u16.to_le_bytes()); // mod time
+        z.extend(0u16.to_le_bytes()); // mod date
+        z.extend(crc.to_le_bytes());
+        z.extend(size.to_le_bytes());
+        z.extend(size.to_le_bytes());
+        z.extend(n.to_le_bytes());
+        z.extend(0u16.to_le_bytes()); // extra len
+        z.extend(0u16.to_le_bytes()); // comment len
+        z.extend(0u16.to_le_bytes()); // disk number start
+        z.extend(0u16.to_le_bytes()); // internal attrs
+        z.extend(0u32.to_le_bytes()); // external attrs
+        z.extend(0u32.to_le_bytes()); // local header offset
+        z.extend(name.as_bytes());
+        let cd_size = z.len() as u32 - cd_offset;
+        // End of central directory.
+        z.extend(b"PK\x05\x06");
+        z.extend(0u16.to_le_bytes()); // this disk
+        z.extend(0u16.to_le_bytes()); // disk with cd
+        z.extend(1u16.to_le_bytes()); // entries this disk
+        z.extend(1u16.to_le_bytes()); // entries total
+        z.extend(cd_size.to_le_bytes());
+        z.extend(cd_offset.to_le_bytes());
+        z.extend(0u16.to_le_bytes()); // comment len
+        z
+    }
+
+    /// M2: `stage_to_tempdir` materialised `git show`'s stdout after it had
+    /// been through `String::from_utf8_lossy`, so every staged non-UTF-8 file
+    /// was rewritten — each invalid byte becoming U+FFFD (`EF BF BD`), which
+    /// changes the content AND the length. The scanners then read the wrong
+    /// bytes, and so does anything else that opens this directory. Reported
+    /// symptom: a staged, valid zip comes out "zipfile corrupt".
+    #[test]
+    fn a_staged_binary_file_is_materialised_byte_for_byte() {
+        let (_d, ctx) = tmp_repo();
+
+        // Every one of the 256 byte values, behind a real PNG signature: the
+        // maximal non-UTF-8 stress, built at runtime.
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend((0u8..=255).rev());
+        assert!(
+            String::from_utf8(png.clone()).is_err(),
+            "fixture must actually be non-UTF-8, or it proves nothing"
+        );
+        let zip = zip_with_stored_entry("payload.bin", &(0u8..=255).collect::<Vec<u8>>());
+
+        std::fs::write(ctx.root.join("image.png"), &png).unwrap();
+        std::fs::write(ctx.root.join("archive.zip"), &zip).unwrap();
+        crate::exec::git(&["add", "image.png", "archive.zip"], &ctx.root).unwrap();
+
+        let (dir, files) = stage_to_tempdir(&ctx).unwrap();
+        assert_eq!(files.len(), 2, "{files:?}");
+
+        let got_png = std::fs::read(dir.path().join("image.png")).unwrap();
+        assert_eq!(
+            got_png.len(),
+            png.len(),
+            "lossy decoding also RESIZES the file: {} bytes staged, {} materialised",
+            png.len(),
+            got_png.len()
+        );
+        assert_eq!(got_png, png, "staged PNG must be materialised verbatim");
+
+        let got_zip = std::fs::read(dir.path().join("archive.zip")).unwrap();
+        assert_eq!(got_zip, zip, "staged zip must be materialised verbatim");
+
+        // …and the materialised archive is still a VALID zip: read its own
+        // stored CRC back and check it against the payload that survived.
+        assert_eq!(&got_zip[0..4], b"PK\x03\x04", "local file header signature");
+        let stored_crc = u32::from_le_bytes(got_zip[14..18].try_into().unwrap());
+        let name_len = u16::from_le_bytes(got_zip[26..28].try_into().unwrap()) as usize;
+        let size = u32::from_le_bytes(got_zip[22..26].try_into().unwrap()) as usize;
+        let start = 30 + name_len;
+        let payload = &got_zip[start..start + size];
+        assert_eq!(
+            crc32(payload),
+            stored_crc,
+            "materialised zip fails its own CRC — this is the `zipfile corrupt` symptom"
+        );
     }
 
     #[test]
@@ -1596,11 +1991,161 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
     }
 
     #[test]
-    fn hooks_installed_is_false_before_init_and_true_after() {
+    fn hook_integrity_fails_before_init_and_passes_after() {
         let (_d, ctx) = bare_repo();
-        assert!(!hooks_installed(&ctx));
+        let before = hook_integrity(&ctx);
+        assert_eq!(before.outcome, Outcome::Fail);
+        assert!(
+            before.messages[0].contains("core.hooksPath is unset"),
+            "{:?}",
+            before.messages
+        );
         install_hooks(&ctx).unwrap();
-        assert!(hooks_installed(&ctx));
+        let after = hook_integrity(&ctx);
+        assert_eq!(after.outcome, Outcome::Pass, "{:?}", after.messages);
+        assert!(after.messages[0].contains("unmodified"));
+    }
+
+    /// Replace the installed shims with `exit 0` — the file is still there,
+    /// still executable, still pointed at by `core.hooksPath`, and enforces
+    /// nothing. Presence-only checking reported this as installed, so every
+    /// control that says "enforced by the hook" reported PASS on a repo where
+    /// a planted AWS key committed cleanly. (H8)
+    #[test]
+    fn neutered_shims_fail_integrity_instead_of_passing() {
+        let (_d, ctx) = bare_repo();
+        install_hooks(&ctx).unwrap();
+        for event in HOOK_EVENTS {
+            let path = ctx.sscsb_dir().join("hooks").join(event);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            make_executable(&path).unwrap();
+        }
+        let state = hook_integrity(&ctx);
+        assert_eq!(
+            state.outcome,
+            Outcome::Fail,
+            "a shim that never invokes sscsb enforces nothing: {:?}",
+            state.messages
+        );
+        assert_eq!(state.messages.len(), HOOK_EVENTS.len());
+        for event in HOOK_EVENTS {
+            assert!(
+                state
+                    .messages
+                    .iter()
+                    .any(|m| m.contains(&format!(".sscsb/hooks/{event} never invokes"))),
+                "{event} must be named as neutered: {:?}",
+                state.messages
+            );
+        }
+    }
+
+    /// A shim a human edited but that still calls the policy engine is NOT
+    /// proof of enforcement (the delegation may sit after an early exit) and
+    /// NOT proof of breakage either. sscsb refuses to claim either: it
+    /// degrades, which `verify --strict` still treats as a failure.
+    #[test]
+    fn edited_but_delegating_shim_degrades_rather_than_passing() {
+        let (_d, ctx) = bare_repo();
+        install_hooks(&ctx).unwrap();
+        let path = ctx.sscsb_dir().join("hooks").join("pre-commit");
+        let edited = format!(
+            "{}\n# locally added trailing note\n",
+            shim_script("pre-commit")
+        );
+        std::fs::write(&path, edited).unwrap();
+        let state = hook_integrity(&ctx);
+        assert_eq!(state.outcome, Outcome::Degraded, "{:?}", state.messages);
+        assert_eq!(state.messages.len(), 1);
+        assert!(state.messages[0].contains(".sscsb/hooks/pre-commit differs from the shim"));
+    }
+
+    /// A CRLF checkout of a committed shim is the same script — the identity
+    /// check must be about content, not about `core.autocrlf`.
+    #[test]
+    fn crlf_line_endings_do_not_count_as_drift() {
+        let (_d, ctx) = bare_repo();
+        install_hooks(&ctx).unwrap();
+        let path = ctx.sscsb_dir().join("hooks").join("pre-push");
+        let crlf = shim_script("pre-push").replace('\n', "\r\n");
+        std::fs::write(&path, crlf).unwrap();
+        assert_eq!(hook_integrity(&ctx).outcome, Outcome::Pass);
+    }
+
+    #[test]
+    fn a_missing_shim_fails_integrity() {
+        let (_d, ctx) = bare_repo();
+        install_hooks(&ctx).unwrap();
+        std::fs::remove_file(ctx.sscsb_dir().join("hooks").join("commit-msg")).unwrap();
+        let state = hook_integrity(&ctx);
+        assert_eq!(state.outcome, Outcome::Fail);
+        assert!(state.messages[0].contains(".sscsb/hooks/commit-msg is missing or unreadable"));
+    }
+
+    /// git SKIPS non-executable hooks with only a hint on stderr, so a shim
+    /// that lost its exec bit is exactly as inert as a deleted one.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_shim_fails_integrity() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, ctx) = bare_repo();
+        install_hooks(&ctx).unwrap();
+        let path = ctx.sscsb_dir().join("hooks").join("pre-commit");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let state = hook_integrity(&ctx);
+        assert_eq!(state.outcome, Outcome::Fail);
+        assert!(state.messages[0].contains("is not executable"));
+    }
+
+    /// Pointing `core.hooksPath` somewhere else disables sscsb's hooks wholesale.
+    #[test]
+    fn a_redirected_hookspath_fails_integrity_and_names_the_path() {
+        let (_d, ctx) = bare_repo();
+        install_hooks(&ctx).unwrap();
+        exec::git(&["config", "core.hooksPath", ".git/hooks"], &ctx.root).unwrap();
+        let state = hook_integrity(&ctx);
+        assert_eq!(state.outcome, Outcome::Fail);
+        assert!(state.messages[0].contains("core.hooksPath is `.git/hooks`"));
+    }
+
+    /// A repo with one neutered shim AND one merely edited shim must report the
+    /// hard failure, not average down to a degrade.
+    #[test]
+    fn broken_and_drifted_shims_together_report_fail_and_list_both() {
+        let (_d, ctx) = bare_repo();
+        install_hooks(&ctx).unwrap();
+        let neutered = ctx.sscsb_dir().join("hooks").join("pre-commit");
+        std::fs::write(&neutered, "#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&neutered).unwrap();
+        let drifted = ctx.sscsb_dir().join("hooks").join("pre-push");
+        std::fs::write(&drifted, format!("{}\n# note\n", shim_script("pre-push"))).unwrap();
+        let state = hook_integrity(&ctx);
+        assert_eq!(state.outcome, Outcome::Fail);
+        assert!(state.messages.iter().any(|m| m.contains("never invokes")));
+        assert!(state
+            .messages
+            .iter()
+            .any(|m| m.contains("differs from the shim")));
+    }
+
+    /// `blocking` is the guard every hook-gated verifier uses: it must stop the
+    /// verifier only on a hard failure, never on drift.
+    #[test]
+    fn blocking_stops_only_on_fail() {
+        let fail = HookIntegrity {
+            outcome: Outcome::Fail,
+            messages: vec!["boom".into()],
+        };
+        let blocked = fail.blocking("secrets").expect("fail must block");
+        assert_eq!(blocked.outcome, Outcome::Fail);
+        assert_eq!(blocked.messages, vec!["boom".to_string()]);
+        for ok in [Outcome::Pass, Outcome::Degraded] {
+            let state = HookIntegrity {
+                outcome: ok,
+                messages: vec![],
+            };
+            assert!(state.blocking("secrets").is_none());
+        }
     }
 
     // ───────────────────────── signer policy ──────────────────────────────
@@ -1624,6 +2169,86 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let signers = load_signers(&path).unwrap();
         assert_eq!(signers.len(), 1);
         assert_eq!(signers[0].principal, "human@example.com");
+    }
+
+    /// One key, two principals, two classes — the shape that defeated the
+    /// protected-branch class gate entirely.
+    ///
+    /// Git resolves `%GS` to the FIRST principal in `allowed_signers` whose key
+    /// verifies the signature, so an agent signing with a key also registered
+    /// under a `human` principal resolved to the human and passed. With
+    /// `agent-signing` off (the default) the `ai` line is never emitted at all,
+    /// so only the human twin existed and the bypass did not even depend on
+    /// ordering. Reproduced end to end against the real binary before this
+    /// guard: the push succeeded and `git log -1 --format='%G? %GS'` printed
+    /// `G human@example.com` for a commit authored and committed by the agent.
+    #[test]
+    fn parse_signers_rejects_one_key_registered_under_two_principals() {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISHARED";
+        let toml = format!(
+            "[[signer]]\nprincipal = \"human@example.com\"\nclass = \"human\"\n\
+             ssh_public_key = \"{key} human@example.com\"\n\n\
+             [[signer]]\nprincipal = \"agent@ci.example.com\"\nclass = \"ai\"\n\
+             ssh_public_key = \"{key} agent@ci.example.com\"\n"
+        );
+        let err = parse_signers(&toml)
+            .expect_err("one key under two principals must be a hard parse error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reuses the ssh_public_key"),
+            "error must name the reuse, got: {msg}"
+        );
+        assert!(
+            msg.contains("human@example.com"),
+            "error must name the principal already holding the key, got: {msg}"
+        );
+    }
+
+    /// The trailing comment is not part of the key. Two entries differing only
+    /// there are the same key wearing two names, which is the disguised form of
+    /// the same attack.
+    #[test]
+    fn parse_signers_compares_key_material_not_the_trailing_comment() {
+        let body = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDISGUISED";
+        let toml = format!(
+            "[[signer]]\nprincipal = \"human@example.com\"\nclass = \"human\"\n\
+             ssh_public_key = \"{body} laptop\"\n\n\
+             [[signer]]\nprincipal = \"agent@ci.example.com\"\nclass = \"ai\"\n\
+             ssh_public_key = \"{body} totally-different-comment\"\n"
+        );
+        assert!(
+            parse_signers(&toml).is_err(),
+            "a differing comment must not disguise shared key material"
+        );
+
+        // Same guard for GPG, which is case- and whitespace-insensitive.
+        let gpg = "[[signer]]\nprincipal = \"a@example.com\"\nclass = \"human\"\n\
+                   gpg_fingerprint = \"ABCD 1234 ABCD 1234\"\n\n\
+                   [[signer]]\nprincipal = \"b@example.com\"\nclass = \"ai\"\n\
+                   gpg_fingerprint = \"abcd1234abcd1234\"\n";
+        assert!(
+            parse_signers(gpg).is_err(),
+            "GPG fingerprints must compare case- and space-insensitively"
+        );
+    }
+
+    /// The guard must not break the legitimate configuration it protects: a
+    /// human and an agent with genuinely distinct keys is the intended setup.
+    #[test]
+    fn parse_signers_admits_distinct_keys_across_classes() {
+        let toml = "[[signer]]\nprincipal = \"human@example.com\"\nclass = \"human\"\n\
+                    ssh_public_key = \"ssh-ed25519 AAAAHUMANKEY human@example.com\"\n\n\
+                    [[signer]]\nprincipal = \"agent@ci.example.com\"\nclass = \"ai\"\n\
+                    ssh_public_key = \"ssh-ed25519 AAAAAGENTKEY agent@ci.example.com\"\n";
+        let signers = parse_signers(toml).expect("distinct keys are the intended configuration");
+        assert_eq!(signers.len(), 2);
+        assert_eq!(signers[0].class, SignerClass::Human);
+        assert_eq!(signers[1].class, SignerClass::Ai);
+
+        // A signer with no key material at all must not collide with another.
+        let keyless = "[[signer]]\nprincipal = \"a@example.com\"\nclass = \"human\"\n\n\
+                       [[signer]]\nprincipal = \"b@example.com\"\nclass = \"ci\"\n";
+        assert_eq!(parse_signers(keyless).unwrap().len(), 2);
     }
 
     #[test]
@@ -1741,7 +2366,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
     #[test]
     fn hook_pre_commit_without_config_allows_the_commit() {
         let (_d, ctx) = bare_repo();
-        assert_eq!(hook_pre_commit(&ctx).unwrap(), 0);
+        assert_eq!(pre_commit(&ctx), 0);
     }
 
     #[test]
@@ -1749,18 +2374,14 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let (_d, ctx) = test_repo();
         write_file(&ctx, "clean.md", "nothing to see here\n");
         stage(&ctx, "clean.md");
-        assert_eq!(hook_pre_commit(&ctx).unwrap(), 0, "clean stage must pass");
+        assert_eq!(pre_commit(&ctx), 0, "clean stage must pass");
 
         // Runtime-constructed token — never a real credential, and never
         // present in this repository's sources as a single string.
         let token = format!("ghp_{}{}", "A1b2C3d4E5f6G7h8I9j0", "K1l2M3n4O5p6Q7r8S9t0");
         write_file(&ctx, "leak.txt", &format!("github_token = \"{token}\"\n"));
         stage(&ctx, "leak.txt");
-        assert_eq!(
-            hook_pre_commit(&ctx).unwrap(),
-            1,
-            "planted secret must block the commit"
-        );
+        assert_eq!(pre_commit(&ctx), 1, "planted secret must block the commit");
     }
 
     #[test]
@@ -1776,7 +2397,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         write_file(&ctx, "a.txt", "a\n");
         stage(&ctx, "a.txt");
         assert_eq!(
-            hook_pre_commit(&ctx).unwrap(),
+            pre_commit(&ctx),
             1,
             "no scanner able to run must fail CLOSED by default"
         );
@@ -1796,14 +2417,14 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         write_file(&ctx, "a.txt", "a\n");
         stage(&ctx, "a.txt");
         assert_eq!(
-            hook_pre_commit(&ctx).unwrap(),
+            pre_commit(&ctx),
             0,
             "fail_open=true must let the commit through with only a warning"
         );
     }
 
     #[test]
-    fn hook_pre_commit_sast_clean_pass_and_misconfigured_engine_degrades_without_blocking() {
+    fn hook_pre_commit_sast_passes_a_clean_stage() {
         let (_d, ctx) = test_repo();
         let cfg_text = std::fs::read_to_string(ctx.config_path())
             .unwrap()
@@ -1813,19 +2434,43 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         write_file(&ctx, "clean.md", "hello\n");
         stage(&ctx, "clean.md");
         assert_eq!(hook_pre_commit(&ctx).unwrap(), 0);
+    }
 
-        // An unusable SAST engine must degrade (advisory), never block.
+    /// M14: the SAST arm of pre-commit degraded open unconditionally, while the
+    /// secret-scan arm beside it respected `general.fail_open`. The gate is
+    /// opt-in twice over — `enabled` AND `pre_commit = true` — and that is the
+    /// argument for the switch applying, not against it: a user who turned it
+    /// on had no way to make it hold. A mistyped engine name or an engine that
+    /// is not installed removed the gate silently, and `fail_open = false`,
+    /// the setting whose entire documented job is "do not let hooks pass when
+    /// scanners are missing", did not reach it.
+    #[test]
+    fn hook_pre_commit_sast_that_cannot_run_obeys_fail_open() {
+        let (_d, ctx) = test_repo();
         let cfg_text = std::fs::read_to_string(ctx.config_path())
             .unwrap()
+            .replace("pre_commit = false", "pre_commit = true")
             .replace("engine = \"opengrep\"", "engine = \"bogus-engine\"");
         std::fs::write(ctx.config_path(), cfg_text).unwrap();
         let ctx = Ctx::discover(&ctx.root).unwrap();
-        write_file(&ctx, "clean2.md", "hello again\n");
-        stage(&ctx, "clean2.md");
+        write_file(&ctx, "clean.md", "hello\n");
+        stage(&ctx, "clean.md");
         assert_eq!(
             hook_pre_commit(&ctx).unwrap(),
+            1,
+            "fail_open=false (the default) must block when the SAST gate could not run"
+        );
+
+        // …and the one documented opt-out still opts out.
+        let cfg_text = std::fs::read_to_string(ctx.config_path())
+            .unwrap()
+            .replace("fail_open = false", "fail_open = true");
+        std::fs::write(ctx.config_path(), cfg_text).unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        assert_eq!(
+            pre_commit(&ctx),
             0,
-            "an unusable SAST engine must degrade, not block"
+            "fail_open=true must let the commit through with only a warning"
         );
     }
 
@@ -1928,20 +2573,48 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         );
     }
 
+    /// Regression (H4): the new-package gate must fail CLOSED when it cannot
+    /// evaluate. DELETING `.sscsb/policy/packages.toml` already failed closed
+    /// (every dependency reads as unapproved), but CORRUPTING it merely printed
+    /// "package-trust check skipped" and returned 0 — so one appended line
+    /// turned the gate off. That asymmetry was the bypass.
     #[test]
-    fn hook_commit_msg_skips_package_trust_check_on_corrupt_policy_without_blocking() {
+    fn hook_commit_msg_fails_closed_when_the_package_policy_cannot_be_parsed() {
         let (_d, ctx) = test_repo();
-        // Corrupt the approved-packages policy so `unapproved_new_packages`
-        // errors; package-trust degrades advisory here, so the commit must
-        // still pass rather than being blocked by an unrelated parse bug.
+        // Baseline: an unapproved new dependency is blocked while the policy
+        // file is intact.
+        write_file(&ctx, "Cargo.toml", "[dependencies]\nleftpad-rs = \"1\"\n");
+        stage(&ctx, "Cargo.toml");
+        assert_eq!(
+            commit_msg(&ctx, "chore: add dep\n"),
+            1,
+            "an unapproved new dependency must block"
+        );
+
+        // Corrupt the policy — the gate can no longer evaluate anything.
         std::fs::write(
             crate::deps::packages_policy_path(&ctx),
             "not = [valid toml\n",
         )
         .unwrap();
-        write_file(&ctx, "a.txt", "a\n");
-        stage(&ctx, "a.txt");
-        assert_eq!(commit_msg(&ctx, "chore: x\n"), 0);
+        assert_eq!(
+            commit_msg(&ctx, "chore: add dep\n"),
+            1,
+            "a policy file that cannot be parsed must not switch the gate off"
+        );
+
+        // `fail_open = true` stays the single explicit, documented opt-out.
+        let cfg_path = ctx.config_path();
+        let text = std::fs::read_to_string(&cfg_path)
+            .unwrap()
+            .replace("fail_open = false", "fail_open = true");
+        std::fs::write(&cfg_path, text).unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        assert_eq!(
+            commit_msg(&ctx, "chore: add dep\n"),
+            0,
+            "fail_open=true must still let the commit through with a warning"
+        );
     }
 
     // ─────────────────────────── parse_push_lines ──────────────────────────
@@ -1975,7 +2648,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
     #[test]
     fn hook_pre_push_without_config_allows_the_push() {
         let (_d, ctx) = bare_repo();
-        assert_eq!(hook_pre_push(&ctx, "origin", "").unwrap(), 0);
+        assert_eq!(pre_push(&ctx, ""), 0);
     }
 
     #[test]
@@ -1988,16 +2661,16 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
 
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "unsigned commit on a protected branch must be blocked"
         );
 
         let stdin = format!("refs/heads/feature/x {local} refs/heads/feature/x {ZERO}\n");
-        assert_eq!(hook_pre_push(&ctx, "origin", &stdin).unwrap(), 0);
+        assert_eq!(pre_push(&ctx, &stdin), 0);
 
         let stdin = format!("(delete) {ZERO} refs/heads/main {ZERO}\n");
-        assert_eq!(hook_pre_push(&ctx, "origin", &stdin).unwrap(), 0);
+        assert_eq!(pre_push(&ctx, &stdin), 0);
     }
 
     #[test]
@@ -2017,7 +2690,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         // signing guard.
         let stdin = format!("refs/heads/feature/x {local} refs/heads/feature/x {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "a secret anywhere in the outgoing range must block the push"
         );
@@ -2189,7 +2862,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "merge with AI-declared parent lacking review evidence must block"
         );
@@ -2214,7 +2887,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         );
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
-        assert_eq!(hook_pre_push(&ctx, "origin", &stdin).unwrap(), 0);
+        assert_eq!(pre_push(&ctx, &stdin), 0);
 
         // Self-review: the committer authored the merged range, so naming
         // themselves as reviewer is refused even though they are a
@@ -2235,7 +2908,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "an author vouching for their own commits must be refused"
         );
@@ -2265,7 +2938,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             0,
             "the merge commit's own author must not be counted as a range author"
         );
@@ -2494,7 +3167,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "agent signature must never satisfy the human-only protected-branch gate"
         );
@@ -2516,7 +3189,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         );
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
-        assert_eq!(hook_pre_push(&ctx, "origin", &stdin).unwrap(), 1);
+        assert_eq!(pre_push(&ctx, &stdin), 1);
     }
 
     #[test]
@@ -2550,7 +3223,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "an attestation artifact must not turn an agent key into a valid protected-branch signer"
         );
@@ -2597,7 +3270,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "AI-history merge without review evidence must stay blocked with agent-signing on"
         );
@@ -2611,7 +3284,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let cfg = ctx.require_config().unwrap();
         let result = verify_secrets_control(&ctx, cfg);
         assert_eq!(result.outcome, Outcome::Fail);
-        assert!(result.messages[0].contains("hooks not installed"));
+        assert!(result.messages[0].contains("core.hooksPath is unset"));
     }
 
     #[test]
@@ -2636,7 +3309,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let cfg = ctx.require_config().unwrap();
         let result = verify_signing_control(&ctx, cfg);
         assert_eq!(result.outcome, Outcome::Fail);
-        assert!(result.messages[0].contains("hooks not installed"));
+        assert!(result.messages[0].contains("core.hooksPath is unset"));
     }
 
     #[test]
@@ -2697,7 +3370,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let result = verify_hook_installed(&ctx, "ai-trailers");
         assert_eq!(result.outcome, Outcome::Fail);
         assert_eq!(result.control, "ai-trailers");
-        assert!(result.messages[0].contains("hooks not installed"));
+        assert!(result.messages[0].contains("core.hooksPath is unset"));
     }
 
     #[test]
@@ -2706,7 +3379,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let result = verify_hook_installed(&ctx, "ai-trailers");
         assert_eq!(result.outcome, Outcome::Pass);
         assert_eq!(result.control, "ai-trailers");
-        assert!(result.messages[0].contains("enforced by commit-msg hook"));
+        assert!(result.messages[0].contains("enforced by the commit-msg hook"));
     }
 
     // ──────────────── remaining branch coverage (config on/off edges) ──────
@@ -2714,7 +3387,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
     #[test]
     fn hook_pre_commit_with_no_staged_files_is_a_no_op() {
         let (_d, ctx) = test_repo();
-        assert_eq!(hook_pre_commit(&ctx).unwrap(), 0);
+        assert_eq!(pre_commit(&ctx), 0);
     }
 
     #[test]
@@ -2728,7 +3401,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         write_file(&ctx, "leak.txt", &format!("github_token = \"{token}\"\n"));
         stage(&ctx, "leak.txt");
         assert_eq!(
-            hook_pre_commit(&ctx).unwrap(),
+            pre_commit(&ctx),
             0,
             "a disabled control must not run — that is the modularity contract"
         );
@@ -2749,9 +3422,98 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         );
         stage(&ctx, "install.sh");
         assert_eq!(
-            hook_pre_commit(&ctx).unwrap(),
+            pre_commit(&ctx),
             1,
             "an ERROR-severity SAST finding in the staged diff must block the commit"
+        );
+    }
+
+    // ── the commit gate's typosquat annotation: two independent suppressors ──
+
+    fn new_dep(qualified: &str, source: Option<crate::deps::DepSource>) -> crate::deps::NewDep {
+        crate::deps::NewDep {
+            qualified: qualified.to_string(),
+            reason: crate::deps::NewDepReason::NotInBaseline,
+            source,
+        }
+    }
+
+    /// Baseline: with a registry source and the heuristic on, the gate that
+    /// actually blocks still names the shadowed package.
+    #[test]
+    fn the_commit_gate_still_names_a_typosquat_on_a_registry_dependency() {
+        let annotation = typosquat_annotation(
+            &new_dep("cargo:tokoi", Some(crate::deps::DepSource::Registry)),
+            crate::deps::TrustChecks::default(),
+        );
+        assert!(
+            annotation.is_some_and(|a| a.contains("tokio")),
+            "the enforcing gate must keep calling out a registry-sourced typosquat"
+        );
+    }
+
+    /// R1's property at the commit gate, asserted with the config fully
+    /// PERMISSIVE: a path dependency's name is not what resolves it, and no
+    /// `TrustChecks` value may re-enable resolving it by name.
+    #[test]
+    fn a_path_dependency_is_never_called_a_typosquat_even_with_every_check_on() {
+        let annotation = typosquat_annotation(
+            &new_dep(
+                "cargo:tokoi",
+                Some(crate::deps::DepSource::Path("../outside/tokoi".into())),
+            ),
+            crate::deps::TrustChecks::default(),
+        );
+        assert_eq!(
+            annotation, None,
+            "a public package sharing a path dependency's name is an unrelated \
+             package; the source guard is correctness, not policy"
+        );
+    }
+
+    /// M21's property at the commit gate — the third place the heuristic runs.
+    /// A toggle that reaches only `deps check` and approval leaves the config
+    /// contradicting itself at the one gate that stops work.
+    #[test]
+    fn typosquat_check_false_reaches_the_commit_gate_too() {
+        let off = crate::deps::TrustChecks {
+            registry: true,
+            typosquat: false,
+        };
+        assert_eq!(
+            typosquat_annotation(
+                &new_dep("cargo:tokoi", Some(crate::deps::DepSource::Registry)),
+                off
+            ),
+            None,
+            "the key must switch the heuristic off everywhere it runs, or it is \
+             the inert key it was fixed for"
+        );
+    }
+
+    /// ...and suppressing the ANNOTATION must never let the PACKAGE through.
+    /// `explain()` is pushed unconditionally by the caller, so the commit is
+    /// still blocked; only the proximity note is withheld.
+    #[test]
+    fn suppressing_the_annotation_does_not_unblock_the_dependency() {
+        let (_d, ctx) = test_repo();
+        let cfg_text = std::fs::read_to_string(ctx.config_path()).unwrap();
+        assert!(
+            cfg_text.contains("typosquat_check = true"),
+            "the generated config is expected to carry the key already"
+        );
+        std::fs::write(
+            ctx.config_path(),
+            cfg_text.replace("typosquat_check = true", "typosquat_check = false"),
+        )
+        .unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\ntokoi = \"1\"\n");
+        stage(&ctx, "Cargo.toml");
+        assert_eq!(
+            commit_msg(&ctx, "chore: add a dep\n"),
+            1,
+            "a new unapproved dependency is still blocked with the heuristic off"
         );
     }
 
@@ -2803,7 +3565,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let local = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
         let stdin = format!("refs/heads/main {local} refs/heads/main {ZERO}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             1,
             "a software (non-hardware-backed) key must be blocked when the policy requires hardware backing"
         );
@@ -2827,7 +3589,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         // than treating this as a brand-new branch.
         let stdin = format!("refs/heads/feature/x {second} refs/heads/feature/x {first}\n");
         assert_eq!(
-            hook_pre_push(&ctx, "origin", &stdin).unwrap(),
+            pre_push(&ctx, &stdin),
             0,
             "clean incremental push must pass"
         );

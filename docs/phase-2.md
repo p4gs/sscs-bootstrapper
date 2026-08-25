@@ -59,6 +59,64 @@ enabled = true
 fail_on = "high"      # critical | high | medium | low
 ```
 
+A `fail_on` that is not one of those four is a configuration error, not a
+default. It used to rank below `low` — which meant `fail_on = "error"` gated on
+*everything*, a misconfigured threshold wearing the appearance of a strict one.
+
+**A severity we could not determine is not a low severity.** Advisory databases
+disagree about where they put a rating: GHSA states a label (`MODERATE`, which
+is this scale's `medium`), while RUSTSEC and PYSEC records carry no label at all
+and state a CVSS vector instead — in the OSV `severity` array, or under
+`affected[].database_specific.cvss`. `sscsb` reads all of them and scores v3
+vectors, because a finding that reads `unknown` cannot be gated on, and reading
+one field only left 13 of 25 findings in a real `osv-scanner` run unrateable.
+What is still genuinely unrated after that breaches **every** threshold and is
+reported with its count. The way to stand one down is a VEX statement, which
+says so out loud:
+
+```sh
+sscsb vex create --vuln RUSTSEC-2024-0375 --product pkg:cargo/atty \
+  --status not_affected --justification vulnerable_code_not_present
+```
+
+### Suppression is allowed. Silence is not.
+
+The scanners take configuration out of the repository without being asked:
+Trivy reads `trivy.yaml` and `.trivyignore` from the directory it scans,
+OSV-Scanner reads `osv-scanner.toml` from the tree. Committing the file is the
+whole install step. On one fixture a `trivy.yaml` of `severity: [CRITICAL]`
+took a scan from 3 findings to 1, and a single `[[IgnoredVulns]]` entry took
+OSV-Scanner from 8 to 6 — and the report said nothing at all.
+
+`sscsb` does not override these files. They are legitimate, and this repo's own
+`.trivyignore` is the example: two container rules that cannot model an
+OSS-Fuzz build image, waived with per-ID rationale in the file. Overriding a
+deliberate waiver would break real decisions and push people into disabling
+scanning altogether, which is worse than the waiver. What was wrong was never
+that suppression exists — it was that it was invisible.
+
+So `sscsb` inherits the waiver and states it, the way it already states VEX
+suppressions:
+
+```text
+note: scanner config: trivy.yaml is present and trivy loads it automatically, and it
+      NARROWS this scan: severity=[CRITICAL] (only these severities are reported at all)
+note: scanner config: .trivyignore is present with 1 entr(ies): CVE-2021-25900
+suppressed: CVE-2021-25900 (smallvec) — trivy ignored via .trivyignore: reviewed 2026-08
+suppressed: RUSTSEC-2021-0003 and 2 aliases — osv-scanner filtered out: not reachable here
+```
+
+Two layers, because one is not enough. The `suppressed:` rows come from the
+scanners themselves — Trivy's `--show-suppressed`, OSV-Scanner's stderr (which
+is the only place it says so; its JSON never mentions a filtered vulnerability,
+even under `--all-vulns`). The `note:` lines come from reading the config files
+directly, which is the *only* signal for `trivy.yaml` narrowing: findings
+excluded by a `severity` allowlist or a `skip-dirs` entry are filtered before
+they are findings, and Trivy reports nothing about them even when asked to show
+suppressions. `sscsb verify` prints the same inventory. It does not change the
+verdict — a documented waiver is a decision, not a failure — so if you want a
+gate on it, `verify --strict` plus a review of that inventory is the place.
+
 ## Package trust — the AI-era control
 
 A model will confidently tell you to install a package that does not exist. If an
@@ -79,8 +137,14 @@ sscsb deps list
 **Existence.** Every package is checked against its own public registry —
 crates.io, npm, PyPI, the Go module proxy, RubyGems. A package that is *not found*
 is reported as a likely hallucination or slopsquatting target, and must not be
-approved without verification. This is a network call; `--offline` skips it, and an
-inconclusive lookup is reported as inconclusive rather than assumed fine.
+approved without verification. This is a network call; `--offline` skips it.
+
+A lookup that cannot be *answered* — DNS failure, a proxy, a registry 503 — is a
+**problem**, not a note: `sscsb deps check` reports it and exits non-zero, and
+`sscsb deps approve` refuses without `--force`. An outage is not evidence that a
+package exists, and the alternative is a control that reports every hallucinated
+name in the manifest as clean the moment the network hiccups. `--offline` is how
+you decline the existence check deliberately; the heuristics still run.
 
 **Typosquat proximity.** A new package name within one edit of a popular package
 in the same ecosystem is flagged, with the name it shadows. The distance is
@@ -88,7 +152,65 @@ in the same ecosystem is flagged, with the name it shadows. The distance is
 typosquat shape is an adjacent transposition (`tokoi` for `tokio`, `reqeusts` for
 `requests`), which plain Levenshtein scores as distance *2* and would wave straight
 through. Hyphen/underscore confusion (`serde-json` for `serde_json`) is caught
-separately.
+separately, and so is case confusion — which is why the curated lists cover all
+five ecosystems including Go, where `github.com/Sirupsen/logrus` and
+`github.com/sirupsen/logrus` are two different module paths that read the same.
+
+One exception, because it is a *family* and not a typo: two names that differ
+only in a trailing digit of the same length — `sha1`/`sha2`/`sha3`,
+`base32`/`base64`, `gopkg.in/yaml.v2`/`gopkg.in/yaml.v3` — do not shadow each
+other. A trailing digit is the whole semantic payload of such a name; nobody
+mistypes it, and picking the wrong one lands you on a different *real* package
+that fails to compile. Only that shape is exempt: `boto` still shadows `boto3`
+(one side has no digits) and `sha22` still shadows `sha2` (the digit runs differ
+in length), and every one of these names still goes through the existence check,
+which is the arm that actually knows whether a name is real.
+
+**Where manifests are looked for.** Everywhere git tracks one, not just the repo
+root — `sub/package.json` and `services/api/requirements.txt` count. The commit
+gate has always matched a staged manifest by filename anywhere in the tree, so
+anything it can block on is something `sscsb deps baseline` can bless in bulk.
+The search is git's index, not a filesystem walk, so `node_modules/`, `target/`
+and anything else your `.gitignore` covers stays out of the baseline.
+
+**What counts as a declaration.** `pyproject.toml` is read as TOML, never scanned
+line by line, and every section that installs code is read: PEP 621 `[project]`
+and its extras, PEP 735 `[dependency-groups]`, **Poetry**
+(`[tool.poetry.dependencies]`, the legacy `dev-dependencies`, per-group
+dependencies, and `[[tool.poetry.source]]`), PDM, uv and Hatch. Poetry's
+`git`/`path`/`url`/`source` origins are classified like any other non-registry
+source, so repointing a Poetry dependency is a fresh trust decision rather than
+an unchanged name.
+
+Both checks are individually switchable, and the switches are real — they gate
+every place the check runs, not just the sentence `sscsb verify` prints about them:
+
+```toml
+[controls.package-trust]
+enabled = true
+registry_check = true    # false: no public existence lookup (private/air-gapped registries)
+typosquat_check = true   # false: no edit-distance heuristic (a name legitimately close to a popular one)
+```
+
+"Every place" is three: `sscsb deps check`, the warnings printed when you approve
+a package, and the **commit-msg gate that actually blocks**. A toggle reaching
+only the advisory two would be the defect these keys were fixed for — you switch
+the heuristic off because your dependency is legitimately one edit from a popular
+name, and it still stops your commit.
+
+Switching an annotation off never switches the *gate* off: a new unapproved
+dependency is still blocked, it is simply no longer also described as a possible
+typosquat. And neither key can re-enable resolving a `path`/`git`/`url`
+dependency by name — that is a correctness rule, not a policy setting. A public
+package sharing a path dependency's name is an unrelated package, and no
+configuration should be able to bring that confusion back.
+
+Turning either off is reported by `sscsb verify` as an `INFO`, naming the check
+that is not running — a control working with half its checks off must not read the
+same as one working whole. `sscsb deps check` says the same thing in its own
+output, once per run, for the same reason it explains why a path dependency was
+not resolved: a check that did not run has to say so, or "checked and found
+nothing" and "never checked" are the same silence.
 
 **Human approval.** New packages introduced by a **staged** manifest change are
 compared against the previous revision and against your approved baseline. Anything
@@ -145,7 +267,7 @@ sscsb verify bumblebee
 It reads only static files — no `npm ls`, no `pip show`, no source-file reads — and the
 binary is Go with a zero-dependency `go.mod`.
 
-**Three things worth knowing before you trust the output:**
+**Things worth knowing before you trust the output:**
 
 - **Findings do not change bumblebee's exit code.** A scan that matches a compromised
   package exits `0`, exactly like a clean one. `sscsb` parses the NDJSON record stream
@@ -160,10 +282,25 @@ binary is Go with a zero-dependency `go.mod`.
   `(ecosystem, name, version)`. A catalog written from the README is a gate that never
   fires — so `sscsb` refuses to count a wildcard-only entry as criteria and fails the
   control rather than reporting a clean scan that checked nothing.
+- **What the scan could NOT read is only ever said on stderr.** stdout carries findings
+  and the summary; `record_type=diagnostic` rows go to stderr, and a config bumblebee
+  cannot parse appears there at `warn` while the run still exits `0` with a `complete`
+  summary. `sscsb` reads that stream on every run — not just failed ones — so a clean
+  scan that dropped a subject reports `DEGRADED` naming the file it could not read,
+  rather than `PASS`. `--strict` gates on it.
 - **`profile = "project"` scopes the scan to the repository**, which for most repos means
   none of the MCP / extension / agent-skill roots are reached, and for a Rust repo means
   nothing is inventoried at all. If a scan inventories zero artifacts the control `FAIL`s
   rather than calling the endpoint clean. The default is `baseline` for that reason.
+- **"It inventoried something" is not the same as "it inventoried the endpoint."** The
+  artifact count is one aggregate number, and a machine whose only populated root is the
+  Homebrew Cellar can clear it with thousands of receipts while no MCP config, editor or
+  browser extension, or agent skill was ever opened — the four classes this control
+  exists for. `sscsb` reads the summary's `roots[].kind` list, reports which of those
+  classes a clean run actually covered, and refuses to call a run that reached none of
+  them a `PASS`: `DEGRADED` under `profile = "project"` (fixable — point it at
+  `baseline`), `INFO` under `baseline` (this endpoint simply has none of those roots, so
+  the run verified installed packages only).
 
 `sscsb` ships **no** catalog. A stale threat feed that reports clean is worse than no
 feed, so the catalog is yours to point at — upstream publishes them under `threat_intel/`.

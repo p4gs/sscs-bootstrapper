@@ -684,6 +684,45 @@ fn receipt_create_verify_and_tamper_detection() {
     );
 }
 
+/// Reported (M16): `sscsb receipt create -- --raw` exited 101 — a panic, not a
+/// diagnosis. The resolver used `git rev-parse <commit>` with no `--verify`,
+/// and rev-parse echoes an unrecognised option back at exit 0, so the receipt
+/// filename's 12-character slice ran off the end of `--raw`.
+///
+/// A CLI must never abort on its own argument. Exit 101 is what this pins
+/// against: any other non-zero exit with a message on stderr is fine.
+#[test]
+fn receipt_create_diagnoses_an_option_shaped_revision_instead_of_panicking() {
+    let dir = throwaway_repo();
+    let repo = dir.path();
+    init_sscsb(repo);
+    write(repo, "README.md", "# x\n");
+    git_ok(repo, &["add", "README.md"]);
+    assert!(commit_with_message(repo, "feat: x\n").status.success());
+
+    for revision in ["--raw", "-s"] {
+        let out = sscsb(repo)
+            .args(["receipt", "create", "--", revision])
+            .assert()
+            .failure();
+        let code = out.get_output().status.code();
+        assert_ne!(
+            code,
+            Some(101),
+            "`receipt create -- {revision}` panicked instead of reporting an error"
+        );
+        let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+        assert!(
+            !stderr.contains("panicked at"),
+            "`receipt create -- {revision}` panicked: {stderr}"
+        );
+        assert!(
+            stderr.contains("sscsb error:"),
+            "`receipt create -- {revision}` must say what went wrong: {stderr}"
+        );
+    }
+}
+
 // ───────────────────────── vex / observability ──────────────────────────────
 
 #[test]
@@ -891,9 +930,20 @@ impl FakeMachine {
     }
 
     /// Replace the fake `gh` this machine puts on PATH.
+    ///
+    /// Every shim answers `--version` first, whatever the caller's script does
+    /// with the API endpoints, because a real `gh` does — even one that is not
+    /// authenticated. Tool detection reads exactly that probe, so a shim that
+    /// failed it would be modelling a BROKEN `gh` rather than the API answers
+    /// the test is actually about.
     fn set_gh(&self, script: &str) {
+        let (shebang, rest) = script.split_once('\n').unwrap_or(("#!/bin/sh", script));
+        let script = format!(
+            "{shebang}\nif [ \"$1\" = \"--version\" ]; then \
+             echo 'gh version 2.96.0 (test shim)'; exit 0; fi\n{rest}"
+        );
         let path = self.dir.path().join("bin/gh");
-        std::fs::write(&path, script).unwrap();
+        std::fs::write(&path, &script).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

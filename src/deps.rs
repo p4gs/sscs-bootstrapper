@@ -68,15 +68,17 @@ impl Ecosystem {
     }
 }
 
-/// Extract direct dependency names from a manifest's content.
+/// Extract dependency names from a manifest's content.
+///
+/// Derived from [`parse_dep_specs`] rather than implemented twice. There used
+/// to be a second family of per-ecosystem name parsers here, and the two
+/// families drifted: whichever one a caller happened to use decided which
+/// declaration sections were visible. One parser, one answer.
 pub fn parse_deps(eco: Ecosystem, content: &str) -> BTreeSet<String> {
-    match eco {
-        Ecosystem::Cargo => parse_cargo(content),
-        Ecosystem::Npm => parse_npm(content),
-        Ecosystem::PyPi => parse_python(content),
-        Ecosystem::Go => parse_go(content),
-        Ecosystem::RubyGems => parse_gemfile(content),
-    }
+    parse_dep_specs(eco, content)
+        .into_iter()
+        .map(|s| s.name)
+        .collect()
 }
 
 /// Where a dependency's code actually comes from. Registry is the trusted,
@@ -91,8 +93,13 @@ pub enum DepSource {
     /// npm `"a": "npm:b@1"` — `a` resolves to a DIFFERENT package `b`.
     Alias(String),
     Url(String),
-    /// A cargo alternate registry (`registry = "…"`), or a go `replace` target.
+    /// A cargo alternate registry (`registry = "…"`), a cargo
+    /// `[patch]`/`[replace]` override, or a go `replace` target.
     Other(String),
+    /// A pip index/link directive (`--extra-index-url`, `--find-links`, …).
+    /// Not a package at all: it re-points where EVERY name in the file may
+    /// resolve from, which is a trust decision the gate has to see.
+    Index(String),
 }
 
 impl DepSource {
@@ -104,6 +111,7 @@ impl DepSource {
             DepSource::Alias(t) => format!("alias:{t}"),
             DepSource::Url(u) => format!("url:{u}"),
             DepSource::Other(o) => format!("other:{o}"),
+            DepSource::Index(u) => format!("index:{u}"),
         }
     }
     fn describe(&self) -> Option<String> {
@@ -114,7 +122,29 @@ impl DepSource {
             DepSource::Alias(t) => Some(format!("npm alias to `{t}`")),
             DepSource::Url(u) => Some(format!("url source {u}")),
             DepSource::Other(o) => Some(format!("non-default source {o}")),
+            DepSource::Index(u) => Some(format!(
+                "alternate package index {u} — it re-points where every dependency \
+                 in this file may resolve from"
+            )),
         }
+    }
+
+    /// Whether this dependency's NAME is what resolves its code on the public
+    /// registry — i.e. whether asking the registry about the name says anything
+    /// true about what will actually be built.
+    ///
+    /// For a `path`, `git`, `url`, alternate-registry or index-directive
+    /// source it does not: the code comes from disk, a URL, or somebody else's
+    /// index, and a public package that happens to share the name is an
+    /// unrelated package. Resolving those anyway is a name/source confusion in
+    /// the very tool that exists to catch name/source confusion — it reported
+    /// an in-repo crate as validated on a collision, and an ordinary
+    /// sibling-repo path dep as a slopsquatting target.
+    ///
+    /// An npm alias IS resolvable: `"a": "npm:b@1"` installs the real registry
+    /// package `b`, and `b` is the name whose existence matters.
+    pub fn is_registry_resolvable(&self) -> bool {
+        matches!(self, DepSource::Registry | DepSource::Alias(_))
     }
 }
 
@@ -139,6 +169,40 @@ impl DepSpec {
 }
 
 /// Source-aware parse: every direct dependency with where it comes from.
+/// Why this manifest could not be read, or `None` if it parses.
+///
+/// The set-returning parsers below deliberately keep their infallible shape —
+/// they are called from a fuzz target and from `current_deps`, where a partial
+/// answer is fine. This is the separate question the GATE has to ask, because
+/// there the difference between "declares nothing" and "cannot be read" decides
+/// whether a commit is allowed through.
+///
+/// Only the two structured formats can fail: `Cargo.toml` (TOML) and
+/// `package.json` (JSON). The line-scanned formats — requirements.txt, go.mod,
+/// Gemfile — have no failure mode, they simply match fewer lines, so they are
+/// `None` by construction rather than by omission. `pyproject.toml` is checked
+/// as TOML because that is what it is, even though the parser falls back to a
+/// line scan when `[project].dependencies` is absent.
+pub fn manifest_parse_error(eco: Ecosystem, file: &str, content: &str) -> Option<String> {
+    // An empty staged file declares nothing and parses as nothing; that is a
+    // real answer, not a failure.
+    if content.trim().is_empty() {
+        return None;
+    }
+    match eco {
+        Ecosystem::Cargo => content.parse::<toml::Table>().err().map(|e| e.to_string()),
+        Ecosystem::Npm => serde_json::from_str::<serde_json::Value>(content)
+            .err()
+            .map(|e| e.to_string()),
+        Ecosystem::PyPi if file.ends_with("pyproject.toml") => {
+            content.parse::<toml::Table>().err().map(|e| e.to_string())
+        }
+        // requirements.txt, go.mod and Gemfile are line-scanned: no parse step,
+        // so no parse failure to distinguish from an empty declaration.
+        Ecosystem::PyPi | Ecosystem::Go | Ecosystem::RubyGems => None,
+    }
+}
+
 pub fn parse_dep_specs(eco: Ecosystem, content: &str) -> BTreeSet<DepSpec> {
     match eco {
         Ecosystem::Cargo => cargo_specs(content),
@@ -149,13 +213,42 @@ pub fn parse_dep_specs(eco: Ecosystem, content: &str) -> BTreeSet<DepSpec> {
     }
 }
 
+/// The three dependency-table names cargo accepts, both at the top level and
+/// under every `[target.<cfg>]` key.
+const CARGO_DEP_KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+/// `package = "real-name"` renames take precedence: the crate that is actually
+/// fetched and compiled is the one whose trust matters.
+fn cargo_real_name(key: &str, val: &toml::Value) -> String {
+    val.as_table()
+        .and_then(|t| t.get("package"))
+        .and_then(|p| p.as_str())
+        .unwrap_or(key)
+        .to_string()
+}
+
+fn cargo_dep_source(val: &toml::Value) -> DepSource {
+    let Some(t) = val.as_table() else {
+        return DepSource::Registry; // `name = "1.0"`
+    };
+    if let Some(u) = t.get("git").and_then(|v| v.as_str()) {
+        DepSource::Git(u.to_string())
+    } else if let Some(p) = t.get("path").and_then(|v| v.as_str()) {
+        DepSource::Path(p.to_string())
+    } else if let Some(r) = t.get("registry").and_then(|v| v.as_str()) {
+        DepSource::Other(format!("registry {r}"))
+    } else {
+        DepSource::Registry // `name = { version = "1" }`
+    }
+}
+
 fn cargo_specs(content: &str) -> BTreeSet<DepSpec> {
     let mut out = BTreeSet::new();
     let Ok(table) = content.parse::<toml::Table>() else {
         return out;
     };
     let mut sections: Vec<&toml::Table> = Vec::new();
-    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+    for key in CARGO_DEP_KINDS {
         if let Some(t) = table.get(key).and_then(|v| v.as_table()) {
             sections.push(t);
         }
@@ -168,31 +261,77 @@ fn cargo_specs(content: &str) -> BTreeSet<DepSpec> {
     {
         sections.push(ws);
     }
-    for s in sections {
-        for (name, val) in s {
-            let real = val
-                .as_table()
-                .and_then(|t| t.get("package"))
-                .and_then(|p| p.as_str())
-                .unwrap_or(name)
-                .to_string();
-            let source = match val.as_table() {
-                None => DepSource::Registry, // `name = "1.0"`
-                Some(t) if t.get("git").and_then(|v| v.as_str()).is_some() => {
-                    DepSource::Git(t["git"].as_str().unwrap().to_string())
-                }
-                Some(t) if t.get("path").and_then(|v| v.as_str()).is_some() => {
-                    DepSource::Path(t["path"].as_str().unwrap().to_string())
-                }
-                Some(t) if t.get("registry").and_then(|v| v.as_str()).is_some() => {
-                    DepSource::Other(format!("registry {}", t["registry"].as_str().unwrap()))
-                }
-                Some(_) => DepSource::Registry, // `name = { version = "1" }`
+    // `[target.'cfg(unix)'.dependencies]` and friends. Platform-conditional
+    // dependencies are ordinary dependencies that happen to build on one
+    // platform; reading only the unconditional tables meant a dependency added
+    // here was never a "new package" at all — a one-line bypass of the gate.
+    if let Some(targets) = table.get("target").and_then(|v| v.as_table()) {
+        for spec in targets.values() {
+            let Some(spec) = spec.as_table() else {
+                continue;
             };
-            out.insert(DepSpec { name: real, source });
+            for key in CARGO_DEP_KINDS {
+                if let Some(t) = spec.get(key).and_then(|v| v.as_table()) {
+                    sections.push(t);
+                }
+            }
         }
     }
+    for s in sections {
+        for (name, val) in s {
+            out.insert(DepSpec {
+                name: cargo_real_name(name, val),
+                source: cargo_dep_source(val),
+            });
+        }
+    }
+    cargo_override_specs(&table, &mut out);
     out
+}
+
+/// `[patch.<registry>]` and the deprecated `[replace]` are the nastiest members
+/// of this class: the NAME stays whatever it already was — very possibly an
+/// already-approved, entirely reputable name — while the CODE behind it is
+/// replaced wholesale by a git checkout, a local directory, or another
+/// registry. A name-keyed diff sees nothing change, which is exactly the
+/// dependency-substitution shape this gate exists to catch.
+fn cargo_override_specs(table: &toml::Table, out: &mut BTreeSet<DepSpec>) {
+    if let Some(patch) = table.get("patch").and_then(|v| v.as_table()) {
+        for entries in patch.values() {
+            let Some(entries) = entries.as_table() else {
+                continue;
+            };
+            for (name, val) in entries {
+                out.insert(DepSpec {
+                    name: cargo_real_name(name, val),
+                    source: cargo_override_source(val),
+                });
+            }
+        }
+    }
+    if let Some(replace) = table.get("replace").and_then(|v| v.as_table()) {
+        for (spec_key, val) in replace {
+            // `[replace]` keys are `name:semver`, e.g. `"serde:1.0.0"`.
+            let name = spec_key
+                .rsplit_once(':')
+                .map_or(spec_key.as_str(), |(n, _)| n);
+            out.insert(DepSpec {
+                name: name.to_string(),
+                source: cargo_override_source(val),
+            });
+        }
+    }
+}
+
+/// An override must never classify as `Registry`: that would give it the same
+/// trust key as the ordinary declaration it overrides, and the whole point is
+/// that it is NOT the same code. Anything cargo will accept here that is not
+/// git/path/alternate-registry still gets a distinct, visible source.
+fn cargo_override_source(val: &toml::Value) -> DepSource {
+    match cargo_dep_source(val) {
+        DepSource::Registry => DepSource::Other("cargo [patch]/[replace] override".into()),
+        other => other,
+    }
 }
 
 fn npm_specs(content: &str) -> BTreeSet<DepSpec> {
@@ -226,51 +365,364 @@ fn npm_specs(content: &str) -> BTreeSet<DepSpec> {
     out
 }
 
-fn python_specs(content: &str) -> BTreeSet<DepSpec> {
-    // PEP 508 direct references (`pkg @ git+https://…`) are the source-swap
-    // vector; a plain `pkg==1.2` is registry-sourced.
-    let classify = |req: &str| -> Option<DepSpec> {
-        let name = python_req_name(req)?;
-        let source = if let Some((_, rhs)) = req.split_once('@') {
-            let rhs = rhs.trim();
-            if rhs.starts_with("git") {
-                DepSource::Git(rhs.to_string())
-            } else if rhs.contains("://") {
-                DepSource::Url(rhs.to_string())
-            } else {
-                DepSource::Registry
-            }
+/// PEP 508 direct references (`pkg @ git+https://…`) are the source-swap
+/// vector; a plain `pkg==1.2` is registry-sourced.
+fn python_requirement_spec(req: &str) -> Option<DepSpec> {
+    let name = python_req_name(req)?;
+    let source = if let Some((_, rhs)) = req.split_once('@') {
+        let rhs = rhs.trim();
+        if rhs.starts_with("git") {
+            DepSource::Git(rhs.to_string())
+        } else if rhs.contains("://") {
+            DepSource::Url(rhs.to_string())
         } else {
             DepSource::Registry
-        };
-        Some(DepSpec { name, source })
+        }
+    } else {
+        DepSource::Registry
     };
+    Some(DepSpec { name, source })
+}
+
+/// The two file shapes that share `Ecosystem::PyPi`: a `pyproject.toml` (TOML)
+/// and a `requirements.txt` (line-oriented). Nothing hands the filename down
+/// here, so the content decides — and a TOML document that announces itself as a
+/// pyproject is parsed as one and NEVER line-scanned.
+///
+/// The old rule was "line-scan whenever the TOML parse produced nothing", and it
+/// produced a garbage trust baseline. A Poetry manifest declares its
+/// dependencies in `[tool.poetry.dependencies]`, so the PEP 621 read found
+/// nothing, fell through, and scanned TOML source as if it were pip
+/// requirements: `python = "^3.11"` became a dependency called `python`,
+/// `version = "0.1.0"` became one called `version`, and the real dependencies
+/// were never seen at all. Those fictions then got written into
+/// `.sscsb/policy/packages.toml` by `deps baseline` and asked about on PyPI by
+/// `deps check`.
+fn python_specs(content: &str) -> BTreeSet<DepSpec> {
     let mut out = BTreeSet::new();
     if let Ok(table) = content.parse::<toml::Table>() {
-        if let Some(deps) = table
-            .get("project")
-            .and_then(|p| p.as_table())
-            .and_then(|p| p.get("dependencies"))
-            .and_then(|d| d.as_array())
-        {
-            for d in deps {
-                if let Some(spec) = d.as_str().and_then(classify) {
-                    out.insert(spec);
-                }
-            }
+        if is_pyproject(&table) {
+            pyproject_specs(&table, &mut out);
             return out;
         }
     }
     for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('-') {
-            continue;
+        requirements_line_spec(line, &mut out);
+    }
+    out
+}
+
+/// A `pyproject.toml` announces itself with one of the four tables that can
+/// legitimately open one: PEP 518 `[build-system]`, PEP 621 `[project]`,
+/// PEP 735 `[dependency-groups]`, or a `[tool.…]` section. A requirements.txt
+/// is not valid TOML at all once it contains a single requirement line, so this
+/// only has to be right about documents that already parsed.
+fn is_pyproject(table: &toml::Table) -> bool {
+    ["build-system", "project", "dependency-groups", "tool"]
+        .iter()
+        .any(|k| table.contains_key(*k))
+}
+
+/// Every place a pyproject.toml declares installable code.
+///
+/// Reading only `[project].dependencies` left whole sections invisible:
+/// `[project.optional-dependencies]` (extras — `pip install pkg[dev]` installs
+/// them, and CI almost always does), `[dependency-groups]` (PEP 735, where
+/// modern tooling puts dev dependencies), and everything any non-PEP-621 build
+/// backend declares under `[tool]`.
+fn pyproject_specs(table: &toml::Table, out: &mut BTreeSet<DepSpec>) {
+    let project = table.get("project").and_then(|p| p.as_table());
+    if let Some(arr) = project
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|d| d.as_array())
+    {
+        push_python_reqs(arr, out);
+    }
+    if let Some(extras) = project
+        .and_then(|p| p.get("optional-dependencies"))
+        .and_then(|d| d.as_table())
+    {
+        for list in extras.values() {
+            if let Some(arr) = list.as_array() {
+                push_python_reqs(arr, out);
+            }
         }
-        if let Some(spec) = classify(line) {
+    }
+    if let Some(groups) = table.get("dependency-groups").and_then(|d| d.as_table()) {
+        for list in groups.values() {
+            // A group entry may be `{ include-group = "other" }`; those are not
+            // requirement strings and `as_str` skips them.
+            if let Some(arr) = list.as_array() {
+                push_python_reqs(arr, out);
+            }
+        }
+    }
+    if let Some(tool) = table.get("tool").and_then(|t| t.as_table()) {
+        if let Some(poetry) = tool.get("poetry").and_then(|p| p.as_table()) {
+            poetry_specs(poetry, out);
+        }
+        tool_requirement_arrays(tool, out);
+    }
+}
+
+/// Poetry, which is neither PEP 621 nor pip.
+///
+/// Its dependencies live under `[tool.poetry]`, and — uniquely among the
+/// formats here — they are a TABLE of `name = constraint` rather than an array
+/// of PEP 508 strings. Constraints may be a bare version string, an inline table
+/// naming a `git`/`path`/`url`/`source` origin, or an ARRAY of such tables when
+/// one package is constrained differently per Python version.
+fn poetry_specs(poetry: &toml::Table, out: &mut BTreeSet<DepSpec>) {
+    let mut tables: Vec<&toml::Table> = Vec::new();
+    // `dev-dependencies` is the pre-1.2 spelling; `[tool.poetry.group.<g>]` is
+    // the current one. Both are still in the wild and both install code.
+    for key in ["dependencies", "dev-dependencies"] {
+        if let Some(t) = poetry.get(key).and_then(|v| v.as_table()) {
+            tables.push(t);
+        }
+    }
+    if let Some(groups) = poetry.get("group").and_then(|v| v.as_table()) {
+        for group in groups.values() {
+            if let Some(t) = group
+                .as_table()
+                .and_then(|g| g.get("dependencies"))
+                .and_then(|v| v.as_table())
+            {
+                tables.push(t);
+            }
+        }
+    }
+    for t in tables {
+        for (name, val) in t {
+            // `python = "^3.11"` is the interpreter constraint, not a package —
+            // and it is one of the two names the old line scan invented.
+            if name == "python" {
+                continue;
+            }
+            push_poetry_dep(name, val, out);
+        }
+    }
+    // `[[tool.poetry.source]]` is Poetry's `--extra-index-url`: it re-points
+    // where names may resolve from, which is a trust decision about every
+    // dependency in the file, not about one package.
+    if let Some(sources) = poetry.get("source").and_then(|v| v.as_array()) {
+        for s in sources {
+            if let Some(url) = s
+                .as_table()
+                .and_then(|t| t.get("url"))
+                .and_then(|v| v.as_str())
+            {
+                out.insert(DepSpec {
+                    name: url.to_string(),
+                    source: DepSource::Index(url.to_string()),
+                });
+            }
+        }
+    }
+}
+
+fn push_poetry_dep(name: &str, val: &toml::Value, out: &mut BTreeSet<DepSpec>) {
+    // `foo = [{ version = "1", python = "<3.9" }, { version = "2" }]` — one
+    // package, several constrained alternatives, each with its own source.
+    if let Some(arr) = val.as_array() {
+        for entry in arr {
+            push_poetry_dep(name, entry, out);
+        }
+        return;
+    }
+    if let Some(name) = python_req_name(name) {
+        out.insert(DepSpec {
+            name,
+            source: poetry_dep_source(val),
+        });
+    }
+}
+
+fn poetry_dep_source(val: &toml::Value) -> DepSource {
+    let Some(t) = val.as_table() else {
+        return DepSource::Registry; // `requests = "^2.31"`
+    };
+    if let Some(u) = t.get("git").and_then(|v| v.as_str()) {
+        DepSource::Git(u.to_string())
+    } else if let Some(p) = t.get("path").and_then(|v| v.as_str()) {
+        DepSource::Path(p.to_string())
+    } else if let Some(u) = t.get("url").and_then(|v| v.as_str()) {
+        DepSource::Url(u.to_string())
+    } else if let Some(s) = t.get("source").and_then(|v| v.as_str()) {
+        // Pinned to a named `[[tool.poetry.source]]` rather than PyPI.
+        DepSource::Other(format!("poetry source {s}"))
+    } else {
+        DepSource::Registry // `requests = { version = "^2.31" }`
+    }
+}
+
+/// The remaining `[tool.<x>]` sections that hold plain PEP 508 requirement
+/// strings in arrays. They all decompose the same way, so they share one reader
+/// rather than each growing a parser.
+fn tool_requirement_arrays(tool: &toml::Table, out: &mut BTreeSet<DepSpec>) {
+    // PDM: `[tool.pdm.dev-dependencies]` is a table of named groups.
+    if let Some(groups) = tool
+        .get("pdm")
+        .and_then(|v| v.as_table())
+        .and_then(|p| p.get("dev-dependencies"))
+        .and_then(|v| v.as_table())
+    {
+        for list in groups.values() {
+            if let Some(arr) = list.as_array() {
+                push_python_reqs(arr, out);
+            }
+        }
+    }
+    // uv, before it adopted PEP 735: a single `[tool.uv] dev-dependencies` array.
+    if let Some(arr) = tool
+        .get("uv")
+        .and_then(|v| v.as_table())
+        .and_then(|u| u.get("dev-dependencies"))
+        .and_then(|v| v.as_array())
+    {
+        push_python_reqs(arr, out);
+    }
+    // Hatch: one array per environment.
+    if let Some(envs) = tool
+        .get("hatch")
+        .and_then(|v| v.as_table())
+        .and_then(|h| h.get("envs"))
+        .and_then(|v| v.as_table())
+    {
+        for env in envs.values() {
+            let Some(env) = env.as_table() else {
+                continue;
+            };
+            for key in ["dependencies", "extra-dependencies"] {
+                if let Some(arr) = env.get(key).and_then(|v| v.as_array()) {
+                    push_python_reqs(arr, out);
+                }
+            }
+        }
+    }
+}
+
+fn push_python_reqs(arr: &[toml::Value], out: &mut BTreeSet<DepSpec>) {
+    for d in arr {
+        if let Some(spec) = d.as_str().and_then(python_requirement_spec) {
             out.insert(spec);
         }
     }
-    out
+}
+
+/// One requirements.txt line.
+///
+/// `line.starts_with('-')` used to skip every option line wholesale, which
+/// discarded two real trust decisions: `-e git+https://…` installs from an
+/// arbitrary VCS URL, and `--extra-index-url` / `--find-links` re-point where
+/// every OTHER name in the file may resolve from. Options that genuinely carry
+/// no dependency (`-r`, `-c`, `--hash`, `--no-binary`, …) are still skipped.
+fn requirements_line_spec(line: &str, out: &mut BTreeSet<DepSpec>) {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return;
+    }
+    // pip's inline comment is a `#` preceded by whitespace — a bare `#` is a
+    // URL fragment (`…#egg=name`) and must survive.
+    let line = match line.find(" #") {
+        Some(i) => line[..i].trim_end(),
+        None => line,
+    };
+    if line.is_empty() {
+        return;
+    }
+    // Split at the first separator so `-e X`, `--index-url=X` and a bare
+    // `pkg==1` all decompose the same way.
+    let (opt, rest) = match line.split_once(['=', ' ', '\t']) {
+        Some((o, r)) => (o, r.trim()),
+        None => (line, ""),
+    };
+    match opt {
+        "-e" | "--editable" => {
+            if let Some(spec) = python_direct_reference(rest) {
+                out.insert(spec);
+            }
+            return;
+        }
+        "-i" | "--index-url" | "--extra-index-url" | "-f" | "--find-links" => {
+            if !rest.is_empty() {
+                out.insert(DepSpec {
+                    name: rest.to_string(),
+                    source: DepSource::Index(rest.to_string()),
+                });
+            }
+            return;
+        }
+        // -r/-c includes, --hash, --no-binary, --require-hashes, …
+        _ if opt.starts_with('-') => return,
+        _ => {}
+    }
+    // A bare direct reference: `https://host/x.whl`, `git+ssh://…`, `./pkg`.
+    // These used to collapse to the name `https` (or `.`), which made every
+    // such line ONE interchangeable trust unit — swap the URL, keep the key.
+    if let Some(spec) = python_direct_reference_if_bare(line) {
+        out.insert(spec);
+        return;
+    }
+    if let Some(spec) = python_requirement_spec(line) {
+        out.insert(spec);
+    }
+}
+
+fn python_direct_reference_if_bare(line: &str) -> Option<DepSpec> {
+    let is_url = match line.split_once("://") {
+        Some((scheme, _)) => {
+            !scheme.is_empty()
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '.' || c == '-')
+        }
+        None => ["git+", "hg+", "svn+", "bzr+"]
+            .iter()
+            .any(|p| line.starts_with(p)),
+    };
+    let is_path = line == "."
+        || line == ".."
+        || line.starts_with("./")
+        || line.starts_with("../")
+        || line.starts_with('/');
+    if is_url || is_path {
+        python_direct_reference(line)
+    } else {
+        None
+    }
+}
+
+/// A `-e`/bare direct reference. The trust unit is the URL or path itself —
+/// two different URLs are two different dependencies even when neither names a
+/// package — unless a `#egg=NAME` fragment names one.
+fn python_direct_reference(target: &str) -> Option<DepSpec> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let name = target
+        .rsplit_once("#egg=")
+        .map(|(_, egg)| {
+            egg.split(['&', '#'])
+                .next()
+                .unwrap_or(egg)
+                .trim()
+                .to_string()
+        })
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| target.to_string());
+    let source = if ["git+", "hg+", "svn+", "bzr+", "git:", "git@"]
+        .iter()
+        .any(|p| target.starts_with(p))
+    {
+        DepSource::Git(target.to_string())
+    } else if target.contains("://") {
+        DepSource::Url(target.to_string())
+    } else {
+        DepSource::Path(target.to_string())
+    };
+    Some(DepSpec { name, source })
 }
 
 fn go_specs(content: &str) -> BTreeSet<DepSpec> {
@@ -344,89 +796,17 @@ fn extract_ruby_value(s: &str) -> String {
         .collect()
 }
 
-fn parse_cargo(content: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let Ok(table) = content.parse::<toml::Table>() else {
-        return out;
-    };
-    let mut sections: Vec<&toml::Table> = Vec::new();
-    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
-        if let Some(t) = table.get(key).and_then(|v| v.as_table()) {
-            sections.push(t);
-        }
-    }
-    if let Some(ws) = table
-        .get("workspace")
-        .and_then(|v| v.as_table())
-        .and_then(|w| w.get("dependencies"))
-        .and_then(|v| v.as_table())
-    {
-        sections.push(ws);
-    }
-    for s in sections {
-        for (name, val) in s {
-            // `package = "real-name"` renames take precedence.
-            let real = val
-                .as_table()
-                .and_then(|t| t.get("package"))
-                .and_then(|p| p.as_str())
-                .unwrap_or(name);
-            out.insert(real.to_string());
-        }
-    }
-    out
-}
-
-fn parse_npm(content: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(content) else {
-        return out;
-    };
-    for key in ["dependencies", "devDependencies", "optionalDependencies"] {
-        if let Some(map) = v.get(key).and_then(|d| d.as_object()) {
-            out.extend(map.keys().cloned());
-        }
-    }
-    out
-}
-
-fn parse_python(content: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    // pyproject.toml
-    if let Ok(table) = content.parse::<toml::Table>() {
-        if let Some(deps) = table
-            .get("project")
-            .and_then(|p| p.as_table())
-            .and_then(|p| p.get("dependencies"))
-            .and_then(|d| d.as_array())
-        {
-            for d in deps {
-                if let Some(s) = d.as_str() {
-                    if let Some(name) = python_req_name(s) {
-                        out.insert(name);
-                    }
-                }
-            }
-            return out;
-        }
-    }
-    // requirements.txt
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('-') {
-            continue;
-        }
-        if let Some(name) = python_req_name(line) {
-            out.insert(name);
-        }
-    }
-    out
-}
-
+/// A requirement's package name.
+///
+/// `is_alphanumeric` rather than `is_ascii_alphanumeric` deliberately: a name
+/// carrying a non-ASCII homoglyph (Cyrillic `г` for Latin `r`) used to stop the
+/// scan on its first character, yield an empty name, and drop the entire line —
+/// so the gate never saw the dependency at all. Surfacing the name is what
+/// turns a silent blind spot into something the existence check can reject.
 fn python_req_name(req: &str) -> Option<String> {
     let name: String = req
         .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
         .collect();
     if name.is_empty() {
         None
@@ -456,26 +836,17 @@ fn parse_go(content: &str) -> BTreeSet<String> {
             continue;
         };
         if let Some(module) = candidate.split_whitespace().next() {
-            if module.contains('/') && !candidate.contains("// indirect") {
+            // NOTE: `// indirect` is deliberately NOT a filter. It is a comment
+            // the go toolchain writes as bookkeeping; it is not a trust
+            // boundary, and `go build` will happily compile a module whose
+            // require line carries it. Skipping those lines meant appending
+            // eight characters to a require made a dependency invisible to this
+            // gate. The cost is that a `go get` which pulls new transitive
+            // modules now needs them approved too — which is the honest answer,
+            // since that is new code entering the build; `sscsb deps baseline`
+            // blesses a whole manifest at once.
+            if module.contains('/') {
                 out.insert(module.to_string());
-            }
-        }
-    }
-    out
-}
-
-fn parse_gemfile(content: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("gem ") {
-            let rest = rest.trim_start_matches(['\'', '"']);
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                .collect();
-            if !name.is_empty() {
-                out.insert(name);
             }
         }
     }
@@ -529,11 +900,83 @@ pub fn load_approved(ctx: &Ctx) -> Result<BTreeSet<String>> {
 
 /// Reasons a package should not be blindly approved. Empty ⇒ safe to approve.
 ///
+/// Which of the two package-trust checks are switched on.
+///
+/// Both keys are emitted into `.sscsb/config.toml` by `sscsb init`, and until
+/// now neither did anything: `typosquat_check` had no reader at all, and
+/// `registry_check` only decided whether `sscsb verify` printed a sentence about
+/// itself — `sscsb deps check` performed the network lookup either way. A config
+/// key that changes only the report text is worse than no key, because it reads
+/// as a control the user has set.
+///
+/// Both default to on, which is what the registry declares and what every
+/// generated config already carries. Turning one off is a real escape hatch:
+/// `typosquat_check = false` for a project whose dependency is legitimately one
+/// edit from a popular name, `registry_check = false` for private or air-gapped
+/// registries where a public existence lookup answers the wrong question. To
+/// switch off both, disable the control.
+#[derive(Debug, Clone, Copy)]
+pub struct TrustChecks {
+    pub registry: bool,
+    pub typosquat: bool,
+}
+
+impl TrustChecks {
+    /// Each key is read by its own literal call rather than through a shared
+    /// closure, so a source scan can see that the key has a reader and that the
+    /// fallback matches the registry. A loop over key names reads the config
+    /// correctly and is invisible to both checks.
+    pub fn from_config(cfg: Option<&Config>) -> Self {
+        TrustChecks {
+            registry: cfg
+                .and_then(|c| c.control_opt_bool("package-trust", "registry_check"))
+                .unwrap_or(true),
+            typosquat: cfg
+                .and_then(|c| c.control_opt_bool("package-trust", "typosquat_check"))
+                .unwrap_or(true),
+        }
+    }
+}
+
+impl Default for TrustChecks {
+    fn default() -> Self {
+        TrustChecks::from_config(None)
+    }
+}
+
 /// This is the check that makes the anti-slopsquat machinery ENFORCING instead
 /// of advisory: `approve` and `baseline` run it before writing to the baseline,
 /// so a typosquat or a hallucinated (registry-absent) name cannot be blessed
 /// without a human seeing the warning and overriding on purpose.
-pub fn approval_warnings(qualified: &str, offline: bool) -> Vec<String> {
+pub fn approval_warnings(qualified: &str, checks: TrustChecks, offline: bool) -> Vec<String> {
+    // A hand-typed `sscsb deps approve <pkg>` names a package to resolve from
+    // the registry; that is exactly the Registry case.
+    approval_warnings_for(qualified, &DepSource::Registry, checks, offline)
+}
+
+/// [`approval_warnings`] for a dependency whose declared source is known.
+///
+/// Both warnings here interrogate the NAME — is it one edit from a popular
+/// package, does it exist on the public registry — and both are meaningless
+/// when the name is not what resolves the code. A `path`/`git`/`url` dependency
+/// gets neither, because a public package sharing its name is an unrelated
+/// package; those sources are flagged on their own terms by
+/// [`new_unapproved_deps`], which does not care about the baseline at all.
+///
+/// TWO INDEPENDENT GATES, AND THE ORDER IS LOAD-BEARING. `is_registry_resolvable`
+/// asks *is this question meaningful*; [`TrustChecks`] asks *do we want to ask
+/// it*. The first is correctness and is deliberately NOT switchable from config:
+/// setting `registry_check = true` must never resurrect the name/source
+/// confusion — reporting an unrelated public package as this dependency's
+/// verdict — that the source guard exists to prevent. So the source guard runs
+/// first and unconditionally, and the config keys then decide which of the
+/// remaining, meaningful checks actually run.
+pub fn approval_warnings_for(
+    qualified: &str,
+    source: &DepSource,
+    checks: TrustChecks,
+    offline: bool,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     let Some((label, name)) = qualified.split_once(':') else {
         return warnings;
@@ -541,26 +984,52 @@ pub fn approval_warnings(qualified: &str, offline: bool) -> Vec<String> {
     let Some(eco) = Ecosystem::from_label(label) else {
         return warnings;
     };
-    if let Some(shadowed) = typosquat_suspect(eco, name) {
-        warnings.push(format!(
-            "`{qualified}` is one edit from popular package `{shadowed}` — possible \
-             typosquat/slopsquat"
-        ));
+    // Correctness first, and unconditionally: a name that does not resolve the
+    // code answers neither question.
+    if !source.is_registry_resolvable() {
+        return warnings;
     }
-    if !offline {
-        match registry_exists(eco, name) {
-            RegistryStatus::NotFound => warnings.push(format!(
-                "`{qualified}` was NOT FOUND on its public registry — likely a hallucinated \
-                 (slopsquat) name; do not approve without verifying it is real"
-            )),
-            RegistryStatus::Unknown(e) => warnings.push(format!(
-                "`{qualified}` existence could not be confirmed ({e}) — verify manually before \
-                 approving (a registry outage must not launder an unverified package)"
-            )),
-            RegistryStatus::Exists => {}
+    // Then policy: which of the meaningful checks the user asked for.
+    if checks.typosquat {
+        if let Some(shadowed) = typosquat_suspect(eco, name) {
+            warnings.push(format!(
+                "`{qualified}` is one edit from popular package `{shadowed}` — possible \
+                 typosquat/slopsquat"
+            ));
         }
     }
+    if checks.registry && !offline {
+        warnings.extend(registry_problem(qualified, &registry_exists(eco, name)));
+    }
     warnings
+}
+
+/// What one registry outcome MEANS — in one place, because the two callers used
+/// to disagree about it.
+///
+/// [`approval_warnings_for`] treated `Unknown` as a reason not to approve, while
+/// [`deps_check`] filed it as a *note*, left `problems` empty, and printed
+/// `deps check: clean` at exit 0. So a DNS failure, a proxy, a 503, or an
+/// offline laptop turned the anti-slopsquat control into a rubber stamp: every
+/// hallucinated name in the manifest reported clean, with the reason buried in
+/// a `note:` line nobody's CI reads.
+///
+/// An outage is not evidence of existence. `Unknown` is a failure to answer, and
+/// the only honest report of a failure to answer is that the check did not pass.
+/// `--offline` remains the way to decline the question deliberately.
+fn registry_problem(qualified: &str, status: &RegistryStatus) -> Option<String> {
+    match status {
+        RegistryStatus::Exists => None,
+        RegistryStatus::NotFound => Some(format!(
+            "{qualified}: NOT FOUND on its public registry — likely hallucinated \
+             (slopsquatting target) or private; do not approve without verification"
+        )),
+        RegistryStatus::Unknown(e) => Some(format!(
+            "{qualified}: registry check inconclusive ({e}) — existence was NOT confirmed, \
+             and a registry outage is not evidence that a package is real; verify manually, \
+             or pass --offline to decline the existence check on purpose"
+        )),
+    }
 }
 
 pub fn approve_package(ctx: &Ctx, qualified: &str) -> Result<()> {
@@ -599,22 +1068,77 @@ pub fn approve_package(ctx: &Ctx, qualified: &str) -> Result<()> {
     Ok(())
 }
 
-/// Current direct deps across all manifests in the repo root (qualified
-/// `eco:name`).
-pub fn current_deps(ctx: &Ctx) -> Result<BTreeSet<String>> {
+/// Current deps across every manifest in the repo — nested ones included — each
+/// keeping the source it was declared with.
+///
+/// The source is the half [`current_deps`] throws away, and throwing it away is
+/// what let `deps check` ask the public registry about a `path` dependency.
+/// A `BTreeSet`, so the same dependency declared in two manifests of one
+/// ecosystem (requirements.txt and pyproject.toml both naming `requests`) is
+/// one target, not two registry lookups.
+pub fn current_dep_specs(ctx: &Ctx) -> Result<BTreeSet<(Ecosystem, DepSpec)>> {
     let mut out = BTreeSet::new();
-    for mf in MANIFEST_FILES {
-        let path = ctx.root.join(mf);
-        if !path.is_file() {
-            continue;
-        }
-        let eco = Ecosystem::of_manifest(mf).expect("manifest list");
-        let content = std::fs::read_to_string(&path)?;
-        for dep in parse_deps(eco, &content) {
-            out.insert(format!("{}:{dep}", eco.label()));
+    for (eco, file) in manifest_paths(ctx)? {
+        let content = std::fs::read_to_string(ctx.root.join(&file))
+            .with_context(|| format!("reading manifest {file}"))?;
+        for spec in parse_dep_specs(eco, &content) {
+            out.insert((eco, spec));
         }
     }
     Ok(out)
+}
+
+/// Every dependency manifest in the repo, repo-relative — not only the ones at
+/// the root.
+///
+/// The root-only read was half of a disagreement with the commit gate, which
+/// matches a staged file by BASENAME *anywhere* in the tree. `sscsb deps
+/// baseline` blessed the root manifest, never saw `sub/package.json`, and the
+/// gate then blocked the commit on a dependency from it that `baseline` had no
+/// way to approve — leaving `sscsb deps approve`, one package at a time, as the
+/// only route out. Monorepos are the common case, not the exotic one.
+///
+/// The search universe is deliberately **git's**, not the filesystem's. The gate
+/// can only ever see a path git is tracking or staging, so `git ls-files` — which
+/// lists the INDEX, and therefore staged-new files too — is exactly the set that
+/// can reach it. It also excludes, for free and by the repo's own rules, every
+/// directory a filesystem walk would have to exclude by hand: `node_modules/`,
+/// `target/`, `.venv/`, vendored trees. Baselining those would approve thousands
+/// of packages nobody is committing.
+///
+/// Root manifests are unioned in unconditionally, so a repo whose first commit
+/// has not happened yet still baselines exactly as it did before.
+fn manifest_paths(ctx: &Ctx) -> Result<BTreeSet<(Ecosystem, String)>> {
+    let mut out: BTreeSet<(Ecosystem, String)> = MANIFEST_FILES
+        .iter()
+        .filter(|mf| ctx.root.join(mf).is_file())
+        .filter_map(|mf| Ecosystem::of_manifest(mf).map(|eco| (eco, (*mf).to_string())))
+        .collect();
+    let tracked = exec::git(&["ls-files", "-z"], &ctx.root)?;
+    for file in tracked.split('\0').filter(|f| !f.is_empty()) {
+        // `of_manifest` is the same table `is_dependency_manifest` consults, so
+        // asking it directly both filters and classifies in one step.
+        if let Some(eco) = Ecosystem::of_manifest(file) {
+            if ctx.root.join(file).is_file() {
+                out.insert((eco, file.to_string()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Current dependency NAMES across every manifest in the repo (qualified
+/// `eco:name`). Anything that has to know where the code comes from must use
+/// [`current_dep_specs`] instead.
+///
+/// Derived from `current_dep_specs` rather than walking the manifests a second
+/// time: the two used to be separate loops, and a separate loop is how the two
+/// views drift into disagreeing about which manifests exist.
+pub fn current_deps(ctx: &Ctx) -> Result<BTreeSet<String>> {
+    Ok(current_dep_specs(ctx)?
+        .into_iter()
+        .map(|(eco, spec)| format!("{}:{}", eco.label(), spec.name))
+        .collect())
 }
 
 /// Why a staged dependency needs a fresh trust decision.
@@ -625,12 +1149,31 @@ pub enum NewDepReason {
     /// The package points at code the registry never vetted (git/path/alias/url),
     /// so it needs review even if the NAME was previously approved.
     NonRegistrySource(String),
+    /// The staged manifest is present but could not be parsed, so what it
+    /// declares is UNKNOWN — not empty.
+    ///
+    /// Conflating those two is how this gate was bypassed: a parse failure
+    /// yielded an empty dependency set, the staged-vs-HEAD diff found nothing
+    /// new, and the commit passed with no output at all. A UTF-8 BOM on
+    /// `package.json` was enough — npm strips it and installs happily,
+    /// `serde_json` does not. A JSONC comment or any TOML syntax error did the
+    /// same. A gate that cannot read its input must fail closed.
+    UnparseableManifest(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewDep {
     pub qualified: String,
     pub reason: NewDepReason,
+    /// Where this dependency's code comes from. `None` only for
+    /// [`NewDepReason::UnparseableManifest`], where `qualified` is a file path
+    /// rather than a package and there is no source to speak of.
+    ///
+    /// Callers that validate a package by NAME — registry existence, typosquat
+    /// distance — must consult this first: those questions are only meaningful
+    /// when the name is what resolves the code. See
+    /// [`DepSource::is_registry_resolvable`].
+    pub source: Option<DepSource>,
 }
 
 impl NewDep {
@@ -647,6 +1190,14 @@ impl NewDep {
                  name may already be approved; confirm intent, then `sscsb deps approve {}`",
                 self.qualified, self.qualified
             ),
+            NewDepReason::UnparseableManifest(detail) => format!(
+                "staged manifest `{}` could not be parsed ({detail}) — its dependencies \
+                 are UNKNOWN, not none, so this gate cannot clear the commit. Note a \
+                 UTF-8 BOM or a JSONC-style comment will do this: the package manager \
+                 tolerates them, the strict parser does not. Fix the file, or stage a \
+                 version that parses.",
+                self.qualified
+            ),
         }
     }
 }
@@ -655,7 +1206,19 @@ impl NewDep {
 /// (repo-relative path) resolves to a location INSIDE the repo — the repo's own
 /// code, already reviewed here (e.g. a cargo-fuzz project's `path = ".."`).
 /// Absolute paths, or `..` components that escape above the repo root, are false.
-fn path_resolves_within_repo(manifest: &str, rel: &str) -> bool {
+///
+/// Two checks, in order, because neither alone is enough:
+///
+/// 1. A lexical component walk. This is the only answer available for a path
+///    that is not on disk yet (a staged manifest may name a directory that
+///    arrives in a later commit), and it is the one that must fail closed.
+/// 2. If the path DOES exist, `canonicalize` on both sides, which resolves
+///    symlinks. Without this the walk was purely textual, so `path =
+///    "link/pkg"` where `link` is a symlink pointing out of the repo counted as
+///    the repo's own reviewed code and was exempted from the gate. The doc
+///    comment above claimed "resolves to a location INSIDE the repo"; before
+///    this it only claimed to *spell* one.
+fn path_resolves_within_repo(root: &std::path::Path, manifest: &str, rel: &str) -> bool {
     use std::path::{Component, Path};
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
@@ -664,8 +1227,9 @@ fn path_resolves_within_repo(manifest: &str, rel: &str) -> bool {
     let manifest_dir = Path::new(manifest)
         .parent()
         .unwrap_or_else(|| Path::new(""));
+    let joined = manifest_dir.join(rel_path);
     let mut depth: i32 = 0;
-    for c in manifest_dir.join(rel_path).components() {
+    for c in joined.components() {
         match c {
             Component::ParentDir => {
                 depth -= 1;
@@ -678,7 +1242,12 @@ fn path_resolves_within_repo(manifest: &str, rel: &str) -> bool {
             Component::RootDir | Component::Prefix(_) => return false,
         }
     }
-    true
+    // Physical check. If either side cannot be canonicalized the path is not
+    // on disk to be followed, so the lexical answer stands.
+    match (root.join(&joined).canonicalize(), root.canonicalize()) {
+        (Ok(target), Ok(root)) => target.starts_with(root),
+        _ => true,
+    }
 }
 
 /// STAGED dependency changes that need a fresh trust decision. Source-aware: a
@@ -712,6 +1281,18 @@ pub fn new_unapproved_deps(ctx: &Ctx) -> Result<Vec<NewDep>> {
         let head_content = exec::git_raw(&["show", &format!("HEAD:{file}")], &ctx.root)
             .map(|o| if o.success() { o.stdout } else { String::new() })
             .unwrap_or_default();
+        // Fail closed on a manifest we cannot read. Its dependencies are
+        // unknown, not none, and treating them as none is exactly how this gate
+        // was bypassed. Only the STAGED side matters: an unparseable HEAD is
+        // history we cannot change, and blocking on it would wedge the repo.
+        if let Some(detail) = manifest_parse_error(eco, file, &staged_content.stdout) {
+            out.push(NewDep {
+                qualified: file.to_string(),
+                reason: NewDepReason::UnparseableManifest(detail),
+                source: None,
+            });
+            continue;
+        }
         let before = parse_dep_specs(eco, &head_content);
         let after = parse_dep_specs(eco, &staged_content.stdout);
         let before_keys: BTreeSet<String> = before.iter().map(DepSpec::key).collect();
@@ -728,7 +1309,7 @@ pub fn new_unapproved_deps(ctx: &Ctx) -> Result<Vec<NewDep>> {
                 // external unvetted code. Exempt them. Out-of-tree paths and
                 // git/url/alias sources still need explicit review.
                 if let DepSource::Path(p) = &spec.source {
-                    if path_resolves_within_repo(file, p) {
+                    if path_resolves_within_repo(&ctx.root, file, p) {
                         continue;
                     }
                 }
@@ -736,11 +1317,13 @@ pub fn new_unapproved_deps(ctx: &Ctx) -> Result<Vec<NewDep>> {
                 out.push(NewDep {
                     qualified,
                     reason: NewDepReason::NonRegistrySource(desc),
+                    source: Some(spec.source.clone()),
                 });
             } else if !approved.contains(&qualified) {
                 out.push(NewDep {
                     qualified,
                     reason: NewDepReason::NotInBaseline,
+                    source: Some(spec.source.clone()),
                 });
             }
         }
@@ -806,6 +1389,17 @@ pub fn registry_exists(eco: Ecosystem, name: &str) -> RegistryStatus {
 /// Popular package names per ecosystem (embedded, deliberately small): a NEW
 /// dependency within edit-distance 1 of one of these — but not equal to it —
 /// is a typosquat suspect.
+///
+/// The list is doing two jobs at once, which is why membership also *clears* a
+/// name: an entry is a package worth protecting AND a package asserted to be
+/// real, so `rake` and `rack` — one edit apart, both entirely legitimate — must
+/// either both be here or neither.
+///
+/// Go and RubyGems used to be absent, so `typosquat_suspect` returned `None` for
+/// them and two whole ecosystems had no typosquat coverage at all. Go is
+/// arguably where it matters most: module paths are case-sensitive, and
+/// `github.com/Sirupsen/logrus` versus `github.com/sirupsen/logrus` is a real
+/// historical split that the `normalize` arm below catches.
 pub const POPULAR: &[(&str, &[&str])] = &[
     (
         "cargo",
@@ -882,6 +1476,66 @@ pub const POPULAR: &[(&str, &[&str])] = &[
             "pillow",
         ],
     ),
+    (
+        "go",
+        &[
+            "github.com/stretchr/testify",
+            "github.com/sirupsen/logrus",
+            "github.com/spf13/cobra",
+            "github.com/spf13/viper",
+            "github.com/pkg/errors",
+            "github.com/google/uuid",
+            "github.com/gorilla/mux",
+            "github.com/gin-gonic/gin",
+            "github.com/prometheus/client_golang",
+            "github.com/davecgh/go-spew",
+            "github.com/lib/pq",
+            "github.com/go-sql-driver/mysql",
+            "github.com/mattn/go-sqlite3",
+            "github.com/aws/aws-sdk-go-v2",
+            "go.uber.org/zap",
+            "google.golang.org/grpc",
+            "google.golang.org/protobuf",
+            "gopkg.in/yaml.v3",
+            "golang.org/x/crypto",
+            "golang.org/x/net",
+            "golang.org/x/sync",
+            "golang.org/x/sys",
+            "golang.org/x/text",
+        ],
+    ),
+    (
+        "rubygems",
+        &[
+            "rails",
+            // `rake` and `rack` are one edit apart and both real. Listing both
+            // is what stops each from being reported as a squat of the other.
+            "rake",
+            "rack",
+            "rspec",
+            "nokogiri",
+            "puma",
+            "sinatra",
+            "devise",
+            "pg",
+            "mysql2",
+            "sqlite3",
+            "sidekiq",
+            "redis",
+            "activerecord",
+            "activesupport",
+            "bundler",
+            "json",
+            "faraday",
+            "rubocop",
+            "httparty",
+            "jwt",
+            "dotenv",
+            "pry",
+            "minitest",
+            "octokit",
+        ],
+    ),
 ];
 
 /// Damerau-Levenshtein distance of at most 1: one substitution, insertion,
@@ -929,6 +1583,53 @@ fn normalize(name: &str) -> String {
     name.to_lowercase().replace(['-', '_'], "")
 }
 
+/// Split a name into its stem and its trailing run of ASCII digits.
+fn split_digit_suffix(name: &str) -> (&str, &str) {
+    name.split_at(name.trim_end_matches(|c: char| c.is_ascii_digit()).len())
+}
+
+/// True when two names are members of one *family*, distinguished only by a
+/// trailing digit — `sha1`/`sha2`/`sha3`, `base32`/`base64`,
+/// `gopkg.in/yaml.v2`/`gopkg.in/yaml.v3`.
+///
+/// These are not typos of one another, and treating them as such was a real
+/// false positive: `sha1` and `sha3` are ubiquitous RustCrypto crates, yet each
+/// was reported as a typosquat of `sha2` and could not be baselined without
+/// `--force`. A false "unapproved dependency" blocks somebody's commit, so the
+/// heuristic has to be right about this class, not merely loud.
+///
+/// A typosquat works by *misreading or mistyping* a name. A trailing digit is
+/// the one token nobody glosses over — it is the whole semantic payload of the
+/// name (which SHA? which base?) and picking the wrong one lands you on a
+/// different real package that fails to compile, not on attacker-controlled
+/// code.
+///
+/// Three conditions keep this from becoming a bypass, and all three are load-
+/// bearing:
+///
+/// * **Both** sides must carry a digit suffix. `requests2` shadowing `requests`,
+///   or `boto` shadowing `boto3`, is a classic squat and stays flagged — only
+///   one side has digits.
+/// * The digit runs must be the **same length**, so `sha22` is still a suspect
+///   of `sha2` while `sha1` is not.
+/// * The stems must be identical and non-empty, so this never fires on names
+///   that merely both happen to end in a digit.
+///
+/// The residue: it does exempt an unknown `<popular-stem><other-digit>` — `sha7`,
+/// `urllib2` — from the *distance* heuristic. Those names still go through the
+/// registry-existence check, which is the arm that actually knows whether a name
+/// is real; the distance heuristic never did.
+fn digit_variant_siblings(a: &str, b: &str) -> bool {
+    let (stem_a, digits_a) = split_digit_suffix(a);
+    let (stem_b, digits_b) = split_digit_suffix(b);
+    !digits_a.is_empty()
+        && !digits_b.is_empty()
+        && digits_a.len() == digits_b.len()
+        && digits_a != digits_b
+        && !stem_a.is_empty()
+        && stem_a == stem_b
+}
+
 /// Typosquat suspicion for a new package name. Returns the popular package it
 /// shadows, if any.
 pub fn typosquat_suspect(eco: Ecosystem, name: &str) -> Option<&'static str> {
@@ -941,8 +1642,9 @@ pub fn typosquat_suspect(eco: Ecosystem, name: &str) -> Option<&'static str> {
     }
     list.iter()
         .find(|popular| {
-            edit_distance_leq1(name, popular)
-                || (normalize(name) == normalize(popular) && name != **popular)
+            !digit_variant_siblings(name, popular)
+                && (edit_distance_leq1(name, popular)
+                    || (normalize(name) == normalize(popular) && name != **popular))
         })
         .copied()
 }
@@ -951,18 +1653,37 @@ pub fn typosquat_suspect(eco: Ecosystem, name: &str) -> Option<&'static str> {
 
 pub fn verify_package_trust(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     let mut messages = Vec::new();
-    if !crate::hooks::hooks_installed(ctx) {
-        return VerifyResult::new(
-            "package-trust",
-            Outcome::Fail,
-            vec!["hooks not installed — run `sscsb init`".into()],
-        );
+    let hooks = crate::hooks::hook_integrity(ctx);
+    if let Some(blocked) = hooks.blocking("package-trust") {
+        return blocked;
     }
     messages.push("new-package approval gate enforced in commit-msg hook".into());
+    messages.extend(hooks.messages.iter().cloned());
     let outcome = if packages_policy_path(ctx).is_file() {
-        let approved = load_approved(ctx).map(|s| s.len()).unwrap_or(0);
-        messages.push(format!("approved baseline present ({approved} package(s))"));
-        Outcome::Pass
+        // A baseline that cannot be parsed is not a baseline of zero packages —
+        // it is a baseline nobody can read, and the commit gate that consumes it
+        // cannot evaluate. Swallowing the error into `0 package(s)` reported the
+        // broken state as PASS.
+        match load_approved(ctx) {
+            Ok(approved) => {
+                messages.push(format!(
+                    "approved baseline present ({} package(s))",
+                    approved.len()
+                ));
+                Outcome::Pass
+            }
+            Err(err) => {
+                messages.push(format!(
+                    "approved baseline UNREADABLE — the commit gate cannot evaluate it: {err:#}"
+                ));
+                messages.push(
+                    "fix .sscsb/policy/packages.toml (or delete it and re-run \
+                     `sscsb deps baseline`) — nothing was verified"
+                        .into(),
+                );
+                Outcome::Degraded
+            }
+        }
     } else {
         messages.push(
             "no approved-packages baseline yet — run `sscsb deps baseline` to bless current deps"
@@ -970,14 +1691,36 @@ pub fn verify_package_trust(ctx: &Ctx, cfg: &Config) -> VerifyResult {
         );
         Outcome::Degraded
     };
-    if cfg
-        .control_opt_bool("package-trust", "registry_check")
-        .unwrap_or(true)
-    {
-        messages
-            .push("registry existence validation on `sscsb deps check` (anti-slopsquat)".into());
-    }
-    VerifyResult::new("package-trust", outcome, messages)
+    // Report what the two toggles actually DO now, including when they are off —
+    // a check the user switched off must be visible in the posture, not silently
+    // absent from it.
+    let checks = TrustChecks::from_config(Some(cfg));
+    messages.push(if checks.registry {
+        "registry existence validation ON for `sscsb deps check` and approvals (anti-slopsquat)"
+            .to_string()
+    } else {
+        "registry existence validation OFF (registry_check = false) — hallucinated package \
+         names will not be caught"
+            .to_string()
+    });
+    messages.push(if checks.typosquat {
+        "typosquat proximity heuristic ON for `sscsb deps check`, approvals, and the \
+         commit gate"
+            .to_string()
+    } else {
+        "typosquat proximity heuristic OFF (typosquat_check = false) — names one edit from a \
+         popular package will not be flagged, in `deps check`, at approval, or at the \
+         commit gate; a new unapproved dependency is still blocked"
+            .to_string()
+    });
+    let outcome = if checks.registry && checks.typosquat {
+        outcome
+    } else {
+        // Not a failure: the user asked for this. But a control running with half
+        // its checks off must not report the same PASS as one running whole.
+        outcome.weakest(Outcome::Info)
+    };
+    VerifyResult::new("package-trust", outcome.weakest(hooks.outcome), messages)
 }
 
 pub fn verify_socket_control(ctx: &Ctx) -> VerifyResult {
@@ -1002,17 +1745,71 @@ pub fn verify_socket_control(ctx: &Ctx) -> VerifyResult {
 }
 
 /// `sscsb deps check`: validate current (or staged-new) packages.
-pub fn deps_check(ctx: &Ctx, offline: bool) -> Result<(Vec<String>, Vec<String>)> {
+///
+/// Every check below asks a question ABOUT A NAME — is it one edit from a
+/// popular package, does the public registry have it — so every check first has
+/// to know whether the name is what resolves the code. It did not: targets were
+/// built from name-only lists, the source was discarded, and a `path`
+/// dependency was resolved against crates.io like any other. That got both
+/// answers wrong in the same run — an in-repo crate reported as "exists on
+/// registry" on nothing but a name collision with an unrelated public crate,
+/// and a sibling-repo path dep (`../grc-controls/…`, an ordinary multi-repo
+/// layout) reported as a likely slopsquatting target at exit 1.
+///
+/// [`TrustChecks`] then decides which of the MEANINGFUL checks run. The two
+/// gates are independent and the source gate is never the configurable one: see
+/// [`approval_warnings_for`] for why turning `registry_check` on must not be
+/// able to bring the name/source confusion back.
+pub fn deps_check(
+    ctx: &Ctx,
+    checks: TrustChecks,
+    offline: bool,
+) -> Result<(Vec<String>, Vec<String>)> {
+    deps_check_with(ctx, checks, offline, registry_exists)
+}
+
+/// [`deps_check`] with the registry lookup injected, so the outage path can be
+/// exercised without an outage (and without a network call).
+fn deps_check_with(
+    ctx: &Ctx,
+    checks: TrustChecks,
+    offline: bool,
+    resolve: impl Fn(Ecosystem, &str) -> RegistryStatus,
+) -> Result<(Vec<String>, Vec<String>)> {
     let mut problems = Vec::new();
     let mut notes = Vec::new();
-    let new_pkgs = unapproved_new_packages(ctx)?;
-    let targets: Vec<String> = if new_pkgs.is_empty() {
-        current_deps(ctx)?.into_iter().collect()
+    // Same principle as the per-dependency note below, applied to config: a
+    // check that did not run has to say so, or "checked and found nothing" and
+    // "never checked" are the same silence. Once per run — this is a fact about
+    // the configuration, not about any one dependency.
+    if !checks.typosquat {
+        notes.push(
+            "typosquat proximity heuristic not run (typosquat_check = false in \
+             [controls.package-trust])"
+                .to_string(),
+        );
+    }
+    if !checks.registry {
+        notes.push(
+            "public-registry existence not checked (registry_check = false in \
+             [controls.package-trust])"
+                .to_string(),
+        );
+    }
+    let new_deps = new_unapproved_deps(ctx)?;
+    let targets: Vec<(String, Option<DepSource>)> = if new_deps.is_empty() {
+        current_dep_specs(ctx)?
+            .into_iter()
+            .map(|(eco, spec)| (format!("{}:{}", eco.label(), spec.name), Some(spec.source)))
+            .collect()
     } else {
-        notes.push(format!("checking {} staged new package(s)", new_pkgs.len()));
-        new_pkgs
+        notes.push(format!("checking {} staged new package(s)", new_deps.len()));
+        new_deps
+            .into_iter()
+            .map(|d| (d.qualified, d.source))
+            .collect()
     };
-    for qualified in &targets {
+    for (qualified, source) in &targets {
         let Some((eco_label, name)) = qualified.split_once(':') else {
             continue;
         };
@@ -1024,22 +1821,40 @@ pub fn deps_check(ctx: &Ctx, offline: bool) -> Result<(Vec<String>, Vec<String>)
             "rubygems" => Ecosystem::RubyGems,
             _ => continue,
         };
-        if let Some(shadowed) = typosquat_suspect(eco, name) {
-            problems.push(format!(
-                "{qualified}: name is one edit away from popular package `{shadowed}` — \
-                 possible typosquat/slopsquat; verify intent before approving"
-            ));
+        // Not registry-resolvable → the name answers nothing. Say so and move
+        // on; the commit gate flags these on their own terms (a non-registry
+        // source needs review whatever the baseline says), so staying silent
+        // here loses no coverage — it only stops inventing a verdict.
+        //
+        // This runs before, and independently of, the config gates below: it is
+        // not a check the user elected to run, it is the reason the checks below
+        // would be meaningless. No `TrustChecks` value can re-enable it.
+        if let Some(source) = source.as_ref().filter(|s| !s.is_registry_resolvable()) {
+            if let Some(desc) = source.describe() {
+                notes.push(format!(
+                    "{qualified}: {desc} — not resolved by name against the public \
+                     {eco_label} registry, because the name is not what resolves it"
+                ));
+            }
+            continue;
         }
-        if !offline {
-            match registry_exists(eco, name) {
-                RegistryStatus::Exists => notes.push(format!("{qualified}: exists on registry")),
-                RegistryStatus::NotFound => problems.push(format!(
-                    "{qualified}: NOT FOUND on its public registry — likely hallucinated \
-                     (slopsquatting target) or private; do not approve without verification"
-                )),
-                RegistryStatus::Unknown(e) => {
-                    notes.push(format!("{qualified}: registry check inconclusive ({e})"));
-                }
+        if checks.typosquat {
+            if let Some(shadowed) = typosquat_suspect(eco, name) {
+                problems.push(format!(
+                    "{qualified}: name is one edit away from popular package `{shadowed}` — \
+                     possible typosquat/slopsquat; verify intent before approving"
+                ));
+            }
+        }
+        // `registry_problem` and not an inline match: it is the one place that
+        // decides what an outcome MEANS, and it files `Unknown` as a PROBLEM.
+        // Resolving this conflict the other way — keeping the inline arm that
+        // filed `Unknown` as a note — would have quietly reopened the fail-open
+        // hole that helper exists to close, while looking like a merge.
+        if checks.registry && !offline {
+            match registry_problem(qualified, &resolve(eco, name)) {
+                Some(problem) => problems.push(problem),
+                None => notes.push(format!("{qualified}: exists on registry")),
             }
         }
     }
@@ -1059,7 +1874,8 @@ mod tests {
 
     #[test]
     fn cargo_parsing_includes_rename_and_workspace() {
-        let deps = parse_cargo(
+        let deps = parse_deps(
+            Ecosystem::Cargo,
             "[dependencies]\nserde = \"1\"\nfancy = { package = \"real-crate\", version = \"1\" }\n\
              [dev-dependencies]\ntempfile = \"3\"\n[workspace.dependencies]\nanyhow = \"1\"\n",
         );
@@ -1072,20 +1888,36 @@ mod tests {
 
     #[test]
     fn npm_python_go_gemfile_parsing() {
-        let npm = parse_npm(r#"{"dependencies":{"react":"18"},"devDependencies":{"jest":"29"}}"#);
+        let npm = parse_deps(
+            Ecosystem::Npm,
+            r#"{"dependencies":{"react":"18"},"devDependencies":{"jest":"29"}}"#,
+        );
         assert!(npm.contains("react") && npm.contains("jest"));
 
-        let py = parse_python("requests==2.31.0\n# comment\nflask>=2\n");
+        let py = parse_deps(Ecosystem::PyPi, "requests==2.31.0\n# comment\nflask>=2\n");
         assert!(py.contains("requests") && py.contains("flask"));
 
-        let pyproject = parse_python("[project]\nname = \"x\"\ndependencies = [\"pydantic>=2\"]\n");
+        let pyproject = parse_deps(
+            Ecosystem::PyPi,
+            "[project]\nname = \"x\"\ndependencies = [\"pydantic>=2\"]\n",
+        );
         assert!(pyproject.contains("pydantic"));
 
         let go = parse_go("module m\n\nrequire (\n\tgithub.com/pkg/errors v0.9.1\n\tgolang.org/x/sys v0.1.0 // indirect\n)\n");
         assert!(go.contains("github.com/pkg/errors"));
-        assert!(!go.iter().any(|d| d.contains("x/sys")), "indirect excluded");
+        // `// indirect` used to exclude the line. It is a toolchain comment, not
+        // a trust boundary — appending it to a require was a one-line way to
+        // hide a module from this gate — so an indirect require is now visible
+        // like any other.
+        assert!(
+            go.contains("golang.org/x/sys"),
+            "an `// indirect` require is still a module in the build: {go:?}"
+        );
 
-        let gems = parse_gemfile("source 'https://rubygems.org'\ngem 'rails', '~> 7'\n");
+        let gems = parse_deps(
+            Ecosystem::RubyGems,
+            "source 'https://rubygems.org'\ngem 'rails', '~> 7'\n",
+        );
         assert!(gems.contains("rails"));
     }
 
@@ -1209,13 +2041,15 @@ mod tests {
 
     #[test]
     fn approval_warnings_flags_typosquat_offline_and_nothing_for_clean() {
-        assert!(approval_warnings("cargo:tokoi", true)
-            .iter()
-            .any(|w| w.contains("tokio")));
-        assert!(approval_warnings("cargo:serde", true).is_empty());
+        assert!(
+            approval_warnings("cargo:tokoi", TrustChecks::default(), true)
+                .iter()
+                .any(|w| w.contains("tokio"))
+        );
+        assert!(approval_warnings("cargo:serde", TrustChecks::default(), true).is_empty());
         // Unknown ecosystem or malformed input is simply not flagged.
-        assert!(approval_warnings("bogus:x", true).is_empty());
-        assert!(approval_warnings("no-colon", true).is_empty());
+        assert!(approval_warnings("bogus:x", TrustChecks::default(), true).is_empty());
+        assert!(approval_warnings("no-colon", TrustChecks::default(), true).is_empty());
     }
 
     #[test]
@@ -1223,11 +2057,13 @@ mod tests {
         let baseline = NewDep {
             qualified: "cargo:x".into(),
             reason: NewDepReason::NotInBaseline,
+            source: Some(DepSource::Registry),
         };
         assert!(baseline.explain().contains("approved baseline"));
         let source = NewDep {
             qualified: "cargo:serde".into(),
             reason: NewDepReason::NonRegistrySource("git source u".into()),
+            source: Some(DepSource::Git("u".into())),
         };
         assert!(source.explain().contains("non-registry source"));
     }
@@ -1342,7 +2178,7 @@ mod tests {
 
     #[test]
     fn parse_cargo_on_unparseable_toml_yields_an_empty_set_not_a_panic() {
-        assert!(parse_cargo("this is { not valid toml").is_empty());
+        assert!(parse_deps(Ecosystem::Cargo, "this is { not valid toml").is_empty());
     }
 
     // ───────────────────────── python parsing edge cases ─────────────────────
@@ -1351,33 +2187,199 @@ mod tests {
     fn parse_python_pyproject_skips_non_string_and_unnameable_array_entries() {
         // TOML 1.0 arrays may be heterogeneous; a stray integer and an empty
         // string must be skipped rather than corrupting the result.
-        let deps =
-            parse_python("[project]\nname = \"x\"\ndependencies = [123, \"\", \"pydantic>=2\"]\n");
+        let deps = parse_deps(
+            Ecosystem::PyPi,
+            "[project]\nname = \"x\"\ndependencies = [123, \"\", \"pydantic>=2\"]\n",
+        );
         assert_eq!(deps, BTreeSet::from(["pydantic".to_string()]));
     }
 
+    /// M10: a pyproject.toml is never line-scanned as if it were pip
+    /// requirements.
+    ///
+    /// It used to be, whenever the PEP 621 read came up empty — and a
+    /// line-oriented scan of TOML source does not find dependencies, it finds
+    /// bare keys. A minimal pyproject.toml declaring no dependencies at all
+    /// yielded two: `name` and `version`.
     #[test]
-    fn parse_python_pyproject_without_a_dependencies_array_falls_back_to_a_line_scan() {
-        // A minimal PEP 621 pyproject.toml with no `[project.dependencies]`
-        // array is still valid TOML, so parsing does not early-return; it
-        // falls through to the requirements.txt-shaped scan of the same raw
-        // text. That scan is line-oriented and does not understand TOML
-        // table syntax, so it picks up bare keys like `name`/`version` as
-        // candidate names — a known limitation (see the accompanying report:
-        // Poetry-style `[tool.poetry.dependencies]` manifests hit this same
-        // path and deserve first-class parsing instead of this accidental
-        // fallback).
-        let deps = parse_python("[project]\nname = \"mypkg\"\nversion = \"0.1.0\"\n");
-        assert_eq!(
-            deps,
-            BTreeSet::from(["name".to_string(), "version".to_string()])
+    fn a_pyproject_declaring_nothing_yields_nothing_not_its_own_toml_keys() {
+        let deps = parse_deps(
+            Ecosystem::PyPi,
+            "[project]\nname = \"mypkg\"\nversion = \"0.1.0\"\n",
+        );
+        assert!(
+            deps.is_empty(),
+            "a pyproject.toml with no dependency section declares no \
+             dependencies; `name`/`version` are TOML keys, not packages: {deps:?}"
+        );
+
+        // A build-system-only pyproject is the same story.
+        assert!(parse_deps(
+            Ecosystem::PyPi,
+            "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+        )
+        .is_empty());
+
+        // …and the requirements.txt path is untouched: a real requirements file
+        // is not valid TOML, so it still line-scans.
+        assert!(parse_deps(Ecosystem::PyPi, "requests==2.31.0\nflask>=2\n").contains("requests"));
+    }
+
+    /// M10: Poetry manifests produced a garbage trust baseline.
+    ///
+    /// Poetry declares dependencies in `[tool.poetry.dependencies]`, so the
+    /// PEP 621 read found nothing and the file fell through to the pip line
+    /// scan. The result was not "some dependencies missed" — it was
+    /// `python` and `version` written into `.sscsb/policy/packages.toml` as
+    /// approved packages, and the real dependencies never seen at all.
+    #[test]
+    fn poetry_dependencies_are_parsed_instead_of_line_scanned_into_nonsense() {
+        let specs = python_specs(
+            "[tool.poetry]\n\
+             name = \"mypkg\"\n\
+             version = \"0.1.0\"\n\
+             [tool.poetry.dependencies]\n\
+             python = \"^3.11\"\n\
+             requests = \"^2.31\"\n\
+             pydantic = { version = \"^2.0\", extras = [\"email\"] }\n\
+             evil = { git = \"https://evil.example/x.git\", branch = \"main\" }\n\
+             localpkg = { path = \"../localpkg\" }\n\
+             wheelpkg = { url = \"https://evil.example/x.whl\" }\n\
+             privpkg = { version = \"^1\", source = \"corp\" }\n\
+             [tool.poetry.dev-dependencies]\n\
+             pytest = \"^7\"\n\
+             [tool.poetry.group.docs.dependencies]\n\
+             sphinx = \"^7\"\n\
+             [[tool.poetry.source]]\n\
+             name = \"corp\"\n\
+             url = \"https://corp.example/simple\"\n",
+        );
+        let names: BTreeSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+
+        // The real dependencies, from all three declaration shapes.
+        assert!(names.contains("requests"), "{specs:?}");
+        assert!(names.contains("pydantic"), "{specs:?}");
+        assert!(
+            names.contains("pytest"),
+            "legacy dev-dependencies: {specs:?}"
+        );
+        assert!(names.contains("sphinx"), "poetry groups: {specs:?}");
+
+        // The nonsense the line scan used to invent.
+        assert!(
+            !names.contains("python"),
+            "`python` is the interpreter constraint, not a package: {specs:?}"
+        );
+        assert!(
+            !names.contains("version") && !names.contains("name"),
+            "TOML keys are not packages: {specs:?}"
+        );
+
+        // Sources are classified, so a repointed Poetry dependency is a fresh
+        // trust decision rather than a name that looks unchanged.
+        assert!(matches!(source_of(&specs, "evil"), DepSource::Git(_)));
+        assert!(matches!(source_of(&specs, "localpkg"), DepSource::Path(_)));
+        assert!(matches!(source_of(&specs, "wheelpkg"), DepSource::Url(_)));
+        assert!(matches!(source_of(&specs, "privpkg"), DepSource::Other(_)));
+        assert_eq!(*source_of(&specs, "requests"), DepSource::Registry);
+        assert_eq!(*source_of(&specs, "pydantic"), DepSource::Registry);
+        assert!(
+            specs
+                .iter()
+                .any(|s| matches!(s.source, DepSource::Index(_))
+                    && s.name.contains("corp.example")),
+            "an added [[tool.poetry.source]] re-points every name in the file: {specs:?}"
+        );
+    }
+
+    /// Poetry's multi-constraint form is one package with several alternatives,
+    /// each of which may carry its own source.
+    #[test]
+    fn poetry_multiple_constraint_dependencies_are_read_per_alternative() {
+        let specs = python_specs(
+            "[tool.poetry.dependencies]\n\
+             backport = [\n\
+               { version = \"^1.0\", python = \"<3.9\" },\n\
+               { git = \"https://evil.example/backport.git\", python = \">=3.9\" },\n\
+             ]\n",
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name == "backport" && s.source == DepSource::Registry),
+            "{specs:?}"
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name == "backport" && matches!(s.source, DepSource::Git(_))),
+            "the git alternative must be its own trust unit: {specs:?}"
+        );
+    }
+
+    /// TOML permits shapes these sections do not — a scalar where a table
+    /// belongs. A hand-broken (or deliberately shaped) manifest must not take
+    /// the dependencies declared beside it down with it, because a section the
+    /// gate silently drops is a section an attacker can hide a package in.
+    #[test]
+    fn malformed_tool_sections_do_not_swallow_the_dependencies_beside_them() {
+        let deps = parse_deps(
+            Ecosystem::PyPi,
+            "[project]\ndependencies = [\"requests\"]\n\
+             [tool.hatch.envs]\ndefault = \"not-a-table\"\n\
+             [tool.pdm]\ndev-dependencies = \"not-a-table\"\n\
+             [tool.uv]\ndev-dependencies = \"not-an-array\"\n\
+             [tool.poetry.dependencies]\nflask = \"^2\"\n",
+        );
+        assert!(deps.contains("requests"), "{deps:?}");
+        assert!(deps.contains("flask"), "{deps:?}");
+        assert!(
+            !deps.contains("default") && !deps.contains("dev-dependencies"),
+            "a malformed section names no package: {deps:?}"
+        );
+    }
+
+    /// The other `[tool.*]` backends that hold plain requirement arrays. Each
+    /// used to line-scan into its own group NAME (`test`, `lint`) instead of the
+    /// packages inside it.
+    #[test]
+    fn pdm_uv_and_hatch_dependency_sections_are_parsed() {
+        let pdm = parse_deps(
+            Ecosystem::PyPi,
+            "[tool.pdm.dev-dependencies]\ntest = [\"pytest>=7\"]\nlint = [\"ruff\"]\n",
+        );
+        assert!(pdm.contains("pytest") && pdm.contains("ruff"), "{pdm:?}");
+        assert!(!pdm.contains("test") && !pdm.contains("lint"), "{pdm:?}");
+
+        let uv = parse_deps(
+            Ecosystem::PyPi,
+            "[tool.uv]\ndev-dependencies = [\"pytest>=7\", \"mypy\"]\n",
+        );
+        assert!(uv.contains("pytest") && uv.contains("mypy"), "{uv:?}");
+
+        let hatch = parse_deps(
+            Ecosystem::PyPi,
+            "[tool.hatch.envs.default]\ndependencies = [\"coverage\"]\n\
+             [tool.hatch.envs.docs]\nextra-dependencies = [\"mkdocs\"]\n",
+        );
+        assert!(
+            hatch.contains("coverage") && hatch.contains("mkdocs"),
+            "{hatch:?}"
         );
     }
 
     #[test]
     fn parse_python_requirements_txt_skips_directives_blanks_and_unnameable_lines() {
-        let deps = parse_python("# a comment\n-e .\n\n==1.0\nrequests\n");
-        assert_eq!(deps, BTreeSet::from(["requests".to_string()]));
+        // `-e .` is no longer skipped: an editable install IS a dependency, and
+        // `-e` was the same option prefix that hid `-e git+https://…`. A local
+        // editable path is recorded as a path source, which the commit gate
+        // exempts when it stays inside the repo — so nothing new blocks — while
+        // `==1.0` (no name) and comments are still dropped.
+        let deps = parse_deps(Ecosystem::PyPi, "# a comment\n-e .\n\n==1.0\nrequests\n");
+        assert_eq!(
+            deps,
+            BTreeSet::from([".".to_string(), "requests".to_string()])
+        );
     }
 
     // ───────────────────────── Ctx-backed deps surface ────────────────────────
@@ -1481,6 +2483,171 @@ mod tests {
         );
     }
 
+    /// M9: `deps check` and `deps baseline` only ever read ROOT manifests, while
+    /// the commit gate matches a staged file by BASENAME anywhere in the tree.
+    ///
+    /// The disagreement had teeth. `sscsb deps baseline` blessed `Cargo.toml`,
+    /// never saw `sub/package.json`, and the gate then blocked the commit on a
+    /// dependency from it that `baseline` had no way to approve — leaving
+    /// `sscsb deps approve`, one package at a time, as the only route. This
+    /// repo's own `.sscsb/policy/packages.toml` carries the scar: `libfuzzer-sys`
+    /// and `sscsb` are in it because `fuzz/Cargo.toml` had to be hand-approved.
+    ///
+    /// The invariant is the whole finding: everything the gate can block must be
+    /// something the baseline can bless.
+    #[test]
+    fn baseline_sees_every_manifest_the_commit_gate_can_block_on() {
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\nserde = \"1\"\n");
+        write_file(
+            &ctx,
+            "sub/package.json",
+            r#"{"dependencies":{"left-pad":"1"}}"#,
+        );
+        write_file(&ctx, "services/api/requirements.txt", "flask>=2\n");
+        write_file(
+            &ctx,
+            "tools/go.mod",
+            "module m\n\nrequire example.com/x v1.0.0\n",
+        );
+        stage(&ctx, ".");
+
+        let gated = unapproved_new_packages(&ctx).unwrap();
+        assert!(
+            gated.contains(&"npm:left-pad".to_string()),
+            "the gate matches a manifest basename anywhere: {gated:?}"
+        );
+
+        let current = current_deps(&ctx).unwrap();
+        for pkg in &gated {
+            assert!(
+                current.contains(pkg),
+                "the gate blocks `{pkg}` but `deps baseline` cannot see it, so it \
+                 cannot be blessed in bulk — only one `deps approve` at a time. \
+                 baseline sees: {current:?}"
+            );
+        }
+        assert!(current.contains("cargo:serde"), "{current:?}");
+        assert!(current.contains("npm:left-pad"), "{current:?}");
+        assert!(current.contains("pypi:flask"), "{current:?}");
+        assert!(current.contains("go:example.com/x"), "{current:?}");
+
+        // `deps baseline` itself runs on the source-aware view; it must agree.
+        let specs = current_dep_specs(&ctx).unwrap();
+        let qualified: BTreeSet<String> = specs
+            .iter()
+            .map(|(eco, s)| format!("{}:{}", eco.label(), s.name))
+            .collect();
+        assert_eq!(qualified, current, "the two views must not drift apart");
+    }
+
+    /// The widened search stays inside git's universe. A manifest under a
+    /// gitignored directory — `node_modules/`, `target/`, a vendored tree — can
+    /// never reach the commit gate, so baselining it would approve thousands of
+    /// packages nobody is committing.
+    #[test]
+    fn baseline_ignores_manifests_git_does_not_track() {
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, ".gitignore", "node_modules/\n");
+        write_file(&ctx, "Cargo.toml", "[dependencies]\nserde = \"1\"\n");
+        write_file(
+            &ctx,
+            "node_modules/leftpad/package.json",
+            r#"{"dependencies":{"transitive-junk":"1"}}"#,
+        );
+        stage(&ctx, ".");
+
+        let current = current_deps(&ctx).unwrap();
+        assert!(current.contains("cargo:serde"));
+        assert!(
+            !current.contains("npm:transitive-junk"),
+            "a gitignored manifest can never reach the gate, so it must not \
+             reach the baseline either: {current:?}"
+        );
+        // …and the gate agrees, which is the point.
+        assert!(!unapproved_new_packages(&ctx)
+            .unwrap()
+            .contains(&"npm:transitive-junk".to_string()));
+    }
+
+    /// A manifest that is present but unreadable must fail the gate closed.
+    ///
+    /// Before this, every parser turned a parse failure into an EMPTY dependency
+    /// set, so the staged-vs-HEAD diff found nothing new and the commit passed
+    /// with no output at all. The cheapest trigger is a UTF-8 BOM on
+    /// `package.json`: npm strips it and installs happily, `serde_json` does
+    /// not. Reproduced end to end — clean manifest blocked at exit 1, the same
+    /// manifest with a BOM exited 0 silently.
+    #[test]
+    fn unparseable_staged_manifest_blocks_instead_of_reading_as_no_dependencies() {
+        for (file, baseline, broken) in [
+            (
+                "package.json",
+                r#"{"dependencies":{"lodash":"4"}}"#.to_string(),
+                // BOM first: the package manager tolerates it, the parser does not.
+                format!("\u{feff}{}", r#"{"dependencies":{"evil-abc":"1"}}"#),
+            ),
+            (
+                "package.json",
+                r#"{"dependencies":{"lodash":"4"}}"#.to_string(),
+                "// deps\n{\"dependencies\":{\"evil-abc\":\"1\"}}".to_string(),
+            ),
+            (
+                "Cargo.toml",
+                "[dependencies]\nserde = \"1\"\n".to_string(),
+                "[dependencies]\nserde = \"1\"\n= = =\n".to_string(),
+            ),
+        ] {
+            let (_d, ctx) = repo_ctx();
+            write_file(&ctx, file, &baseline);
+            stage(&ctx, file);
+            exec::git_raw(&["commit", "-m", "base", "--no-verify"], &ctx.root).unwrap();
+
+            write_file(&ctx, file, &broken);
+            stage(&ctx, file);
+
+            let found = new_unapproved_deps(&ctx).unwrap();
+            assert_eq!(
+                found.len(),
+                1,
+                "{file}: an unreadable manifest must produce exactly one problem, got {found:?}"
+            );
+            assert!(
+                matches!(found[0].reason, NewDepReason::UnparseableManifest(_)),
+                "{file}: expected UnparseableManifest, got {:?}",
+                found[0].reason
+            );
+            assert!(
+                found[0].explain().contains("UNKNOWN, not none"),
+                "the message must say why an empty read is not a clean read"
+            );
+        }
+    }
+
+    /// The guard must not fire on manifests that legitimately declare nothing,
+    /// or on the three line-scanned formats that have no parse step at all.
+    #[test]
+    fn manifest_parse_error_distinguishes_unreadable_from_empty() {
+        // Structured formats: real failures.
+        assert!(manifest_parse_error(Ecosystem::Npm, "package.json", "{ not json").is_some());
+        assert!(manifest_parse_error(Ecosystem::Cargo, "Cargo.toml", "= = =").is_some());
+        assert!(
+            manifest_parse_error(Ecosystem::PyPi, "pyproject.toml", "= = =").is_some(),
+            "pyproject.toml is TOML and must be checked as TOML"
+        );
+
+        // Valid, and validly empty.
+        assert!(manifest_parse_error(Ecosystem::Npm, "package.json", "{}").is_none());
+        assert!(manifest_parse_error(Ecosystem::Cargo, "Cargo.toml", "").is_none());
+        assert!(manifest_parse_error(Ecosystem::Npm, "package.json", "   \n ").is_none());
+
+        // Line-scanned formats cannot fail to parse; they match fewer lines.
+        // These are None by construction, not by omission.
+        assert!(manifest_parse_error(Ecosystem::PyPi, "requirements.txt", "= = =").is_none());
+        assert!(manifest_parse_error(Ecosystem::Go, "go.mod", "= = =").is_none());
+        assert!(manifest_parse_error(Ecosystem::RubyGems, "Gemfile", "= = =").is_none());
+    }
+
     #[test]
     fn unapproved_new_packages_diffs_staged_content_against_head() {
         let (_d, ctx) = repo_ctx();
@@ -1515,22 +2682,253 @@ mod tests {
         );
     }
 
+    /// M17 (a): `sha1`, `sha2` and `sha3` are three different, ubiquitous
+    /// crates. Each was reported as a typosquat of the others, so baselining a
+    /// perfectly ordinary hashing dependency needed `--force`. A false
+    /// "unapproved dependency" blocks somebody's commit; that is the expensive
+    /// direction to be wrong in.
     #[test]
-    fn typosquat_suspect_is_none_for_ecosystems_without_a_curated_popular_list() {
-        // POPULAR only curates cargo/npm/pypi; go and rubygems fall through
-        // the lookup's `?` and correctly return None rather than panicking.
+    fn digit_variant_siblings_are_a_family_not_a_typosquat() {
+        // `sha2` is the POPULAR entry; its siblings must clear.
+        assert_eq!(typosquat_suspect(Ecosystem::Cargo, "sha1"), None);
+        assert_eq!(typosquat_suspect(Ecosystem::Cargo, "sha3"), None);
+        // `base64` is a POPULAR entry and `base32` is a real crate.
+        assert_eq!(typosquat_suspect(Ecosystem::Cargo, "base32"), None);
+        // Go: `gopkg.in/yaml.v2` and `.v3` are both in wide use.
+        assert_eq!(
+            typosquat_suspect(Ecosystem::Go, "gopkg.in/yaml.v2"),
+            None,
+            "the two live major versions of a module are not typos of each other"
+        );
+
+        // …and none of the three guards may be relaxed. Each of these is still
+        // a suspect, which is what stops the exemption becoming a bypass.
+        assert_eq!(
+            typosquat_suspect(Ecosystem::Cargo, "shal"),
+            Some("sha2"),
+            "a lookalike letter for the digit is exactly the squat this catches"
+        );
+        assert_eq!(
+            typosquat_suspect(Ecosystem::Cargo, "sha22"),
+            Some("sha2"),
+            "differing digit-run LENGTH is an appended digit, not a sibling"
+        );
+        assert_eq!(
+            typosquat_suspect(Ecosystem::PyPi, "boto"),
+            Some("boto3"),
+            "only one side carries digits — dropping the `3` is a squat shape"
+        );
+        assert_eq!(
+            typosquat_suspect(Ecosystem::Cargo, "sha"),
+            Some("sha2"),
+            "same: no digit suffix on one side"
+        );
+
+        // The predicate itself, at its boundaries.
+        assert!(digit_variant_siblings("sha1", "sha2"));
+        assert!(!digit_variant_siblings("sha1", "sha1")); // identical digits
+        assert!(!digit_variant_siblings("sha", "sha2")); // one side bare
+        assert!(!digit_variant_siblings("sha2", "sha22")); // different lengths
+        assert!(!digit_variant_siblings("1", "2")); // empty stem
+        assert!(!digit_variant_siblings("abc1", "xyz2")); // different stems
+    }
+
+    /// M17 (b): `POPULAR` curated cargo/npm/pypi only, so `typosquat_suspect`
+    /// fell out of the lookup's `?` for Go and RubyGems and two whole
+    /// ecosystems had NO typosquat coverage — `sscsb deps check` on a Go or
+    /// Rails repo could not flag a single lookalike.
+    #[test]
+    fn go_and_rubygems_have_typosquat_coverage() {
+        // Go: a transposed module path.
+        assert_eq!(
+            typosquat_suspect(Ecosystem::Go, "github.com/stretchr/testfiy"),
+            Some("github.com/stretchr/testify")
+        );
+        // Go's own hazard: module paths are case-sensitive, so a capitalised
+        // path is a different module that reads identically.
+        assert_eq!(
+            typosquat_suspect(Ecosystem::Go, "github.com/Sirupsen/logrus"),
+            Some("github.com/sirupsen/logrus")
+        );
+        // The real ones still clear.
         assert_eq!(
             typosquat_suspect(Ecosystem::Go, "github.com/pkg/errors"),
             None
         );
+        assert_eq!(typosquat_suspect(Ecosystem::Go, "golang.org/x/sync"), None);
+        assert_eq!(
+            typosquat_suspect(Ecosystem::Go, "github.com/something/entirely-else"),
+            None
+        );
+
+        // RubyGems.
+        assert_eq!(
+            typosquat_suspect(Ecosystem::RubyGems, "nokogiri "),
+            Some("nokogiri"),
+            "a trailing space is a distinct gem name one edit away"
+        );
+        assert_eq!(
+            typosquat_suspect(Ecosystem::RubyGems, "sinatr"),
+            Some("sinatra")
+        );
         assert_eq!(typosquat_suspect(Ecosystem::RubyGems, "rails"), None);
+        // `rake` and `rack` are one edit apart and BOTH real: listing both is
+        // what keeps each from being reported as a squat of the other.
+        assert_eq!(typosquat_suspect(Ecosystem::RubyGems, "rake"), None);
+        assert_eq!(typosquat_suspect(Ecosystem::RubyGems, "rack"), None);
+        assert_eq!(
+            typosquat_suspect(Ecosystem::RubyGems, "unrelated-gem"),
+            None
+        );
+    }
+
+    /// Structural guard for the same finding: every ecosystem sscsb can parse
+    /// must have a curated list, or `typosquat_suspect` drops out of the
+    /// lookup's `?` and that ecosystem gets no coverage at all — silently, with
+    /// `deps check` reporting clean.
+    ///
+    /// And every curated name must clear its own ecosystem's heuristic,
+    /// otherwise adding a protected name silently converts it into a suspect —
+    /// which is precisely the `rake`/`rack` trap.
+    #[test]
+    fn every_ecosystem_has_a_popular_list_and_no_curated_name_is_a_suspect() {
+        for eco in [
+            Ecosystem::Cargo,
+            Ecosystem::Npm,
+            Ecosystem::PyPi,
+            Ecosystem::Go,
+            Ecosystem::RubyGems,
+        ] {
+            assert!(
+                POPULAR.iter().any(|(label, _)| *label == eco.label()),
+                "`{}` has no curated popular list, so it has no typosquat coverage at all",
+                eco.label()
+            );
+        }
+        for (label, names) in POPULAR {
+            let eco = Ecosystem::from_label(label).expect("POPULAR label is an ecosystem");
+            for name in *names {
+                assert_eq!(
+                    typosquat_suspect(eco, name),
+                    None,
+                    "{label}: `{name}` is curated as popular and must never be \
+                     reported as a squat of another curated name"
+                );
+            }
+        }
+    }
+
+    // ── M21: two config keys that used to do nothing ──
+
+    fn checks_from_toml(body: &str) -> TrustChecks {
+        let dir = tempfile::tempdir().unwrap();
+        let sscsb = dir.path().join(".sscsb");
+        std::fs::create_dir_all(&sscsb).unwrap();
+        std::fs::write(sscsb.join("config.toml"), body).unwrap();
+        let cfg = Config::load(dir.path()).unwrap().unwrap();
+        TrustChecks::from_config(Some(&cfg))
+    }
+
+    #[test]
+    fn typosquat_check_false_actually_switches_the_heuristic_off() {
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\ntokoi = \"1\"\n");
+
+        let on = checks_from_toml("[controls.package-trust]\ntyposquat_check = true\n");
+        let (problems, _) = deps_check(&ctx, on, true).unwrap();
+        assert!(
+            problems.iter().any(|p| p.contains("typosquat")),
+            "sanity: the heuristic fires when on: {problems:?}"
+        );
+
+        let off = checks_from_toml("[controls.package-trust]\ntyposquat_check = false\n");
+        let (problems, _) = deps_check(&ctx, off, true).unwrap();
+        assert!(
+            !problems.iter().any(|p| p.contains("typosquat")),
+            "the key was written into every config and did nothing: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn typosquat_check_false_also_reaches_approval_time() {
+        let off = checks_from_toml("[controls.package-trust]\ntyposquat_check = false\n");
+        assert!(
+            approval_warnings("cargo:tokoi", off, true).is_empty(),
+            "a toggle that only covers `deps check` leaves the approval path \
+             contradicting the config"
+        );
+        assert!(
+            !approval_warnings("cargo:tokoi", TrustChecks::default(), true).is_empty(),
+            "sanity: on by default"
+        );
+    }
+
+    /// `registry_check` had a reader, but it only decided whether `sscsb verify`
+    /// printed a sentence — `deps check` performed the lookup either way.
+    ///
+    /// Note `offline = false`: the network is deliberately NOT the thing being
+    /// tested. Post-fix no lookup is attempted at all, so every arm of
+    /// `registry_exists` — Exists, NotFound, Unknown — is unreachable and the
+    /// test is connectivity-independent; pre-fix, one of those three strings was
+    /// always pushed. The assertion names those result strings rather than the
+    /// word "registry", because the run now also carries an explanatory note
+    /// saying the check did not run, and suppressing THAT would put us back to
+    /// silence the user cannot interpret.
+    #[test]
+    fn registry_check_false_suppresses_the_lookup_not_just_the_sentence() {
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\nserde = \"1\"\n");
+        let off = checks_from_toml("[controls.package-trust]\nregistry_check = false\n");
+        let (problems, notes) = deps_check(&ctx, off, false).unwrap();
+        for verdict in ["exists on registry", "registry check inconclusive"] {
+            assert!(
+                !notes.iter().any(|n| n.contains(verdict)),
+                "registry_check = false must stop the check, not just stop describing it \
+                 (found `{verdict}`): {notes:?}"
+            );
+        }
+        assert!(
+            !problems.iter().any(|p| p.contains("NOT FOUND")),
+            "no lookup ran, so no lookup verdict may appear: {problems:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("registry_check = false")),
+            "a check that did not run must say so, or the user cannot tell it from \
+             a check that ran and found nothing: {notes:?}"
+        );
+    }
+
+    /// The same honesty requirement for the other key.
+    #[test]
+    fn a_typosquat_check_that_did_not_run_says_so() {
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\ntokoi = \"1\"\n");
+        let off = checks_from_toml("[controls.package-trust]\ntyposquat_check = false\n");
+        let (problems, notes) = deps_check(&ctx, off, true).unwrap();
+        assert!(
+            !problems.iter().any(|p| p.contains("typosquat")),
+            "{problems:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("typosquat_check = false")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_control_running_with_half_its_checks_off_does_not_report_a_whole_pass() {
+        assert!(TrustChecks::default().registry && TrustChecks::default().typosquat);
+        let off = checks_from_toml(
+            "[controls.package-trust]\nregistry_check = false\ntyposquat_check = true\n",
+        );
+        assert!(!off.registry && off.typosquat);
     }
 
     #[test]
     fn deps_check_offline_flags_typosquats_and_never_touches_the_network() {
         let (_d, ctx) = repo_ctx();
         write_file(&ctx, "Cargo.toml", "[dependencies]\ntokoi = \"1\"\n");
-        let (problems, notes) = deps_check(&ctx, true).unwrap();
+        let (problems, notes) = deps_check(&ctx, TrustChecks::default(), true).unwrap();
         assert!(
             problems
                 .iter()
@@ -1561,7 +2959,7 @@ mod tests {
             "[dependencies]\nserde = \"1\"\ntokoi = \"1\"\n",
         );
         stage(&ctx, "Cargo.toml");
-        let (problems, notes) = deps_check(&ctx, true).unwrap();
+        let (problems, notes) = deps_check(&ctx, TrustChecks::default(), true).unwrap();
         assert!(notes
             .iter()
             .any(|n| n.contains("checking 1 staged new package")));
@@ -1571,14 +2969,70 @@ mod tests {
     }
 
     #[test]
-    fn deps_check_online_leaves_a_registry_note_for_every_target_regardless_of_connectivity() {
+    fn deps_check_online_records_the_registry_outcome_for_every_target() {
         let (_d, ctx) = repo_ctx();
         write_file(&ctx, "Cargo.toml", "[dependencies]\nserde = \"1\"\n");
-        let (problems, notes) = deps_check(&ctx, false).unwrap();
+        let (problems, notes) = deps_check(&ctx, TrustChecks::default(), false).unwrap();
         assert!(!problems.iter().any(|p| p.contains("typosquat")));
+        // Online: `serde` exists → a note. Degraded: the lookup could not
+        // answer → a PROBLEM, never silence. Either way the outcome is on the
+        // record; what must never happen is neither.
         assert!(
-            !notes.is_empty(),
-            "the registry outcome for `serde` must always be recorded, online or degraded: {notes:?}"
+            notes.iter().any(|n| n.contains("cargo:serde"))
+                || problems.iter().any(|p| p.contains("cargo:serde")),
+            "the registry outcome for `serde` must always be recorded, online or \
+             degraded: problems={problems:?} notes={notes:?}"
+        );
+    }
+
+    /// M11: a registry outage used to report `deps check: clean` at exit 0.
+    ///
+    /// The two `registry_exists` callers disagreed about what `Unknown` means:
+    /// `approval_warnings_for` treated it as a reason not to approve, while
+    /// `deps_check` filed it as a *note*, left `problems` empty, and let the CLI
+    /// print `deps check: clean`. One blocked DNS lookup, one corporate proxy,
+    /// one crates.io 503, and the anti-slopsquat control passed every
+    /// hallucinated name in the manifest.
+    ///
+    /// The lookup is injected, so this proves the policy without a network call
+    /// and without waiting for a real outage.
+    #[test]
+    fn a_registry_outage_is_a_problem_not_a_clean_check() {
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\nsome-crate = \"1\"\n");
+        let outage = |_: Ecosystem, _: &str| RegistryStatus::Unknown("dns error".into());
+
+        let (problems, notes) =
+            deps_check_with(&ctx, TrustChecks::default(), false, outage).unwrap();
+        assert!(
+            problems.iter().any(
+                |p| p.contains("cargo:some-crate") && p.contains("registry check inconclusive")
+            ),
+            "an unanswered existence check must fail the check, not annotate it: \
+             problems={problems:?} notes={notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|n| n.contains("some-crate")),
+            "an outage must not be filed as a passing note: {notes:?}"
+        );
+
+        // …and the two callers now agree, because they share one verdict.
+        let status = RegistryStatus::Unknown("dns error".into());
+        assert_eq!(
+            registry_problem("cargo:some-crate", &status),
+            problems.first().cloned(),
+            "`deps check` and `deps approve` must reach the same verdict"
+        );
+        assert!(registry_problem("cargo:serde", &RegistryStatus::Exists).is_none());
+        assert!(registry_problem("cargo:nope", &RegistryStatus::NotFound)
+            .is_some_and(|p| p.contains("NOT FOUND")));
+
+        // `--offline` remains the deliberate way to decline the question.
+        let (offline_problems, _) =
+            deps_check_with(&ctx, TrustChecks::default(), true, outage).unwrap();
+        assert!(
+            offline_problems.is_empty(),
+            "--offline declines the existence check on purpose: {offline_problems:?}"
         );
     }
 
@@ -1639,6 +3093,44 @@ mod tests {
         assert_eq!(verify_package_trust(&ctx, cfg).outcome, Outcome::Pass);
     }
 
+    /// Regression (H4): a baseline file that exists but cannot be parsed is not
+    /// a baseline of zero packages — it is a baseline the commit gate cannot
+    /// evaluate. `load_approved(..).map(len).unwrap_or(0)` swallowed the parse
+    /// error and reported `approved baseline present (0 package(s))` under a
+    /// PASS verdict, so corrupting the file looked healthier than deleting it.
+    #[test]
+    fn verify_package_trust_degrades_when_the_baseline_cannot_be_parsed() {
+        let (_d, ctx) = repo_ctx();
+        let cfg = ctx.require_config().unwrap();
+        // Sanity: the pristine bootstrapped baseline passes.
+        assert_eq!(verify_package_trust(&ctx, cfg).outcome, Outcome::Pass);
+
+        // One appended line — the whole file stops parsing.
+        let path = packages_policy_path(&ctx);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("garbage [ not toml\n");
+        std::fs::write(&path, text).unwrap();
+
+        let result = verify_package_trust(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.contains("approved baseline UNREADABLE")),
+            "{:?}",
+            result.messages
+        );
+        assert!(
+            !result
+                .messages
+                .iter()
+                .any(|m| m.contains("baseline present (0 package(s))")),
+            "an unparseable baseline must never be reported as an empty one: {:?}",
+            result.messages
+        );
+    }
+
     #[test]
     fn verify_socket_control_reports_presence_or_absence_of_sfw() {
         let (_d, ctx) = repo_ctx();
@@ -1659,14 +3151,357 @@ mod tests {
 
     #[test]
     fn path_within_repo_exempts_intree_but_not_escapes() {
+        // None of these exist on disk, so only the lexical walk can answer —
+        // which is the case the physical check must leave alone.
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
         // in-tree (own code) — exempt
-        assert!(path_resolves_within_repo("fuzz/Cargo.toml", "..")); // → repo root
-        assert!(path_resolves_within_repo("fuzz/Cargo.toml", "../src"));
-        assert!(path_resolves_within_repo("Cargo.toml", "."));
-        assert!(path_resolves_within_repo("a/b/Cargo.toml", "../.."));
+        assert!(path_resolves_within_repo(root, "fuzz/Cargo.toml", "..")); // → repo root
+        assert!(path_resolves_within_repo(root, "fuzz/Cargo.toml", "../src"));
+        assert!(path_resolves_within_repo(root, "Cargo.toml", "."));
+        assert!(path_resolves_within_repo(root, "a/b/Cargo.toml", "../.."));
         // escapes the repo — still flagged
-        assert!(!path_resolves_within_repo("fuzz/Cargo.toml", "../.."));
-        assert!(!path_resolves_within_repo("Cargo.toml", ".."));
-        assert!(!path_resolves_within_repo("fuzz/Cargo.toml", "/etc/passwd"));
+        assert!(!path_resolves_within_repo(root, "fuzz/Cargo.toml", "../.."));
+        assert!(!path_resolves_within_repo(root, "Cargo.toml", ".."));
+        assert!(!path_resolves_within_repo(
+            root,
+            "fuzz/Cargo.toml",
+            "/etc/passwd"
+        ));
+    }
+
+    /// The physical half of the same predicate. A lexical walk can only tell
+    /// you how a path is SPELLED; `link/pkg` spells an in-tree location while
+    /// resolving anywhere the symlink points.
+    #[cfg(unix)]
+    #[test]
+    fn path_within_repo_follows_symlinks_before_deciding() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("pkg")).unwrap();
+        std::fs::create_dir_all(root.path().join("real")).unwrap();
+        symlink(outside.path(), root.path().join("link")).unwrap();
+
+        assert!(
+            !path_resolves_within_repo(root.path(), "Cargo.toml", "link/pkg"),
+            "a symlink out of the repo is not the repo's own reviewed code"
+        );
+        // A real in-tree directory still resolves in-tree.
+        assert!(path_resolves_within_repo(root.path(), "Cargo.toml", "real"));
+    }
+
+    // ───────── H7: declaration classes that must not be invisible ─────────
+    //
+    // Each of these is a way to put code into the build that the trust gate
+    // never looked at. They are regressions, not features: every one of them
+    // passed at exit 0 before the parsers below learned to read the section.
+
+    /// `[target.'cfg(unix)'.dependencies]` is a real, buildable dependency
+    /// table. Reading only the three unconditional tables meant a
+    /// platform-gated dependency was never a "new package" at all.
+    #[test]
+    fn cargo_target_specific_sections_are_not_invisible() {
+        let specs = cargo_specs(
+            "[dependencies]\n\
+             serde = \"1\"\n\
+             [target.'cfg(unix)'.dependencies]\n\
+             unixdep = \"1\"\n\
+             [target.\"cfg(windows)\".dev-dependencies]\n\
+             windep = \"1\"\n\
+             [target.'cfg(target_os = \"macos\")'.build-dependencies]\n\
+             macdep = \"1\"\n\
+             [target.'cfg(unix)'.dependencies.gitdep]\n\
+             git = \"https://evil.example/repo\"\n",
+        );
+        let names: BTreeSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains("unixdep"), "{specs:?}");
+        assert!(names.contains("windep"), "{specs:?}");
+        assert!(names.contains("macdep"), "{specs:?}");
+        assert!(
+            matches!(source_of(&specs, "gitdep"), DepSource::Git(_)),
+            "a target-gated git source must still classify as git: {specs:?}"
+        );
+        // The name-only view must agree — it feeds the baseline.
+        assert!(parse_deps(
+            Ecosystem::Cargo,
+            "[target.'cfg(unix)'.dependencies]\nunixdep = \"1\"\n"
+        )
+        .contains("unixdep"));
+    }
+
+    /// `[patch.crates-io]` is the nastiest of the class: the NAME stays the
+    /// already-approved one while the CODE is replaced wholesale by an
+    /// attacker-controlled git checkout. A name-keyed diff sees nothing.
+    /// `[replace]` is the deprecated spelling of the same swap.
+    #[test]
+    fn cargo_patch_and_replace_repoint_a_trusted_name_to_an_untrusted_source() {
+        let specs = cargo_specs(
+            "[dependencies]\n\
+             serde = \"1\"\n\
+             [patch.crates-io]\n\
+             serde = { git = \"https://evil.example/serde\" }\n",
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name == "serde" && matches!(s.source, DepSource::Git(_))),
+            "a [patch.crates-io] git override must be a distinct trust unit: {specs:?}"
+        );
+
+        let replaced = cargo_specs(
+            "[dependencies]\nserde = \"1\"\n\
+             [replace]\n\"serde:1.0.0\" = { git = \"https://evil.example/serde\" }\n",
+        );
+        assert!(
+            replaced
+                .iter()
+                .any(|s| s.name == "serde" && matches!(s.source, DepSource::Git(_))),
+            "[replace] must be read too: {replaced:?}"
+        );
+    }
+
+    /// `[project.optional-dependencies]` (PEP 621 extras) and
+    /// `[dependency-groups]` (PEP 735) install real code. The parser returned
+    /// early on `[project].dependencies` and never looked at either.
+    #[test]
+    fn pyproject_optional_dependencies_and_dependency_groups_are_parsed() {
+        let specs = python_specs(
+            "[project]\nname = \"x\"\ndependencies = [\"requests==2.31.0\"]\n\
+             [project.optional-dependencies]\n\
+             dev = [\"evil-extra==1.0\"]\n\
+             docs = [\"sphinx\"]\n",
+        );
+        let names: BTreeSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains("requests"), "{specs:?}");
+        assert!(names.contains("evil-extra"), "{specs:?}");
+        assert!(names.contains("sphinx"), "{specs:?}");
+
+        let groups = python_specs(
+            "[project]\nname = \"x\"\ndependencies = []\n\
+             [dependency-groups]\ntest = [\"evil-group @ git+https://evil.example/x\"]\n",
+        );
+        assert!(
+            groups
+                .iter()
+                .any(|s| s.name == "evil-group" && matches!(s.source, DepSource::Git(_))),
+            "PEP 735 dependency groups must be read, with their sources: {groups:?}"
+        );
+    }
+
+    /// `// indirect` is a comment. `go build` does not treat it as a trust
+    /// boundary and neither may this gate: appending it to a `require` line
+    /// hid the module completely.
+    #[test]
+    fn go_indirect_comment_cannot_hide_a_required_module() {
+        let deps = parse_go(
+            "module m\n\nrequire (\n\tevil.example/pkg v1.0.0 // indirect\n)\n\
+             require evil.example/two v1.0.0 // indirect\n",
+        );
+        assert!(deps.contains("evil.example/pkg"), "{deps:?}");
+        assert!(deps.contains("evil.example/two"), "{deps:?}");
+    }
+
+    /// requirements.txt option lines were skipped wholesale by
+    /// `line.starts_with('-')`. `-e git+…` installs from an arbitrary VCS URL
+    /// and `--extra-index-url` re-points resolution for EVERY package in the
+    /// file — both are trust decisions, not formatting.
+    #[test]
+    fn requirements_editable_and_index_directives_are_parsed_not_skipped() {
+        let specs = python_specs(
+            "requests==2.31.0  # pinned by security\n\
+             -e git+https://evil.example/x#egg=evil-editable\n\
+             --extra-index-url https://evil.example/simple\n\
+             https://evil.example/wheels/first.whl\n\
+             -r shared/base.txt\n\
+             --require-hashes\n",
+        );
+        // An inline comment is stripped, but the `#` of a `#egg=` fragment (no
+        // preceding space) is not — that one names the package.
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name == "requests" && s.source == DepSource::Registry),
+            "{specs:?}"
+        );
+        // Options that carry no dependency are still skipped.
+        assert!(
+            specs.iter().all(|s| !s.name.contains("base.txt")),
+            "a -r include names no package of its own: {specs:?}"
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name == "evil-editable" && matches!(s.source, DepSource::Git(_))),
+            "-e git+… must be a git-sourced dependency: {specs:?}"
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name.contains("evil.example/simple") && s.source != DepSource::Registry),
+            "--extra-index-url must be visible as a non-registry source: {specs:?}"
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name.contains("evil.example/wheels/first.whl")),
+            "a bare direct-reference URL must not collapse to the name `https`: {specs:?}"
+        );
+        assert!(
+            specs.iter().all(|s| s.name != "https"),
+            "every URL line collapsing to `https` made them one interchangeable \
+             trust unit: {specs:?}"
+        );
+    }
+
+    /// A name outside ASCII was dropped on the floor — `python_req_name`
+    /// returned `None` and the whole line vanished from the gate's view. Whether
+    /// such a name can resolve anywhere is a separate question; a manifest line
+    /// the gate cannot see is a blind spot either way.
+    #[test]
+    fn a_non_ascii_package_name_is_surfaced_not_silently_dropped() {
+        // Cyrillic 'г' (U+0433) in place of Latin 'r'.
+        let specs = python_specs("\u{0433}equests==2.31.0\n");
+        assert_eq!(
+            specs.len(),
+            1,
+            "a homoglyph name must still be a visible dependency: {specs:?}"
+        );
+        assert_eq!(specs.iter().next().unwrap().name, "\u{0433}equests");
+    }
+
+    /// The gate itself, not just the parser: both bypasses have to change the
+    /// staged-vs-HEAD verdict.
+    #[test]
+    fn the_commit_gate_sees_target_specific_and_patched_cargo_dependencies() {
+        // (a) a platform-gated new dependency
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\nserde = \"1\"\n");
+        stage(&ctx, "Cargo.toml");
+        exec::git_raw(&["commit", "-m", "base", "--no-verify"], &ctx.root).unwrap();
+        write_file(
+            &ctx,
+            "Cargo.toml",
+            "[dependencies]\nserde = \"1\"\n[target.'cfg(unix)'.dependencies]\nsneaky = \"1\"\n",
+        );
+        stage(&ctx, "Cargo.toml");
+        let flagged = new_unapproved_deps(&ctx).unwrap();
+        assert!(
+            flagged.iter().any(|d| d.qualified == "cargo:sneaky"),
+            "a target-gated new dependency must reach the gate: {flagged:?}"
+        );
+
+        // (b) an APPROVED name whose code is swapped by [patch.crates-io]
+        let (_d, ctx) = repo_ctx();
+        write_file(&ctx, "Cargo.toml", "[dependencies]\nserde = \"1\"\n");
+        stage(&ctx, "Cargo.toml");
+        exec::git_raw(&["commit", "-m", "base", "--no-verify"], &ctx.root).unwrap();
+        approve_package(&ctx, "cargo:serde").unwrap();
+        assert!(unapproved_new_packages(&ctx).unwrap().is_empty());
+
+        write_file(
+            &ctx,
+            "Cargo.toml",
+            "[dependencies]\nserde = \"1\"\n\
+             [patch.crates-io]\nserde = { git = \"https://evil.example/serde\" }\n",
+        );
+        stage(&ctx, "Cargo.toml");
+        let flagged = new_unapproved_deps(&ctx).unwrap();
+        assert!(
+            flagged.iter().any(|d| d.qualified == "cargo:serde"
+                && matches!(d.reason, NewDepReason::NonRegistrySource(_))),
+            "patching an approved crate to a git URL must be flagged: {flagged:?}"
+        );
+    }
+    // ─────────── R1: `deps check` must consult the source, not the name ───────
+
+    /// A `path` dependency's code comes from disk, never from the public
+    /// registry. Resolving its NAME there answered a question nobody asked and
+    /// got both possible answers wrong: an in-repo crate was reported as
+    /// "exists on registry" purely on a name collision with an unrelated public
+    /// crate, and a perfectly ordinary sibling-repo path dep was reported as a
+    /// slopsquatting target at exit 1.
+    ///
+    /// Note the `offline = false` argument: post-fix this test makes no network
+    /// call at all, because a non-registry source is never resolved by name.
+    /// Pre-fix it did, and every arm of that match — Exists, NotFound, Unknown —
+    /// pushed one of the strings asserted absent below, so the test fails
+    /// regardless of connectivity.
+    #[test]
+    fn deps_check_never_resolves_a_non_registry_dependency_by_name_on_the_public_registry() {
+        let (_d, ctx) = repo_ctx();
+        write_file(
+            &ctx,
+            "Cargo.toml",
+            "[dependencies]\n\
+             serde = { path = \"vendor/serde\" }\n\
+             sibling-crate = { path = \"../outside/sibling-crate\" }\n",
+        );
+        // `TrustChecks::default()` is BOTH checks fully ON — the strongest form
+        // of this assertion after M21 landed. The source guard must hold even
+        // when the config is asking for every check there is; it is not one of
+        // the things config can switch off.
+        let (problems, notes) = deps_check(&ctx, TrustChecks::default(), false).unwrap();
+
+        assert!(
+            !notes.iter().any(|n| n.contains("exists on registry")),
+            "a path dependency must never be VALIDATED by a same-named public \
+             crate: {notes:?}"
+        );
+        assert!(
+            !problems.iter().any(|p| p.contains("NOT FOUND")),
+            "a sibling-repo path dependency is a normal multi-repo layout, not a \
+             slopsquatting target: {problems:?}"
+        );
+        assert!(
+            !notes
+                .iter()
+                .any(|n| n.contains("registry check inconclusive")),
+            "no registry lookup should have been attempted at all: {notes:?}"
+        );
+        assert!(
+            problems.is_empty(),
+            "a repo whose only deps are path deps must exit clean: {problems:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("sibling-crate"))
+                && notes.iter().any(|n| n.contains("path source")),
+            "the user still has to be told WHY the name was not checked: {notes:?}"
+        );
+    }
+
+    /// `path_resolves_within_repo` walked path components lexically with no
+    /// `canonicalize`, so `path = "link/pkg"` where `link` is a symlink out of
+    /// the repo counted as the repo's own reviewed code and was exempted.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_dependency_through_a_symlink_that_escapes_the_repo_is_not_exempt() {
+        use std::os::unix::fs::symlink;
+        let (_d, ctx) = repo_ctx();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("pkg")).unwrap();
+        std::fs::write(
+            outside.path().join("pkg/Cargo.toml"),
+            "[package]\nname = \"pkg\"\n",
+        )
+        .unwrap();
+        symlink(outside.path(), ctx.root.join("link")).unwrap();
+
+        write_file(&ctx, "Cargo.toml", "[package]\nname = \"root\"\n");
+        stage(&ctx, "Cargo.toml");
+        exec::git_raw(&["commit", "-m", "base", "--no-verify"], &ctx.root).unwrap();
+
+        write_file(
+            &ctx,
+            "Cargo.toml",
+            "[package]\nname = \"root\"\n[dependencies]\npkg = { path = \"link/pkg\" }\n",
+        );
+        stage(&ctx, "Cargo.toml");
+        let flagged = new_unapproved_deps(&ctx).unwrap();
+        assert!(
+            flagged.iter().any(|d| d.qualified == "cargo:pkg"
+                && matches!(d.reason, NewDepReason::NonRegistrySource(_))),
+            "a path that only LOOKS in-tree must not be exempted: {flagged:?}"
+        );
     }
 }

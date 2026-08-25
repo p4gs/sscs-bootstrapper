@@ -12,10 +12,178 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     table: toml::Table,
     pub path: PathBuf,
+    /// Keys sscsb does not recognize. Not fatal — a config written by another
+    /// version of sscsb must keep working — but said out loud, because the far
+    /// likelier cause is a typo that silently does nothing.
+    pub warnings: Vec<String>,
+}
+
+/// `[general]` keys and the TOML type each must have.
+const GENERAL_KEYS: &[(&str, &str)] = &[
+    ("protected_branches", "array"),
+    ("fail_open", "boolean"),
+    ("github_repo", "string"),
+];
+
+/// The type the registry's own default for an option has. Deriving the
+/// expectation from the same literal that GENERATES the config is what keeps
+/// the validator and the generated file from drifting apart.
+fn expected_option_value(literal: &str) -> Option<toml::Value> {
+    let table: toml::Table = format!("v = {literal}").parse().ok()?;
+    table.get("v").cloned()
+}
+
+/// "a" or "an" for a TOML type name (`integer` and `array` take "an").
+fn article(type_name: &str) -> &'static str {
+    match type_name.chars().next() {
+        Some('a' | 'e' | 'i' | 'o' | 'u') => "an",
+        _ => "a",
+    }
+}
+
+/// The offending value, quoted back at the reader so the message names what is
+/// actually in their file — `"false"` reads very differently from `false`.
+fn render(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(s) => format!("{s:?}"),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Datetime(d) => d.to_string(),
+        toml::Value::Array(_) => "[…]".to_string(),
+        toml::Value::Table(_) => "{…}".to_string(),
+    }
+}
+
+/// Everything wrong with a parsed config, split into what must stop the run and
+/// what is only worth saying out loud.
+#[derive(Default)]
+struct Inspection {
+    errors: Vec<String>,
+    warnings: Vec<String>,
+}
+
+impl Inspection {
+    /// A known key holding the wrong TOML type. Unambiguous, and silently
+    /// wrong: `enabled = "false"` is a *string*, so the bool accessor returns
+    /// None, the caller falls back to the registry default — `true` for most
+    /// controls — and the user who thought they turned a control off is still
+    /// running it.
+    fn check_type(&mut self, path: &str, expected: &str, found: &toml::Value) {
+        if found.type_str() != expected {
+            self.errors.push(format!(
+                "{path} must be {} {expected}, found {} ({})",
+                article(expected),
+                found.type_str(),
+                render(found)
+            ));
+            return;
+        }
+        // A list option whose registry default is strings must stay strings:
+        // the accessor filters non-strings out, so `["a", 1]` silently becomes
+        // a one-element list.
+        if let toml::Value::Array(items) = found {
+            for (i, item) in items.iter().enumerate() {
+                if !item.is_str() {
+                    self.errors.push(format!(
+                        "{path}[{i}] must be a string, found {}",
+                        item.type_str()
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Type- and key-check a parsed config against the control registry.
+fn inspect(table: &toml::Table) -> Inspection {
+    let mut out = Inspection::default();
+    for key in table.keys() {
+        if key != "general" && key != "controls" {
+            out.warnings
+                .push(format!("`{key}` is not a section sscsb reads — ignored"));
+        }
+    }
+    match table.get("general") {
+        None => {}
+        Some(toml::Value::Table(general)) => {
+            for (key, value) in general {
+                match GENERAL_KEYS.iter().find(|(k, _)| k == key) {
+                    Some((_, expected)) => {
+                        out.check_type(&format!("general.{key}"), expected, value)
+                    }
+                    None => out.warnings.push(format!(
+                        "general.{key} is not a setting sscsb reads — ignored"
+                    )),
+                }
+            }
+        }
+        Some(other) => out.errors.push(format!(
+            "`general` must be a table (`[general]`), found {}",
+            other.type_str()
+        )),
+    }
+    let controls = match table.get("controls") {
+        None => return out,
+        Some(toml::Value::Table(controls)) => controls,
+        Some(other) => {
+            out.errors.push(format!(
+                "`controls` must be a table, found {}",
+                other.type_str()
+            ));
+            return out;
+        }
+    };
+    for (id, section) in controls {
+        // An unknown control section is the forward/backward-compatible case —
+        // a config written by a version of sscsb with a control this binary
+        // does not have. Legal, but worth naming: the other way to get here is
+        // a misspelt id, which silently configures nothing.
+        let Some(def) = crate::controls::control(id) else {
+            out.warnings.push(format!(
+                "controls.{id} is not a control this sscsb knows — ignored (check the \
+                 spelling against `sscsb status`)"
+            ));
+            continue;
+        };
+        let Some(section) = section.as_table() else {
+            out.errors.push(format!(
+                "controls.{id} must be a table (`[controls.{id}]`), found {}",
+                section.type_str()
+            ));
+            continue;
+        };
+        for (key, value) in section {
+            let path = format!("controls.{id}.{key}");
+            if key == "enabled" {
+                out.check_type(&path, "boolean", value);
+                continue;
+            }
+            match def
+                .default_options
+                .iter()
+                .find(|(k, _)| k == key)
+                .and_then(|(_, literal)| expected_option_value(literal))
+            {
+                Some(expected) => out.check_type(&path, expected.type_str(), value),
+                None => out
+                    .warnings
+                    .push(format!("{path} is not an option of `{id}` — ignored")),
+            }
+        }
+    }
+    out
 }
 
 impl Config {
     /// Load `.sscsb/config.toml` under `repo_root` if it exists.
+    ///
+    /// A key that is *absent* is always legal — the config is generated from
+    /// the registry and `sscsb init` never overwrites an existing one, so every
+    /// config written by an older sscsb is missing whatever has been added
+    /// since, and the caller falls back to the registry default. A key that is
+    /// PRESENT with the wrong type is a different thing entirely, and is an
+    /// error rather than a silent fallback.
     pub fn load(repo_root: &Path) -> Result<Option<Self>> {
         let path = repo_root.join(".sscsb").join("config.toml");
         if !path.is_file() {
@@ -26,7 +194,25 @@ impl Config {
         let table: toml::Table = text
             .parse()
             .with_context(|| format!("parsing {}", path.display()))?;
-        Ok(Some(Config { table, path }))
+        let found = inspect(&table);
+        if !found.errors.is_empty() {
+            anyhow::bail!(
+                "{} has {} invalid value(s):\n  {}\n\
+                 fix them, or use `sscsb enable <control>` / `sscsb disable <control>`, \
+                 which always write the right type",
+                path.display(),
+                found.errors.len(),
+                found.errors.join("\n  ")
+            );
+        }
+        for warning in &found.warnings {
+            eprintln!("sscsb: {}: {warning}", path.display());
+        }
+        Ok(Some(Config {
+            table,
+            path,
+            warnings: found.warnings,
+        }))
     }
 
     fn control_table(&self, id: &str) -> Option<&toml::Table> {
@@ -37,6 +223,23 @@ impl Config {
     /// (caller falls back to the registry default).
     pub fn control_enabled(&self, id: &str) -> Option<bool> {
         self.control_table(id)?.get("enabled")?.as_bool()
+    }
+
+    /// Whether a control is enabled, falling back to the registry's own
+    /// `default_enabled` when config does not say.
+    ///
+    /// The fallback lives here, once, rather than at each call site. Every caller
+    /// that wrote its own `.unwrap_or(<literal>)` was a second copy of the
+    /// registry that could disagree with it — and one did: the pre-commit hook
+    /// assumed `sast` was OFF while the registry, `sscsb status` and `sscsb
+    /// verify` all reported it ON, so a config without an explicit
+    /// `[controls.sast] enabled` key showed the control installed while the gate
+    /// silently skipped every commit.
+    ///
+    /// An id that is not in the registry is not enabled: there is nothing to run.
+    pub fn control_enabled_or_default(&self, id: &str) -> bool {
+        self.control_enabled(id)
+            .unwrap_or_else(|| crate::controls::control(id).is_some_and(|d| d.default_enabled))
     }
 
     pub fn control_opt_bool(&self, id: &str, key: &str) -> Option<bool> {
@@ -188,6 +391,179 @@ mod tests {
         default_config_toml(Some("owner/repo")).parse().unwrap()
     }
 
+    /// Write `body` as a repo's config and load it.
+    fn load_config(body: &str) -> (tempfile::TempDir, Result<Option<Config>>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".sscsb")).unwrap();
+        std::fs::write(dir.path().join(".sscsb/config.toml"), body).unwrap();
+        let loaded = Config::load(dir.path());
+        (dir, loaded)
+    }
+
+    /// Regression (M24): `enabled = "false"` is a STRING, so `as_bool()`
+    /// returned None, the caller fell back to the registry default — `true` for
+    /// most controls — and a user who believed they had turned secret scanning
+    /// off was still running it. The wrong type on a known key is unambiguous
+    /// and must be an error, never a silent fallback to the opposite meaning.
+    #[test]
+    fn a_wrong_typed_enabled_is_an_error_not_a_silent_fallback() {
+        let (_d, loaded) = load_config("[controls.secrets]\nenabled = \"false\"\n");
+        let err = format!("{:#}", loaded.unwrap_err());
+        assert!(err.contains("controls.secrets.enabled"), "{err}");
+        assert!(err.contains("must be a boolean"), "{err}");
+        // The message quotes the value back, because `"false"` and `false`
+        // differ by exactly the thing that went wrong.
+        assert!(err.contains("found string (\"false\")"), "{err}");
+        assert!(err.contains("sscsb disable"), "{err}");
+
+        // The same key with the right type is fine, and MEANS what it says.
+        let (_d, loaded) = load_config("[controls.secrets]\nenabled = false\n");
+        let cfg = loaded.unwrap().unwrap();
+        assert_eq!(cfg.control_enabled("secrets"), Some(false));
+    }
+
+    /// Options carry types too, and a list option whose elements are silently
+    /// filtered out is the same bug wearing a different hat.
+    #[test]
+    fn wrong_typed_options_and_list_elements_are_errors() {
+        let (_d, loaded) =
+            load_config("[controls.agent-signing]\nenabled = true\nmax_key_age_days = \"90\"\n");
+        let err = format!("{:#}", loaded.unwrap_err());
+        assert!(
+            err.contains("controls.agent-signing.max_key_age_days must be an integer"),
+            "{err}"
+        );
+
+        // `allowed_backends` is an array of strings in the registry; a numeric
+        // element would be dropped by the accessor without a word.
+        let (_d, loaded) =
+            load_config("[controls.agent-signing]\nallowed_backends = [\"tpm\", 7]\n");
+        let err = format!("{:#}", loaded.unwrap_err());
+        assert!(
+            err.contains("controls.agent-signing.allowed_backends[1] must be a string"),
+            "{err}"
+        );
+
+        // `[general]` is type-checked on the same terms.
+        let (_d, loaded) = load_config("[general]\nfail_open = \"yes\"\n");
+        let err = format!("{:#}", loaded.unwrap_err());
+        assert!(err.contains("general.fail_open must be a boolean"), "{err}");
+
+        // Every invalid value is reported at once, not one per run.
+        let (_d, loaded) = load_config(
+            "[general]\nfail_open = 1\n[controls.secrets]\nenabled = \"no\"\ngitleaks = 0\n",
+        );
+        let err = format!("{:#}", loaded.unwrap_err());
+        assert!(err.contains("3 invalid value(s)"), "{err}");
+    }
+
+    /// The message has to name what is actually in the file, whatever the user
+    /// typed — the whole point is that the reader can see their own value and
+    /// the type it turned out to be.
+    #[test]
+    fn the_type_error_quotes_the_offending_value_back() {
+        for (body, expected) in [
+            ("[general]\ngithub_repo = true\n", "found boolean (true)"),
+            ("[general]\nfail_open = 1.5\n", "found float (1.5)"),
+            ("[general]\ngithub_repo = [\"a\"]\n", "found array ([…])"),
+            (
+                "[general]\ngithub_repo = 1979-05-27\n",
+                "found datetime (1979-05-27)",
+            ),
+            (
+                "[controls.secrets]\ngitleaks = { on = true }\n",
+                "found table ({…})",
+            ),
+            (
+                "[controls.agent-signing]\nmax_key_age_days = 90.5\n",
+                "must be an integer, found float (90.5)",
+            ),
+        ] {
+            let (_d, loaded) = load_config(body);
+            let err = format!("{:#}", loaded.unwrap_err());
+            assert!(err.contains(expected), "{body} → {err}");
+        }
+    }
+
+    /// A section or key sscsb does not know is the forward-compatible case — a
+    /// config written by another version — so it must still load. It is also
+    /// how a typo looks, so it is said out loud rather than swallowed.
+    #[test]
+    fn unknown_sections_and_keys_warn_but_still_load() {
+        let (_d, loaded) = load_config(
+            "[general]\nprotectd_brnaches = [\"x\"]\n\
+             [controls.secrets]\nenabled = false\ntrufflhog = true\n\
+             [controls.not-a-control]\nenabled = true\n\
+             [extras]\nfoo = 1\n",
+        );
+        let cfg = loaded.unwrap().unwrap();
+        // Loaded, and the known-good part of the file still works.
+        assert_eq!(cfg.control_enabled("secrets"), Some(false));
+        let warnings = cfg.warnings.join("\n");
+        assert!(warnings.contains("general.protectd_brnaches"), "{warnings}");
+        assert!(
+            warnings.contains("controls.secrets.trufflhog is not an option of `secrets`"),
+            "{warnings}"
+        );
+        assert!(warnings.contains("controls.not-a-control"), "{warnings}");
+        assert!(warnings.contains("`extras` is not a section"), "{warnings}");
+        assert_eq!(cfg.warnings.len(), 4, "{warnings}");
+    }
+
+    /// A section that is not a table at all cannot be read as one.
+    #[test]
+    fn sections_that_are_not_tables_are_errors() {
+        for (body, expected) in [
+            ("controls = 3\n", "`controls` must be a table"),
+            ("general = \"x\"\n", "`general` must be a table"),
+            (
+                "[controls]\nsecrets = 1\n",
+                "controls.secrets must be a table",
+            ),
+        ] {
+            let (_d, loaded) = load_config(body);
+            let err = format!("{:#}", loaded.unwrap_err());
+            assert!(err.contains(expected), "{body} → {err}");
+        }
+    }
+
+    /// The load-time check must never turn on a config that already works.
+    /// `.sscsb/config.toml` is generated from the registry and `sscsb init`
+    /// never overwrites an existing one, so a stricter loader meets configs
+    /// written by older versions: MISSING is legal, and stays legal.
+    #[test]
+    fn generated_and_older_configs_load_without_a_single_complaint() {
+        for slug in [Some("owner/repo"), None] {
+            let (_d, loaded) = load_config(&default_config_toml(slug));
+            let cfg = loaded.unwrap().unwrap();
+            assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+        }
+
+        // An older config: whole control sections absent, and `[general]`
+        // missing keys. Absent is not wrong — the caller falls back to the
+        // registry default — so nothing is reported.
+        let (_d, loaded) =
+            load_config("[general]\nfail_open = false\n[controls.secrets]\nenabled = true\n");
+        let cfg = loaded.unwrap().unwrap();
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+        assert_eq!(cfg.control_enabled("secrets"), Some(true));
+        assert_eq!(cfg.control_enabled("sbom"), None, "absent stays absent");
+        // An empty config is a config.
+        let (_d, loaded) = load_config("# nothing here\n");
+        assert!(loaded.unwrap().unwrap().warnings.is_empty());
+    }
+
+    /// sscsb's own repository config — 36 of 44 registered controls, written by
+    /// an older version — must keep loading cleanly and silently.
+    #[test]
+    fn this_repos_own_config_loads_without_error_or_warning() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cfg = Config::load(root)
+            .expect("sscsb's own config must load")
+            .expect("sscsb's own config must exist");
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+    }
+
     #[test]
     fn default_config_parses_and_covers_every_control() {
         let t = parsed_default();
@@ -305,6 +681,53 @@ mod tests {
             Some(90)
         );
         assert_eq!(cfg.control_opt_int("agent-signing", "absent_key"), None);
+    }
+
+    /// M27. A config that declares no control sections at all must resolve every
+    /// control to the registry's own default — that is what the pre-commit hook
+    /// now reads, instead of a literal typed at the call site. `sast` is named
+    /// explicitly because it is the one that disagreed: the hook treated it as
+    /// off while `status` and `verify` both reported it on.
+    #[test]
+    fn control_enabled_or_default_resolves_every_control_from_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let sscsb = dir.path().join(".sscsb");
+        std::fs::create_dir_all(&sscsb).unwrap();
+        std::fs::write(sscsb.join("config.toml"), "[general]\nfail_open = false\n").unwrap();
+        let cfg = Config::load(dir.path()).unwrap().unwrap();
+        for c in CONTROLS {
+            assert_eq!(
+                cfg.control_enabled_or_default(c.id),
+                c.default_enabled,
+                "{} resolved against a config that says nothing must equal its registry default",
+                c.id
+            );
+        }
+        assert!(
+            cfg.control_enabled_or_default("sast"),
+            "sast is enabled by default in the registry; every reader must agree"
+        );
+        assert!(
+            !cfg.control_enabled_or_default("not-a-control"),
+            "an id with no registry entry has nothing to run"
+        );
+    }
+
+    /// An explicit setting still wins over the registry — the fallback is a
+    /// fallback, not an override.
+    #[test]
+    fn an_explicit_enabled_key_still_beats_the_registry_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let sscsb = dir.path().join(".sscsb");
+        std::fs::create_dir_all(&sscsb).unwrap();
+        std::fs::write(
+            sscsb.join("config.toml"),
+            "[controls.sast]\nenabled = false\n[controls.grype]\nenabled = true\n",
+        )
+        .unwrap();
+        let cfg = Config::load(dir.path()).unwrap().unwrap();
+        assert!(!cfg.control_enabled_or_default("sast"));
+        assert!(cfg.control_enabled_or_default("grype"));
     }
 
     #[test]

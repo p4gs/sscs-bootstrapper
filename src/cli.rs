@@ -266,7 +266,16 @@ enum ReceiptAction {
         sign: bool,
     },
     /// Verify a receipt against the repository
-    Verify { receipt: PathBuf },
+    Verify {
+        receipt: PathBuf,
+        /// Expected cosign certificate identity for the receipt's signature
+        /// bundle (default: cosign_identity under [controls.ai-receipts])
+        #[arg(long)]
+        identity: Option<String>,
+        /// OIDC issuer for that identity (default: cosign_issuer, else GitHub)
+        #[arg(long)]
+        issuer: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -281,6 +290,11 @@ enum ProvenanceAction {
         source_uri: String,
         #[arg(long)]
         source_tag: Option<String>,
+        /// Trusted builder id (default: builder_id under
+        /// [controls.provenance-verify]). One of the two is required — an
+        /// unpinned builder makes "verified" mean far less than it looks.
+        #[arg(long)]
+        builder_id: Option<String>,
     },
     /// Inspect a DSSE/in-toto provenance file (subjects, builder)
     Inspect { file: PathBuf },
@@ -439,7 +453,11 @@ fn cmd_status(cwd: &std::path::Path) -> Result<ExitCode> {
             "MISSING — run `sscsb init`"
         }
     );
-    println!("hooks installed: {}", hooks::hooks_installed(&ctx));
+    let hook_state = hooks::hook_integrity(&ctx);
+    println!("hooks: {}", hook_state.outcome.symbol());
+    for m in &hook_state.messages {
+        println!("  {m}");
+    }
     println!();
     for phase in 1..=5u8 {
         println!("Phase {phase}");
@@ -596,7 +614,7 @@ fn cmd_scan(cwd: &std::path::Path, vex: Option<&std::path::Path>, grype: bool) -
         println!("  [{}] {} {} ({})", f.severity, f.id, f.package, f.source);
     }
     if grype {
-        let cfg_enabled = cfg.control_enabled("grype").unwrap_or(false);
+        let cfg_enabled = cfg.control_enabled_or_default("grype");
         if !cfg_enabled {
             println!("grype: control disabled — `sscsb enable grype` first");
         } else {
@@ -611,7 +629,10 @@ fn cmd_scan(cwd: &std::path::Path, vex: Option<&std::path::Path>, grype: bool) -
     let fail_on = cfg
         .control_opt_str("vuln-scan", "fail_on")
         .unwrap_or_else(|| "high".to_string());
-    if scan::breaches_threshold(&report, &fail_on) {
+    // A `fail_on` that is not a severity is a configuration error, not the
+    // strictest setting — it surfaces here rather than silently gating on
+    // everything.
+    if scan::breaches_threshold(&report, &fail_on)? {
         println!("threshold breached (fail_on = {fail_on})");
         return fail(1);
     }
@@ -621,15 +642,24 @@ fn cmd_scan(cwd: &std::path::Path, vex: Option<&std::path::Path>, grype: bool) -
 fn cmd_sast(cwd: &std::path::Path) -> Result<ExitCode> {
     let ctx = Ctx::discover(cwd)?;
     let cfg = ctx.require_config()?;
-    let findings = sast::run_sast(&ctx, cfg, &ctx.root)?;
-    println!("{} finding(s)", findings.len());
-    for f in findings.iter().take(50) {
+    let scan = sast::run_sast(&ctx, cfg, &ctx.root)?;
+    // What the engine could not read is stated before what it found: a scan
+    // that skipped part of the tree has not cleared that part of the tree, and
+    // "0 finding(s)" alone would say otherwise.
+    if !scan.incomplete.is_empty() {
+        println!(
+            "note: {} part(s) of the tree could not be scanned, and are not covered by this run:",
+            scan.incomplete.len()
+        );
+        for i in scan.incomplete.iter().take(20) {
+            println!("  ? {i}");
+        }
+    }
+    println!("{} finding(s)", scan.findings.len());
+    for f in scan.findings.iter().take(50) {
         println!("  {}", f.render());
     }
-    if findings
-        .iter()
-        .any(|f| f.severity.eq_ignore_ascii_case("ERROR"))
-    {
+    if scan.blocking().next().is_some() {
         return fail(1);
     }
     ok()
@@ -639,7 +669,8 @@ fn cmd_deps(cwd: &std::path::Path, action: DepsAction) -> Result<ExitCode> {
     let ctx = Ctx::discover(cwd)?;
     match action {
         DepsAction::Check { offline } => {
-            let (problems, notes) = deps::deps_check(&ctx, offline)?;
+            let checks = deps::TrustChecks::from_config(ctx.config.as_ref());
+            let (problems, notes) = deps::deps_check(&ctx, checks, offline)?;
             for n in &notes {
                 println!("note: {n}");
             }
@@ -658,7 +689,8 @@ fn cmd_deps(cwd: &std::path::Path, action: DepsAction) -> Result<ExitCode> {
             force,
             offline,
         } => {
-            let warnings = deps::approval_warnings(&package, offline);
+            let checks = deps::TrustChecks::from_config(ctx.config.as_ref());
+            let warnings = deps::approval_warnings(&package, checks, offline);
             if !warnings.is_empty() {
                 for w in &warnings {
                     eprintln!("  ✗ {w}");
@@ -681,11 +713,19 @@ fn cmd_deps(cwd: &std::path::Path, action: DepsAction) -> Result<ExitCode> {
             // bless a typosquat/hallucinated name. Clean packages are approved;
             // suspect ones are reported and SKIPPED for a deliberate
             // `sscsb deps approve <pkg> --force`.
-            let current = deps::current_deps(&ctx)?;
+            // Source-aware: a `path`/`git` dependency's name is not what
+            // resolves its code, so validating it against the public registry
+            // would hand back an unrelated same-named package as its verdict.
+            let current = deps::current_dep_specs(&ctx)?;
+            // Read once: the config does not change between packages, and
+            // re-reading it per dependency only invites the two halves of one
+            // run to disagree.
+            let checks = deps::TrustChecks::from_config(ctx.config.as_ref());
             let mut approved = 0usize;
             let mut skipped = Vec::new();
-            for pkg in current {
-                let warnings = deps::approval_warnings(&pkg, offline);
+            for (eco, spec) in current {
+                let pkg = format!("{}:{}", eco.label(), spec.name);
+                let warnings = deps::approval_warnings_for(&pkg, &spec.source, checks, offline);
                 if warnings.is_empty() {
                     deps::approve_package(&ctx, &pkg)?;
                     approved += 1;
@@ -726,14 +766,21 @@ fn cmd_receipt(cwd: &std::path::Path, action: ReceiptAction) -> Result<ExitCode>
             let path = provenance::create_receipt(&ctx, &commit, &out_dir)?;
             println!("receipt written: {}", path.display());
             if sign {
-                let bundle = path.with_extension("json.sigstore.json");
+                let bundle = provenance::receipt_bundle_path(&path);
                 let log = provenance::cosign_sign_blob(&ctx, &path, &bundle)?;
                 println!("signed: {} \n{log}", bundle.display());
             }
             ok()
         }
-        ReceiptAction::Verify { receipt } => {
-            println!("{}", provenance::verify_receipt(&ctx, &receipt)?);
+        ReceiptAction::Verify {
+            receipt,
+            identity,
+            issuer,
+        } => {
+            println!(
+                "{}",
+                provenance::verify_receipt(&ctx, &receipt, identity.as_deref(), issuer.as_deref())?
+            );
             ok()
         }
     }
@@ -747,6 +794,7 @@ fn cmd_provenance(cwd: &std::path::Path, action: ProvenanceAction) -> Result<Exi
             provenance: prov,
             source_uri,
             source_tag,
+            builder_id,
         } => {
             let output = provenance::verify_artifact(
                 &ctx,
@@ -755,6 +803,7 @@ fn cmd_provenance(cwd: &std::path::Path, action: ProvenanceAction) -> Result<Exi
                     provenance: &prov,
                     source_uri: &source_uri,
                     source_tag: source_tag.as_deref(),
+                    builder_id: builder_id.as_deref(),
                 },
             )?;
             println!("{output}");

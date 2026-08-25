@@ -11,6 +11,7 @@ use sscsb::context::Ctx;
 use sscsb::controls::{self, Outcome};
 use sscsb::{
     audit, compliance, deps, exec, hooks, init, observability, provenance, sast, sbom, scan,
+    signers,
 };
 use std::path::Path;
 
@@ -56,7 +57,17 @@ fn tool(bin: &str) -> bool {
 #[test]
 fn install_hooks_writes_executable_posix_shims_and_sets_hookspath() {
     let (_d, ctx) = repo();
-    assert!(hooks::hooks_installed(&ctx));
+    // A freshly bootstrapped repo must reach the STRONGEST state the integrity
+    // check can report — shims present, executable, and byte-identical to the
+    // generated ones. Anything weaker means `sscsb init` just shipped a shim
+    // sscsb cannot vouch for.
+    let integrity = hooks::hook_integrity(&ctx);
+    assert_eq!(
+        integrity.outcome,
+        Outcome::Pass,
+        "freshly installed hooks must verify clean: {:?}",
+        integrity.messages
+    );
     for event in hooks::HOOK_EVENTS {
         let path = ctx.sscsb_dir().join("hooks").join(event);
         let content = std::fs::read_to_string(&path).unwrap();
@@ -76,6 +87,82 @@ fn install_hooks_writes_executable_posix_shims_and_sets_hookspath() {
     let signers_cfg = exec::git(&["config", "gpg.ssh.allowedSignersFile"], &ctx.root).unwrap();
     assert!(signers_cfg.ends_with(".sscsb/policy/allowed_signers"));
     assert!(Path::new(&signers_cfg).is_file());
+}
+
+/// Overwrite every shim with `#!/bin/sh\nexit 0`. The files still exist, are
+/// still executable, and `core.hooksPath` still points at them — and they
+/// enforce nothing: with this exact setup a planted `AKIAIOSFODNN7EXAMPLE`
+/// committed cleanly while `sscsb verify --strict` reported
+/// `[PASS] secrets / commit-signing / ai-trailers / ai-dep-gate /
+/// package-trust`. Presence-only checking is what made that possible. (H8)
+#[test]
+fn neutered_hook_shims_fail_every_hook_gated_control() {
+    let (_d, ctx) = repo();
+    let cfg = ctx.require_config().unwrap();
+    for event in hooks::HOOK_EVENTS {
+        let path = ctx.sscsb_dir().join("hooks").join(event);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    for r in [
+        hooks::verify_secrets_control(&ctx, cfg),
+        hooks::verify_signing_control(&ctx, cfg),
+        hooks::verify_hook_installed(&ctx, "ai-trailers"),
+        hooks::verify_hook_installed(&ctx, "ai-dep-gate"),
+        deps::verify_package_trust(&ctx, cfg),
+        signers::verify_agent_signing_control(&ctx, cfg),
+    ] {
+        assert_eq!(
+            r.outcome,
+            Outcome::Fail,
+            "`{}` reported {:?} on shims that run nothing: {:?}",
+            r.control,
+            r.outcome,
+            r.messages
+        );
+    }
+}
+
+/// The other half of the H8 contract, and the more important one: a correctly
+/// installed hook set must NOT start failing. A false FAIL on every user's
+/// repo would be worse than the bug being fixed.
+#[test]
+fn a_correctly_installed_hook_set_keeps_every_hook_gated_control_off_fail() {
+    let (_d, ctx) = repo();
+    let cfg = ctx.require_config().unwrap();
+    for r in [
+        hooks::verify_secrets_control(&ctx, cfg),
+        hooks::verify_signing_control(&ctx, cfg),
+        hooks::verify_hook_installed(&ctx, "ai-trailers"),
+        hooks::verify_hook_installed(&ctx, "ai-dep-gate"),
+        deps::verify_package_trust(&ctx, cfg),
+        signers::verify_agent_signing_control(&ctx, cfg),
+    ] {
+        assert_ne!(
+            r.outcome,
+            Outcome::Fail,
+            "`{}` must not fail on a freshly bootstrapped repo: {:?}",
+            r.control,
+            r.messages
+        );
+        assert!(
+            !r.messages.iter().any(|m| m.contains("never invokes")
+                || m.contains("differs from the shim")
+                || m.contains("is not executable")),
+            "`{}` reported hook damage on a clean install: {:?}",
+            r.control,
+            r.messages
+        );
+    }
+    // The controls whose ONLY prerequisite is the hook set must be fully green.
+    assert_eq!(
+        hooks::verify_hook_installed(&ctx, "ai-trailers").outcome,
+        Outcome::Pass
+    );
 }
 
 // ───────────────────────── hook engine: pre-commit ──────────────────────────
@@ -584,8 +671,8 @@ fn scan_runs_configured_scanners_and_applies_vex() {
 
     let report = scan::run_scan(&ctx, cfg, None).unwrap();
     // Threshold gating is configurable and honored.
-    let breached_low = scan::breaches_threshold(&report, "low");
-    let breached_crit = scan::breaches_threshold(&report, "critical");
+    let breached_low = scan::breaches_threshold(&report, "low").unwrap();
+    let breached_crit = scan::breaches_threshold(&report, "critical").unwrap();
     assert!(
         !breached_crit || breached_low,
         "thresholds must be monotonic: anything that breaches `critical` must \
@@ -607,6 +694,218 @@ fn scan_runs_configured_scanners_and_applies_vex() {
     assert!(report.notes.iter().any(|n| n.contains("VEX applied")));
 }
 
+// ── H5: config a repository hands the scanners must never be silent ─────────
+//
+// Trivy reads `trivy.yaml` and `.trivyignore` from the directory it scans;
+// OSV-Scanner reads `osv-scanner.toml` from the tree. Committing the file is
+// the whole install step. These tests drive the REAL scanners against a
+// lockfile with real advisories, mute one, and require that the muting shows
+// up in the report — the waiver is honoured, and it is stated.
+
+/// A lockfile pinning crates with long-standing published advisories, so the
+/// scanners have something real to find and something real to mute.
+fn vulnerable_rust_fixture(ctx: &Ctx) {
+    write(
+        ctx,
+        "Cargo.lock",
+        "version = 3\n\n\
+         [[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\ndependencies = [\"smallvec\", \"time\"]\n\n\
+         [[package]]\nname = \"smallvec\"\nversion = \"1.6.0\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+         checksum = \"1a55ca5f3b68e41c979bf8c46a6f1da892ca4db8f94023ce0bd32407573b1ac0\"\n\n\
+         [[package]]\nname = \"time\"\nversion = \"0.1.43\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+         checksum = \"ca8a50ef2360fbd1eeb0ecd46795a87a19024eb4b53c5dc916ca1fd95fe62438\"\n",
+    );
+}
+
+/// A present-but-unhealthy scanner — cold or racing DB cache, transient crash
+/// — is an environmental precondition, not a logic failure. Anything else is
+/// a real failure and is re-raised.
+fn scan_or_skip(ctx: &Ctx, cfg: &config::Config) -> Option<scan::ScanReport> {
+    match scan::run_scan(ctx, cfg, None) {
+        Ok(report) => Some(report),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let environmental = msg.contains("DB error")
+                || msg.contains("failed to download")
+                || msg.contains("unexpected fault address")
+                || msg.contains("trivy failed")
+                || msg.contains("osv-scanner failed");
+            assert!(environmental, "run_scan failed unexpectedly: {msg}");
+            eprintln!("skipping: scanner unhealthy in this environment ({msg})");
+            None
+        }
+    }
+}
+
+/// Skip when the baseline scan cannot see the advisory at all (no advisory
+/// data in this environment) — there is then nothing to mute and nothing to
+/// prove either way.
+fn baseline_has(report: &scan::ScanReport, id: &str, source: &str) -> bool {
+    let present = report
+        .findings
+        .iter()
+        .any(|f| f.id == id && f.source == source);
+    if !present {
+        eprintln!("skipping: {source} did not report {id} in this environment");
+    }
+    present
+}
+
+#[test]
+fn a_committed_trivyignore_is_reported_not_silently_inherited() {
+    let (_d, ctx) = repo();
+    vulnerable_rust_fixture(&ctx);
+    let cfg = ctx.require_config().unwrap();
+    if !tool("trivy") {
+        return; // the degrade path is covered elsewhere
+    }
+    let Some(before) = scan_or_skip(&ctx, cfg) else {
+        return;
+    };
+    let muted = "CVE-2021-25900";
+    if !baseline_has(&before, muted, "trivy") {
+        return;
+    }
+    assert!(
+        before.suppressed.is_empty(),
+        "nothing is suppressed before a waiver exists: {:?}",
+        before.suppressed
+    );
+
+    write(
+        &ctx,
+        ".trivyignore",
+        "# documented waiver: reviewed 2026-08\nCVE-2021-25900\n",
+    );
+    let Some(after) = scan_or_skip(&ctx, cfg) else {
+        return;
+    };
+
+    // The waiver is HONOURED — overriding a deliberate one would be its own
+    // defect, and would push anyone needing a waiver into disabling scanning.
+    assert!(
+        !after
+            .findings
+            .iter()
+            .any(|f| f.id == muted && f.source == "trivy"),
+        "the waiver must still take effect"
+    );
+    // ...and it is not silent: the muted finding is named, with its source.
+    assert!(
+        after
+            .suppressed
+            .iter()
+            .any(|s| s.contains(muted) && s.contains(".trivyignore")),
+        "the suppression must be itemised: {:?}",
+        after.suppressed
+    );
+    // ...and the file itself is inventoried, with its entry count.
+    assert!(
+        after
+            .notes
+            .iter()
+            .any(|n| n.contains("scanner config") && n.contains(".trivyignore")),
+        "the ignore file must be reported: {:?}",
+        after.notes
+    );
+}
+
+#[test]
+fn a_committed_osv_scanner_toml_is_reported_not_silently_inherited() {
+    let (_d, ctx) = repo();
+    vulnerable_rust_fixture(&ctx);
+    let cfg = ctx.require_config().unwrap();
+    if !tool("osv-scanner") {
+        return;
+    }
+    let Some(before) = scan_or_skip(&ctx, cfg) else {
+        return;
+    };
+    let muted = "RUSTSEC-2021-0003";
+    if !baseline_has(&before, muted, "osv-scanner") {
+        return;
+    }
+
+    write(
+        &ctx,
+        "osv-scanner.toml",
+        "[[IgnoredVulns]]\nid = \"RUSTSEC-2021-0003\"\n\
+         reason = \"reviewed 2026-08: insert_many path not reachable here\"\n",
+    );
+    let Some(after) = scan_or_skip(&ctx, cfg) else {
+        return;
+    };
+
+    assert!(
+        !after
+            .findings
+            .iter()
+            .any(|f| f.id == muted && f.source == "osv-scanner"),
+        "the waiver must still take effect"
+    );
+    // OSV-Scanner states this on stderr and nowhere in its JSON — including
+    // under --all-vulns — so discarding stderr made the waiver invisible.
+    assert!(
+        after
+            .suppressed
+            .iter()
+            .any(|s| s.contains(muted) && s.contains("not reachable here")),
+        "the filtered entry and its stated reason must be itemised: {:?}",
+        after.suppressed
+    );
+    assert!(
+        after
+            .notes
+            .iter()
+            .any(|n| n.contains("scanner config") && n.contains("osv-scanner.toml")),
+        "the config file must be reported: {:?}",
+        after.notes
+    );
+}
+
+#[test]
+fn a_committed_trivy_yaml_that_narrows_the_scan_is_reported() {
+    let (_d, ctx) = repo();
+    vulnerable_rust_fixture(&ctx);
+    let cfg = ctx.require_config().unwrap();
+    if !tool("trivy") {
+        return;
+    }
+    let Some(before) = scan_or_skip(&ctx, cfg) else {
+        return;
+    };
+    let filtered_out = "CVE-2020-26235"; // MEDIUM, per trivy
+    if !baseline_has(&before, filtered_out, "trivy") {
+        return;
+    }
+
+    write(&ctx, "trivy.yaml", "severity:\n  - CRITICAL\n");
+    let Some(after) = scan_or_skip(&ctx, cfg) else {
+        return;
+    };
+
+    // Config-level narrowing is the invisible case: trivy filters these
+    // findings before they are findings and reports NOTHING about them, not
+    // even in its own suppression list. Naming the file and the keys is the
+    // only signal there is.
+    assert!(
+        !after
+            .findings
+            .iter()
+            .any(|f| f.id == filtered_out && f.source == "trivy"),
+        "precondition: the config really does mute this finding"
+    );
+    let note = after
+        .notes
+        .iter()
+        .find(|n| n.contains("trivy.yaml"))
+        .unwrap_or_else(|| panic!("trivy.yaml must be reported: {:?}", after.notes));
+    assert!(note.contains("NARROWS"), "{note}");
+    assert!(note.contains("severity=[CRITICAL]"), "{note}");
+}
+
 #[test]
 fn sast_runs_the_default_engine_and_reports_findings() {
     let (_d, ctx) = repo();
@@ -622,7 +921,7 @@ fn sast_runs_the_default_engine_and_reports_findings() {
         assert!(format!("{err:#}").contains("opengrep not found"));
         return;
     }
-    let findings = sast::run_sast(&ctx, cfg, &ctx.root).unwrap();
+    let findings = sast::run_sast(&ctx, cfg, &ctx.root).unwrap().findings;
     let hit = findings
         .iter()
         .find(|f| f.check_id.contains("curl-pipe-shell"))
@@ -665,7 +964,7 @@ fn receipts_bind_commits_and_detect_tampering() {
     assert_eq!(doc["predicate"]["aiTool"], "Claude Code");
     assert_eq!(doc["predicate"]["aiRole"], "draft");
 
-    let ok = provenance::verify_receipt(&ctx, &receipt).unwrap();
+    let ok = provenance::verify_receipt(&ctx, &receipt, None, None).unwrap();
     assert!(ok.contains("receipt verified"));
 
     // Tampered digest is caught.
@@ -675,7 +974,7 @@ fn receipts_bind_commits_and_detect_tampering() {
         text.replacen("\"sha256\": \"", "\"sha256\": \"ff", 1),
     )
     .unwrap();
-    let err = provenance::verify_receipt(&ctx, &receipt).unwrap_err();
+    let err = provenance::verify_receipt(&ctx, &receipt, None, None).unwrap_err();
     assert!(format!("{err:#}").contains("DIGEST MISMATCH"));
 
     // A non-receipt JSON file is rejected.
@@ -685,7 +984,7 @@ fn receipts_bind_commits_and_detect_tampering() {
         r#"{"predicateType":"https://slsa.dev/provenance/v1"}"#,
     )
     .unwrap();
-    let err = provenance::verify_receipt(&ctx, &other).unwrap_err();
+    let err = provenance::verify_receipt(&ctx, &other, None, None).unwrap_err();
     assert!(format!("{err:#}").contains("not an sscsb AI provenance receipt"));
 }
 
@@ -856,7 +1155,7 @@ fn deps_check_offline_flags_typosquats_without_network() {
         "Cargo.toml",
         "[package]\nname = \"f\"\nversion = \"0.1.0\"\n\n[dependencies]\ntokoi = \"1\"\n",
     );
-    let (problems, _notes) = deps::deps_check(&ctx, true).unwrap();
+    let (problems, _notes) = deps::deps_check(&ctx, deps::TrustChecks::default(), true).unwrap();
     assert!(
         problems
             .iter()
@@ -1050,13 +1349,13 @@ fn new_dependencies_are_flagged_in_go_python_and_ruby_manifests() {
 fn approve_refuses_a_typosquat_without_force() {
     // Enforcement, not advice: `deps approve` must reject a typosquat unless the
     // human overrides on purpose. Offline so only the typosquat heuristic runs.
-    let warnings = deps::approval_warnings("cargo:tokoi", true);
+    let warnings = deps::approval_warnings("cargo:tokoi", deps::TrustChecks::default(), true);
     assert!(
         warnings.iter().any(|w| w.contains("tokio")),
         "approval must warn on a typosquat: {warnings:?}"
     );
     // A clean name produces no warning.
-    assert!(deps::approval_warnings("cargo:serde", true).is_empty());
+    assert!(deps::approval_warnings("cargo:serde", deps::TrustChecks::default(), true).is_empty());
 }
 
 #[test]

@@ -12,7 +12,7 @@
 //!
 //! ## Tool contract (established empirically against bumblebee v0.1.2, not from docs)
 //!
-//! Three behaviours drive this implementation and none of them are guessable:
+//! Four behaviours drive this implementation and none of them are guessable:
 //!
 //! 1. **Findings do not change the exit code.** A scan that matches a compromised
 //!    package exits `0`, exactly like a clean one; `2` means the scan itself
@@ -29,10 +29,22 @@
 //!    therefore matches nothing — a gate that always passes. `sscsb` cannot fix
 //!    the matcher, so `count_catalog_entries` refuses to count a wildcard-only
 //!    entry as criteria and the run fails before it can report a false clean.
+//! 4. **What the scan could not read is reported ONLY on stderr, and only there.**
+//!    stdout carries `finding` and `scan_summary` records; `record_type=diagnostic`
+//!    rows go to stderr as NDJSON with a `level`, an optional `path`, and a
+//!    `message`. A config bumblebee cannot parse produces
+//!    `{"level":"warn","path":"…/mcp_config.json","message":"parse MCP config:
+//!    unexpected end of JSON input"}` there — while the run still exits `0` and
+//!    emits a `status:"complete"` summary. Reading stdout alone therefore turns a
+//!    dropped subject into silence inside a PASS, so `parse_diagnostics` reads
+//!    stderr on every run, not just failed ones. Fatal errors arrive on the same
+//!    stream as bare non-JSON text (`unsupported exposure catalog
+//!    schema_version …`), so the parser keeps unrecognised lines rather than
+//!    dropping them.
 //!
-//! ## Three ways a bumblebee run can be empty, none of which mean "clean"
+//! ## Four ways a bumblebee run can be empty, none of which mean "clean"
 //!
-//! Every one of these produces zero findings and, in two cases, exit 0 and a
+//! Every one of these produces zero findings and, in three cases, exit 0 and a
 //! well-formed summary. Each is refused explicitly rather than passed:
 //!
 //! - **No criteria.** The catalog is an empty directory, has `entries: []`, or
@@ -42,12 +54,19 @@
 //!   "project"` does to a repository with no npm/pypi/go/gem/composer manifests,
 //!   which includes every Rust repository. `package_records_emitted +
 //!   package_records_suppressed == 0` is the signal.
+//! - **No subjects OF THE RIGHT CLASS.** `inventoried` is a single aggregate, so
+//!   a machine whose only populated root is the Homebrew Cellar clears the guard
+//!   above with 16,912 receipts while every class this control exists for — MCP
+//!   configs, editor extensions, browser extensions, agent skills — went
+//!   unexamined. `--findings-only` suppresses the per-package records, so the
+//!   summary's `roots[].kind` list is the only per-class signal there is.
 //! - **No completion.** The run timed out or ended with a non-`complete`
 //!   `status`. A summary record alone is not proof of a finished scan; the
 //!   summary's own `status` and `timed_out` fields are.
 //!
 //! A scanner that reports clean without having scanned is worse than no scanner,
-//! so `Outcome::Pass` requires criteria, subjects, and completion together.
+//! so `Outcome::Pass` requires criteria, subjects of the classes this control is
+//! for, and completion together.
 
 use crate::config::Config;
 use crate::context::Ctx;
@@ -89,6 +108,18 @@ pub struct ScanRecords {
     ///
     /// Zero means the scan matched the catalog against nothing at all.
     pub inventoried: u64,
+    /// The `kind` of every root the scan actually reached, deduplicated in
+    /// first-seen order — `mcp_config_root`, `editor_extension_root`,
+    /// `browser_extension_root`, `agent_skill_root`, `homebrew_root`,
+    /// `user_package_root`, or `project_root`.
+    ///
+    /// This is the ONLY per-class signal bumblebee emits. Under `--findings-only`
+    /// package records are suppressed rather than printed, so nothing in the
+    /// stream says which ecosystem the inventory came from, and the summary's own
+    /// `counts` are aggregates. `inventoried` is therefore one number that 16,912
+    /// Homebrew receipts satisfy on their own — which is why a guard built on it
+    /// alone cannot tell "scanned the endpoint" from "counted the Cellar".
+    pub root_kinds: Vec<String>,
     /// Lines in the parsed stream that were not valid JSON. bumblebee writes its
     /// diagnostics to **stderr**, not into this stream, so a malformed line here
     /// is genuinely unexpected rather than routine — it is counted and surfaced.
@@ -136,6 +167,17 @@ pub fn parse_records(ndjson: &str) -> ScanRecords {
                 out.status = status;
                 let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
                 out.inventoried = n("package_records_emitted") + n("package_records_suppressed");
+                for kind in v
+                    .get("roots")
+                    .and_then(|x| x.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r.get("kind").and_then(|k| k.as_str()))
+                {
+                    if !out.root_kinds.iter().any(|k| k == kind) {
+                        out.root_kinds.push(kind.to_string());
+                    }
+                }
             }
             _ => {}
         }
@@ -148,6 +190,102 @@ fn str_field(v: &serde_json::Value, key: &str) -> String {
         .and_then(|x| x.as_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+/// A `record_type=diagnostic` row. bumblebee writes these to **stderr**, one
+/// NDJSON object per line, and they are the only place it says what it could
+/// NOT read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub level: String,
+    /// The file the diagnostic is about, when it names one.
+    pub path: Option<String>,
+    pub message: String,
+}
+
+impl Diagnostic {
+    /// Does this diagnostic report something the scan could not do?
+    ///
+    /// `info` is bookkeeping — "default roots: 19 present, 85 candidate paths
+    /// absent", "scan complete: …", "no MCP servers parsed" — and appears on
+    /// every run. Anything above it is bumblebee reporting that a subject it was
+    /// asked to examine was dropped. Measured on a real v0.1.2 `baseline` run
+    /// over 464,986 files and 19 roots: 3 diagnostics, of which exactly one was
+    /// `warn`, and it named a genuinely malformed file. Non-`info` is rare, and
+    /// when it fires it means something.
+    fn is_problem(&self) -> bool {
+        !matches!(self.level.as_str(), "info" | "debug" | "trace" | "")
+    }
+
+    fn render(&self) -> String {
+        match &self.path {
+            Some(p) => format!("{}: {p} — {}", self.level, self.message),
+            None => format!("{}: {}", self.level, self.message),
+        }
+    }
+}
+
+/// What bumblebee said on stderr.
+#[derive(Debug, Default)]
+pub struct Diagnostics {
+    pub entries: Vec<Diagnostic>,
+    /// stderr lines that are not diagnostic records. bumblebee's fatal errors
+    /// arrive this way — a `schema_version` rejection is the bare line
+    /// `unsupported exposure catalog schema_version "0.2.0" (supported: "0.1.0")`
+    /// with no JSON around it — as would a runtime panic. Kept verbatim so the
+    /// tool's own words reach the user rather than our paraphrase of them.
+    pub plain: Vec<String>,
+}
+
+impl Diagnostics {
+    fn problems(&self) -> Vec<&Diagnostic> {
+        self.entries.iter().filter(|d| d.is_problem()).collect()
+    }
+
+    fn informational(&self) -> usize {
+        self.entries.iter().filter(|d| !d.is_problem()).count()
+    }
+}
+
+/// Parse bumblebee's stderr stream.
+///
+/// Exists because the exit code and the stdout record stream together do not
+/// carry everything the tool established: a config it could not parse is
+/// reported ONLY here, at `warn`, and the run still exits 0 with a well-formed
+/// `complete` summary. Reading stdout alone therefore turns "I could not read
+/// this MCP config" into silence inside a PASS.
+///
+/// Tolerant by construction: a line that is not a diagnostic record — valid JSON
+/// or not — is kept as `plain` rather than dropped, because the one thing this
+/// function must never do is lose output.
+pub fn parse_diagnostics(stderr: &str) -> Diagnostics {
+    let mut out = Diagnostics::default();
+    for line in stderr.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .filter(|v| v.get("record_type").and_then(|x| x.as_str()) == Some("diagnostic"));
+        match record {
+            Some(v) => out.entries.push(Diagnostic {
+                level: v
+                    .get("level")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                path: v.get("path").and_then(|x| x.as_str()).map(str::to_string),
+                message: v
+                    .get("message")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("(no message)")
+                    .to_string(),
+            }),
+            None => out.plain.push(line.to_string()),
+        }
+    }
+    out
 }
 
 /// How many exposure entries does this catalog path actually resolve to?
@@ -222,22 +360,87 @@ fn count_catalog_entries(path: &std::path::Path) -> std::io::Result<usize> {
     }
 }
 
+/// The registry's declared default for `[controls.bumblebee] profile` — the
+/// value `sscsb init` actually writes into `.sscsb/config.toml`.
+///
+/// Read from the registry rather than repeated as a literal because a hard-coded
+/// second copy is exactly how the two drifted apart: the registry said
+/// `"baseline"` while the code fell back to `"project"`, so the same control
+/// scanned two different things depending on whether the config key happened to
+/// be present. One source, one default.
+///
+/// The match arm is not redundant with `trim_matches`: it keeps an unrecognised
+/// registry value from becoming a profile bumblebee would reject, and preserves
+/// the never-widen rule below as the failure mode.
+fn registry_default_profile() -> &'static str {
+    crate::controls::control(CONTROL)
+        .and_then(|d| d.default_options.iter().find(|(k, _)| *k == "profile"))
+        .map(|(_, v)| v.trim_matches('"'))
+        .and_then(|v| match v {
+            "baseline" => Some("baseline"),
+            "project" => Some("project"),
+            _ => None,
+        })
+        .unwrap_or("project")
+}
+
 /// Scan profile, validated against what v0.1.2 actually accepts.
 ///
 /// `deep` is deliberately NOT reachable from config: it requires explicit
 /// `--root` paths and is the mode that walks `$HOME`. Scanning a developer's
 /// entire home directory is a decision for the developer at a shell prompt, not
 /// something a repository bootstrapper turns on from a config file it generated.
-/// Anything unrecognised — including an attempt to name `deep` — falls back to
-/// the repo-scoped profile, so config can never widen the blast radius.
+/// Anything *named* but unrecognised — including an attempt to name `deep` —
+/// narrows to the repo-scoped profile, so config can never widen the blast
+/// radius.
+///
+/// An ABSENT (or blank) option is not an unrecognised one: nobody chose
+/// anything, so the registry default applies — the same value the generated
+/// config carries. Conflating the two is what made the default disagree with
+/// itself.
 ///
 /// Takes the raw option rather than a `Config` so the allow-list is testable
 /// without materialising a config file.
 fn profile_from(opt: Option<&str>) -> &'static str {
     match opt.map(str::trim) {
+        None | Some("") => registry_default_profile(),
         Some("baseline") => "baseline",
         _ => "project",
     }
+}
+
+/// No catalog means no exposure criteria, which means no gate is possible.
+/// Report that plainly as Info: an inventory with nothing to match against is
+/// useful context, but it is not a passing security control and must not be
+/// dressed up as one.
+///
+/// Pure, so the hint it prints is testable without a `bumblebee` on PATH — the
+/// hint named the wrong profile for as long as nothing could check it.
+fn no_catalog_result(version: &str) -> VerifyResult {
+    VerifyResult::new(
+        CONTROL,
+        Outcome::Info,
+        vec![
+            format!("bumblebee {version} available; no exposure catalog configured"),
+            // `sscsb init` will not backfill options into a config that already
+            // exists, and `sscsb enable` writes only `enabled`. So a user who
+            // turns this control on may have no `catalog` key to edit — spell
+            // the whole block out rather than naming a key that isn't there.
+            //
+            // The profile printed here is read from the registry, not typed in:
+            // this hint used to say `project`, the opposite of what the generated
+            // config says and of what this control needs.
+            format!(
+                "add to .sscsb/config.toml:  [controls.bumblebee]  profile = \"{}\"  \
+                 catalog = \"path/to/catalog.json\"",
+                registry_default_profile()
+            ),
+            "catalogs must use schema_version \"0.1.0\" and exact versions \
+             (wildcards do not match in v0.1.2) — upstream publishes them under threat_intel/"
+                .into(),
+            "inventory-only: nothing to match against, so no exposure gate is applied".into(),
+        ],
+    )
 }
 
 pub fn verify_bumblebee_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
@@ -260,29 +463,8 @@ pub fn verify_bumblebee_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
         .trim()
         .to_string();
 
-    // No catalog means no exposure criteria, which means no gate is possible.
-    // Report that plainly as Info: an inventory with nothing to match against is
-    // useful context, but it is not a passing security control and must not be
-    // dressed up as one.
     if catalog.is_empty() {
-        return VerifyResult::new(
-            CONTROL,
-            Outcome::Info,
-            vec![
-                format!("bumblebee {version} available; no exposure catalog configured"),
-                // `sscsb init` will not backfill options into a config that already
-                // exists, and `sscsb enable` writes only `enabled`. So a user who
-                // turns this control on may have no `catalog` key to edit — spell
-                // the whole block out rather than naming a key that isn't there.
-                "add to .sscsb/config.toml:  [controls.bumblebee]  profile = \"project\"  \
-                 catalog = \"path/to/catalog.json\""
-                    .into(),
-                "catalogs must use schema_version \"0.1.0\" and exact versions \
-                 (wildcards do not match in v0.1.2) — upstream publishes them under threat_intel/"
-                    .into(),
-                "inventory-only: nothing to match against, so no exposure gate is applied".into(),
-            ],
-        );
+        return no_catalog_result(&version);
     }
 
     match plan_scan(
@@ -424,6 +606,30 @@ pub fn plan_scan(
     })
 }
 
+/// The root classes this control exists for — the surface nothing else in the
+/// registry looks at. Keys are bumblebee's own `roots[].kind` values, read off a
+/// real v0.1.2 `baseline` summary; values are what to call them in a report.
+///
+/// Deliberately excludes `homebrew_root`, `user_package_root` and `project_root`:
+/// those are package inventories, which `vuln-scan`, `package-trust` and the SBOM
+/// controls already cover from the repository side. A scan that reached only
+/// those has not looked at the endpoint.
+const ENDPOINT_ROOT_KINDS: &[(&str, &str)] = &[
+    ("mcp_config_root", "MCP server configs"),
+    ("editor_extension_root", "editor extensions"),
+    ("browser_extension_root", "browser extensions"),
+    ("agent_skill_root", "agent skills"),
+];
+
+/// Which of the endpoint classes did this scan actually reach?
+fn endpoint_classes_reached(root_kinds: &[String]) -> Vec<&'static str> {
+    ENDPOINT_ROOT_KINDS
+        .iter()
+        .filter(|(kind, _)| root_kinds.iter().any(|k| k == kind))
+        .map(|(_, label)| *label)
+        .collect()
+}
+
 /// Turn a finished bumblebee invocation into an outcome.
 ///
 /// Split out from `verify_bumblebee_control` deliberately: every decision that
@@ -461,6 +667,19 @@ fn evaluate_scan(
         );
     }
 
+    let mut result = evaluate_records(version, prof, catalog, coerced, out);
+    apply_diagnostics(&mut result, &parse_diagnostics(&out.stderr));
+    result
+}
+
+/// The stdout half of the verdict: everything decidable from the record stream.
+fn evaluate_records(
+    version: &str,
+    prof: &str,
+    catalog: &str,
+    coerced: Option<&str>,
+    out: &exec::CmdOutput,
+) -> VerifyResult {
     let records = parse_records(&out.stdout);
 
     // A run that did not finish did not establish anything. Empty findings from a
@@ -516,11 +735,59 @@ fn evaluate_scan(
     }
 
     if records.exposures.is_empty() {
+        // The class-aware half of the "did this scan actually look?" question.
+        // `inventoried` is one aggregate number, so a machine whose only populated
+        // root was the Homebrew Cellar satisfied the zero-subject guard above and
+        // then reported a clean ENDPOINT — having never opened an MCP config, an
+        // editor or browser extension, or an agent skill. Those four classes are
+        // the entire reason this control exists; nothing else in the registry
+        // looks at them, so a clean verdict that never reached one of them is
+        // claiming more than it checked.
+        let reached = endpoint_classes_reached(&records.root_kinds);
         let mut messages = vec![format!(
             "bumblebee {version}: {} artifact(s) inventoried, no known-compromised packages found \
              (profile {prof}, catalog {catalog})",
             records.inventoried
         )];
+        let outcome = if reached.is_empty() {
+            let missing: Vec<&str> = ENDPOINT_ROOT_KINDS.iter().map(|(_, l)| *l).collect();
+            messages.push(format!(
+                "scan reached no {} — nothing was established about the artifact classes this \
+                 control exists to check; the inventory above is packages only",
+                missing.join(", ")
+            ));
+            messages.push(format!(
+                "roots reached: {}",
+                if records.root_kinds.is_empty() {
+                    "none reported".to_string()
+                } else {
+                    records.root_kinds.join(", ")
+                }
+            ));
+            if prof == "project" {
+                // Fixable from config, so it degrades rather than merely
+                // informing: `--strict` should catch a control pointed at the
+                // wrong surface.
+                messages.push(
+                    "profile `project` scopes the scan to this repository, where none of those \
+                     roots live — set profile = \"baseline\" in [controls.bumblebee]"
+                        .into(),
+                );
+                Outcome::Degraded
+            } else {
+                // Nothing to fix: this endpoint genuinely has none of those roots.
+                // Say so plainly instead of failing a build over it.
+                messages.push(
+                    "none of those roots are present on this endpoint, so this run verified \
+                     installed packages only"
+                        .into(),
+                );
+                Outcome::Info
+            }
+        } else {
+            messages.push(format!("endpoint classes covered: {}", reached.join(", ")));
+            Outcome::Pass
+        };
         if let Some(c) = &coerced {
             messages.push(format!(
                 "note: unrecognised profile `{c}` was treated as `{prof}`"
@@ -532,7 +799,7 @@ fn evaluate_scan(
                 records.unparsable_lines
             ));
         }
-        return VerifyResult::new(CONTROL, Outcome::Pass, messages);
+        return VerifyResult::new(CONTROL, outcome, messages);
     }
 
     let mut messages = vec![format!(
@@ -551,6 +818,68 @@ fn evaluate_scan(
     VerifyResult::new(CONTROL, Outcome::Fail, messages)
 }
 
+/// How many problem diagnostics are spelled out before the rest are counted.
+const DIAGNOSTIC_LIMIT: usize = 10;
+
+/// Fold what bumblebee said on stderr into the verdict the record stream
+/// produced.
+///
+/// The stderr stream was previously read only when the exit code was non-zero,
+/// which discarded it on every successful run — and a successful run is exactly
+/// where it matters, because a subject bumblebee could not read is reported
+/// there at `warn` while the run still exits 0 and emits a `complete` summary.
+/// Observed on a real machine: a malformed MCP config was dropped from the scan
+/// and the control reported PASS.
+///
+/// A dropped subject weakens a clean verdict rather than invalidating it — the
+/// artifacts that WERE read were genuinely matched — so a would-be `Pass`
+/// becomes `Degraded`, the same rung `package-trust` uses when its approved
+/// baseline cannot be read. `--strict` catches it; a plain `verify` reports it
+/// without failing the build. Outcomes that are already weaker are left alone:
+/// `weakest` never promotes.
+fn apply_diagnostics(result: &mut VerifyResult, diags: &Diagnostics) {
+    let problems = diags.problems();
+    if !problems.is_empty() {
+        result.messages.push(format!(
+            "bumblebee could not read {} subject(s) it was asked to examine — those artifacts \
+             were NOT matched against the catalog",
+            problems.len()
+        ));
+        for d in problems.iter().take(DIAGNOSTIC_LIMIT) {
+            result.messages.push(d.render());
+        }
+        if problems.len() > DIAGNOSTIC_LIMIT {
+            result.messages.push(format!(
+                "… and {} more diagnostic(s)",
+                problems.len() - DIAGNOSTIC_LIMIT
+            ));
+        }
+        result.outcome = result.outcome.clone().weakest(Outcome::Degraded);
+    }
+    // Routine per-run bookkeeping ("default roots: 19 present…", "scan complete:
+    // …"). Counted rather than reprinted: the point is that the user knows the
+    // stream exists and is not being hidden, not that four lines of provenance
+    // are pasted into every report.
+    let informational = diags.informational();
+    if informational > 0 {
+        result.messages.push(format!(
+            "note: {informational} informational diagnostic(s) from the scan"
+        ));
+    }
+    // Anything bumblebee wrote that was not a diagnostic record. On a successful
+    // run this should be empty; if it is not, it is the tool saying something we
+    // have no schema for, and dropping it is how the schema stays unknown.
+    for line in diags.plain.iter().take(3) {
+        result.messages.push(format!("stderr: {line}"));
+    }
+    if diags.plain.len() > 3 {
+        result.messages.push(format!(
+            "… and {} more stderr line(s)",
+            diags.plain.len() - 3
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,14 +887,27 @@ mod tests {
     fn out(stdout: &str, stderr: &str, status: i32) -> exec::CmdOutput {
         exec::CmdOutput {
             status,
+            signal: None,
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
         }
     }
 
+    /// The root set a real `baseline` run reports on a developer machine, so the
+    /// default fixture is a scan that actually reached the endpoint classes.
+    const ENDPOINT_ROOTS: &str = r#"[{"path":"/h/.claude","kind":"mcp_config_root"},{"path":"/h/.vscode/extensions","kind":"editor_extension_root"},{"path":"/h/Library/.../Extensions","kind":"browser_extension_root"},{"path":"/h/.agents","kind":"agent_skill_root"},{"path":"/opt/homebrew/Cellar","kind":"homebrew_root"}]"#;
+    /// What a machine with nothing but Homebrew reports — the M20 case.
+    const HOMEBREW_ONLY_ROOTS: &str = r#"[{"path":"/opt/homebrew/Cellar","kind":"homebrew_root"},{"path":"/h/go","kind":"user_package_root"}]"#;
+    /// What `--profile project --root <repo>` reports, verbatim from a real run.
+    const PROJECT_ROOTS: &str = r#"[{"path":"/repo","kind":"project_root"}]"#;
+
     fn summary(status: &str, timed_out: bool, inventoried: u64) -> String {
+        summary_with_roots(status, timed_out, inventoried, ENDPOINT_ROOTS)
+    }
+
+    fn summary_with_roots(status: &str, timed_out: bool, inventoried: u64, roots: &str) -> String {
         format!(
-            r#"{{"record_type":"scan_summary","status":"{status}","timed_out":{timed_out},"package_records_emitted":0,"package_records_suppressed":{inventoried}}}"#
+            r#"{{"record_type":"scan_summary","status":"{status}","timed_out":{timed_out},"package_records_emitted":0,"package_records_suppressed":{inventoried},"roots":{roots}}}"#
         )
     }
 
@@ -782,6 +1124,287 @@ mod tests {
             r.messages[0].contains("148"),
             "a pass must say how much it looked at: {:?}",
             r.messages
+        );
+    }
+
+    // ── M20: the inventory guard must be per-class, not one aggregate number ──
+
+    /// The finding. 16,912 Homebrew receipts satisfied "did the scan look at
+    /// anything?" while every class this control exists for went unopened, and
+    /// the report said the ENDPOINT was clean.
+    #[test]
+    fn a_homebrew_only_scan_is_not_a_clean_endpoint() {
+        let r = evaluate_scan(
+            "0.1.2",
+            "baseline",
+            "catalog.json",
+            None,
+            &out(
+                &summary_with_roots("complete", false, 16912, HOMEBREW_ONLY_ROOTS),
+                "",
+                0,
+            ),
+        );
+        assert_ne!(
+            r.outcome,
+            Outcome::Pass,
+            "a single populated class must not satisfy a guard meant to prove the scan \
+             looked at the endpoint: {:?}",
+            r.messages
+        );
+        assert_eq!(r.outcome, Outcome::Info);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("MCP server configs") && m.contains("agent skills")),
+            "the unexamined classes must be named: {:?}",
+            r.messages
+        );
+        assert!(
+            r.messages.iter().any(|m| m.contains("homebrew_root")),
+            "what WAS reached must be named too: {:?}",
+            r.messages
+        );
+    }
+
+    /// Same blindness, the version a user can fix: `project` cannot reach those
+    /// roots by construction, so it degrades and names the config change. An npm
+    /// repo inventories plenty under `project` and sailed past the aggregate
+    /// guard.
+    #[test]
+    fn a_project_scoped_scan_degrades_and_points_at_the_profile() {
+        let r = evaluate_scan(
+            "0.1.2",
+            "project",
+            "catalog.json",
+            None,
+            &out(
+                &summary_with_roots("complete", false, 431, PROJECT_ROOTS),
+                "",
+                0,
+            ),
+        );
+        assert_eq!(
+            r.outcome,
+            Outcome::Degraded,
+            "a control pointed at the wrong surface is fixable, so --strict should see it: {:?}",
+            r.messages
+        );
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("profile = \"baseline\"")),
+            "must name the fix: {:?}",
+            r.messages
+        );
+    }
+
+    /// The other direction: reaching even one endpoint class is a real endpoint
+    /// scan, and it passes — with the covered classes stated, so the verdict is
+    /// no longer a class-blind number.
+    #[test]
+    fn a_scan_that_reached_endpoint_roots_passes_and_names_the_classes_covered() {
+        let r = eval(&summary("complete", false, 148), "", 0);
+        assert_eq!(r.outcome, Outcome::Pass);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("endpoint classes covered") && m.contains("MCP server configs")),
+            "a pass must say WHICH classes it covered: {:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn one_endpoint_class_is_enough_to_be_an_endpoint_scan() {
+        let only_skills = r#"[{"path":"/h/.agents","kind":"agent_skill_root"},{"path":"/opt/homebrew/Cellar","kind":"homebrew_root"}]"#;
+        let r = evaluate_scan(
+            "0.1.2",
+            "baseline",
+            "catalog.json",
+            None,
+            &out(
+                &summary_with_roots("complete", false, 9, only_skills),
+                "",
+                0,
+            ),
+        );
+        assert_eq!(r.outcome, Outcome::Pass, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("endpoint classes covered: agent skills")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// A summary with no `roots` at all is not evidence of coverage either.
+    #[test]
+    fn a_summary_with_no_roots_array_is_not_a_covered_endpoint() {
+        let no_roots = r#"{"record_type":"scan_summary","status":"complete","timed_out":false,"package_records_suppressed":50}"#;
+        let r = eval(no_roots, "", 0);
+        assert_ne!(r.outcome, Outcome::Pass, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("none reported")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn root_kinds_are_parsed_and_deduplicated_in_first_seen_order() {
+        let dup = r#"{"record_type":"scan_summary","status":"complete","timed_out":false,"package_records_suppressed":1,"roots":[{"path":"/a","kind":"mcp_config_root"},{"path":"/b","kind":"mcp_config_root"},{"path":"/c","kind":"homebrew_root"}]}"#;
+        let r = parse_records(dup);
+        assert_eq!(r.root_kinds, vec!["mcp_config_root", "homebrew_root"]);
+        assert_eq!(
+            endpoint_classes_reached(&r.root_kinds),
+            vec!["MCP server configs"]
+        );
+    }
+
+    // ── M19: stderr diagnostics, which a successful run is the ONLY place for ──
+
+    /// Captured verbatim from a real v0.1.2 `baseline` run. bumblebee reached
+    /// this MCP config, could not parse it, dropped it from the inventory, and
+    /// still exited 0 with a `status:"complete"` summary.
+    const WARN_DIAG: &str = r#"{"record_type":"diagnostic","run_id":"08dd","time":"2026-08-24T20:43:03.635305Z","level":"warn","path":"/Users/p4gs/.gemini/config/mcp_config.json","message":"parse MCP config: unexpected end of JSON input"}"#;
+    /// Routine bookkeeping from the same run.
+    const INFO_DIAG: &str = r#"{"record_type":"diagnostic","run_id":"08dd","level":"info","message":"default roots: 19 present, 85 candidate paths absent (use --root to override)"}"#;
+
+    /// The finding, in one test: bumblebee reports what it could not read ONLY
+    /// on stderr, and the exit code stays 0. Reading stdout alone reported a
+    /// dropped MCP config as a clean endpoint.
+    #[test]
+    fn a_subject_the_scan_could_not_read_is_surfaced_and_weakens_a_clean_verdict() {
+        let r = eval(&summary("complete", false, 148), WARN_DIAG, 0);
+        assert_eq!(
+            r.outcome,
+            Outcome::Degraded,
+            "a scan that dropped a subject has not established that subject is clean: {:?}",
+            r.messages
+        );
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("mcp_config.json") && m.contains("unexpected end of JSON")),
+            "the tool's own diagnostic must survive verbatim: {:?}",
+            r.messages
+        );
+        assert!(
+            r.messages.iter().any(|m| m.contains("could not read 1")),
+            "the count of dropped subjects must be stated: {:?}",
+            r.messages
+        );
+    }
+
+    /// The other half: routine `info` chatter must NOT weaken a clean run, or
+    /// every scan degrades and the signal is worthless.
+    #[test]
+    fn informational_diagnostics_are_counted_without_weakening_a_pass() {
+        let r = eval(&summary("complete", false, 148), INFO_DIAG, 0);
+        assert_eq!(r.outcome, Outcome::Pass);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("1 informational diagnostic")),
+            "the stream must be acknowledged rather than hidden: {:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn diagnostics_are_reported_on_a_findings_fail_too_and_never_promote_it() {
+        let r = eval(
+            &format!("{FINDING}\n{}", summary("complete", false, 148)),
+            &format!("{INFO_DIAG}\n{WARN_DIAG}"),
+            0,
+        );
+        assert_eq!(
+            r.outcome,
+            Outcome::Fail,
+            "Degraded must never promote a Fail"
+        );
+        assert!(
+            r.messages.iter().any(|m| m.contains("mcp_config.json")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// Many dropped subjects are truncated in the listing, but the COUNT stays
+    /// truthful — the same rule the findings list follows.
+    #[test]
+    fn many_diagnostics_are_truncated_but_the_count_is_not() {
+        let stderr = (0..14)
+            .map(|i| {
+                format!(
+                    r#"{{"record_type":"diagnostic","level":"warn","path":"/p/{i}","message":"unreadable"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let r = eval(&summary("complete", false, 148), &stderr, 0);
+        assert_eq!(r.outcome, Outcome::Degraded);
+        assert!(
+            r.messages.iter().any(|m| m.contains("could not read 14")),
+            "{:?}",
+            r.messages
+        );
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("and 4 more diagnostic")),
+            "truncation must be declared: {:?}",
+            r.messages
+        );
+    }
+
+    /// stderr that is not a diagnostic record is still output, and still reaches
+    /// the user. bumblebee's own fatal errors are bare text on this stream.
+    #[test]
+    fn non_record_stderr_lines_are_surfaced_verbatim_rather_than_dropped() {
+        let r = eval(
+            &summary("complete", false, 148),
+            "runtime: out of memory\n",
+            0,
+        );
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("runtime: out of memory")),
+            "unrecognised stderr must not be swallowed: {:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn diagnostics_parse_levels_paths_and_plain_lines_apart() {
+        let d = parse_diagnostics(&format!("{INFO_DIAG}\n{WARN_DIAG}\nnot a record\n\n"));
+        assert_eq!(d.entries.len(), 2);
+        assert_eq!(d.informational(), 1);
+        let problems = d.problems();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].level, "warn");
+        assert_eq!(
+            problems[0].path.as_deref(),
+            Some("/Users/p4gs/.gemini/config/mcp_config.json")
+        );
+        assert_eq!(d.plain, vec!["not a record".to_string()]);
+    }
+
+    /// A diagnostic with no `level` and no `message` must not panic or silently
+    /// vanish — an unknown level is not a safe level.
+    #[test]
+    fn a_diagnostic_missing_its_fields_is_treated_as_a_problem_not_as_noise() {
+        let d = parse_diagnostics(r#"{"record_type":"diagnostic"}"#);
+        assert_eq!(d.entries.len(), 1);
+        assert_eq!(d.entries[0].level, "unknown");
+        assert_eq!(d.entries[0].message, "(no message)");
+        assert_eq!(
+            d.problems().len(),
+            1,
+            "an unrecognised level must not be assumed benign"
         );
     }
 
@@ -1077,12 +1700,11 @@ mod tests {
     }
 
     #[test]
-    fn profile_defaults_to_project_and_deep_is_unreachable() {
-        assert_eq!(profile_from(None), "project");
-        // Anything that is not an explicit `baseline` — including an attempt to
+    fn an_unrecognised_profile_never_widens_the_scan() {
+        // Anything NAMED but not an explicit `baseline` — including an attempt to
         // select the $HOME-walking `deep` mode — resolves to the repo-scoped
         // profile. Config cannot escalate scan scope beyond the repository.
-        for attempted in ["deep", "DEEP", "", "nonsense", "  deep  "] {
+        for attempted in ["deep", "DEEP", "nonsense", "  deep  "] {
             assert_eq!(
                 profile_from(Some(attempted)),
                 "project",
@@ -1091,5 +1713,57 @@ mod tests {
         }
         assert_eq!(profile_from(Some("baseline")), "baseline");
         assert_eq!(profile_from(Some("  baseline  ")), "baseline");
+        assert_eq!(profile_from(Some("project")), "project");
+    }
+
+    /// The registry literal, unquoted — the value `sscsb init` writes into
+    /// `.sscsb/config.toml` for `[controls.bumblebee] profile`.
+    fn registry_profile_literal() -> &'static str {
+        crate::controls::control(CONTROL)
+            .expect("bumblebee is in the registry")
+            .default_options
+            .iter()
+            .find(|(k, _)| *k == "profile")
+            .map(|(_, v)| v.trim_matches('"'))
+            .expect("bumblebee declares a default profile")
+    }
+
+    /// M25. The registry said `"baseline"` and the code fell back to `"project"`,
+    /// so the SAME control scanned a different surface depending on whether the
+    /// config key happened to be present — a hand-written or trimmed config got
+    /// the repo-scoped scan while a generated one got the endpoint scan. An
+    /// absent key must mean the registry default, not a second opinion.
+    #[test]
+    fn the_runtime_profile_default_is_the_registry_default() {
+        assert_eq!(
+            profile_from(None),
+            registry_profile_literal(),
+            "the fallback used when `profile` is absent must equal the value the \
+             generated config carries"
+        );
+        assert_eq!(
+            profile_from(Some("")),
+            registry_profile_literal(),
+            "a blank value is nobody choosing anything, not an unrecognised choice"
+        );
+    }
+
+    /// M25, second half: the Info hint printed when no catalog is configured told
+    /// the user to set the profile the module's own doc says inventories nothing
+    /// on a Rust repo — advice that produced the zero-subject FAIL below.
+    #[test]
+    fn the_no_catalog_hint_names_the_registry_default_profile() {
+        let r = no_catalog_result("0.1.2");
+        assert_eq!(r.outcome, Outcome::Info);
+        let hint = r
+            .messages
+            .iter()
+            .find(|m| m.contains("[controls.bumblebee]"))
+            .expect("the hint must spell out the config block");
+        assert!(
+            hint.contains(&format!("profile = \"{}\"", registry_profile_literal())),
+            "the hint must not tell the user to set a different profile than the \
+             registry default: {hint}"
+        );
     }
 }

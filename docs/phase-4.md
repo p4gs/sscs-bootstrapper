@@ -33,18 +33,44 @@ sscsb sast
 catches `curl … | sh` install steps, which is the shape half of AI-suggested setup
 instructions take. `rules = "auto"` opts into the registry instead.
 
-In pre-commit, SAST runs over the **staged** files, and `ERROR`-severity findings
-block the commit. Warnings do not. A pre-commit hook that blocks on everything gets
-disabled by the second day; the severity line is where the control survives contact
-with actual work.
+In pre-commit, SAST runs over the **staged** files, and blocking-severity findings
+block the commit. `INFO`, `WARNING`, `LOW` and `MEDIUM` are advisory and do not. A
+pre-commit hook that blocks on everything gets disabled by the second day; the
+severity line is where the control survives contact with actual work.
+
+The blocking half is deliberately **everything else**, rather than a list of
+names. Semgrep's rule schema documents `INFO | WARNING | ERROR`, but both engines
+accept and echo back a rule that declares `severity: CRITICAL` or `HIGH` — so a
+gate written as "block on `ERROR`" waves through the two strictest severities a
+rule can carry. And a finding whose severity `sscsb` could not read at all is
+recorded as `UNRATED`, which blocks: a severity we cannot place is not a low
+severity, the same rule Phase 2 applies to advisories.
+
+**A file the engine could not read is not a clean file.** Both engines report a
+file they failed to parse in the results JSON's `errors` array and still exit `0`
+with whatever else they found. In pre-commit that is an error rather than an
+empty result — the gate's claim is about the files being committed right now, and
+it cannot make that claim about a file nobody parsed — so `general.fail_open`
+governs it, exactly as it governs a scanner that could not run at all. A
+whole-tree `sscsb sast` reports the same thing as a `note:` naming each part of
+the tree the run does not cover, without changing the exit code.
+
+`engine` takes `opengrep` or `semgrep`, and nothing else. Anything else is a
+configuration error that `sscsb verify` reports as a **FAIL** — not a pass on
+some other tool's behalf. `sscsb` orchestrates a registry of tools, so a name
+like `trivy` resolves to a real, installed binary; detecting it would say
+nothing about whether the SAST control works, and `sscsb sast` would refuse to
+run it.
 
 A detail that cost real debugging time and is worth writing down: **OpenGrep exits
 0 even when it finds things** (you need `--error` to change that), and it prints
 rule-parse errors to **stdout** with an empty stderr. So `sscsb` gates on the parsed
 JSON rather than the exit code, and when the tool does fail, it surfaces whichever
 stream actually carried the diagnostic. Semgrep, for its part, exits `1` on
-findings and `2+` on errors. Three tools, three conventions — treating them
-interchangeably is how a scanner ends up reporting green forever.
+findings and `2+` on errors — and a scanner that was *killed* exits with nothing
+at all, which is a failed scan and not a low exit code. Three tools, three
+conventions — treating them interchangeably is how a scanner ends up reporting
+green forever.
 
 ## CodeQL
 

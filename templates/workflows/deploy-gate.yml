@@ -66,7 +66,13 @@ jobs:
               --certificate-oidc-issuer https://token.actions.githubusercontent.com || fail=1
           done
           exit $fail
+      # --builder-id is OPTIONAL to slsa-verifier, and omitting it makes this
+      # gate accept provenance from ANY builder slsa-verifier trusts for this
+      # repository — not the one that actually builds these releases.
+      # BUILDER_ID must track the generator pinned in release-slsa.yml.
       - name: Verify SLSA provenance (provenance gate)
+        env:
+          BUILDER_ID: https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.1.0
         run: |
           set -uo pipefail
           cd assets
@@ -86,7 +92,8 @@ jobs:
             slsa-verifier verify-artifact "$f" \
               --provenance-path "${provenance[0]}" \
               --source-uri "github.com/${GITHUB_REPOSITORY}" \
-              --source-tag "$TAG" || fail=1
+              --source-tag "$TAG" \
+              --builder-id "$BUILDER_ID" || fail=1
           done
           exit $fail
 
