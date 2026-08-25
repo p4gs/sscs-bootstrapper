@@ -173,8 +173,14 @@ anything it can block on is something `sscsb deps baseline` can bless in bulk.
 The search is git's index, not a filesystem walk, so `node_modules/`, `target/`
 and anything else your `.gitignore` covers stays out of the baseline.
 
-**What counts as a declaration.** `pyproject.toml` is read as TOML, never scanned
-line by line, and every section that installs code is read: PEP 621 `[project]`
+**What counts as a declaration.** The FILENAME decides how a manifest is read,
+not its contents: `pyproject.toml` is TOML and `requirements.txt` is
+line-oriented, even though both are PyPI. So `pyproject.toml` is read as TOML,
+never scanned line by line — including when its TOML does not parse, which
+yields no dependencies rather than its own key names. (A manifest the parser
+cannot read is not thereby a manifest that declares nothing: the commit gate
+refuses to let an unparseable one through as "no new dependencies", which is
+the case that matters.) Every section that installs code is read: PEP 621 `[project]`
 and its extras, PEP 735 `[dependency-groups]`, **Poetry**
 (`[tool.poetry.dependencies]`, the legacy `dev-dependencies`, per-group
 dependencies, and `[[tool.poetry.source]]`), PDM, uv and Hatch. Poetry's

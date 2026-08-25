@@ -504,6 +504,11 @@ fn cmd_toggle(cwd: &std::path::Path, control: &str, enabled: bool) -> Result<Exi
 fn cmd_verify(cwd: &std::path::Path, only: &[String], strict: bool) -> Result<ExitCode> {
     let ctx = Ctx::discover(cwd)?;
     let cfg = ctx.require_config()?;
+    // Before ANY control runs: an id nobody recognises is a usage error (exit
+    // 2), not a clean verification of nothing. Placed ahead of the loop so a
+    // partially-valid invocation cannot half-run and still report success.
+    let named: Vec<&str> = only.iter().map(String::as_str).collect();
+    controls::reject_unknown_controls(&named)?;
     let mut failed = 0u32;
     let mut degraded = 0u32;
     for def in controls::CONTROLS {

