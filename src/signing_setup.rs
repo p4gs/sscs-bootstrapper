@@ -31,6 +31,7 @@ use crate::context::Ctx;
 use crate::controls::{Outcome, VerifyResult};
 use crate::exec;
 use anyhow::Result;
+use chrono::NaiveDate;
 use std::path::{Path, PathBuf};
 
 pub const CONTROL: &str = "signing-model";
@@ -539,6 +540,151 @@ fn record_lane_attestation(ctx: &Ctx, env: Environment, today: &str) -> Result<(
     }
     std::fs::write(&path, doc.to_string())?;
     Ok(())
+}
+
+// ─────────────────────── attestation freshness model ────────────────────────
+
+/// How long a recorded `--confirm` stays good before it must be re-confirmed.
+/// Documented in [`SIGNING_MODEL_TEMPLATE`] and in `signing_model_policy_path`'s
+/// doc comment; both consumers (`sscsb signing verify` and
+/// `sscsb verify signing-model`) read this one constant so they cannot drift.
+pub const ATTESTATION_STALE_DAYS: i64 = 180;
+
+/// The state of one recorded attestation date.
+///
+/// This is deliberately NOT [`crate::signers::ExpiryState`]. An `expires` date
+/// is a deadline in the FUTURE and asks "how long until?"; an attestation date
+/// records an action already taken and asks "how long since?". The two count in
+/// opposite directions, so sharing one evaluator silently reads every
+/// attestation as an already-blown deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttestationFreshness {
+    /// No date recorded for this key — the lane was never confirmed.
+    Unset,
+    /// Recorded within the window and still good.
+    Fresh {
+        days_old: i64,
+        days_until_stale: i64,
+    },
+    /// Recorded, but longer ago than the window allows — re-confirm.
+    Stale { days_old: i64 },
+    /// Dated in the future. A confirmation records something you already did,
+    /// so this is a typo or a forgery; either way it is not evidence.
+    FutureDated { days_ahead: i64 },
+    /// Present but not a `YYYY-MM-DD` date.
+    Unparseable,
+}
+
+impl AttestationFreshness {
+    /// Only a genuinely fresh confirmation counts as evidence. Every other
+    /// state — including future-dated — is treated as not-attested.
+    pub fn counts_as_attested(&self) -> bool {
+        matches!(self, AttestationFreshness::Fresh { .. })
+    }
+}
+
+/// Pure attestation-freshness evaluation, so tests can pin "today" rather than
+/// depend on the wall clock. `stale_after_days` is the width of the window; a
+/// confirmation recorded exactly that many days ago is still fresh.
+pub fn evaluate_attestation_freshness(
+    recorded: Option<&str>,
+    today: NaiveDate,
+    stale_after_days: i64,
+) -> AttestationFreshness {
+    let Some(raw) = recorded else {
+        return AttestationFreshness::Unset;
+    };
+    let Ok(date) = NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d") else {
+        return AttestationFreshness::Unparseable;
+    };
+    // NOTE the operand order: `today - date`, days SINCE the confirmation.
+    // `evaluate_expiry` computes `date - today`; that inversion is the bug this
+    // function exists to prevent.
+    let days_old = (today - date).num_days();
+    if days_old < 0 {
+        AttestationFreshness::FutureDated {
+            days_ahead: -days_old,
+        }
+    } else if days_old > stale_after_days {
+        AttestationFreshness::Stale { days_old }
+    } else {
+        AttestationFreshness::Fresh {
+            days_old,
+            days_until_stale: stale_after_days - days_old,
+        }
+    }
+}
+
+/// Evaluate every attestation key for `env` against the recorded policy.
+/// Returns (every key fresh, one report line per key). Shared by the report
+/// card and the control so a lane cannot read ATTESTED in one and pending in
+/// the other.
+fn lane_attestation_report(
+    policy: &toml::Table,
+    env: Environment,
+    today: NaiveDate,
+) -> (bool, Vec<String>) {
+    let keys = lane_attestation_keys(env);
+    let lane = policy.get(env.id()).and_then(|v| v.as_table());
+    let mut lines = Vec::new();
+    let mut fresh = 0usize;
+    for k in keys {
+        let recorded = lane.and_then(|t| t.get(*k)).and_then(|v| v.as_str());
+        let state = evaluate_attestation_freshness(recorded, today, ATTESTATION_STALE_DAYS);
+        if state.counts_as_attested() {
+            fresh += 1;
+        }
+        lines.push(match state {
+            AttestationFreshness::Unset => format!(
+                "{k}: not attested — `sscsb signing setup {} --confirm`",
+                env.id()
+            ),
+            AttestationFreshness::Fresh {
+                days_old,
+                days_until_stale,
+            } => format!("{k}: attested {days_old}d ago, fresh ({days_until_stale}d until stale)"),
+            AttestationFreshness::Stale { days_old } => format!(
+                "{k}: attestation STALE ({days_old}d old, window {ATTESTATION_STALE_DAYS}d) — \
+                 re-confirm"
+            ),
+            AttestationFreshness::FutureDated { days_ahead } => format!(
+                "{k}: attestation dated {days_ahead}d in the FUTURE — a confirmation records an \
+                 action already taken; fix the date and re-confirm"
+            ),
+            AttestationFreshness::Unparseable => {
+                format!("{k}: attestation date unparseable (want YYYY-MM-DD)")
+            }
+        });
+    }
+    (!keys.is_empty() && fresh == keys.len(), lines)
+}
+
+/// A probe signal that overrides an operator's attestation for a guided lane.
+///
+/// An attestation may fill a gap the probe CANNOT reach; it may never overrule
+/// one it can. So each guided lane is trusted only as far as its probe is
+/// blind:
+///
+/// * `cloud-claude` is a hybrid — the repo-side attribution block IS probeable,
+///   so anything short of `Configured` is a real, visible gap that a
+///   confirmation about the App install does not close.
+/// * `github-web` exposes exactly one fact through the API: account MFA. If
+///   GitHub says it is off, an attestation claiming a passkey is contradicted.
+/// * `codespaces` has no read API at all, so the attestation stands alone.
+fn probe_contradiction(st: &EnvStatus) -> Option<String> {
+    match st.env {
+        Environment::CloudClaude if st.state != EnvState::Configured => Some(
+            "repo-side attribution is probeable and is not in place — an attestation cannot \
+             stand in for it"
+                .to_string(),
+        ),
+        Environment::GithubWeb => st
+            .details
+            .iter()
+            .find(|d| d.contains("MFA DISABLED"))
+            .map(|d| format!("attestation contradicted by the account's own state: {d}")),
+        _ => None,
+    }
 }
 
 // ───────────────────────────── setup engine ─────────────────────────────────
@@ -1174,7 +1320,6 @@ pub fn cmd_signing_verify(ctx: &Ctx) -> Result<i32> {
     let paths = SigningPaths::real()?;
     let policy = read_signing_policy(ctx);
     let today = chrono::Utc::now().date_naive();
-    const STALE_DAYS: i64 = 180;
 
     println!("sscsb signing verify — five-environment commit-signing report card\n");
     let mut worst_fail = false;
@@ -1182,35 +1327,13 @@ pub fn cmd_signing_verify(ctx: &Ctx) -> Result<i32> {
 
     for env in Environment::ALL {
         let st = probe_env(ctx, &paths, env);
-        let keys = lane_attestation_keys(env);
-        let (verdict, extra): (&str, Vec<String>) = if !keys.is_empty() {
-            let lane = policy.get(env.id()).and_then(|v| v.as_table());
-            let mut lines = Vec::new();
-            let mut fresh = 0usize;
-            for k in keys {
-                let date = lane.and_then(|t| t.get(*k)).and_then(|v| v.as_str());
-                match crate::signers::evaluate_expiry(date, today, STALE_DAYS) {
-                    crate::signers::ExpiryState::Unset => lines.push(format!(
-                        "{k}: not attested — `sscsb signing setup {} --confirm`",
-                        env.id()
-                    )),
-                    crate::signers::ExpiryState::Expired { days_ago } => lines.push(format!(
-                        "{k}: attestation STALE ({days_ago}d old) — re-confirm"
-                    )),
-                    crate::signers::ExpiryState::Unparseable => lines.push(format!(
-                        "{k}: attestation date unparseable (want YYYY-MM-DD)"
-                    )),
-                    crate::signers::ExpiryState::WindowTooLong { .. } => {
-                        lines.push(format!("{k}: attested (date far in the future — check it)"));
-                        fresh += 1;
-                    }
-                    crate::signers::ExpiryState::Valid { days_left } => {
-                        lines.push(format!("{k}: attested, fresh ({days_left}d until stale)"));
-                        fresh += 1;
-                    }
-                }
+        let (verdict, extra): (&str, Vec<String>) = if !lane_attestation_keys(env).is_empty() {
+            let (attested, mut lines) = lane_attestation_report(&policy, env, today);
+            let contradiction = probe_contradiction(&st);
+            if let Some(c) = &contradiction {
+                lines.push(c.clone());
             }
-            if fresh == keys.len() {
+            if attested && contradiction.is_none() {
                 ("ATTESTED", lines)
             } else {
                 any_pending = true;
@@ -1321,6 +1444,14 @@ pub fn cmd_signing_status(ctx: &Ctx) -> Result<i32> {
 /// reserved for actual VIOLATIONS of the model, of which there is exactly one
 /// probeable class today: identity blur, the agent signing/authoring as the
 /// human. Absence is a to-do; blur is a breach.
+///
+/// A guided lane (github-web, codespaces, cloud-claude) sits behind a web UI
+/// with no read API, so no probe can ever report it `Configured` — that is
+/// precisely why `--confirm` records a dated attestation. This reads that
+/// store, on the same freshness rule as the report card, so a lane the operator
+/// really did complete can count. An attestation only ever fills a gap the
+/// probe cannot reach; where a probe can positively see the setting is off, the
+/// contradiction wins and the lane stays pending.
 pub fn verify_signing_model_control(ctx: &Ctx, _cfg: &Config) -> VerifyResult {
     let paths = match SigningPaths::real() {
         Ok(p) => p,
@@ -1328,30 +1459,53 @@ pub fn verify_signing_model_control(ctx: &Ctx, _cfg: &Config) -> VerifyResult {
             return VerifyResult::new(CONTROL, Outcome::Degraded, vec![format!("{e:#}")]);
         }
     };
+    let policy = read_signing_policy(ctx);
+    let today = chrono::Utc::now().date_naive();
     let mut messages = Vec::new();
     let mut violation = false;
     let mut pending = false;
 
     for env in Environment::ALL {
         let st = probe_env(ctx, &paths, env);
+
+        // Identity blur is a breach in any lane, attested or not: no
+        // confirmation can make the agent wearing the human's identity ok.
+        if st.details.iter().any(|d| d.contains("IDENTITY BLUR")) {
+            violation = true;
+            for d in &st.details {
+                messages.push(format!("{}: {d}", env.id()));
+            }
+            continue;
+        }
+
+        if !lane_attestation_keys(env).is_empty() {
+            let (attested, lines) = lane_attestation_report(&policy, env, today);
+            let contradiction = probe_contradiction(&st);
+            if attested && contradiction.is_none() {
+                messages.push(format!("{}: attested", env.id()));
+            } else {
+                pending = true;
+                if let Some(c) = contradiction {
+                    messages.push(format!("{}: {c}", env.id()));
+                }
+                for l in lines {
+                    messages.push(format!("{}: {l}", env.id()));
+                }
+            }
+            continue;
+        }
+
         match &st.state {
             EnvState::Configured => {
                 messages.push(format!("{}: configured", env.id()));
             }
             EnvState::Partial => {
-                if st.details.iter().any(|d| d.contains("IDENTITY BLUR")) {
-                    violation = true;
-                    for d in &st.details {
-                        messages.push(format!("{}: {d}", env.id()));
-                    }
-                } else {
-                    pending = true;
-                    messages.push(format!(
-                        "{}: incomplete — run `sscsb signing setup {}`",
-                        env.id(),
-                        env.id()
-                    ));
-                }
+                pending = true;
+                messages.push(format!(
+                    "{}: incomplete — run `sscsb signing setup {}`",
+                    env.id(),
+                    env.id()
+                ));
             }
             EnvState::GuidedPending => {
                 pending = true;
@@ -2367,5 +2521,299 @@ mod tests {
         let err =
             merge_git_config_env(r#"{"env": "oops"}"#, &[("user.email", "a@b.c")]).unwrap_err();
         assert!(format!("{err:#}").contains("`env` is not a JSON object"));
+    }
+
+    // ──────────────── attestation freshness (the --confirm window) ───────────
+
+    fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn attestation_freshness_counts_days_since_not_days_until() {
+        // The defect this pins: an attestation date is a record of something
+        // already done, so it must be measured BACKWARD from today. Measuring
+        // it forward (the `evaluate_expiry` contract) reads every confirmation
+        // older than today as an already-blown deadline, collapsing the
+        // documented 180-day window to a single UTC day.
+        let today = ymd(2026, 8, 25);
+        let w = ATTESTATION_STALE_DAYS;
+
+        assert_eq!(
+            evaluate_attestation_freshness(None, today, w),
+            AttestationFreshness::Unset
+        );
+        assert_eq!(
+            evaluate_attestation_freshness(Some("2026-08-25"), today, w),
+            AttestationFreshness::Fresh {
+                days_old: 0,
+                days_until_stale: 180
+            },
+            "confirmed today"
+        );
+        // The exact day the old code broke on.
+        assert_eq!(
+            evaluate_attestation_freshness(Some("2026-08-24"), today, w),
+            AttestationFreshness::Fresh {
+                days_old: 1,
+                days_until_stale: 179
+            },
+            "a confirmation made yesterday is still fresh"
+        );
+        // Both sides of the window boundary.
+        assert_eq!(
+            evaluate_attestation_freshness(Some("2026-02-26"), today, w),
+            AttestationFreshness::Fresh {
+                days_old: 180,
+                days_until_stale: 0
+            },
+            "exactly 180d old is the last fresh day"
+        );
+        assert_eq!(
+            evaluate_attestation_freshness(Some("2026-02-25"), today, w),
+            AttestationFreshness::Stale { days_old: 181 },
+            "181d old has aged out"
+        );
+        // Fail-closed on a date that cannot describe a past action — one day
+        // ahead is enough to disqualify it, and a far-future typo stays out.
+        assert_eq!(
+            evaluate_attestation_freshness(Some("2026-08-26"), today, w),
+            AttestationFreshness::FutureDated { days_ahead: 1 }
+        );
+        assert!(matches!(
+            evaluate_attestation_freshness(Some("2099-01-01"), today, w),
+            AttestationFreshness::FutureDated { .. }
+        ));
+        assert_eq!(
+            evaluate_attestation_freshness(Some("nope"), today, w),
+            AttestationFreshness::Unparseable
+        );
+
+        // Only a fresh confirmation is evidence.
+        assert!(AttestationFreshness::Fresh {
+            days_old: 1,
+            days_until_stale: 179
+        }
+        .counts_as_attested());
+        for not_evidence in [
+            AttestationFreshness::Unset,
+            AttestationFreshness::Stale { days_old: 200 },
+            AttestationFreshness::FutureDated { days_ahead: 5 },
+            AttestationFreshness::Unparseable,
+        ] {
+            assert!(
+                !not_evidence.counts_as_attested(),
+                "{not_evidence:?} must not count as attested"
+            );
+        }
+    }
+
+    /// Build a signing-model policy table with every guided-lane key set to
+    /// `date`, exactly as `record_lane_attestation` would have written it.
+    fn policy_all_lanes(date: &str) -> toml::Table {
+        let mut doc = String::new();
+        for env in Environment::ALL {
+            let keys = lane_attestation_keys(env);
+            if keys.is_empty() {
+                continue;
+            }
+            doc.push_str(&format!("[{}]\n", env.id()));
+            for k in keys {
+                doc.push_str(&format!("{k} = \"{date}\"\n"));
+            }
+        }
+        doc.parse::<toml::Table>().unwrap()
+    }
+
+    #[test]
+    fn a_confirmation_holds_for_the_whole_documented_window_not_one_day() {
+        // Read through the real policy shape, so this covers the wiring
+        // (lane keys → recorded date → freshness) and not just the arithmetic.
+        let today = ymd(2026, 8, 25);
+        let lane = Environment::GithubWeb;
+
+        for (date, why) in [
+            ("2026-08-25", "confirmed today"),
+            ("2026-08-24", "confirmed yesterday"),
+            ("2026-07-26", "confirmed 30 days ago"),
+            ("2026-02-27", "confirmed 179 days ago — inside the window"),
+        ] {
+            let (attested, lines) = lane_attestation_report(&policy_all_lanes(date), lane, today);
+            assert!(attested, "{why}: must still be attested — {lines:?}");
+            assert!(
+                lines.iter().all(|l| l.contains("fresh")),
+                "{why}: {lines:?}"
+            );
+        }
+
+        // Past the window it must drop out, naming the window it blew.
+        let (attested, lines) =
+            lane_attestation_report(&policy_all_lanes("2026-02-24"), lane, today);
+        assert!(!attested, "182 days old must not be attested");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("STALE") && l.contains("182d old")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_future_dated_attestation_is_never_treated_as_a_confirmation() {
+        // The fail-OPEN half of the same defect: reading the date forward made
+        // a far-future value look like a comfortably distant deadline, so a
+        // typo (or a forgery) read as attested indefinitely.
+        let today = ymd(2026, 8, 25);
+        let (attested, lines) = lane_attestation_report(
+            &policy_all_lanes("2099-01-01"),
+            Environment::Codespaces,
+            today,
+        );
+        assert!(!attested, "a future-dated attestation must not count");
+        assert!(
+            lines.iter().any(|l| l.contains("FUTURE")),
+            "must say why: {lines:?}"
+        );
+    }
+
+    // ─────────────── the control's passing verdict is reachable ─────────────
+
+    /// A machine with every lane genuinely set up: human key + agent key with a
+    /// distinct identity, repo attribution block, and a fresh confirmation for
+    /// each guided lane. Returns the fixture plus its repo root.
+    fn fully_configured_machine(attested_on: &str) -> (FakeMachine, tempfile::TempDir) {
+        let m = FakeMachine::new();
+        let human_key = m.with_human_identity();
+
+        // Human lane: every gap closed.
+        m.set("gpg.format", "ssh");
+        m.set("commit.gpgsign", "true");
+        m.set(
+            "gpg.ssh.allowedSignersFile",
+            m.home().join(".ssh/allowed_signers").to_str().unwrap(),
+        );
+        m.set("alias.sign", "commit -S");
+
+        // Agent lane: its OWN key and its OWN email.
+        let agent_key = m.touch(".ssh/agent_signing_key.pub", "ssh-ed25519 AAAAC3Nz agent\n");
+        assert_ne!(agent_key, human_key);
+        m.touch(
+            ".claude/settings.json",
+            &serde_json::json!({
+                "env": {
+                    "GIT_CONFIG_COUNT": "3",
+                    "GIT_CONFIG_KEY_0": "user.signingkey",
+                    "GIT_CONFIG_VALUE_0": agent_key.to_str().unwrap(),
+                    "GIT_CONFIG_KEY_1": "commit.gpgsign",
+                    "GIT_CONFIG_VALUE_1": "true",
+                    "GIT_CONFIG_KEY_2": "user.email",
+                    "GIT_CONFIG_VALUE_2": "agent@example.invalid",
+                }
+            })
+            .to_string(),
+        );
+
+        // Repo side: the cloud lane's probeable half, plus the attestations.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".claude")).unwrap();
+        std::fs::write(
+            repo.path().join(".claude/settings.json"),
+            r#"{"attribution": {"co_authored_by": true}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".sscsb/policy")).unwrap();
+        let mut doc = String::new();
+        for env in Environment::ALL {
+            let keys = lane_attestation_keys(env);
+            if keys.is_empty() {
+                continue;
+            }
+            doc.push_str(&format!("[{}]\n", env.id()));
+            for k in keys {
+                doc.push_str(&format!("{k} = \"{attested_on}\"\n"));
+            }
+        }
+        std::fs::write(repo.path().join(".sscsb/policy/signing-model.toml"), doc).unwrap();
+        (m, repo)
+    }
+
+    #[test]
+    fn signing_model_control_passes_only_when_every_lane_is_configured_and_attested() {
+        // Before this, `Outcome::Pass` was unreachable: github-web's probe
+        // never returns Configured and codespaces' is a constant
+        // GuidedPending, so a fully set-up machine still read Degraded and the
+        // control could never go green.
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let (_m, repo) = fully_configured_machine(&today);
+        let ctx = scratch_ctx(repo.path());
+        let cfg = scratch_config(repo.path());
+
+        let r = verify_signing_model_control(&ctx, &cfg);
+        assert_eq!(r.outcome, Outcome::Pass, "{:?}", r.messages);
+        for lane in ["github-web", "codespaces", "cloud-claude"] {
+            assert!(
+                r.messages.iter().any(|m| m == &format!("{lane}: attested")),
+                "{lane} should be attested: {:?}",
+                r.messages
+            );
+        }
+    }
+
+    #[test]
+    fn signing_model_control_drops_out_of_pass_when_a_confirmation_ages_out() {
+        // The passing verdict is earned, not a freebie: age the confirmations
+        // past the window on an otherwise identical machine and the control
+        // must fall back to Degraded and say which key went stale.
+        let stale = (chrono::Utc::now().date_naive()
+            - chrono::Duration::days(ATTESTATION_STALE_DAYS + 1))
+        .format("%Y-%m-%d")
+        .to_string();
+        let (_m, repo) = fully_configured_machine(&stale);
+        let ctx = scratch_ctx(repo.path());
+        let cfg = scratch_config(repo.path());
+
+        let r = verify_signing_model_control(&ctx, &cfg);
+        assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("gpg_verification") && m.contains("STALE")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    #[test]
+    fn an_attestation_cannot_paper_over_a_gap_the_probe_can_see() {
+        // The guard that keeps the reachable Pass from being a loosening: a
+        // confirmation fills in what no API exposes, it never overrules what
+        // one does. Remove the repo-side attribution block the cloud lane is
+        // actually able to probe, keep every confirmation fresh, and the lane
+        // must still refuse to count.
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let (_m, repo) = fully_configured_machine(&today);
+        std::fs::write(
+            repo.path().join(".claude/settings.json"),
+            r#"{"permissions": {}}"#,
+        )
+        .unwrap();
+        let ctx = scratch_ctx(repo.path());
+        let cfg = scratch_config(repo.path());
+
+        let r = verify_signing_model_control(&ctx, &cfg);
+        assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("cloud-claude") && m.contains("attribution is probeable")),
+            "{:?}",
+            r.messages
+        );
     }
 }
