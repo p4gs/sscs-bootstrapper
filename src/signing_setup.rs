@@ -19,8 +19,12 @@
 //!
 //! Everything here is probe → converge (programmatic) → guide (numbered steps
 //! for what technically cannot be automated) → verify. v1 implements the
-//! macOS + Secretive + Claude Code stack behind generalization seams
-//! (`human_backend` / `agent` config options).
+//! macOS + Secretive + Claude Code stack. Generalizing it — other enclave
+//! backends, other agents — is real work in `SigningPaths` and `Environment`,
+//! not a config key: `agent` and `human_backend` were emitted into
+//! `.sscsb/config.toml` for exactly that purpose and read by nothing, so setting
+//! them changed nothing and said nothing. They were removed rather than left
+//! advertising configurability that does not exist.
 
 use crate::config::Config;
 use crate::context::Ctx;
@@ -2035,9 +2039,19 @@ mod tests {
     // ─────────────────── E4: forge web (gh-probed MFA state) ────────────────
 
     /// Run `probe_github_web` with a fake `gh` whose `api user` prints `body`.
+    ///
+    /// The shim answers `--version` successfully whatever `exit` is, because a
+    /// real `gh` does: an unauthenticated `gh` still reports its version, and
+    /// tool detection reads exactly that. A shim that failed EVERY invocation
+    /// modelled "gh is broken" rather than "gh is not logged in" — a different
+    /// lane of this same function, and one detection now (correctly) treats as
+    /// the tool being unusable.
     fn probe_web_with_gh(body: &str, exit: i32) -> EnvStatus {
         let _lock = env_lock();
-        let script = format!("#!/bin/sh\ncat <<'EOF'\n{body}\nEOF\nexit {exit}\n");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'gh version 2.96.0 (test shim)'; \
+             exit 0; fi\ncat <<'EOF'\n{body}\nEOF\nexit {exit}\n"
+        );
         let bin = fake_gh(&script);
         let _path = PathPrepend::new(bin.path());
         let tmp = tempfile::tempdir().unwrap();

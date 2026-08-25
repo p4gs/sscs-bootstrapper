@@ -69,10 +69,16 @@ pub const CONTROLS: &[ControlDef] = &[
         summary: "Machine-wide signing posture: human enclave lane, distinct agent identity, cloud/web/Codespaces guidance",
         default_enabled: true,
         tools: &[],
-        default_options: &[
-            ("agent", "\"claude-code\""),
-            ("human_backend", "\"secretive\""),
-        ],
+        // No options. `agent = "claude-code"` and `human_backend = "secretive"`
+        // used to be emitted here as "generalization seams" and were read by
+        // nothing: `Environment::ALL` has one hard-coded AI variant and
+        // `SigningPaths` hard-codes Secretive's container path, so a user who set
+        // `human_backend = "1password"` still got Secretive probes and no
+        // indication their setting was ignored. Honouring them means implementing
+        // multi-backend and multi-agent support — a feature, not a default — and
+        // until that exists an inert key is worse than no key, because it reads as
+        // a control the user has set.
+        default_options: &[],
     },
     ControlDef {
         id: "branch-protection",
@@ -135,7 +141,18 @@ pub const CONTROLS: &[ControlDef] = &[
         summary: "Optional cryptographic receipts linking commits to AI tool/model/role",
         default_enabled: false,
         tools: &["cosign"],
-        default_options: &[("sign_with_cosign", "false")],
+        default_options: &[
+            ("sign_with_cosign", "false"),
+            // Empty means "no signature policy configured". A receipt that IS
+            // signed but has no identity to check the signature against fails
+            // verification rather than passing quietly — see
+            // `provenance::verify_receipt_signature`.
+            ("cosign_identity", "\"\""),
+            (
+                "cosign_issuer",
+                "\"https://token.actions.githubusercontent.com\"",
+            ),
+        ],
     },
     // ───────────────────────── Phase 2 — Dependencies & vulnerabilities ─────
     ControlDef {
@@ -268,7 +285,12 @@ pub const CONTROLS: &[ControlDef] = &[
         summary: "slsa-verifier + cosign verification required before promote/deploy/publish",
         default_enabled: true,
         tools: &["slsa-verifier", "cosign"],
-        default_options: &[],
+        // The builder whose provenance this repo trusts, e.g.
+        // "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/\
+        // generator_generic_slsa3.yml@refs/tags/v2.0.0". Empty means unset, and
+        // `sscsb provenance verify` refuses to run unpinned — see
+        // `provenance::verify_artifact`.
+        default_options: &[("builder_id", "\"\"")],
     },
     ControlDef {
         id: "release-immutability",
@@ -295,7 +317,15 @@ pub const CONTROLS: &[ControlDef] = &[
         summary: "StepSecurity Harden-Runner egress/tamper monitoring in every workflow",
         default_enabled: true,
         tools: &[],
-        default_options: &[("egress_policy", "\"audit\"")],
+        // No options. `egress_policy = "audit"` was emitted here and read by
+        // nothing: every workflow template hard-codes `egress-policy: audit`, and
+        // `render` substitutes only repo_slug/default_branch/project. The value
+        // this key appeared to offer is `block`, which harden-runner enforces
+        // against an `allowed-endpoints` allowlist that sscsb cannot synthesise —
+        // a generated `block` with no allowlist breaks the first `actions/checkout`
+        // in every workflow. Offering that from a config key is a trap, so egress
+        // policy stays a per-repo decision made in the workflow file.
+        default_options: &[],
     },
     ControlDef {
         id: "witness",
@@ -523,7 +553,7 @@ impl VerifyResult {
 /// Verify one control. Central dispatch so `sscsb verify` and `sscsb report`
 /// share behavior; per-control logic lives in the phase modules.
 pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> VerifyResult {
-    if !cfg.control_enabled(def.id).unwrap_or(def.default_enabled) {
+    if !cfg.control_enabled_or_default(def.id) {
         return VerifyResult::new(
             def.id,
             Outcome::Disabled,
@@ -594,6 +624,199 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `.rs` file under `src/`, whitespace-collapsed so a rustfmt line
+    /// break cannot hide a call from a source scan.
+    ///
+    /// Source scanning is the only way to assert a *negative* about the code —
+    /// "no second copy of this default exists anywhere" — and that negative is
+    /// the whole anti-recurrence property here. Nothing weaker catches a default
+    /// re-typed into a call site three modules away.
+    fn collapsed_sources() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("src/ is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("source is readable");
+            // Production code only. A key whose only "reader" is an assertion in
+            // its own test module is still a key that does nothing at runtime,
+            // and every module in this crate puts its `#[cfg(test)]` block last.
+            let production = match text.find("#[cfg(test)]") {
+                Some(i) => &text[..i],
+                None => &text[..],
+            };
+            let collapsed = production.split_whitespace().collect::<Vec<_>>().join(" ");
+            out.push((
+                path.file_name().unwrap().to_string_lossy().to_string(),
+                collapsed,
+            ));
+        }
+        assert!(
+            out.len() > 10,
+            "source scan found almost nothing — wrong dir?"
+        );
+        out
+    }
+
+    /// M27. The registry declared `sast` enabled by default while the pre-commit
+    /// hook read the same control's enabled state with a hard-coded `false`
+    /// fallback, so a config with no explicit `[controls.sast] enabled` key
+    /// reported the control ON in `status` and `verify` while the commit gate
+    /// silently skipped every commit. Every such literal was a second copy of the
+    /// registry that could disagree with it; `Config::control_enabled_or_default`
+    /// reads the registry, so no call site needs one. Ban them, and the class
+    /// cannot come back.
+    ///
+    /// (This comment deliberately describes the banned shape instead of quoting
+    /// it — a verbatim example here would trip the scanner on its own source.)
+    ///
+    /// A fallback derived FROM the registry (`unwrap_or(def.default_enabled)`) is
+    /// fine and is not what this matches.
+    #[test]
+    fn no_call_site_hard_codes_a_controls_enabled_default() {
+        let pattern = regex_lite_enabled_literal();
+        for (file, text) in collapsed_sources() {
+            if file == "config.rs" {
+                continue; // where the single registry-backed fallback lives
+            }
+            assert!(
+                !pattern(&text),
+                "{file} hard-codes an enabled-state default next to `control_enabled(` — \
+                 use `Config::control_enabled_or_default` so the registry stays the only \
+                 source of that value"
+            );
+        }
+    }
+
+    /// Hand-rolled scan for an enabled-state call followed by a boolean literal
+    /// fallback, so the test needs no regex dependency.
+    ///
+    /// The needles are BUILT rather than written out: a literal copy of the
+    /// pattern in this file would make the scanner match its own source and fail
+    /// on `controls.rs` forever, which would mean exempting the registry module
+    /// from its own rule.
+    fn regex_lite_enabled_literal() -> impl Fn(&str) -> bool {
+        let call = format!("control_{}(", "enabled");
+        let fallbacks = [
+            format!("unwrap_or({})", true),
+            format!("unwrap_or({})", false),
+        ];
+        move |text: &str| {
+            let mut rest = text;
+            while let Some(i) = rest.find(&call) {
+                let after = &rest[i + call.len()..];
+                if let Some(close) = after.find(')') {
+                    let tail = after[close + 1..].trim_start();
+                    let tail = tail.strip_prefix('.').map(str::trim_start).unwrap_or(tail);
+                    if fallbacks.iter().any(|f| tail.starts_with(f.as_str())) {
+                        return true;
+                    }
+                }
+                rest = &rest[i + call.len()..];
+            }
+            false
+        }
+    }
+
+    /// The same drift class one level down: a per-control OPTION whose code
+    /// fallback disagrees with the value `sscsb init` writes for it. Checked by
+    /// comparing the literal at the call site against the registry rather than
+    /// banning it, because an option's fallback has nowhere else to live.
+    ///
+    /// `[controls.sast] pre_commit = false` is deliberately false in BOTH places
+    /// and must stay that way — this asserts agreement, not a direction.
+    #[test]
+    fn every_hard_coded_option_default_agrees_with_the_registry() {
+        let mut checked = 0;
+        for (file, text) in collapsed_sources() {
+            for c in CONTROLS {
+                for (key, declared) in c.default_options {
+                    for (accessor, unwrap_form) in [
+                        ("control_opt_bool", "unwrap_or("),
+                        ("control_opt_str", "unwrap_or_else(|| \""),
+                    ] {
+                        let call = format!("{accessor}(\"{}\", \"{key}\")", c.id);
+                        let Some(i) = text.find(&call) else { continue };
+                        let tail = text[i + call.len()..].trim_start();
+                        let Some(tail) = tail.strip_prefix('.') else {
+                            continue;
+                        };
+                        let tail = tail.trim_start();
+                        let Some(rest) = tail.strip_prefix(unwrap_form) else {
+                            continue;
+                        };
+                        let literal: String = match accessor {
+                            "control_opt_bool" => {
+                                rest.chars().take_while(|ch| *ch != ')').collect()
+                            }
+                            _ => rest.chars().take_while(|ch| *ch != '"').collect(),
+                        };
+                        let expected = declared.trim_matches('"');
+                        assert_eq!(
+                            literal.trim(),
+                            expected,
+                            "{file}: fallback for [controls.{}] {key} disagrees with the \
+                             registry, so the control behaves differently depending on \
+                             whether the config key happens to be present",
+                            c.id
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 8,
+            "expected to check several option fallbacks, found {checked} — the scan \
+             stopped matching real call sites"
+        );
+    }
+
+    /// M21. `.sscsb/config.toml` is generated from `default_options`, so every
+    /// key in that table becomes a line in the user's config that looks like a
+    /// control they have set. Four of them were read by nothing at all —
+    /// `signing-model.agent`, `signing-model.human_backend`,
+    /// `package-trust.typosquat_check`, `harden-runner.egress_policy` — and a
+    /// fifth, `package-trust.registry_check`, changed only the sentence `sscsb
+    /// verify` printed while the check itself ran regardless.
+    ///
+    /// An inert key is worse than a missing one: it answers "is this on?" with a
+    /// value that means nothing. So every key must be reachable through a
+    /// `Config::control_opt_*` accessor in production code, or not be emitted.
+    #[test]
+    fn every_generated_config_key_has_a_reader() {
+        let accessor = format!("control_{}_", "opt");
+        let sources = collapsed_sources();
+        let mut orphans = Vec::new();
+        for c in CONTROLS {
+            for (key, _) in c.default_options {
+                // The id may be a literal or a module `CONTROL` const, so match on
+                // the key argument and require an accessor call immediately
+                // before it: `control_opt_str(CONTROL, "catalog")`,
+                // `control_opt_bool("secrets", "gitleaks")`.
+                let needle = format!("\"{key}\")");
+                let read = sources.iter().any(|(file, text)| {
+                    file != "controls.rs"
+                        && text.match_indices(&needle).any(|(i, _)| {
+                            let window = &text[i.saturating_sub(80)..i];
+                            window.contains(&accessor)
+                        })
+                });
+                if !read {
+                    orphans.push(format!("[controls.{}] {key}", c.id));
+                }
+            }
+        }
+        assert!(
+            orphans.is_empty(),
+            "these keys are written into every generated config and read by nothing — \
+             wire them to behaviour or stop emitting them: {}",
+            orphans.join(", ")
+        );
+    }
 
     #[test]
     fn registry_ids_unique_and_phases_valid() {

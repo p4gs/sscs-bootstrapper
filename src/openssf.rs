@@ -9,8 +9,207 @@
 use crate::context::Ctx;
 use crate::controls::{Outcome, VerifyResult};
 use std::path::Path;
+use yaml_rust2::parser::{Event, EventReceiver, Parser};
+use yaml_rust2::Yaml;
 
 // ─────────────────────────── Security Insights ──────────────────────────────
+
+/// Security Insights schema MAJOR versions this verifier understands. Minor and
+/// patch releases inside a known major are accepted — that is what the version
+/// scheme promises — so a spec point release does not turn a good file red. A
+/// major sscsb has never heard of is a different matter: every structural check
+/// below is written against v1/v2 field names, so on `9.9.9` those checks are
+/// not evidence of anything and PASS would be a claim sscsb cannot support.
+const KNOWN_SI_SCHEMA_MAJORS: &[u64] = &[1, 2];
+
+/// The generator's own placeholder markers. A field still carrying one is an
+/// unfinished starter, which the Info branch below already reports; it is not a
+/// separate malformed-value complaint.
+fn is_placeholder(text: &str) -> bool {
+    text.contains("REPLACE-ME") || text.contains("TODO:")
+}
+
+/// The literal text of a YAML scalar, whatever type it resolved to. `9.9.9` is
+/// a string to YAML and `2.0` is a float; both are answers to "what version did
+/// this file claim", so both are worth reading.
+fn scalar_text(node: &Yaml) -> Option<String> {
+    match node {
+        Yaml::String(s) | Yaml::Real(s) => Some(s.clone()),
+        Yaml::Integer(i) => Some(i.to_string()),
+        Yaml::Boolean(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// MAJOR of a `MAJOR.MINOR.PATCH` version, or `None` when the text is not one.
+fn schema_major(text: &str) -> Option<u64> {
+    let mut parts = text.trim().split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    parts.next()?.parse::<u64>().ok()?;
+    parts.next()?.parse::<u64>().ok()?;
+    parts.next().is_none().then_some(major)
+}
+
+/// Fields whose name says outright that the value is a URL. Kept to the
+/// unambiguous set — `url`, `<something>-url`, `<something>_url` — because this
+/// is a structural verifier, not a schema: `si validate` is what knows that
+/// `documentation.detailed-guide` is a URI too.
+fn is_url_key(key: &str) -> bool {
+    key == "url" || key.ends_with("-url") || key.ends_with("_url")
+}
+
+/// Shape-only URL check: a scheme, `://`, and something after it. sscsb is not
+/// resolving these — it is declining to call `not-a-url` a URL.
+fn looks_like_url(value: &str) -> bool {
+    let Some((scheme, rest)) = value.trim().split_once("://") else {
+        return false;
+    };
+    !rest.is_empty()
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// Every `url`-shaped field in the document whose value is not a URL.
+///
+/// Iterative on purpose: the walk runs over a document sscsb did not write, and
+/// a recursive one would be a second way to knock `verify` over.
+fn url_field_problems(doc: &Yaml) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut stack = vec![(String::new(), doc)];
+    while let Some((path, node)) = stack.pop() {
+        match node {
+            Yaml::Hash(map) => {
+                for (k, v) in map {
+                    let key = k.as_str().unwrap_or("?");
+                    let child = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if is_url_key(key) {
+                        match scalar_text(v) {
+                            Some(text) if is_placeholder(&text) => {}
+                            Some(text) if !looks_like_url(&text) => {
+                                problems.push(format!("{child} is not a URL: `{text}`"));
+                            }
+                            Some(_) => {}
+                            None => problems.push(format!("{child} must be a URL string")),
+                        }
+                    }
+                    stack.push((child, v));
+                }
+            }
+            Yaml::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    stack.push((format!("{path}[{i}]"), v));
+                }
+            }
+            _ => {}
+        }
+    }
+    problems.sort();
+    problems
+}
+
+/// Ceiling on the bytes sscsb reads from `security-insights.yml`. It is project
+/// metadata — the OpenSSF spec's own examples are a couple of kilobytes — and a
+/// repository sscsb is pointed at is not a repository sscsb trusts.
+const MAX_SI_BYTES: usize = 1024 * 1024;
+
+/// Ceiling on the number of YAML nodes the document may expand to once anchors
+/// and aliases are resolved.
+///
+/// yaml-rust2 resolves an alias by CLONING the node it points at (`yaml.rs`:
+/// `anchor_map.insert(node.1, node.0.clone())`), and exposes no limit on that —
+/// its only "recursion limit" is a `u8` overflow on flow nesting depth. So a few
+/// hundred bytes of nested anchors expand geometrically: a 439-byte file of
+/// eight 9-way alias levels drove `sscsb verify` past 4.5 GB RSS before it was
+/// killed, still growing. That is a denial of service reachable by anyone who
+/// can add a file to a repository, and `verify` is what people wire into CI.
+///
+/// The expansion is counted on the parser's EVENT stream, which is linear in
+/// the input (an alias is one event, not a subtree), and the document is
+/// refused before it ever reaches the loader. 500 000 nodes is roughly the most
+/// an alias-free document of `MAX_SI_BYTES` could contain, so nothing that
+/// would have parsed on its own text is turned away.
+const MAX_SI_NODES: u64 = 500_000;
+
+/// Read at most `max` bytes of `path`, so an oversized (or endless) file is a
+/// reported refusal rather than an unbounded read.
+fn read_bounded(path: &Path, max: usize) -> Result<String, String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|e| format!("unreadable: {e}"))?;
+    let mut buf = Vec::new();
+    file.take(max as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("unreadable: {e}"))?;
+    if buf.len() > max {
+        return Err(format!(
+            "is larger than the {max}-byte ceiling sscsb reads — Security Insights is a \
+             metadata file, not a data file"
+        ));
+    }
+    String::from_utf8(buf).map_err(|_| "is not valid UTF-8".to_string())
+}
+
+/// Counts the nodes a YAML document would expand to *without* expanding it, by
+/// walking the parser's event stream. Anchored node sizes are remembered, and an
+/// alias is charged the size of the node it points at — exactly the clone the
+/// loader would make.
+#[derive(Default)]
+struct NodeBudget {
+    /// Expanded size of each anchored node, by anchor id.
+    anchors: std::collections::HashMap<usize, u64>,
+    /// (anchor id, accumulated child cost) per still-open collection.
+    open: Vec<(usize, u64)>,
+    /// Expanded size of every completed top-level node.
+    total: u64,
+}
+
+impl NodeBudget {
+    fn finish(&mut self, anchor: usize, cost: u64) {
+        if anchor > 0 {
+            self.anchors.insert(anchor, cost);
+        }
+        match self.open.last_mut() {
+            Some((_, acc)) => *acc = acc.saturating_add(cost),
+            None => self.total = self.total.saturating_add(cost),
+        }
+    }
+}
+
+impl EventReceiver for NodeBudget {
+    fn on_event(&mut self, ev: Event) {
+        match ev {
+            Event::Scalar(_, _, anchor, _) => self.finish(anchor, 1),
+            // An alias that resolves to nothing is stored as BadValue by the
+            // loader — one node, not a subtree.
+            Event::Alias(id) => {
+                let cost = self.anchors.get(&id).copied().unwrap_or(1);
+                self.finish(0, cost);
+            }
+            Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
+                self.open.push((anchor, 0));
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                if let Some((anchor, children)) = self.open.pop() {
+                    self.finish(anchor, children.saturating_add(1));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// How many YAML nodes `content` expands to. `None` when the document does not
+/// parse — the loader reports that with its own message and marker.
+fn expanded_node_count(content: &str) -> Option<u64> {
+    let mut budget = NodeBudget::default();
+    Parser::new_from_str(content).load(&mut budget, true).ok()?;
+    Some(budget.total)
+}
 
 /// `security-insights.yml` must exist, parse as YAML, carry a `header` with a
 /// `schema-version`, and describe the `project` or `repository`. Full schema
@@ -25,16 +224,36 @@ pub fn verify_security_insights(ctx: &Ctx) -> VerifyResult {
             vec!["security-insights.yml missing — run `sscsb init`".into()],
         );
     }
-    let content = match std::fs::read_to_string(&path) {
+    let content = match read_bounded(&path, MAX_SI_BYTES) {
         Ok(c) => c,
         Err(e) => {
             return VerifyResult::new(
                 "security-insights",
                 Outcome::Fail,
-                vec![format!("security-insights.yml unreadable: {e}")],
+                vec![format!("security-insights.yml {e}")],
             )
         }
     };
+    // Count the alias expansion on the event stream and refuse the document
+    // before the loader can materialize it. See `MAX_SI_NODES`.
+    if let Some(nodes) = expanded_node_count(&content) {
+        if nodes > MAX_SI_NODES {
+            return VerifyResult::new(
+                "security-insights",
+                Outcome::Fail,
+                vec![
+                    format!(
+                        "security-insights.yml expands to {nodes} YAML nodes from {} bytes \
+                         (ceiling {MAX_SI_NODES}) — REFUSED, not parsed",
+                        content.len()
+                    ),
+                    "its anchors/aliases amplify a small document into a huge one (a \
+                     \"billion laughs\" denial of service); remove the nested aliases"
+                        .into(),
+                ],
+            );
+        }
+    }
     let docs = match yaml_rust2::YamlLoader::load_from_str(&content) {
         Ok(d) => d,
         Err(e) => {
@@ -58,8 +277,26 @@ pub fn verify_security_insights(ctx: &Ctx) -> VerifyResult {
     // Structural checks mirroring the v2-required fields `si validate` enforces
     // (not the full CUE evaluation — that's si-tooling's job).
     let mut problems: Vec<String> = Vec::new();
-    if doc["header"]["schema-version"].is_badvalue() {
+    let declared = &doc["header"]["schema-version"];
+    if declared.is_badvalue() {
         problems.push("MISSING header.schema-version".into());
+    } else {
+        // A version this tool has never heard of is cheap to catch and makes
+        // every check below meaningless — it must not read as PASS.
+        match scalar_text(declared) {
+            None => problems
+                .push("header.schema-version must be a version string like \"2.0.0\"".into()),
+            Some(text) => match schema_major(&text) {
+                None => problems.push(format!(
+                    "header.schema-version `{text}` is not a MAJOR.MINOR.PATCH version"
+                )),
+                Some(major) if !KNOWN_SI_SCHEMA_MAJORS.contains(&major) => problems.push(format!(
+                    "header.schema-version `{text}` declares Security Insights v{major}; sscsb's \
+                     structural checks only know v1 and v2 — upgrade sscsb or fix the version"
+                )),
+                Some(_) => {}
+            },
+        }
     }
     let has_project = !doc["project"].is_badvalue();
     let has_repository = !doc["repository"].is_badvalue();
@@ -87,6 +324,9 @@ pub fn verify_security_insights(ctx: &Ctx) -> VerifyResult {
             problems.push("repository.license must be an object with `expression` + `url`".into());
         }
     }
+    // A field the file itself names `url` and fills with `not-a-url` is not a
+    // schema question — it is wrong on its face, wherever in the document it is.
+    problems.extend(url_field_problems(doc));
     if !problems.is_empty() {
         return VerifyResult::new("security-insights", Outcome::Fail, problems);
     }
@@ -127,16 +367,47 @@ const MODEL_EXTS: &[&str] = &[
     "npz",
 ];
 
+/// Bound on DIRECTORIES traversed (not just matches) so a match-free tree
+/// can't stall verify, independent of the match cap.
+const MODEL_SCAN_DIR_BUDGET: usize = 4000;
+
+/// Bound on matches collected: enough to prove the control applies.
+const MODEL_SCAN_MATCH_CAP: usize = 50;
+
+/// What a bounded scan actually established.
+struct ModelScan {
+    files: Vec<String>,
+    /// The directory budget ran out with directories still unvisited. The tree
+    /// was NOT searched to the end, so "this repo ships no models" is unproven —
+    /// the distinction between a completed search and an abandoned one.
+    incomplete: bool,
+    /// The match cap stopped collection; there may be more model files than the
+    /// ones listed.
+    more_matches: bool,
+}
+
 /// Bounded recursive scan for model files under `root`, skipping VCS/build dirs.
-/// Capped so a large repo can't stall `verify`.
-fn find_model_files(root: &Path) -> Vec<String> {
+/// Capped so a large repo can't stall `verify` — and the caps are reported, not
+/// swallowed, so a truncated search cannot be read as a completed one.
+fn find_model_files(root: &Path) -> ModelScan {
+    scan_model_files(root, MODEL_SCAN_DIR_BUDGET, MODEL_SCAN_MATCH_CAP)
+}
+
+fn scan_model_files(root: &Path, dir_budget: usize, match_cap: usize) -> ModelScan {
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
-    // Bound on DIRECTORIES traversed (not just matches) so a match-free tree
-    // can't stall verify, independent of the 50-match cap below.
     let mut dirs_visited = 0usize;
+    let mut incomplete = false;
+    let mut more_matches = false;
     while let Some(dir) = stack.pop() {
-        if found.len() >= 50 || dirs_visited >= 4000 {
+        if found.len() >= match_cap {
+            more_matches = true;
+            break;
+        }
+        if dirs_visited >= dir_budget {
+            // `dir` was popped but never read, so whatever is under it is
+            // unexamined — that is exactly what `incomplete` records.
+            incomplete = true;
             break;
         }
         dirs_visited += 1;
@@ -179,7 +450,11 @@ fn find_model_files(root: &Path) -> Vec<String> {
         }
     }
     found.sort();
-    found
+    ModelScan {
+        files: found,
+        incomplete,
+        more_matches,
+    }
 }
 
 /// Model signing applies only when the repo ships models. If it does, the
@@ -187,13 +462,33 @@ fn find_model_files(root: &Path) -> Vec<String> {
 /// reported as N/A (Info) rather than a false pass or fail.
 pub fn verify_model_signing(ctx: &Ctx) -> VerifyResult {
     let workflow_ok = ctx.root.join(".github/workflows/sign-models.yml").is_file();
-    let models = find_model_files(&ctx.root);
-    if models.is_empty() {
+    let scan = find_model_files(&ctx.root);
+    if scan.files.is_empty() {
         let installed = if workflow_ok {
             "sign-models.yml installed (ready if models are added)"
         } else {
             "sign-models.yml not installed — run `sscsb init`"
         };
+        // "Found nothing" and "stopped looking" are different answers. Saying
+        // N/A off an abandoned search would hide a repo that does ship models
+        // (a FAIL) behind a verdict that reads like a clean bill of health.
+        if scan.incomplete {
+            return VerifyResult::new(
+                "model-signing",
+                Outcome::Degraded,
+                vec![
+                    format!(
+                        "model scan STOPPED after {MODEL_SCAN_DIR_BUDGET} directories with the \
+                         tree unfinished — no models found so far, but whether this repo ships \
+                         models is UNKNOWN, not N/A"
+                    ),
+                    "check the model paths yourself, or narrow the tree (the scan already skips \
+                     .git/target/node_modules/.venv/venv/dist)"
+                        .into(),
+                    installed.into(),
+                ],
+            );
+        }
         return VerifyResult::new(
             "model-signing",
             Outcome::Info,
@@ -204,10 +499,14 @@ pub fn verify_model_signing(ctx: &Ctx) -> VerifyResult {
             ],
         );
     }
+    let count = if scan.more_matches {
+        format!("{}+", scan.files.len())
+    } else {
+        scan.files.len().to_string()
+    };
     let mut messages = vec![format!(
-        "{} model file(s) detected (e.g. {})",
-        models.len(),
-        models[0]
+        "{count} model file(s) detected (e.g. {})",
+        scan.files[0]
     )];
     if !workflow_ok {
         messages.push(".github/workflows/sign-models.yml MISSING — run `sscsb init`".into());
@@ -457,8 +756,9 @@ mod tests {
         std::fs::write(root.join(".git/x.onnx"), b"x").unwrap();
         std::fs::write(root.join("target/y.pt"), b"y").unwrap();
         std::fs::write(root.join("real.gguf"), b"z").unwrap();
-        let found = find_model_files(root);
-        assert_eq!(found, vec!["real.gguf".to_string()]);
+        let scan = find_model_files(root);
+        assert_eq!(scan.files, vec!["real.gguf".to_string()]);
+        assert!(!scan.incomplete, "a small tree is searched to the end");
     }
 
     #[cfg(unix)]
@@ -480,10 +780,130 @@ mod tests {
             root.join("linked.onnx"),
         )
         .unwrap();
-        let found = find_model_files(root);
+        let scan = find_model_files(root);
         // Only the real in-repo file — the scan neither follows the dir symlink
         // (escaping the repo), the cycle (stalling), nor the file symlink.
-        assert_eq!(found, vec!["in-repo.safetensors".to_string()]);
+        assert_eq!(scan.files, vec!["in-repo.safetensors".to_string()]);
+        assert!(!scan.incomplete);
+    }
+
+    /// Regression (M26): the scan stops after `MODEL_SCAN_DIR_BUDGET`
+    /// directories. If it had found nothing by then it reported Info — "N/A for
+    /// this repo" — which is the same verdict a repo that genuinely ships no
+    /// models gets. A repo big enough to truncate the scan could therefore hide
+    /// unsigned models behind what reads as a clean bill of health.
+    #[test]
+    fn model_signing_will_not_call_a_truncated_scan_n_a() {
+        let (_d, ctx) = repo();
+        // One directory more than the budget, none of them holding a model, so
+        // the outcome does not depend on which order the scan happens to pop.
+        for i in 0..=MODEL_SCAN_DIR_BUDGET {
+            std::fs::create_dir(ctx.root.join(format!("d{i:05}"))).unwrap();
+        }
+        std::fs::write(
+            ctx.root.join(".github/workflows/sign-models.yml"),
+            "name: Sign ML Models\non:\n  workflow_dispatch:\n",
+        )
+        .unwrap();
+
+        let r = verify_model_signing(&ctx);
+        assert_eq!(r.outcome, Outcome::Degraded, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("UNKNOWN, not N/A")),
+            "{:?}",
+            r.messages
+        );
+        assert!(
+            !r.messages.iter().any(|m| m.contains("N/A for this repo")),
+            "a truncated search must not present as a completed one: {:?}",
+            r.messages
+        );
+    }
+
+    /// The half a whole-tree fixture cannot show deterministically: a model that
+    /// exists but sits past the budget. The scan must report empty AND say so.
+    #[test]
+    fn model_scan_reports_when_the_budget_hid_a_real_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // root + `a` fit in a 2-directory budget; `a/b`, holding the model, does
+        // not. The chain makes the visit order the only possible one.
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/model.safetensors"), b"\x00").unwrap();
+
+        let stopped = scan_model_files(root, 2, MODEL_SCAN_MATCH_CAP);
+        assert!(stopped.files.is_empty(), "{:?}", stopped.files);
+        assert!(
+            stopped.incomplete,
+            "the model was missed because the scan stopped, and that must be recorded"
+        );
+
+        // Given the budget to finish, the same tree yields the model and the
+        // scan reports itself complete.
+        let complete = scan_model_files(root, MODEL_SCAN_DIR_BUDGET, MODEL_SCAN_MATCH_CAP);
+        assert_eq!(complete.files, vec!["a/b/model.safetensors".to_string()]);
+        assert!(!complete.incomplete);
+    }
+
+    /// A capped tally must read as a floor, not a total — `50+`, not `50`.
+    #[test]
+    fn model_signing_reports_a_capped_count_as_a_floor() {
+        let (_d, ctx) = repo();
+        // Two directories, each already over the cap, so whichever the scan
+        // reaches first leaves the other unwalked — the flag must not depend on
+        // the order the filesystem hands entries back.
+        for dir in ["weights-a", "weights-b"] {
+            std::fs::create_dir(ctx.root.join(dir)).unwrap();
+            for i in 0..=MODEL_SCAN_MATCH_CAP {
+                std::fs::write(ctx.root.join(format!("{dir}/m{i:03}.safetensors")), b"\x00")
+                    .unwrap();
+            }
+        }
+        std::fs::write(
+            ctx.root.join(".github/workflows/sign-models.yml"),
+            "name: Sign ML Models\non:\n  workflow_dispatch:\n",
+        )
+        .unwrap();
+
+        let r = verify_model_signing(&ctx);
+        // The count is what was collected before the cap stopped it, marked as
+        // a floor — never a bare number implying the whole tree was tallied.
+        let (count, rest) = r.messages[0].split_once(' ').unwrap();
+        assert!(
+            rest.starts_with("model file(s) detected"),
+            "{:?}",
+            r.messages
+        );
+        let floor: usize = count
+            .strip_suffix('+')
+            .expect(&r.messages[0])
+            .parse()
+            .unwrap();
+        assert!(floor >= MODEL_SCAN_MATCH_CAP, "{:?}", r.messages);
+    }
+
+    /// The match cap is the other truncation: the count reported must not claim
+    /// to be the whole tally when collection stopped early.
+    #[test]
+    fn model_signing_counts_are_marked_when_the_match_cap_stopped_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for i in 0..4 {
+            std::fs::write(root.join(format!("m{i}.safetensors")), b"\x00").unwrap();
+        }
+        let capped = scan_model_files(root, MODEL_SCAN_DIR_BUDGET, 2);
+        // The cap is checked when a directory is popped, so a single directory
+        // yields all four; the flag fires when there is still tree to walk.
+        assert!(!capped.more_matches, "one directory, nothing left to pop");
+
+        std::fs::create_dir(root.join("more")).unwrap();
+        std::fs::write(root.join("more/m4.safetensors"), b"\x00").unwrap();
+        let capped = scan_model_files(root, MODEL_SCAN_DIR_BUDGET, 2);
+        assert!(capped.more_matches, "{:?}", capped.files);
+        assert!(
+            !capped.incomplete,
+            "the budget was not the reason it stopped"
+        );
     }
 
     #[test]
@@ -579,6 +999,301 @@ mod tests {
             r.messages
         );
         assert!(r.messages.iter().any(|m| m.contains("NOT verified")));
+    }
+
+    /// Regression (M22): this exact document — a schema version that does not
+    /// exist, a `url` that is not a URL, and a second `url` that is a number —
+    /// reported `[PASS] structurally valid`. The verifier is deliberately
+    /// structural rather than a schema check (`si validate` owns conformance),
+    /// but "structural" was never a licence to pass things that are wrong on
+    /// their face.
+    #[test]
+    fn security_insights_rejects_an_unknown_schema_version_and_non_urls() {
+        let (_d, ctx) = repo();
+        let path = ctx.root.join("security-insights.yml");
+        std::fs::write(
+            &path,
+            "header:\n  schema-version: 9.9.9\n  url: not-a-url\nproject:\n  name: \"acme/widget\"\n  administrators:\n    - name: \"Real Maintainer\"\n      primary: true\n  repositories:\n    - name: \"acme/widget\"\n      url: 42\n",
+        )
+        .unwrap();
+        let r = verify_security_insights(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("9.9.9") && m.contains("v9")),
+            "{:?}",
+            r.messages
+        );
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m == "header.url is not a URL: `not-a-url`"),
+            "{:?}",
+            r.messages
+        );
+        // A numeric `url` is reported by path, wherever it is nested.
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m == "project.repositories[0].url is not a URL: `42`"),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// A malformed version is as unusable as an unknown one, and a `url:` with
+    /// no scalar value at all is its own kind of wrong.
+    #[test]
+    fn security_insights_rejects_a_malformed_version_and_a_non_scalar_url() {
+        let (_d, ctx) = repo();
+        let path = ctx.root.join("security-insights.yml");
+        std::fs::write(
+            &path,
+            "header:\n  schema-version: \"two\"\n  url:\n    - \"https://example.com\"\nproject:\n  name: \"x\"\n  administrators:\n    - name: \"m\"\n      primary: true\n",
+        )
+        .unwrap();
+        let r = verify_security_insights(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("not a MAJOR.MINOR.PATCH")),
+            "{:?}",
+            r.messages
+        );
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m == "header.url must be a URL string"),
+            "{:?}",
+            r.messages
+        );
+        // A non-string schema-version (a plain YAML mapping) is caught too.
+        std::fs::write(
+            &path,
+            "header:\n  schema-version:\n    major: 2\n  url: \"https://example.com\"\nproject:\n  name: \"x\"\n  administrators:\n    - name: \"m\"\n      primary: true\n",
+        )
+        .unwrap();
+        let r = verify_security_insights(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail, "{:?}", r.messages);
+        assert!(
+            r.messages
+                .iter()
+                .any(|m| m.contains("must be a version string")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// A `url` still holding a generator placeholder belongs to the unfinished-
+    /// starter branch, not to the malformed-value branch — otherwise `sscsb
+    /// init` would install a file its own verifier fails.
+    #[test]
+    fn security_insights_leaves_placeholder_urls_to_the_starter_branch() {
+        let (_d, ctx) = repo();
+        std::fs::write(
+            ctx.root.join("security-insights.yml"),
+            "header:\n  schema-version: \"2.0.0\"\n  url: \"REPLACE-ME: publish this file first\"\nproject:\n  name: \"x\"\n  administrators:\n    - name: \"m\"\n      primary: true\n",
+        )
+        .unwrap();
+        let r = verify_security_insights(&ctx);
+        assert_eq!(r.outcome, Outcome::Info, "{:?}", r.messages);
+        assert!(r.messages.iter().any(|m| m.contains("placeholder")));
+    }
+
+    /// YAML resolves an unquoted version to whatever type it looks like. A
+    /// float and a boolean are both "what version did this file claim", and
+    /// neither is one, so both are reported rather than shrugged at.
+    #[test]
+    fn security_insights_reads_an_unquoted_version_whatever_type_it_became() {
+        let (_d, ctx) = repo();
+        let path = ctx.root.join("security-insights.yml");
+        for (written, expect) in [("2.0", "`2.0`"), ("true", "`true`")] {
+            std::fs::write(
+                &path,
+                format!("header:\n  schema-version: {written}\n  url: \"https://example.com\"\nproject:\n  name: \"x\"\n  administrators:\n    - name: \"m\"\n      primary: true\n"),
+            )
+            .unwrap();
+            let r = verify_security_insights(&ctx);
+            assert_eq!(r.outcome, Outcome::Fail, "{written}: {:?}", r.messages);
+            assert!(
+                r.messages
+                    .iter()
+                    .any(|m| m.contains(expect) && m.contains("not a MAJOR.MINOR.PATCH")),
+                "{written}: {:?}",
+                r.messages
+            );
+        }
+    }
+
+    /// The bounded read hands back bytes, so a file that is not text at all is
+    /// a named refusal rather than a parser error about a stray byte.
+    #[test]
+    fn security_insights_reports_a_file_that_is_not_text() {
+        let (_d, ctx) = repo();
+        std::fs::write(
+            ctx.root.join("security-insights.yml"),
+            [0xffu8, 0xfe, 0x00, 0x01],
+        )
+        .unwrap();
+        let r = verify_security_insights(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("not valid UTF-8")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// The version gate is on the MAJOR, not the exact string: a spec point
+    /// release inside a known major must not turn a good file red, and v1 files
+    /// still verify. Nor may the URL check flinch at real-world URL shapes.
+    #[test]
+    fn security_insights_accepts_known_majors_and_real_url_shapes() {
+        let (_d, ctx) = repo();
+        let path = ctx.root.join("security-insights.yml");
+        for version in ["1.0.0", "2.0.0", "2.7.13"] {
+            std::fs::write(
+                &path,
+                format!("header:\n  schema-version: \"{version}\"\n  url: \"https://example.com/si.yml\"\nproject:\n  name: \"x\"\n  administrators:\n    - name: \"m\"\n      primary: true\n"),
+            )
+            .unwrap();
+            let r = verify_security_insights(&ctx);
+            assert_eq!(r.outcome, Outcome::Pass, "{version}: {:?}", r.messages);
+        }
+        // Schemes other than https, ports, and query strings are all URLs.
+        // What is under test is the SCHEME, not the clone-path suffix, so the
+        // insecure-transport case deliberately does not carry one. Our own
+        // shipped `sscsb.git-protocol-insecure` rule reads an unauthenticated
+        // transport plus a clone suffix as a real insecure remote, and it is
+        // right to — including here. Keep the fixture off that shape.
+        for url in [
+            "https://example.com/a?b=c#d",
+            "http://127.0.0.1:8080/x",
+            "git://example.com/r",
+            "ssh://git@example.com/r.git",
+        ] {
+            assert!(looks_like_url(url), "{url} should read as a URL");
+        }
+        for not_url in [
+            "not-a-url",
+            "",
+            "://nohost",
+            "1https://x.com",
+            "example.com",
+        ] {
+            assert!(
+                !looks_like_url(not_url),
+                "{not_url} should not read as a URL"
+            );
+        }
+    }
+
+    /// A structurally COMPLETE Security Insights document — it would PASS every
+    /// check below — whose five nested 9-way anchor levels expand to ~672 000
+    /// YAML nodes from 434 bytes. Deliberately sized just over `MAX_SI_NODES`
+    /// rather than as large as it could be: pre-fix this costs ~125 MB and ~1 s,
+    /// so a future regression of the guard is caught without the test itself
+    /// allocating gigabytes.
+    const ALIAS_BOMB: &str = concat!(
+        "header:\n",
+        "  schema-version: \"2.0.0\"\n",
+        "  url: \"https://example.com/si.yml\"\n",
+        "project:\n",
+        "  name: \"acme/widget\"\n",
+        "  administrators:\n",
+        "    - name: \"Real Maintainer\"\n",
+        "      primary: true\n",
+        "  a0: &a0 [\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\"]\n",
+        "  a1: &a1 [*a0,*a0,*a0,*a0,*a0,*a0,*a0,*a0,*a0]\n",
+        "  a2: &a2 [*a1,*a1,*a1,*a1,*a1,*a1,*a1,*a1,*a1]\n",
+        "  a3: &a3 [*a2,*a2,*a2,*a2,*a2,*a2,*a2,*a2,*a2]\n",
+        "  a4: &a4 [*a3,*a3,*a3,*a3,*a3,*a3,*a3,*a3,*a3]\n",
+        "  a5: &a5 [*a4,*a4,*a4,*a4,*a4,*a4,*a4,*a4,*a4]\n",
+    );
+
+    /// Regression (M23): `verify` is what people wire into CI, and sscsb is
+    /// pointed at repositories it does not trust. A few hundred bytes of nested
+    /// YAML anchors made yaml-rust2 clone its way past 4.5 GB RSS with no end
+    /// in sight — a denial of service reachable by anyone who can add a file to
+    /// the repository. The document must be REFUSED, not expanded.
+    #[test]
+    fn security_insights_refuses_an_alias_bomb_instead_of_expanding_it() {
+        let (_d, ctx) = repo();
+        assert!(
+            ALIAS_BOMB.len() < 1000,
+            "the bomb must stay small — the point is that the FILE is tiny"
+        );
+        std::fs::write(ctx.root.join("security-insights.yml"), ALIAS_BOMB).unwrap();
+
+        let started = std::time::Instant::now();
+        let r = verify_security_insights(&ctx);
+        let elapsed = started.elapsed();
+
+        assert_eq!(r.outcome, Outcome::Fail, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("REFUSED, not parsed")),
+            "{:?}",
+            r.messages
+        );
+        assert!(
+            r.messages.iter().any(|m| m.contains("billion laughs")),
+            "{:?}",
+            r.messages
+        );
+        // Refusing is cheap; expanding is not. Pre-fix this same document took
+        // ~1s and ~125MB before answering (and grows geometrically with one
+        // more line), so the bound is the regression signal, not decoration.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "refusing the bomb took {elapsed:?} — the guard is not short-circuiting"
+        );
+    }
+
+    /// The guard must catch amplification, not anchors. A file that reuses an
+    /// anchor the way a human would still parses and still passes.
+    #[test]
+    fn security_insights_still_accepts_ordinary_anchor_reuse() {
+        let (_d, ctx) = repo();
+        let legit = "header:\n  schema-version: \"2.0.0\"\n  url: \"https://example.com/si.yml\"\nproject:\n  name: \"acme/widget\"\n  administrators: &admins\n    - name: \"Real Maintainer\"\n      primary: true\n  responsible-disclosure: *admins\n  security-contacts: *admins\n";
+        std::fs::write(ctx.root.join("security-insights.yml"), legit).unwrap();
+        let r = verify_security_insights(&ctx);
+        assert_eq!(r.outcome, Outcome::Pass, "{:?}", r.messages);
+    }
+
+    /// The bounded read is the other half of M23: sscsb must not slurp an
+    /// arbitrarily large file just because it is named `security-insights.yml`.
+    #[test]
+    fn security_insights_refuses_a_file_past_the_byte_ceiling() {
+        let (_d, ctx) = repo();
+        let mut huge = String::from("header:\n  schema-version: \"2.0.0\"\n");
+        while huge.len() <= MAX_SI_BYTES {
+            huge.push_str("# padding padding padding padding padding padding padding\n");
+        }
+        std::fs::write(ctx.root.join("security-insights.yml"), &huge).unwrap();
+        let r = verify_security_insights(&ctx);
+        assert_eq!(r.outcome, Outcome::Fail, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("byte ceiling")),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// The node counter models the loader's own cost: a scalar is one node, a
+    /// collection is one plus its children, and an alias costs what it clones.
+    #[test]
+    fn node_budget_charges_an_alias_what_the_loader_would_clone() {
+        // 3 scalars + 1 seq node = 4; the root map is 1 + key + value.
+        assert_eq!(expanded_node_count("a: [1, 2, 3]\n"), Some(6));
+        // The alias costs the whole 4-node sequence again, not one token.
+        assert_eq!(expanded_node_count("a: &s [1, 2, 3]\nb: *s\n"), Some(11));
+        // An alias to an anchor that never resolves is the loader's BadValue:
+        // one node, so a dangling reference cannot be inflated either.
+        assert_eq!(expanded_node_count("a: *nope\n"), None);
+        // Not YAML at all: the caller falls through to the loader's own error.
+        assert_eq!(expanded_node_count("header: [this is: not: valid"), None);
     }
 
     #[test]

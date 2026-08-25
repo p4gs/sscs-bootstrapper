@@ -210,11 +210,11 @@ pub fn install_all(ctx: &Ctx, cfg: &Config) -> Result<Vec<String>> {
     let branch = ctx.default_branch();
     let mut lines = Vec::new();
     for artifact in ARTIFACTS {
-        let def = crate::controls::control(artifact.control).expect("registry");
-        let enabled = cfg
-            .control_enabled(artifact.control)
-            .unwrap_or(def.default_enabled);
-        if !enabled {
+        // Every artifact must name a registered control; the lookup is the
+        // assertion, and `control_enabled_or_default` reads that same registry
+        // entry for the fallback rather than repeating its default here.
+        crate::controls::control(artifact.control).expect("registry");
+        if !cfg.control_enabled_or_default(artifact.control) {
             lines.push(format!(
                 "skip {} (control {} disabled)",
                 artifact.dest, artifact.control
@@ -474,7 +474,17 @@ pub fn verify_template_control(ctx: &Ctx, control: &'static str) -> VerifyResult
     VerifyResult::new(control, outcome, messages)
 }
 
-/// Harden-Runner is verified across EVERY installed workflow.
+/// Harden-Runner is verified across EVERY installed workflow, one JOB at a time.
+///
+/// The predecessor asked `content.contains("step-security/harden-runner@")` of
+/// each file's raw text, which answered a different question than the one the
+/// control claims. Three ways that passed a repo that was not protected:
+/// a `#`-commented-out reference still matched; one hardened job vouched for
+/// every OTHER job in the same file; and an existing-but-empty
+/// `.github/workflows/` directory examined nothing and reported Pass. The check
+/// now parses each workflow and asks [`crate::audit::harden_runner_status`] the
+/// per-job question, and anything it could not read, parse, or find jobs in is
+/// reported as unverified rather than silently counted either way.
 fn verify_harden_runner(ctx: &Ctx) -> VerifyResult {
     let dir = ctx.root.join(".github").join("workflows");
     if !dir.is_dir() {
@@ -485,7 +495,8 @@ fn verify_harden_runner(ctx: &Ctx) -> VerifyResult {
         );
     }
     let mut messages = Vec::new();
-    let mut missing = 0;
+    let mut missing = 0usize;
+    let mut workflows = 0usize;
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
         .unwrap_or_default();
@@ -499,19 +510,61 @@ fn verify_harden_runner(ctx: &Ctx) -> VerifyResult {
         if !name.ends_with(".yml") && !name.ends_with(".yaml") {
             continue;
         }
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        if content.contains("step-security/harden-runner@") {
-            messages.push(format!("{name}: harden-runner present"));
-        } else if content.contains("slsa-framework/slsa-github-generator")
-            && !content.contains("steps:")
-        {
-            messages.push(format!(
-                "{name}: reusable-workflow only (harden-runner runs inside the trusted builder)"
-            ));
-        } else {
+        workflows += 1;
+        let Ok(content) = std::fs::read_to_string(&path) else {
             missing += 1;
-            messages.push(format!("{name}: MISSING harden-runner"));
+            messages.push(format!(
+                "{name}: unreadable as text — harden-runner could not be verified"
+            ));
+            continue;
+        };
+        let jobs = match crate::audit::harden_runner_status(&content) {
+            Ok(jobs) => jobs,
+            Err(err) => {
+                missing += 1;
+                messages.push(format!(
+                    "{name}: could not be parsed ({err:#}) — harden-runner is unverified, \
+                     not confirmed"
+                ));
+                continue;
+            }
+        };
+        if jobs.is_empty() {
+            missing += 1;
+            messages.push(format!(
+                "{name}: declares no jobs — nothing runs here and nothing was verified"
+            ));
+            continue;
         }
+        for (job, status) in jobs {
+            match status {
+                crate::audit::HardenRunner::Present => {
+                    messages.push(format!("{name}: harden-runner present in job `{job}`"))
+                }
+                // Kept deliberately: a job that only calls a reusable workflow
+                // has no step list to head, so hardening belongs to the callee
+                // (for slsa-github-generator, the trusted builder does it).
+                crate::audit::HardenRunner::Reusable(calls) => messages.push(format!(
+                    "{name}: reusable-workflow only — job `{job}` calls `{calls}`, where \
+                     harden-runner is the called workflow's concern"
+                )),
+                crate::audit::HardenRunner::Absent => {
+                    missing += 1;
+                    messages.push(format!(
+                        "{name}: MISSING harden-runner in job `{job}` — that job's egress and \
+                         file tampering are unmonitored"
+                    ));
+                }
+            }
+        }
+    }
+    if workflows == 0 {
+        messages.push(
+            ".github/workflows/ holds no workflow files — zero jobs were examined, so \
+             harden-runner coverage is unverified, not confirmed"
+                .into(),
+        );
+        return VerifyResult::new("harden-runner", Outcome::Degraded, messages);
     }
     let outcome = if missing == 0 {
         Outcome::Pass
@@ -1002,6 +1055,160 @@ mod tests {
         assert!(
             !result.messages.iter().any(|m| m.contains("README.md")),
             "non-workflow files must be skipped entirely: {:?}",
+            result.messages
+        );
+    }
+
+    /// M1: the check was a substring search over the file's TEXT, so a
+    /// commented-out reference — the exact thing a developer leaves behind when
+    /// they rip harden-runner out — satisfied it.
+    #[test]
+    fn a_commented_out_harden_runner_reference_does_not_satisfy_the_control() {
+        let (_d, ctx) = repo();
+        std::fs::write(
+            ctx.root.join(".github/workflows/custom.yml"),
+            "name: custom\non: push\npermissions:\n  contents: read\njobs:\n  b:\n    \
+             runs-on: ubuntu-latest\n    steps:\n      \
+             # - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920\n      \
+             - run: echo hi\n",
+        )
+        .unwrap();
+        let result = verify_template_control(&ctx, "harden-runner");
+        assert_eq!(
+            result.outcome,
+            Outcome::Fail,
+            "a comment monitors no egress: {:?}",
+            result.messages
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.contains("custom.yml: MISSING harden-runner")),
+            "{:?}",
+            result.messages
+        );
+    }
+
+    /// M1: harden-runner protects the JOB it starts, not the file it appears
+    /// in. One hardened job used to vouch for every other job in the workflow.
+    #[test]
+    fn harden_runner_is_checked_per_job_not_per_file() {
+        let (_d, ctx) = repo();
+        std::fs::write(
+            ctx.root.join(".github/workflows/custom.yml"),
+            "name: custom\non: push\npermissions:\n  contents: read\njobs:\n  \
+             hardened:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920\n        \
+             with:\n          egress-policy: audit\n      - run: echo hi\n  \
+             unhardened:\n    runs-on: ubuntu-latest\n    steps:\n      - run: curl evil.example\n",
+        )
+        .unwrap();
+        let result = verify_template_control(&ctx, "harden-runner");
+        assert_eq!(
+            result.outcome,
+            Outcome::Fail,
+            "the second job runs unmonitored: {:?}",
+            result.messages
+        );
+        assert!(
+            result.messages.iter().any(
+                |m| m.contains("custom.yml: MISSING harden-runner") && m.contains("unhardened")
+            ),
+            "the unprotected job must be named: {:?}",
+            result.messages
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.contains("custom.yml: harden-runner present") && m.contains("hardened")),
+            "{:?}",
+            result.messages
+        );
+    }
+
+    /// M1: an existing-but-empty workflow directory verified NOTHING, and
+    /// reported that as a pass with no messages at all.
+    #[test]
+    fn harden_runner_degrades_when_the_workflow_directory_holds_no_workflows() {
+        let (_d, ctx) = repo();
+        let dir = ctx.root.join(".github/workflows");
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        // A non-workflow file in the directory is not a workflow either.
+        std::fs::write(dir.join("README.md"), "not a workflow\n").unwrap();
+        let result = verify_template_control(&ctx, "harden-runner");
+        assert_eq!(
+            result.outcome,
+            Outcome::Degraded,
+            "zero workflows examined is not a pass: {:?}",
+            result.messages
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.contains("no workflow files")),
+            "{:?}",
+            result.messages
+        );
+    }
+
+    /// A non-UTF-8 blob sitting at a `.yml` path in the workflow directory is
+    /// not a workflow sscsb read — so it is unverified, not protected.
+    #[test]
+    fn harden_runner_reports_a_workflow_it_could_not_read_as_text() {
+        let (_d, ctx) = repo();
+        std::fs::write(
+            ctx.root.join(".github/workflows/blob.yml"),
+            [0xff_u8, 0xfe, 0x00, 0x01],
+        )
+        .unwrap();
+        let result = verify_template_control(&ctx, "harden-runner");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.contains("blob.yml") && m.contains("unreadable as text")),
+            "{:?}",
+            result.messages
+        );
+    }
+
+    /// A workflow sscsb cannot parse, or one that declares no jobs, proves
+    /// nothing about harden-runner — and must not be reported as protected.
+    #[test]
+    fn harden_runner_reports_workflows_it_could_not_check() {
+        let (_d, ctx) = repo();
+        std::fs::write(
+            ctx.root.join(".github/workflows/broken.yml"),
+            "name: broken\n  bad: [unclosed\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.root.join(".github/workflows/jobless.yml"),
+            "name: jobless\non: push\npermissions:\n  contents: read\n",
+        )
+        .unwrap();
+        let result = verify_template_control(&ctx, "harden-runner");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.contains("broken.yml") && m.contains("could not be parsed")),
+            "{:?}",
+            result.messages
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.contains("jobless.yml") && m.contains("declares no jobs")),
+            "{:?}",
             result.messages
         );
     }

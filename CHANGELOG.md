@@ -73,6 +73,73 @@ versions.
   anything else that opened that directory. Staged blobs are now carried as
   bytes end to end, through a new `exec::run_bytes`/`RawOutput` path that
   exists precisely to keep file content out of the lossy `String` channel.
+- **A bumblebee scan reported PASS while silently dropping what it could not
+  read.** The control read the tool's stderr only when the exit code was
+  non-zero — and a successful run is the only place that stream carries
+  anything. Measured against v0.1.2 on a real machine: a `baseline` scan over
+  464,986 files emitted
+  `{"record_type":"diagnostic","level":"warn","path":"…/mcp_config.json",
+  "message":"parse MCP config: unexpected end of JSON input"}` on stderr, exited
+  `0` with a `status:"complete"` summary, and the control reported PASS with one
+  message. That MCP config was never matched against the catalog. Diagnostics are
+  now parsed on every run: non-`info` levels print verbatim with the path they
+  name and a clean verdict drops to `DEGRADED` (the rung `package-trust` already
+  uses for input it cannot read, and the one `--strict` gates on). `info` is
+  per-run bookkeeping and is counted, not reprinted; non-record stderr lines
+  (bumblebee's fatal errors are bare text) are surfaced verbatim.
+- **The bumblebee inventory guard could not tell "scanned the endpoint" from
+  "counted the Cellar".** Its "no subjects" refusal read one aggregate counter.
+  On a real machine that counter was 16,912 — all Homebrew receipts — while every
+  class the control exists for went unopened: MCP configs, editor extensions,
+  browser extensions, agent skills. `--findings-only` suppresses the per-package
+  records, so the summary's `roots[].kind` list is the only per-class signal
+  there is. A clean run now states which endpoint classes it covered, and one
+  that reached none of them is not a PASS: `DEGRADED` under
+  `profile = "project"`, which cannot reach those roots by construction and is
+  fixable from config, and `INFO` under `baseline`, where their absence means the
+  endpoint genuinely has none.
+- **`[controls.bumblebee] profile` had two different defaults.** The registry
+  declared `"baseline"` and the code fell back to `"project"`, so the control
+  scanned a different surface depending on whether the config key happened to be
+  present — and `project` inventories nothing at all on a Rust repository. The
+  runtime default is now read from the registry rather than repeated as a
+  literal. An absent key means the registry default; a NAMED but unrecognised
+  profile (including an attempt at the `$HOME`-walking `deep`) still narrows to
+  `project` and is still reported as a coercion. The `INFO` hint printed when no
+  catalog is configured was telling users to set `profile = "project"` — the
+  value that produces the zero-subject FAIL — and now prints the real default.
+- **The pre-commit hook and the report disagreed about whether SAST was on.** The
+  registry declares `sast` enabled by default; the hook read that state with a
+  hard-coded `false` fallback. Measured against a config of
+  `[controls.sast]` carrying `pre_commit = true` and no `enabled` key: the hook
+  saw `enabled=false` while `status` and `verify` saw `enabled=true` — the user
+  has explicitly asked for the commit gate, the report says the control is
+  installed, and every commit goes through unscanned. The fallback now lives once in
+  `Config::control_enabled_or_default`, reading `ControlDef.default_enabled`, and
+  a source-scanning test bans any call site from carrying its own copy.
+  (`[controls.sast] pre_commit = false` is a separate key, is deliberately false
+  in both places, and is now asserted rather than assumed.)
+- **Five keys in the generated config did nothing.** `.sscsb/config.toml` is
+  generated from the control registry, so every key in it reads as a control the
+  user has set. `signing-model.agent`, `signing-model.human_backend`,
+  `package-trust.typosquat_check` and `harden-runner.egress_policy` had no reader
+  at all, and `package-trust.registry_check` changed only the sentence `verify`
+  printed while the lookup ran regardless. The two `package-trust` keys are now
+  real, gating all three places their checks run — `deps check`, approval-time
+  warnings, and the commit-msg gate that actually blocks — with `verify`
+  reporting `INFO` when either is off and `deps check` saying so once per run.
+  Neither key can re-enable resolving a `path`/`git`/`url` dependency by name:
+  that source guard is correctness rather than policy, so it runs first and
+  unconditionally, and suppressing an annotation never unblocks the dependency.
+  The other three were removed: honouring `agent`/`human_backend` means
+  implementing multi-backend signing support, and
+  `egress_policy`'s only non-default value is `block`, which harden-runner
+  enforces against an `allowed-endpoints` allowlist sscsb cannot synthesise —
+  a generated `block` would break the first `actions/checkout` in every workflow.
+  A test now asserts every `default_options` key has a reader in production code.
+  Note that `sscsb init` never overwrites an existing config, so removed keys
+  linger in configs already written; they are ignored, exactly as before.
+
 - **A file committed to the repository silently muted the scanners.** Trivy
   reads `trivy.yaml` and `.trivyignore` from the directory it scans;
   OSV-Scanner reads `osv-scanner.toml` from the tree. None of it is asked
@@ -150,6 +217,58 @@ versions.
   returned `0` — one appended line switched the gate off. It now fails closed,
   with `fail_open = true` as the single explicit opt-out, matching the
   secret-scan and SAST arms of the same hook.
+- **A file on `PATH` counted as an installed tool.** `find_in_path` accepted any
+  regular file and `detect` swallowed the version probe's failure, so a
+  three-line shell script nobody made executable, named `guacone`, took
+  `sscsb verify --strict guac` from exit 1 (DEGRADED) to exit 0 (PASS,
+  "guacone ? available"). Reproduced end to end. A candidate must now be
+  executable, and the probe must run, exit 0, and say something: a present but
+  broken install is not a working tool. This is the root of the class — every
+  orchestrated tool resolves through the same lookup, so cosign, slsa-verifier,
+  guacone, oras and witness are all covered by it. Unparseable versions are
+  still accepted (`sighthound` reports two components), because calling a
+  genuinely installed tool missing would be the opposite error; an *executable*
+  stub that prints anything still detects, and telling a real tool from an
+  impostor needs binary checksum pinning, which is a separate control. The
+  degrade message now distinguishes "not found on PATH" from "found at <path>
+  but its version probe did not succeed".
+- **`sscsb receipt create -- --raw` exited 101.** `git rev-parse` echoes an
+  unrecognised option back at exit 0 when `--verify` is absent, so the resolved
+  "sha" was `--raw` and the receipt filename's twelve-character slice ran off
+  the end of it. `--verify --end-of-options` (added the same day for an
+  unrelated injection fix) already stopped that particular input; the slice
+  itself is now behind a full-object-name check, because `is_object_name`
+  admits abbreviations from seven characters and any resolver answer between
+  seven and eleven still aborted the process. A CLI must not panic on its own
+  argument.
+- **A receipt's actual claim was never verified.** `receipt verify` recomputed
+  the patch digest and stopped. The AI trailers live in the commit *message*,
+  which `git show --format=` does not print, so the digest covers none of them:
+  a receipt whose `aiTool` disagreed with the commit it named verified at exit
+  0, and deleting the declaration outright — laundering AI-assisted work into
+  apparently unassisted work — was equally invisible. The commit's trailers are
+  now re-read and diffed field by field (`CLAIM MISMATCH`). Separately,
+  `receipt create --sign` wrote a cosign bundle that nothing ever read, so a
+  signed receipt and an unsigned one verified identically; any bundle beside a
+  receipt is now put to `cosign verify-blob` against an expected identity, from
+  `--identity` or the new `cosign_identity`/`cosign_issuer` options. A bundle
+  that is present but *unverifiable* — no identity, or no cosign — is an error,
+  not a footnote: "receipt verified" must not be printable next to a signature
+  nobody looked at.
+- **`provenance verify` pinned the source repository and nothing else.**
+  `--builder-id` is optional to slsa-verifier, so an unpinned run asserted only
+  that *some* builder slsa-verifier trusts produced the provenance for that
+  source URI — anyone able to get any trusted builder to run in the repository
+  cleared the gate. A trusted builder is now required, from `--builder-id` or
+  `builder_id` under `[controls.provenance-verify]`, and resolved before the
+  tool-availability check, because an unpinned builder is a policy gap whether
+  or not slsa-verifier is installed. Not defaulted: a default has to name one
+  generator, and one that is wrong for a repo narrows the gate silently or gets
+  copied without thought. `--source-tag` stays optional — branch builds are
+  legitimate — but the verdict now states `source tag NOT pinned` rather than
+  letting "verified" carry more weight than it earned. The shipped
+  `deploy-gate.yml` and `release-slsa.yml` workflows had the same gap and now
+  pass a `BUILDER_ID` tied to the generator they pin.
 
 ### Changed
 

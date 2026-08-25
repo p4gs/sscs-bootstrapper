@@ -280,6 +280,11 @@ fn provenance_verify_passes_on_a_real_slsa_signed_artifact() {
                 "y",
                 "--source-uri",
                 "github.com/o/r",
+                // A trusted builder must be pinned before the tool is even
+                // consulted, so supply one to reach the tool-absence branch
+                // this half of the test is about.
+                "--builder-id",
+                "https://example.invalid/builder",
             ])
             .assert()
             .failure();
@@ -321,7 +326,75 @@ fn provenance_verify_passes_on_a_real_slsa_signed_artifact() {
         "subject digest expected: {stdout}"
     );
 
-    // 2. sscsb's gate wraps slsa-verifier and PASSES on the genuine pair.
+    // The builder this genuine release was actually built by, read out of the
+    // provenance the way an operator configures the pin once: from a build they
+    // trust. `inspect` prints it as "builder:   <id>".
+    let real_builder = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("builder:"))
+        .expect("inspect names the builder")
+        .trim()
+        .to_string();
+
+    // 2. sscsb's gate wraps slsa-verifier and PASSES on the genuine pair, with
+    //    the builder pinned to the one that really produced it.
+    let out = sscsb(repo)
+        .args([
+            "provenance",
+            "verify",
+            "--artifact",
+            artifact.to_str().unwrap(),
+            "--provenance",
+            provenance.to_str().unwrap(),
+            "--source-uri",
+            "github.com/slsa-framework/slsa-verifier",
+            "--source-tag",
+            "v2.7.1",
+            "--builder-id",
+            &real_builder,
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("PASSED"),
+        "slsa-verifier must pass: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("builder-id {real_builder}")),
+        "the verdict must say what it pinned: {stdout}"
+    );
+
+    // 2b. (M15) The pin has TEETH against real provenance: the same genuine,
+    //     untampered artifact and provenance, verified against a DIFFERENT
+    //     trusted builder, must be rejected. Without --builder-id this exact
+    //     invocation passed, which is the finding.
+    let out = sscsb(repo)
+        .args([
+            "provenance",
+            "verify",
+            "--artifact",
+            artifact.to_str().unwrap(),
+            "--provenance",
+            provenance.to_str().unwrap(),
+            "--source-uri",
+            "github.com/slsa-framework/slsa-verifier",
+            "--source-tag",
+            "v2.7.1",
+            "--builder-id",
+            "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/\
+             generator_container_slsa3.yml@refs/tags/v2.0.0",
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("FAILED") || stderr.to_lowercase().contains("builder"),
+        "provenance from another builder must be rejected: {stderr}"
+    );
+
+    // 2c. And an unpinned run is refused outright rather than verifying less
+    //     than it appears to.
     let out = sscsb(repo)
         .args([
             "provenance",
@@ -336,11 +409,11 @@ fn provenance_verify_passes_on_a_real_slsa_signed_artifact() {
             "v2.7.1",
         ])
         .assert()
-        .success();
-    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
     assert!(
-        stdout.contains("PASSED"),
-        "slsa-verifier must pass: {stdout}"
+        stderr.contains("no trusted builder is pinned"),
+        "an unpinned verify must be refused: {stderr}"
     );
 
     // 3. TAMPERED artifact must FAIL the gate (the gate has teeth).
@@ -359,6 +432,8 @@ fn provenance_verify_passes_on_a_real_slsa_signed_artifact() {
             "github.com/slsa-framework/slsa-verifier",
             "--source-tag",
             "v2.7.1",
+            "--builder-id",
+            &real_builder,
         ])
         .assert()
         .failure();
@@ -378,6 +453,69 @@ fn download(url: &str, dest: &Path) -> bool {
 }
 
 // ───────────────────────── package trust (network) ──────────────────────────
+
+/// The commit gate is the third place the typosquat heuristic runs, and the only
+/// one that blocks. This drives the REAL binary end to end — config file on disk
+/// through `sscsb hook commit-msg` to the message on stderr — because the
+/// in-process tests construct `TrustChecks` directly and therefore cannot prove
+/// the hook consults the config at all.
+///
+/// Both halves matter: the annotation must disappear when the key is off, and
+/// the dependency must still be blocked, because suppressing a NOTE must never
+/// suppress the GATE.
+#[test]
+fn typosquat_check_false_reaches_the_commit_gate_through_the_real_binary() {
+    let dir = rust_repo();
+    let repo = dir.path();
+    let msg = repo.join("COMMIT_EDITMSG");
+    std::fs::write(&msg, "chore: add a dependency\n").unwrap();
+    // A registry-sourced name one edit from `tokio`: the heuristic's own case.
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n         [dependencies]\nitoa = \"1.0.11\"\ntokoi = \"1\"\n",
+    )
+    .unwrap();
+    git_ok(repo, &["add", "Cargo.toml"]);
+
+    let cfg_path = repo.join(".sscsb").join("config.toml");
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(
+        cfg.contains("typosquat_check = true"),
+        "the generated config is expected to carry the key"
+    );
+
+    // On (as generated): the gate blocks AND names the shadowed package.
+    let on = sscsb(repo)
+        .args(["hook", "commit-msg", msg.to_str().unwrap()])
+        .assert()
+        .failure();
+    let on_err = String::from_utf8_lossy(&on.get_output().stderr).to_string();
+    assert!(
+        on_err.contains("one edit from popular package") && on_err.contains("tokio"),
+        "sanity: the enforcing gate names a registry-sourced typosquat: {on_err}"
+    );
+
+    // Off: same commit, same dependency — annotation gone, gate still closed.
+    std::fs::write(
+        &cfg_path,
+        cfg.replace("typosquat_check = true", "typosquat_check = false"),
+    )
+    .unwrap();
+    let off = sscsb(repo)
+        .args(["hook", "commit-msg", msg.to_str().unwrap()])
+        .assert()
+        .failure();
+    let off_err = String::from_utf8_lossy(&off.get_output().stderr).to_string();
+    assert!(
+        !off_err.contains("one edit from popular package"),
+        "typosquat_check = false must reach the gate that actually blocks, or the \
+         config contradicts itself where it matters most: {off_err}"
+    );
+    assert!(
+        off_err.contains("not in the approved baseline"),
+        "suppressing the annotation must NOT unblock the dependency: {off_err}"
+    );
+}
 
 #[test]
 fn deps_check_flags_nonexistent_and_typosquat_packages() {

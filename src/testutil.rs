@@ -132,6 +132,32 @@ fn mirror_without(_dir: &std::path::Path, _hidden: &[&str]) -> Option<tempfile::
     None
 }
 
+/// Run `f` with PATH masked down to `dir` followed by git's own directory, so
+/// a decoy written into `dir` is the ONLY candidate for its name whatever the
+/// host machine has installed — the fixture cannot be fooled by a real
+/// `guacone`/`oras` sitting further along the real PATH.
+///
+/// Deliberately NOT built on [`path_without`]: that mirrors a whole PATH
+/// directory into a tempdir which is deleted when the test ends, and a
+/// concurrently-running test that resolved a tool through the mirror and spawns
+/// it a moment later gets ENOENT for a tool that is installed. git's own
+/// directory is real and permanent, so there is nothing to tear down.
+///
+/// Takes [`env_lock`] for the duration — callers must not already hold it.
+pub fn with_decoy_dir_on_path<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+    let _lock = env_lock();
+    let git_dir = crate::exec::find_in_path("git")
+        .expect("git must be on PATH")
+        .parent()
+        .expect("git binary has a parent dir")
+        .to_path_buf();
+    let mut joined = std::ffi::OsString::from(dir);
+    joined.push(":");
+    joined.push(&git_dir);
+    let _env = EnvGuard::new(&[("PATH", Some(&joined.to_string_lossy()))]);
+    f()
+}
+
 /// Write an executable POSIX `gh` shim running `script` into a fresh temp dir.
 pub fn fake_gh(script: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();

@@ -266,7 +266,16 @@ enum ReceiptAction {
         sign: bool,
     },
     /// Verify a receipt against the repository
-    Verify { receipt: PathBuf },
+    Verify {
+        receipt: PathBuf,
+        /// Expected cosign certificate identity for the receipt's signature
+        /// bundle (default: cosign_identity under [controls.ai-receipts])
+        #[arg(long)]
+        identity: Option<String>,
+        /// OIDC issuer for that identity (default: cosign_issuer, else GitHub)
+        #[arg(long)]
+        issuer: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -281,6 +290,11 @@ enum ProvenanceAction {
         source_uri: String,
         #[arg(long)]
         source_tag: Option<String>,
+        /// Trusted builder id (default: builder_id under
+        /// [controls.provenance-verify]). One of the two is required — an
+        /// unpinned builder makes "verified" mean far less than it looks.
+        #[arg(long)]
+        builder_id: Option<String>,
     },
     /// Inspect a DSSE/in-toto provenance file (subjects, builder)
     Inspect { file: PathBuf },
@@ -600,7 +614,7 @@ fn cmd_scan(cwd: &std::path::Path, vex: Option<&std::path::Path>, grype: bool) -
         println!("  [{}] {} {} ({})", f.severity, f.id, f.package, f.source);
     }
     if grype {
-        let cfg_enabled = cfg.control_enabled("grype").unwrap_or(false);
+        let cfg_enabled = cfg.control_enabled_or_default("grype");
         if !cfg_enabled {
             println!("grype: control disabled — `sscsb enable grype` first");
         } else {
@@ -655,7 +669,8 @@ fn cmd_deps(cwd: &std::path::Path, action: DepsAction) -> Result<ExitCode> {
     let ctx = Ctx::discover(cwd)?;
     match action {
         DepsAction::Check { offline } => {
-            let (problems, notes) = deps::deps_check(&ctx, offline)?;
+            let checks = deps::TrustChecks::from_config(ctx.config.as_ref());
+            let (problems, notes) = deps::deps_check(&ctx, checks, offline)?;
             for n in &notes {
                 println!("note: {n}");
             }
@@ -674,7 +689,8 @@ fn cmd_deps(cwd: &std::path::Path, action: DepsAction) -> Result<ExitCode> {
             force,
             offline,
         } => {
-            let warnings = deps::approval_warnings(&package, offline);
+            let checks = deps::TrustChecks::from_config(ctx.config.as_ref());
+            let warnings = deps::approval_warnings(&package, checks, offline);
             if !warnings.is_empty() {
                 for w in &warnings {
                     eprintln!("  ✗ {w}");
@@ -701,11 +717,15 @@ fn cmd_deps(cwd: &std::path::Path, action: DepsAction) -> Result<ExitCode> {
             // resolves its code, so validating it against the public registry
             // would hand back an unrelated same-named package as its verdict.
             let current = deps::current_dep_specs(&ctx)?;
+            // Read once: the config does not change between packages, and
+            // re-reading it per dependency only invites the two halves of one
+            // run to disagree.
+            let checks = deps::TrustChecks::from_config(ctx.config.as_ref());
             let mut approved = 0usize;
             let mut skipped = Vec::new();
             for (eco, spec) in current {
                 let pkg = format!("{}:{}", eco.label(), spec.name);
-                let warnings = deps::approval_warnings_for(&pkg, &spec.source, offline);
+                let warnings = deps::approval_warnings_for(&pkg, &spec.source, checks, offline);
                 if warnings.is_empty() {
                     deps::approve_package(&ctx, &pkg)?;
                     approved += 1;
@@ -746,14 +766,21 @@ fn cmd_receipt(cwd: &std::path::Path, action: ReceiptAction) -> Result<ExitCode>
             let path = provenance::create_receipt(&ctx, &commit, &out_dir)?;
             println!("receipt written: {}", path.display());
             if sign {
-                let bundle = path.with_extension("json.sigstore.json");
+                let bundle = provenance::receipt_bundle_path(&path);
                 let log = provenance::cosign_sign_blob(&ctx, &path, &bundle)?;
                 println!("signed: {} \n{log}", bundle.display());
             }
             ok()
         }
-        ReceiptAction::Verify { receipt } => {
-            println!("{}", provenance::verify_receipt(&ctx, &receipt)?);
+        ReceiptAction::Verify {
+            receipt,
+            identity,
+            issuer,
+        } => {
+            println!(
+                "{}",
+                provenance::verify_receipt(&ctx, &receipt, identity.as_deref(), issuer.as_deref())?
+            );
             ok()
         }
     }
@@ -767,6 +794,7 @@ fn cmd_provenance(cwd: &std::path::Path, action: ProvenanceAction) -> Result<Exi
             provenance: prov,
             source_uri,
             source_tag,
+            builder_id,
         } => {
             let output = provenance::verify_artifact(
                 &ctx,
@@ -775,6 +803,7 @@ fn cmd_provenance(cwd: &std::path::Path, action: ProvenanceAction) -> Result<Exi
                     provenance: &prov,
                     source_uri: &source_uri,
                     source_tag: source_tag.as_deref(),
+                    builder_id: builder_id.as_deref(),
                 },
             )?;
             println!("{output}");

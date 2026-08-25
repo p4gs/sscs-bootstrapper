@@ -152,19 +152,41 @@ missing or unauthenticated, or no GitHub repo is configured, the control reports
 
 ## Actions audit
 
-Every workflow in `.github/workflows/` is parsed and checked for:
+Every YAML document in every workflow in `.github/workflows/` is parsed and
+checked for (every document, because a `---` separator is not the end of a file
+and sscsb must not call a file clean on the strength of the half it read):
 
 - **Mutable action refs.** `uses: actions/checkout@v4` is a tag. Tags move. The
   audit requires a 40-character commit SHA.
 - **Missing or over-broad `permissions:`.** No block at all means the job inherits
   whatever the repository default is — historically `write-all`. Every job should
-  declare least privilege.
+  declare least privilege. "Over-broad" is not just the literal string
+  `write-all`; three further shapes are called out, each chosen to stay silent on
+  ordinary correct workflows:
+  - **`write-all` spelled out.** Write on five or more of the GITHUB_TOKEN's
+    fifteen scopes is the same grant with extra typing. The most privileged job
+    `sscsb` itself ships — a release that pushes the release, publishes a
+    package, mints an OIDC token and writes an attestation — needs four, so the
+    threshold sits above every real workflow rather than at the edge of one.
+    (Error.)
+  - **CI tampering held together with publishing rights.** `actions: write`
+    reaches outside the job's own build: it can replace another run's artifacts
+    and caches. Held alongside `contents`/`packages`/`attestations`/
+    `deployments`/`id-token` write, one compromised step can poison the build
+    *and* ship the result — which neither half can do alone. (Warn.)
+  - **Write scopes at the top level.** A top-level grant goes to every job that
+    does not override it, including the one that only runs the test suite, and
+    to every job added later. The finding names the jobs that inherit it (Warn),
+    or notes that the grant is currently overridden by all of them and is
+    therefore latent rather than live (Info).
 - Self-hosted runners, and other patterns extended in [phase-4.md](phase-4.md).
 
 There is one sanctioned exception, `slsa-framework/slsa-github-generator`, which
 **must** be tag-referenced: its trust model depends on the builder ref, and
 slsa-verifier validates it. That exception is a single named entry in the auditor,
-not a general escape hatch.
+not a general escape hatch — and it ends at the repository boundary, so
+`slsa-framework/slsa-github-generator-anything-else` is a different repository
+and inherits nothing from it.
 
 `sscsb`'s own shipped templates are held to this: a test asserts that every
 workflow template it installs passes this very audit.

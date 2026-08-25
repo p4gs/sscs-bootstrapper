@@ -177,18 +177,65 @@ pub fn is_object_name(s: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// Locate an executable on PATH (adds `.exe` on Windows).
+/// True when the OS would actually execute `path`.
+///
+/// On Unix that is a regular file with an execute bit. `metadata` follows
+/// symlinks deliberately: PATH directories are full of them (Homebrew,
+/// update-alternatives, cargo shims) and it is the *target* that gets executed.
+///
+/// The test is "any execute bit", not "executable by me": reading the effective
+/// answer needs `access(2)`, which std does not expose, and this crate takes no
+/// libc dependency. The residual over-acceptance is a root-only-executable file
+/// — orders of magnitude narrower than accepting every regular file, and the
+/// spawn still fails loudly rather than silently passing a control.
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Windows carries executability in the file *extension* (PATHEXT), not a mode
+/// bit — `is_file()` is the right test there, and the caller only ever offers
+/// candidates at executable extensions.
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// Locate an executable on PATH (adds `.exe`/`.cmd` on Windows).
+///
+/// A candidate only counts when it is EXECUTABLE. Accepting any regular file —
+/// which is what `is_file()` alone does — means a plain text file dropped into
+/// a PATH directory under a tool's name is reported as that tool being
+/// installed. Combined with [`crate::tools::detect`], which used to swallow the
+/// version probe's failure, a non-executable three-line shell script named
+/// `guacone` flipped `sscsb verify --strict guac` from exit 1 (DEGRADED, tool
+/// absent) to exit 0 (PASS). Reproduced end to end against the real binary.
+///
+/// This is the root of the class: every orchestrated tool — cosign,
+/// slsa-verifier, guacone, oras, witness, gh — resolves through here.
 pub fn find_in_path(bin: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
+    find_in(&std::env::var_os("PATH")?, bin)
+}
+
+/// The lookup itself, against an explicit PATH value.
+///
+/// Split out so the search can be tested without mutating the process
+/// environment: PATH is process-global and the test harness is threaded, so
+/// every env-mutating test steals time from every other one and risks handing
+/// a neighbour a PATH that does not contain the tool it is about to spawn.
+pub fn find_in(path_var: &std::ffi::OsStr, bin: &str) -> Option<PathBuf> {
     let exts: &[&str] = if cfg!(windows) {
         &["", ".exe", ".cmd"]
     } else {
         &[""]
     };
-    for dir in std::env::split_paths(&path_var) {
+    for dir in std::env::split_paths(path_var) {
         for ext in exts {
             let candidate = dir.join(format!("{bin}{ext}"));
-            if candidate.is_file() {
+            if is_executable_file(&candidate) {
                 return Some(candidate);
             }
         }
@@ -244,6 +291,110 @@ mod tests {
     fn find_in_path_finds_git_and_misses_garbage() {
         assert!(find_in_path("git").is_some());
         assert!(find_in_path("sscsb-definitely-not-a-real-binary").is_none());
+    }
+
+    /// A PATH entry is only a tool when the OS would actually run it.
+    ///
+    /// Before the executable check, `is_file()` accepted ANY regular file, so a
+    /// plain text file named after a tool was reported as that tool being
+    /// installed — the root of the `guacone`/`oras` false-detection class that
+    /// flipped `sscsb verify --strict` from exit 1 to exit 0.
+    ///
+    /// Unix-only because executability is only a mode bit on Unix; on Windows
+    /// it is carried by the file extension, and there the second layer
+    /// (`tools::detect`'s version probe, which cannot spawn an extensionless
+    /// file) is what closes the same hole.
+    #[cfg(unix)]
+    #[test]
+    fn find_in_path_refuses_a_non_executable_file_named_after_a_tool() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path_var = std::ffi::OsString::from(dir.path());
+        let decoy = dir.path().join("guacone");
+        std::fs::write(&decoy, "#!/bin/sh\n# never chmod +x\necho hi\n").unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            find_in(&path_var, "guacone").is_none(),
+            "a non-executable regular file must never be reported as an installed tool"
+        );
+
+        // The other side of the guard: the SAME file, once executable, is
+        // found. The check must not become a false negative for a tool that is
+        // genuinely installed.
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            find_in(&path_var, "guacone").as_deref(),
+            Some(decoy.as_path()),
+            "an executable file on PATH must still be found"
+        );
+    }
+
+    /// PATH entries are routinely symlinks (Homebrew, update-alternatives), and
+    /// it is the TARGET that gets executed — so the mode check must follow the
+    /// link rather than reading the symlink's own (always 0777) mode.
+    #[cfg(unix)]
+    #[test]
+    fn find_in_path_follows_symlinks_to_judge_executability() {
+        use std::os::unix::fs::PermissionsExt;
+        let target_dir = tempfile::tempdir().unwrap();
+        let link_dir = tempfile::tempdir().unwrap();
+        let path_var = std::ffi::OsString::from(link_dir.path());
+
+        let target = target_dir.path().join("real-payload");
+        std::fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = link_dir.path().join("oras");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            find_in(&path_var, "oras").is_none(),
+            "a symlink to a NON-executable file is not an installed tool"
+        );
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            find_in(&path_var, "oras").as_deref(),
+            Some(link.as_path()),
+            "a symlink to an executable file is a normal, valid install"
+        );
+    }
+
+    /// The first EXECUTABLE candidate wins, not the first file: a decoy
+    /// earlier on PATH must not mask the real tool behind it.
+    #[cfg(unix)]
+    #[test]
+    fn find_in_path_skips_a_non_executable_candidate_and_keeps_searching() {
+        use std::os::unix::fs::PermissionsExt;
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+
+        let decoy = first.path().join("witness");
+        std::fs::write(&decoy, "not a binary\n").unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let real = second.path().join("witness");
+        std::fs::write(&real, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path_var =
+            std::env::join_paths([first.path(), second.path()]).expect("joinable PATH entries");
+        assert_eq!(
+            find_in(&path_var, "witness").as_deref(),
+            Some(real.as_path()),
+            "the search must step over the decoy and find the real install"
+        );
+    }
+
+    /// `find_in_path` is `find_in` bound to the process PATH — pinned so the
+    /// pure-function tests above really do describe the real lookup.
+    #[test]
+    fn find_in_path_is_find_in_against_the_process_path() {
+        let path_var = std::env::var_os("PATH").expect("PATH is set");
+        assert_eq!(find_in_path("git"), find_in(&path_var, "git"));
+        assert_eq!(
+            find_in_path("sscsb-definitely-not-a-real-binary"),
+            find_in(&path_var, "sscsb-definitely-not-a-real-binary")
+        );
     }
 
     #[test]

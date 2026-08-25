@@ -964,7 +964,7 @@ fn receipts_bind_commits_and_detect_tampering() {
     assert_eq!(doc["predicate"]["aiTool"], "Claude Code");
     assert_eq!(doc["predicate"]["aiRole"], "draft");
 
-    let ok = provenance::verify_receipt(&ctx, &receipt).unwrap();
+    let ok = provenance::verify_receipt(&ctx, &receipt, None, None).unwrap();
     assert!(ok.contains("receipt verified"));
 
     // Tampered digest is caught.
@@ -974,7 +974,7 @@ fn receipts_bind_commits_and_detect_tampering() {
         text.replacen("\"sha256\": \"", "\"sha256\": \"ff", 1),
     )
     .unwrap();
-    let err = provenance::verify_receipt(&ctx, &receipt).unwrap_err();
+    let err = provenance::verify_receipt(&ctx, &receipt, None, None).unwrap_err();
     assert!(format!("{err:#}").contains("DIGEST MISMATCH"));
 
     // A non-receipt JSON file is rejected.
@@ -984,7 +984,7 @@ fn receipts_bind_commits_and_detect_tampering() {
         r#"{"predicateType":"https://slsa.dev/provenance/v1"}"#,
     )
     .unwrap();
-    let err = provenance::verify_receipt(&ctx, &other).unwrap_err();
+    let err = provenance::verify_receipt(&ctx, &other, None, None).unwrap_err();
     assert!(format!("{err:#}").contains("not an sscsb AI provenance receipt"));
 }
 
@@ -1155,7 +1155,7 @@ fn deps_check_offline_flags_typosquats_without_network() {
         "Cargo.toml",
         "[package]\nname = \"f\"\nversion = \"0.1.0\"\n\n[dependencies]\ntokoi = \"1\"\n",
     );
-    let (problems, _notes) = deps::deps_check(&ctx, true).unwrap();
+    let (problems, _notes) = deps::deps_check(&ctx, deps::TrustChecks::default(), true).unwrap();
     assert!(
         problems
             .iter()
@@ -1349,13 +1349,13 @@ fn new_dependencies_are_flagged_in_go_python_and_ruby_manifests() {
 fn approve_refuses_a_typosquat_without_force() {
     // Enforcement, not advice: `deps approve` must reject a typosquat unless the
     // human overrides on purpose. Offline so only the typosquat heuristic runs.
-    let warnings = deps::approval_warnings("cargo:tokoi", true);
+    let warnings = deps::approval_warnings("cargo:tokoi", deps::TrustChecks::default(), true);
     assert!(
         warnings.iter().any(|w| w.contains("tokio")),
         "approval must warn on a typosquat: {warnings:?}"
     );
     // A clean name produces no warning.
-    assert!(deps::approval_warnings("cargo:serde", true).is_empty());
+    assert!(deps::approval_warnings("cargo:serde", deps::TrustChecks::default(), true).is_empty());
 }
 
 #[test]

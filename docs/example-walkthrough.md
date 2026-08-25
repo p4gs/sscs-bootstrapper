@@ -257,7 +257,10 @@ $ sscsb verify
            slsa-verifier: 2.7.1
            cosign: 3.1.1
            gate: `sscsb provenance verify --artifact <f> --provenance <f>.intoto.jsonl
-                  --source-uri github.com/<owner>/<repo> [--source-tag vX.Y.Z]`
+                  --source-uri github.com/<owner>/<repo> --builder-id <trusted builder>
+                  [--source-tag vX.Y.Z]`
+           no builder_id pinned under [controls.provenance-verify] — `provenance verify`
+           will require --builder-id on the command line rather than trusting any builder
            deploy-gate workflow present (verification before publish)
 [PASS    ] harden-runner
            codeql.yml: harden-runner present

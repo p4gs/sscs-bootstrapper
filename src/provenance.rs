@@ -20,11 +20,52 @@ pub struct ProvenanceArgs<'a> {
     pub provenance: &'a Path,
     pub source_uri: &'a str,
     pub source_tag: Option<&'a str>,
+    /// The builder whose provenance this repo trusts. Falls back to
+    /// `[controls.provenance-verify] builder_id`; one of the two must be set.
+    pub builder_id: Option<&'a str>,
 }
 
 /// Verify an artifact's SLSA provenance with slsa-verifier. Returns the tool's
 /// stdout on success.
+///
+/// Reported (M15): this pinned the source repository and nothing else.
+/// `--builder-id` is optional to slsa-verifier ("[optional] the unique builder
+/// ID who created the provenance", 2.7.1), and leaving it off means the
+/// verdict is "some builder slsa-verifier trusts produced this, for this
+/// source URI" — not "the builder our release pipeline actually uses". Anyone
+/// who can get any trusted builder to run in that repository clears the gate.
+///
+/// Required, not defaulted. Defaulting would have to name one generator, and a
+/// default that is wrong for a repo either narrows the gate silently or gets
+/// copied without thought, which is the same failure with extra steps. Required
+/// is affordable here because the error names both places it can be set and
+/// because `sscsb provenance inspect` already prints the builder from a
+/// provenance file — read it ONCE, from a build you trust, when configuring;
+/// never off the file you are currently verifying, which is the untrusted input.
+///
+/// The builder is resolved BEFORE the tool-availability check on purpose: an
+/// unset trust anchor is a policy gap, and it should be reported as one whether
+/// or not slsa-verifier happens to be installed on this machine.
 pub fn verify_artifact(ctx: &Ctx, args: &ProvenanceArgs) -> Result<String> {
+    let builder_id = args
+        .builder_id
+        .map(str::to_string)
+        .or_else(|| {
+            ctx.config
+                .as_ref()
+                .and_then(|c| c.control_opt_str("provenance-verify", "builder_id"))
+                .filter(|s| !s.trim().is_empty())
+        })
+        .context(
+            "no trusted builder is pinned, so `verified` would only mean `some builder \
+             slsa-verifier trusts built this` — pass `--builder-id <id>` or set builder_id \
+             under [controls.provenance-verify] in .sscsb/config.toml. The id is the \
+             workflow your releases are actually built by (e.g. \
+             https://github.com/slsa-framework/slsa-github-generator/.github/workflows/\
+             generator_generic_slsa3.yml@refs/tags/vX.Y.Z); `sscsb provenance inspect \
+             <provenance>` prints the builder from a file, which is how to look it up ONCE \
+             from a build you trust — not off the file you are verifying",
+        )?;
     if !tools::is_available("slsa-verifier") {
         anyhow::bail!("{}", tools::degrade_message("slsa-verifier", ctx.platform));
     }
@@ -37,6 +78,8 @@ pub fn verify_artifact(ctx: &Ctx, args: &ProvenanceArgs) -> Result<String> {
         &provenance,
         "--source-uri",
         args.source_uri,
+        "--builder-id",
+        &builder_id,
     ];
     if let Some(tag) = args.source_tag {
         argv.push("--source-tag");
@@ -51,7 +94,21 @@ pub fn verify_artifact(ctx: &Ctx, args: &ProvenanceArgs) -> Result<String> {
             out.stderr
         );
     }
-    Ok(format!("{}{}", out.stdout, out.stderr))
+    // Say what was pinned. `--source-tag` stays optional — verifying an
+    // artifact built from a branch, or before any tag exists, is legitimate and
+    // slsa-verifier treats it as optional too — but an unpinned tag means
+    // provenance from ANY ref of that repository satisfies this check, and a
+    // reader of the output must not have to guess which of the two they got.
+    let tag = match args.source_tag {
+        Some(tag) => format!("source tag {tag}"),
+        None => "source tag NOT pinned (any ref of this repository satisfies it; \
+                 pass --source-tag for a release artifact)"
+            .to_string(),
+    };
+    Ok(format!(
+        "{}{}\npinned: source-uri {}, builder-id {builder_id}, {tag}",
+        out.stdout, out.stderr, args.source_uri
+    ))
 }
 
 // ─────────────────────────── DSSE / in-toto ─────────────────────────────────
@@ -211,14 +268,10 @@ pub fn create_receipt(ctx: &Ctx, commit: &str, out_dir: &Path) -> Result<std::pa
         &["rev-parse", "--verify", "--end-of-options", commit],
         &ctx.root,
     )?;
-    anyhow::ensure!(
-        is_object_name(&sha),
-        "rev-parse resolved {commit:?} to {sha:?}, which is not a git object name"
-    );
+    let file_name = receipt_file_name(commit, &sha)?;
     let patch = exec::git(&["show", "--format=", "--no-color", &sha], &ctx.root)?;
     let patch_digest = hex::encode(Sha256::digest(patch.as_bytes()));
-    let body = exec::git(&["log", "-1", "--format=%B", &sha], &ctx.root)?;
-    let trailers = crate::hooks::parse_trailers(&body);
+    let claim = AiClaim::from_commit(ctx, &sha)?;
     let statement = serde_json::json!({
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [{
@@ -227,24 +280,160 @@ pub fn create_receipt(ctx: &Ctx, commit: &str, out_dir: &Path) -> Result<std::pa
         }],
         "predicateType": RECEIPT_PREDICATE_TYPE,
         "predicate": {
-            "aiAssisted": trailers.get("AI-Assisted").cloned().unwrap_or_else(|| "undeclared".into()),
-            "aiTool": trailers.get("AI-Tool").cloned(),
-            "aiModel": trailers.get("AI-Model").cloned(),
-            "aiRole": trailers.get("AI-Role").cloned(),
+            "aiAssisted": claim.assisted,
+            "aiTool": claim.tool,
+            "aiModel": claim.model,
+            "aiRole": claim.role,
             "patchSha256": patch_digest,
             "generatedBy": format!("sscsb {}", env!("CARGO_PKG_VERSION")),
             "timestamp": chrono::Utc::now().to_rfc3339(),
         }
     });
     std::fs::create_dir_all(out_dir)?;
-    let path = out_dir.join(format!("receipt-{}.json", &sha[..12]));
+    let path = out_dir.join(file_name);
     std::fs::write(&path, serde_json::to_string_pretty(&statement)?)?;
     Ok(path)
 }
 
-/// Verify a receipt against the repository: recompute the commit's patch
-/// digest and compare.
-pub fn verify_receipt(ctx: &Ctx, receipt_path: &Path) -> Result<String> {
+/// The receipt filename for a sha that `git rev-parse --verify` resolved.
+///
+/// Reported (M16): `sscsb receipt create -- --raw` exited 101. Before
+/// `--verify`, the resolver was a bare `git rev-parse <commit>`, and rev-parse
+/// ECHOES an unrecognised option back at exit 0 — `git rev-parse --raw` prints
+/// `--raw`, five characters — so this function's twelve-character slice ran off
+/// the end: "end byte index 12 is out of bounds for string of length 5".
+/// A CLI must never abort on its own argument.
+///
+/// `--verify` closed that door; the length check closes the class. `rev-parse
+/// --verify` resolves to a FULL object name — 40 hex under sha1, 64 under
+/// sha256 — while [`is_object_name`] deliberately admits abbreviations from 7
+/// characters, because a RECEIPT may legitimately carry an abbreviated name.
+/// This value did not come from a receipt, so anything shorter than a full oid
+/// means the invocation did not do what the caller believes it did, and the
+/// honest answer is an error rather than a filename built from a slice that
+/// happens not to panic.
+fn receipt_file_name(commit: &str, sha: &str) -> Result<String> {
+    anyhow::ensure!(
+        is_object_name(sha) && matches!(sha.len(), 40 | 64),
+        "rev-parse resolved {commit:?} to {sha:?}, which is not a full git object name"
+    );
+    // Belt and braces: `get` cannot panic even if the guard above is ever
+    // loosened. A filename is not worth a process abort.
+    Ok(format!("receipt-{}.json", sha.get(..12).unwrap_or(sha)))
+}
+
+/// The AI claim a receipt makes about a commit: exactly the four trailers
+/// `create_receipt` reads, in one place so creation and verification cannot
+/// drift apart.
+#[derive(Debug, PartialEq, Eq)]
+struct AiClaim {
+    assisted: String,
+    tool: Option<String>,
+    model: Option<String>,
+    role: Option<String>,
+}
+
+impl AiClaim {
+    /// What the repository says, right now, about `sha`.
+    fn from_commit(ctx: &Ctx, sha: &str) -> Result<Self> {
+        let body = exec::git(
+            &["log", "-1", "--format=%B", "--end-of-options", sha],
+            &ctx.root,
+        )?;
+        let t = crate::hooks::parse_trailers(&body);
+        Ok(AiClaim {
+            assisted: t
+                .get("AI-Assisted")
+                .cloned()
+                .unwrap_or_else(|| "undeclared".into()),
+            tool: t.get("AI-Tool").cloned(),
+            model: t.get("AI-Model").cloned(),
+            role: t.get("AI-Role").cloned(),
+        })
+    }
+
+    /// What the receipt says.
+    fn from_predicate(predicate: &serde_json::Value) -> Self {
+        let field = |k: &str| {
+            predicate
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        AiClaim {
+            assisted: field("aiAssisted").unwrap_or_else(|| "undeclared".into()),
+            tool: field("aiTool"),
+            model: field("aiModel"),
+            role: field("aiRole"),
+        }
+    }
+
+    /// Field-by-field differences, `self` being the receipt's claim.
+    fn differences_from(&self, commit: &AiClaim) -> Vec<String> {
+        let show = |v: &Option<String>| match v {
+            Some(s) => format!("{s:?}"),
+            None => "absent".to_string(),
+        };
+        let mut out = Vec::new();
+        if self.assisted != commit.assisted {
+            out.push(format!(
+                "aiAssisted: receipt claims {:?}, commit says {:?}",
+                self.assisted, commit.assisted
+            ));
+        }
+        for (name, mine, theirs) in [
+            ("aiTool", &self.tool, &commit.tool),
+            ("aiModel", &self.model, &commit.model),
+            ("aiRole", &self.role, &commit.role),
+        ] {
+            if mine != theirs {
+                out.push(format!(
+                    "{name}: receipt claims {}, commit says {}",
+                    show(mine),
+                    show(theirs)
+                ));
+            }
+        }
+        out
+    }
+}
+
+/// Where `receipt create --sign` puts a receipt's cosign bundle. One function
+/// so the writer and the reader cannot disagree about the name — until now
+/// nothing read it at all.
+pub fn receipt_bundle_path(receipt: &Path) -> std::path::PathBuf {
+    let mut name = receipt.as_os_str().to_os_string();
+    name.push(".sigstore.json");
+    std::path::PathBuf::from(name)
+}
+
+/// The default OIDC issuer for keyless signatures made in GitHub Actions.
+pub const GITHUB_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+/// Verify a receipt against the repository:
+///
+/// 1. the commit's patch still hashes to the digest the receipt binds, and
+/// 2. the commit still declares the AI tool/model/role the receipt claims, and
+/// 3. any cosign bundle sitting beside the receipt actually verifies.
+///
+/// Reported (M8): only (1) existed. A receipt's whole purpose is to bind a
+/// commit to a DECLARED AI tool, model and role, and that declaration was the
+/// one thing never checked — a receipt whose `aiTool` said "Claude Code" while
+/// the commit's trailer said something else verified happily, because the patch
+/// bytes were untouched. `--sign` wrote a bundle that nothing ever read, so a
+/// signed receipt and an unsigned one verified identically.
+///
+/// `identity`/`issuer` come from the command line and fall back to
+/// `[controls.ai-receipts]` `cosign_identity`/`cosign_issuer`. A bundle that is
+/// PRESENT but cannot be checked — no identity to check it against, or no
+/// cosign — is an error, not a footnote: "receipt verified" must not be
+/// printable next to a signature nobody looked at.
+pub fn verify_receipt(
+    ctx: &Ctx,
+    receipt_path: &Path,
+    identity: Option<&str>,
+    issuer: Option<&str>,
+) -> Result<String> {
     let text = std::fs::read_to_string(receipt_path)?;
     let v: serde_json::Value = serde_json::from_str(&text).context("receipt is not JSON")?;
     anyhow::ensure!(
@@ -283,8 +472,80 @@ pub fn verify_receipt(ctx: &Ctx, receipt_path: &Path) -> Result<String> {
         "receipt DIGEST MISMATCH for {commit}: receipt claims {claimed}, repository has {actual} \
          — the commit or the receipt has been tampered with"
     );
+
+    // The claim itself. The patch digest proves the commit's CONTENT is the one
+    // the receipt was made from; it says nothing about the AI declaration, which
+    // lives in the commit message and is the thing the receipt exists to bind.
+    let declared = AiClaim::from_predicate(
+        v.get("predicate")
+            .context("receipt missing predicate — nothing to check the commit against")?,
+    );
+    let recorded = AiClaim::from_commit(ctx, commit)?;
+    let differences = declared.differences_from(&recorded);
+    anyhow::ensure!(
+        differences.is_empty(),
+        "receipt CLAIM MISMATCH for {commit}: {} \
+         — the receipt no longer describes the commit it names",
+        differences.join("; ")
+    );
+
+    // Any signature sitting beside the receipt.
+    let signature = verify_receipt_signature(ctx, receipt_path, identity, issuer)?;
+
     Ok(format!(
-        "receipt verified: commit {commit} patch digest {actual} matches"
+        "receipt verified: commit {commit} patch digest {actual} matches; \
+         AI claim matches the commit trailers (aiAssisted={}, aiTool={}); {signature}",
+        declared.assisted,
+        declared.tool.as_deref().unwrap_or("absent"),
+    ))
+}
+
+/// Check the cosign bundle beside `receipt_path`, if there is one.
+///
+/// Fails closed in both directions a signature can be unverifiable: no identity
+/// to check it against, and no cosign to check it with. Either way the caller
+/// must not go on to print "receipt verified".
+fn verify_receipt_signature(
+    ctx: &Ctx,
+    receipt_path: &Path,
+    identity: Option<&str>,
+    issuer: Option<&str>,
+) -> Result<String> {
+    let bundle = receipt_bundle_path(receipt_path);
+    if !bundle.is_file() {
+        return Ok(format!(
+            "no signature bundle at {} (`sscsb receipt create --sign` writes one)",
+            bundle.display()
+        ));
+    }
+    // Each key is read by its own literal `control_opt_str` call rather than
+    // through a shared `|key|` closure. `every_generated_config_key_has_a_reader`
+    // proves a generated key is not inert by finding the accessor next to the key
+    // name in source, and a closure taking the key as a parameter reads the config
+    // correctly while being invisible to that scan — which is indistinguishable,
+    // to the guard, from the dead keys it exists to catch. Keep the accessor and
+    // the key literal together; the duplicated `.filter` is the price.
+    let cfg = ctx.config.as_ref();
+    let identity = identity.map(str::to_string).or_else(|| {
+        cfg.and_then(|c| c.control_opt_str("ai-receipts", "cosign_identity"))
+            .filter(|s| !s.trim().is_empty())
+    });
+    let identity = identity.context(
+        "this receipt is SIGNED but there is no identity to verify the signature against — \
+         pass `--identity <certificate identity>` or set cosign_identity under \
+         [controls.ai-receipts] in .sscsb/config.toml. A signature nobody checks is not \
+         evidence, so this is a failure rather than a warning",
+    )?;
+    let issuer = issuer
+        .map(str::to_string)
+        .or_else(|| {
+            cfg.and_then(|c| c.control_opt_str("ai-receipts", "cosign_issuer"))
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| GITHUB_OIDC_ISSUER.to_string());
+    cosign_verify_blob(ctx, receipt_path, &bundle, &identity, &issuer)?;
+    Ok(format!(
+        "signature verified against identity {identity} (issuer {issuer})"
     ))
 }
 
@@ -307,9 +568,23 @@ pub fn verify_provenance_control(ctx: &Ctx) -> VerifyResult {
     }
     messages.push(
         "gate: `sscsb provenance verify --artifact <f> --provenance <f>.intoto.jsonl \
-         --source-uri github.com/<owner>/<repo> [--source-tag vX.Y.Z]`"
+         --source-uri github.com/<owner>/<repo> --builder-id <trusted builder> \
+         [--source-tag vX.Y.Z]`"
             .into(),
     );
+    let pinned = ctx
+        .config
+        .as_ref()
+        .and_then(|c| c.control_opt_str("provenance-verify", "builder_id"))
+        .filter(|s| !s.trim().is_empty());
+    match pinned {
+        Some(id) => messages.push(format!("trusted builder pinned in config: {id}")),
+        None => messages.push(
+            "no builder_id pinned under [controls.provenance-verify] — `provenance verify` \
+             will require --builder-id on the command line rather than trusting any builder"
+                .into(),
+        ),
+    }
     let deploy_gate = ctx
         .root
         .join(".github")
@@ -324,7 +599,8 @@ pub fn verify_provenance_control(ctx: &Ctx) -> VerifyResult {
 pub fn verify_receipts_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     let mut messages = vec![
         "receipts: `sscsb receipt create [commit]` → .sscsb/out/receipts/, \
-         `sscsb receipt verify <file>` recomputes the patch digest"
+         `sscsb receipt verify <file>` recomputes the patch digest, re-reads the commit's \
+         AI trailers, and verifies any cosign bundle beside the receipt"
             .into(),
     ];
     let sign = cfg
@@ -485,6 +761,164 @@ mod tests {
 
     // ─────────────────────────── slsa-verifier wrapper ───────────────────────
 
+    const TEST_BUILDER: &str = "https://github.com/slsa-framework/slsa-github-generator\
+                                /.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.0.0";
+
+    /// Reported (M15): `provenance verify` pinned the source repository and
+    /// nothing else. `--builder-id` is optional to slsa-verifier, so an
+    /// unpinned run only asserts "SOME builder slsa-verifier trusts produced
+    /// this, for this source URI" — anyone able to get any trusted builder to
+    /// run in that repository clears the gate.
+    ///
+    /// Required rather than defaulted: a default would have to name one
+    /// generator, and a default that is wrong for a repo either narrows the
+    /// gate silently or gets copied without thought. The trust anchor is also
+    /// resolved BEFORE the tool-availability check, because an unpinned builder
+    /// is a policy gap whether or not slsa-verifier is installed here.
+    #[test]
+    fn verify_artifact_refuses_to_run_without_a_pinned_builder() {
+        let (_d, ctx) = repo();
+        let artifact = ctx.root.join("artifact.txt");
+        let provenance = ctx.root.join("prov.intoto.jsonl");
+        std::fs::write(&artifact, b"hello\n").unwrap();
+        std::fs::write(&provenance, b"{}\n").unwrap();
+
+        let err = verify_artifact(
+            &ctx,
+            &ProvenanceArgs {
+                artifact: &artifact,
+                provenance: &provenance,
+                source_uri: "github.com/o/r",
+                source_tag: Some("v1.0.0"),
+                builder_id: None,
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no trusted builder is pinned"), "{msg}");
+        assert!(msg.contains("--builder-id"), "names the flag: {msg}");
+        assert!(msg.contains("[controls.provenance-verify]"), "{msg}");
+    }
+
+    /// The pin actually reaches slsa-verifier, and the verdict says what was
+    /// pinned — including, loudly, when the source TAG was not. `--source-tag`
+    /// stays optional (verifying a branch build is legitimate, and
+    /// slsa-verifier treats it as optional), but an unpinned tag means any ref
+    /// of that repository satisfies the check, and a reader must not have to
+    /// guess which of the two they were handed.
+    #[test]
+    fn verify_artifact_passes_the_pinned_builder_and_reports_what_it_pinned() {
+        let (_d, ctx) = repo();
+        let artifact = ctx.root.join("artifact.txt");
+        let provenance = ctx.root.join("prov.intoto.jsonl");
+        std::fs::write(&artifact, b"hello\n").unwrap();
+        std::fs::write(&provenance, b"{}\n").unwrap();
+
+        // A slsa-verifier that reports the argv it was handed.
+        let script = "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'slsa-verifier 2.7.1'; \
+                      exit 0; fi\necho \"ARGV: $*\"\nexit 0\n";
+
+        let tagged = with_fake_tool("slsa-verifier", script, || {
+            verify_artifact(
+                &ctx,
+                &ProvenanceArgs {
+                    artifact: &artifact,
+                    provenance: &provenance,
+                    source_uri: "github.com/o/r",
+                    source_tag: Some("v1.2.3"),
+                    builder_id: Some(TEST_BUILDER),
+                },
+            )
+        })
+        .unwrap();
+        assert!(
+            tagged.contains(&format!("--builder-id {TEST_BUILDER}")),
+            "the builder pin must reach slsa-verifier: {tagged}"
+        );
+        assert!(tagged.contains("--source-tag v1.2.3"), "{tagged}");
+        assert!(tagged.contains("source tag v1.2.3"), "{tagged}");
+
+        let untagged = with_fake_tool("slsa-verifier", script, || {
+            verify_artifact(
+                &ctx,
+                &ProvenanceArgs {
+                    artifact: &artifact,
+                    provenance: &provenance,
+                    source_uri: "github.com/o/r",
+                    source_tag: None,
+                    builder_id: Some(TEST_BUILDER),
+                },
+            )
+        })
+        .unwrap();
+        assert!(
+            untagged.contains("source tag NOT pinned"),
+            "an unpinned tag must be stated, not left to inference: {untagged}"
+        );
+        let argv = untagged
+            .lines()
+            .find(|l| l.starts_with("ARGV:"))
+            .expect("the shim echoes its argv");
+        assert!(
+            !argv.contains("--source-tag"),
+            "no tag was asked for, so none may be invented: {argv}"
+        );
+    }
+
+    /// A repo pins its builder once, in config, and every later verify uses it.
+    #[test]
+    fn verify_artifact_takes_the_builder_pin_from_config_when_no_flag_is_given() {
+        let (_d, ctx) = repo();
+        let artifact = ctx.root.join("artifact.txt");
+        let provenance = ctx.root.join("prov.intoto.jsonl");
+        std::fs::write(&artifact, b"hello\n").unwrap();
+        std::fs::write(&provenance, b"{}\n").unwrap();
+
+        let cfg_path = ctx.config_path();
+        let text = std::fs::read_to_string(&cfg_path).unwrap().replace(
+            "builder_id = \"\"",
+            &format!("builder_id = \"{TEST_BUILDER}\""),
+        );
+        assert!(
+            text.contains(TEST_BUILDER),
+            "the generated [controls.provenance-verify] block changed shape — fix this test"
+        );
+        std::fs::write(&cfg_path, text).unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+
+        let script = "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'slsa-verifier 2.7.1'; \
+                      exit 0; fi\necho \"ARGV: $*\"\nexit 0\n";
+        let out = with_fake_tool("slsa-verifier", script, || {
+            verify_artifact(
+                &ctx,
+                &ProvenanceArgs {
+                    artifact: &artifact,
+                    provenance: &provenance,
+                    source_uri: "github.com/o/r",
+                    source_tag: None,
+                    builder_id: None,
+                },
+            )
+        })
+        .unwrap();
+        assert!(
+            out.contains(&format!("--builder-id {TEST_BUILDER}")),
+            "{out}"
+        );
+
+        // …and the control verifier reports the pin, so `sscsb verify` shows
+        // whether this repo has a trust anchor at all.
+        let result = serialized(|| verify_provenance_control(&ctx));
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.contains("trusted builder pinned in config")),
+            "{:?}",
+            result.messages
+        );
+    }
+
     #[test]
     fn verify_artifact_degrades_when_slsa_verifier_missing_and_fails_loudly_when_present() {
         let (_d, ctx) = repo();
@@ -497,6 +931,7 @@ mod tests {
             provenance: &provenance,
             source_uri: "github.com/o/r",
             source_tag: None,
+            builder_id: Some(TEST_BUILDER),
         };
         let err = with_only_git_on_path(|| verify_artifact(&ctx, &args)).unwrap_err();
         assert!(format!("{err:#}").contains("slsa-verifier not found"));
@@ -508,6 +943,7 @@ mod tests {
             provenance: &provenance,
             source_uri: "github.com/o/r",
             source_tag: Some("v1.0.0"),
+            builder_id: Some(TEST_BUILDER),
         };
         let err = serialized(|| verify_artifact(&ctx, &args_tagged)).unwrap_err();
         let msg = format!("{err:#}");
@@ -599,7 +1035,7 @@ mod tests {
         assert_eq!(doc["predicate"]["aiRole"], "draft");
         assert_eq!(doc["predicate"]["aiAssisted"], "true");
 
-        let ok = verify_receipt(&ctx, &receipt).unwrap();
+        let ok = verify_receipt(&ctx, &receipt, None, None).unwrap();
         assert!(ok.contains("receipt verified"));
 
         // Tampered digest is caught — this is the tamper-detection contract;
@@ -610,7 +1046,7 @@ mod tests {
             text.replacen("\"sha256\": \"", "\"sha256\": \"ff", 1),
         )
         .unwrap();
-        let err = verify_receipt(&ctx, &receipt).unwrap_err();
+        let err = verify_receipt(&ctx, &receipt, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("DIGEST MISMATCH"));
 
         // A non-receipt JSON file is rejected.
@@ -620,8 +1056,161 @@ mod tests {
             r#"{"predicateType":"https://slsa.dev/provenance/v1"}"#,
         )
         .unwrap();
-        let err = verify_receipt(&ctx, &other).unwrap_err();
+        let err = verify_receipt(&ctx, &other, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("not an sscsb AI provenance receipt"));
+    }
+
+    /// Reported (M8): the receipt's actual CLAIM was never verified.
+    ///
+    /// A receipt exists to bind a commit to a declared AI tool, model and role.
+    /// Verification only recomputed the patch digest — which proves the
+    /// commit's CONTENT is what the receipt was made from and says nothing
+    /// about the declaration, because the trailers live in the commit message
+    /// and are not part of `git show --format=`. So a receipt claiming one tool
+    /// over a commit declaring another verified happily, at exit 0.
+    #[test]
+    fn verify_receipt_rejects_a_claim_the_commit_no_longer_supports() {
+        let (_d, ctx) = repo();
+        write(&ctx, "a.txt", "a\n");
+        commit_all(
+            &ctx,
+            "feat: x\n\nAI-Assisted: true\nAI-Tool: Claude Code\nAI-Model: Fable 5\nAI-Role: draft",
+        );
+        let out_dir = ctx.sscsb_dir().join("out").join("receipts");
+        let receipt = create_receipt(&ctx, "HEAD", &out_dir).unwrap();
+        let genuine = std::fs::read_to_string(&receipt).unwrap();
+
+        // Every field, edited one at a time. The patch digest is left alone in
+        // each case, which is exactly why the digest check cannot see any of
+        // them: the commit's bytes are untouched.
+        let forgeries = [
+            ("aiTool", serde_json::json!("Some Other Tool")),
+            ("aiModel", serde_json::json!("Some Other Model")),
+            ("aiRole", serde_json::json!("author")),
+            ("aiAssisted", serde_json::json!("false")),
+            // Dropping the declaration entirely is the most useful forgery of
+            // all: it launders AI-assisted work into apparently unassisted work.
+            ("aiTool", serde_json::json!(null)),
+        ];
+        for (field, value) in forgeries {
+            let mut doc: serde_json::Value = serde_json::from_str(&genuine).unwrap();
+            doc["predicate"][field] = value.clone();
+            let forged = ctx.root.join("forged-claim.json");
+            std::fs::write(&forged, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+            let err = verify_receipt(&ctx, &forged, None, None).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("CLAIM MISMATCH") && msg.contains(field),
+                "editing {field} to {value} must be caught and named: {msg}"
+            );
+        }
+
+        // The unedited receipt still verifies, and says so about the claim.
+        let ok = verify_receipt(&ctx, &receipt, None, None).unwrap();
+        assert!(ok.contains("AI claim matches"), "{ok}");
+        assert!(ok.contains("Claude Code"), "{ok}");
+    }
+
+    /// The other half of M8: `--sign` wrote a cosign bundle beside the receipt
+    /// and NOTHING ever read it, so a signed receipt and an unsigned one
+    /// verified identically. A signature that is present but unchecked must not
+    /// be printable next to the words "receipt verified".
+    #[test]
+    fn verify_receipt_refuses_a_signed_receipt_it_cannot_check() {
+        let (_d, ctx) = repo();
+        write(&ctx, "a.txt", "a\n");
+        commit_all(&ctx, "feat: x\n\nAI-Assisted: true");
+        let out_dir = ctx.sscsb_dir().join("out").join("receipts");
+        let receipt = create_receipt(&ctx, "HEAD", &out_dir).unwrap();
+
+        // No bundle: verification says plainly that there is nothing to check.
+        let ok = verify_receipt(&ctx, &receipt, None, None).unwrap();
+        assert!(ok.contains("no signature bundle"), "{ok}");
+
+        // A bundle appears, and there is no identity to check it against.
+        let bundle = receipt_bundle_path(&receipt);
+        std::fs::write(&bundle, r#"{"not":"a real bundle"}"#).unwrap();
+        let err = verify_receipt(&ctx, &receipt, None, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("SIGNED but there is no identity"), "{msg}");
+        assert!(msg.contains("--identity"), "names the fix: {msg}");
+
+        // With an identity, the bogus bundle is actually put to cosign, and
+        // fails. (When cosign is absent the degrade message is the failure —
+        // either way it must not be an Ok.)
+        //
+        // `serialized` because THIS call resolves `cosign` by name off the real
+        // PATH, and a sibling test three functions below installs a fake cosign
+        // that answers "Verified OK" and exits 0 for anything. Without the lock
+        // the two interleave and the bogus bundle "verifies" — the exact Ok this
+        // assertion exists to forbid. It failed that way on Linux CI twice while
+        // passing on macOS, because the race turns on thread scheduling rather
+        // than on anything about the receipt. The first two calls above return
+        // before any tool is spawned, so they need no lock.
+        let err = serialized(|| {
+            verify_receipt(
+                &ctx,
+                &receipt,
+                Some(
+                    "https://github.com/example/repo/.github/workflows/release.yml@refs/heads/main",
+                ),
+                None,
+            )
+        })
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cosign verify-blob FAILED") || msg.contains("cosign not found"),
+            "a bogus bundle must never verify: {msg}"
+        );
+    }
+
+    /// A cosign that says yes is believed, and the identity it was checked
+    /// against is named in the verdict — an operator must be able to see WHICH
+    /// identity a receipt was accepted for. The identity also comes from
+    /// config, so a repo can set its signing policy once.
+    #[test]
+    fn verify_receipt_reports_the_identity_a_signature_was_checked_against() {
+        let (_d, ctx) = repo();
+        write(&ctx, "a.txt", "a\n");
+        commit_all(&ctx, "feat: x\n\nAI-Assisted: true\nAI-Tool: Claude Code");
+        let out_dir = ctx.sscsb_dir().join("out").join("receipts");
+        let receipt = create_receipt(&ctx, "HEAD", &out_dir).unwrap();
+        std::fs::write(receipt_bundle_path(&receipt), r#"{"a":"bundle"}"#).unwrap();
+
+        let script = "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'cosign 0.0.0'; exit 0; \
+                      fi\necho 'Verified OK' 1>&2\nexit 0\n";
+        let ok = with_fake_tool("cosign", script, || {
+            verify_receipt(
+                &ctx,
+                &receipt,
+                Some("ci@example.invalid"),
+                Some("https://issuer"),
+            )
+        })
+        .unwrap();
+        assert!(ok.contains("signature verified"), "{ok}");
+        assert!(ok.contains("ci@example.invalid"), "{ok}");
+        assert!(ok.contains("https://issuer"), "{ok}");
+
+        // Same thing, but the identity comes from .sscsb/config.toml.
+        let cfg_path = ctx.config_path();
+        let text = std::fs::read_to_string(&cfg_path).unwrap().replace(
+            "cosign_identity = \"\"",
+            "cosign_identity = \"from-config@example.invalid\"",
+        );
+        assert!(
+            text.contains("from-config@example.invalid"),
+            "the generated [controls.ai-receipts] block changed shape — fix this test"
+        );
+        std::fs::write(&cfg_path, text).unwrap();
+        let ctx2 = Ctx::discover(&ctx.root).unwrap();
+        let ok = with_fake_tool("cosign", script, || {
+            verify_receipt(&ctx2, &receipt, None, None)
+        })
+        .unwrap();
+        assert!(ok.contains("from-config@example.invalid"), "{ok}");
     }
 
     /// A receipt's `gitCommit` is untrusted input — it is the thing under
@@ -654,7 +1243,7 @@ mod tests {
             let forged = ctx.root.join("forged.json");
             std::fs::write(&forged, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
 
-            let err = verify_receipt(&ctx, &forged)
+            let err = verify_receipt(&ctx, &forged, None, None)
                 .expect_err("a receipt whose gitCommit is a git option must not verify");
             let msg = format!("{err:#}");
             assert!(
@@ -686,7 +1275,7 @@ mod tests {
         for rev in ["HEAD", "HEAD~1", "main"] {
             let receipt = create_receipt(&ctx, rev, &out_dir)
                 .unwrap_or_else(|e| panic!("revision expression {rev:?} must still work: {e:#}"));
-            let ok = verify_receipt(&ctx, &receipt).unwrap();
+            let ok = verify_receipt(&ctx, &receipt, None, None).unwrap();
             assert!(
                 ok.contains("receipt verified"),
                 "{rev} receipt should verify"
@@ -700,6 +1289,82 @@ mod tests {
         assert!(!is_object_name("HEAD"));
         assert!(!is_object_name("123456")); // too short to be an abbreviation
         assert!(!is_object_name("DEADBEEF1")); // uppercase is not git's output form
+    }
+
+    /// Reported (M16): `sscsb receipt create -- --raw` exited 101.
+    ///
+    /// Before `--verify`, the resolver was `git rev-parse <commit>`, and
+    /// rev-parse ECHOES an unrecognised option back at exit 0 — `git rev-parse
+    /// --raw` prints `--raw`, five characters — so the receipt filename's
+    /// `&sha[..12]` sliced past the end. Reproduced at
+    /// "end byte index 12 is out of bounds for string of length 5".
+    ///
+    /// `--verify` shut that particular door, but the slice was still one
+    /// unexpected short answer away from a crash, because `is_object_name`
+    /// admits a 7-character abbreviation: a resolver answering with one used to
+    /// clear the guard and then abort the process. Asserted directly on the
+    /// filename derivation, which is where the slice lives — shimming `git`
+    /// itself onto PATH would break every other test in this threaded suite.
+    #[test]
+    fn receipt_file_name_errors_rather_than_panicking_on_anything_but_a_full_sha() {
+        // The exact reported payload, five characters, and the abbreviations
+        // `is_object_name` admits — all of them refused, none of them fatal.
+        for bad in [
+            "--raw",           // what `git rev-parse --raw` echoes back at exit 0
+            "-s",              //
+            "deadbee",         // 7 hex: passes is_object_name, too short to slice
+            "deadbeef1234def", // 15 hex: long enough to slice, still not an oid
+            "",
+            "HEAD",
+        ] {
+            let err = receipt_file_name("HEAD", bad)
+                .expect_err("{bad:?} must be an error, never a process abort");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not a full git object name"),
+                "for {bad:?}: {msg}"
+            );
+            assert!(msg.contains(bad), "the message names what it got: {msg}");
+        }
+
+        // Both real widths still work — the guard must not become a false
+        // positive for the answers rev-parse actually gives.
+        assert_eq!(
+            receipt_file_name("HEAD", &"a".repeat(40)).unwrap(),
+            "receipt-aaaaaaaaaaaa.json"
+        );
+        assert_eq!(
+            receipt_file_name("HEAD", &"b".repeat(64)).unwrap(),
+            "receipt-bbbbbbbbbbbb.json"
+        );
+    }
+
+    /// The reported invocation itself, pinned end to end at the library level:
+    /// a leading-dash revision is refused by git under `--end-of-options` and
+    /// surfaces as an ordinary error.
+    #[test]
+    fn create_receipt_refuses_an_option_shaped_revision_without_panicking() {
+        let (_d, ctx) = repo();
+        write(&ctx, "a.txt", "a\n");
+        commit_all(&ctx, "feat: x");
+        let out_dir = ctx.sscsb_dir().join("out").join("receipts");
+
+        let victim = ctx.root.join("victim.txt");
+        std::fs::write(&victim, "ORIGINAL CONTENT\n").unwrap();
+
+        for revision in ["--raw", "-s", &format!("--output={}", victim.display())] {
+            let err = create_receipt(&ctx, revision, &out_dir)
+                .expect_err("an option-shaped revision must be refused, not turned into a receipt");
+            assert!(
+                !format!("{err:#}").is_empty(),
+                "{revision} must produce a real error"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "ORIGINAL CONTENT\n",
+            "creating a receipt must never write to a file on disk"
+        );
     }
 
     #[test]
@@ -718,12 +1383,13 @@ mod tests {
     #[test]
     fn verify_receipt_reports_unreadable_file_and_malformed_json() {
         let (_d, ctx) = repo();
-        let err = verify_receipt(&ctx, &ctx.root.join("does-not-exist.json")).unwrap_err();
+        let err =
+            verify_receipt(&ctx, &ctx.root.join("does-not-exist.json"), None, None).unwrap_err();
         assert!(!format!("{err:#}").is_empty());
 
         let bad = ctx.root.join("bad.json");
         std::fs::write(&bad, "not json").unwrap();
-        let err = verify_receipt(&ctx, &bad).unwrap_err();
+        let err = verify_receipt(&ctx, &bad, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("receipt is not JSON"));
     }
 
@@ -737,7 +1403,7 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
-        let err = verify_receipt(&ctx, &missing_commit).unwrap_err();
+        let err = verify_receipt(&ctx, &missing_commit, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("missing gitCommit digest"));
 
         let missing_sha = ctx.root.join("missing-sha.json");
@@ -750,7 +1416,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let err = verify_receipt(&ctx, &missing_sha).unwrap_err();
+        let err = verify_receipt(&ctx, &missing_sha, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("missing sha256 digest"));
     }
 
