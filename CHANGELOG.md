@@ -10,6 +10,32 @@ versions.
 
 ### Fixed
 
+- **A typo'd control id read as a clean run.** `sscsb verify not-a-real-control`
+  filtered the registry down to nothing, ran zero controls, printed
+  `verify: 0 failed, 0 degraded` and exited `0` — so a typo in a CI invocation
+  was indistinguishable from a genuine clean verification of a control that
+  never existed. An unknown id is now a usage error and exits `2`, naming the
+  id and listing the valid ones. The check runs before any control does, so a
+  partially-valid invocation (`sscsb verify secrets not-a-real-control`) also
+  exits `2` and verifies nothing rather than passing `secrets` and never
+  mentioning the typo. `enable`/`disable` already behaved this way; both routes
+  now share one rule. This is a behaviour change for anyone whose CI passes a
+  control id that was silently ignored — such a run was never verifying what it
+  claimed.
+
+- **A bare TOML key in a `pyproject.toml` was read as a dependency.** A manifest
+  whose entire contents were `name = "throwaway"` made `sscsb deps check`
+  report `pypi:name` as `NOT FOUND on its public registry — likely hallucinated
+  (slopsquatting target)` and exit `1`. The parser decided TOML-vs-line-scan by
+  sniffing content — a document counted as a pyproject only if it contained
+  `[build-system]`, `[project]`, `[dependency-groups]` or `[tool]` — so a
+  manifest announcing none of them fell through to the requirements.txt line
+  scanner. The filename now decides: anything named `pyproject.toml` is parsed
+  as TOML and never line-scanned, which also covers a malformed pyproject (no
+  content sniff can classify a file it cannot parse, and that case invented the
+  same phantom package). A false "hallucinated package" verdict is worse than a
+  miss — it trains users to run `deps approve` on noise.
+
 - **The pre-commit SAST gate could not be made to hold.** Its arm degraded open
   unconditionally — a missing engine, or a mistyped `[controls.sast] engine`
   name, printed a notice and let the commit through — while the secret-scan arm

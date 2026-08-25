@@ -98,7 +98,7 @@ Every command below exists in the binary. Run `sscsb <command> --help` for flags
 |---------|---------|
 | `sscsb init` | Bootstrap the repo — config, hooks, policies, CI templates. Idempotent. |
 | `sscsb status` | Every control with enabled state and tool availability. |
-| `sscsb verify [controls...] [--strict]` | Verify all enabled controls, or only the named ones. |
+| `sscsb verify [controls...] [--strict]` | Verify all enabled controls, or only the named ones. An id that is not a real control exits `2` and runs nothing — including when other named ids are valid. |
 | `sscsb report [--format text\|json]` | Control → framework coverage map. |
 | `sscsb enable <control>` / `sscsb disable <control>` | Toggle a control in `.sscsb/config.toml`. Off means the code does not run. |
 | `sscsb tools` | The pinned external-tool registry and where each was detected. |
