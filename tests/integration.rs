@@ -197,6 +197,78 @@ fn enable_disable_toggles_config_and_verify_behavior() {
         .failure();
 }
 
+/// A typo'd control id must never read as a clean run.
+///
+/// `sscsb verify not-a-real-control` used to filter the registry down to
+/// nothing, run zero controls, print `verify: 0 failed, 0 degraded` and exit
+/// `0` — so a typo in a CI invocation was indistinguishable from a genuine
+/// clean verification of a control that never existed. That is the precise
+/// false assurance this tool exists to eliminate, and it is worse than a
+/// crash: the exit code, which `AGENTS.md` tells agents to read INSTEAD of
+/// scraping stdout, affirmatively lied.
+///
+/// Per the documented contract an unknown id is a usage error (`2`), not a
+/// gate failure (`1`) — nothing about the repository's security posture was
+/// learned. `enable`/`disable` already rejected unknown ids this way; `verify`
+/// was the outlier.
+#[test]
+fn verify_rejects_an_unknown_control_id_instead_of_reporting_a_clean_run() {
+    let dir = throwaway_repo();
+    let repo = dir.path();
+    init_sscsb(repo);
+
+    // 1. An unknown id alone: exit 2, and NO clean verdict on stdout.
+    let out = sscsb(repo)
+        .args(["verify", "not-a-real-control"])
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        !stdout.contains("0 failed, 0 degraded"),
+        "an unknown id must not print a clean summary: {stdout}"
+    );
+    assert!(
+        stderr.contains("not-a-real-control"),
+        "the message must name the invalid id: {stderr}"
+    );
+    assert!(
+        stderr.contains("secrets"),
+        "the message must list the valid control ids: {stderr}"
+    );
+
+    // 2. A PARTIALLY valid invocation must not half-run and report success.
+    //    `secrets` is a real control that would otherwise PASS here, so a
+    //    surviving `[PASS    ]` line is proof the run started anyway.
+    let out = sscsb(repo)
+        .args(["verify", "secrets", "not-a-real-control"])
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stdout.is_empty(),
+        "no control may run when any named id is invalid: {stdout}"
+    );
+    assert!(
+        stderr.contains("not-a-real-control"),
+        "the invalid id must be named: {stderr}"
+    );
+    assert!(
+        !stderr.contains("`secrets`"),
+        "the VALID id must not be reported as invalid: {stderr}"
+    );
+
+    // 3. Every named id being real still verifies normally — the gate above
+    //    rejects typos, not legitimate selective verification.
+    let out = sscsb(repo).args(["verify", "secrets"]).assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("secrets") && stdout.contains("verify: 0 failed"),
+        "a valid selective verify must still run: {stdout}"
+    );
+}
+
 #[test]
 fn status_and_report_render_all_phases() {
     let dir = throwaway_repo();

@@ -306,10 +306,9 @@ impl Config {
 /// Flip `controls.<id>.enabled` in place, preserving comments/layout.
 /// Returns an error naming valid ids when `id` is unknown.
 pub fn set_control_enabled(config_path: &Path, id: &str, enabled: bool) -> Result<()> {
-    if crate::controls::control(id).is_none() {
-        let ids: Vec<&str> = CONTROLS.iter().map(|c| c.id).collect();
-        anyhow::bail!("unknown control `{id}`. Valid controls: {}", ids.join(", "));
-    }
+    // Same rule, same message as `sscsb verify` — one function, so the two
+    // routes cannot drift into disagreeing about what a control id is.
+    crate::controls::reject_unknown_controls(&[id])?;
     let text = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading {}", config_path.display()))?;
     let mut doc: toml_edit::DocumentMut = text

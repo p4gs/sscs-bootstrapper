@@ -483,6 +483,45 @@ pub fn control(id: &str) -> Option<&'static ControlDef> {
     CONTROLS.iter().find(|c| c.id == id)
 }
 
+/// Reject any id that is not a real control, before the caller acts on ANY of
+/// them.
+///
+/// An id nobody recognises is a usage error — exit `2` per `AGENTS.md` — and
+/// never a verdict about the repository. `sscsb verify not-a-real-control` used
+/// to filter the registry down to nothing, run zero controls, print
+/// `verify: 0 failed, 0 degraded` and exit `0`, so a typo in a CI invocation
+/// was indistinguishable from a genuine clean run: the tool reported success
+/// for a check that never existed. That is the exact false assurance this
+/// project exists to eliminate, and it defeated the advice `AGENTS.md` gives
+/// agents — read the exit code rather than scraping stdout — because the exit
+/// code was the part that lied.
+///
+/// All-or-nothing on purpose. `sscsb verify secrets not-a-real-control` must
+/// not verify `secrets`, report success and leave the typo unmentioned; a
+/// partially-understood invocation is not a partially-valid one.
+///
+/// `enable`/`disable` already rejected unknown ids exactly this way. Both
+/// routes share this function so the two can never drift into disagreeing
+/// about what a control id is.
+pub fn reject_unknown_controls(ids: &[&str]) -> anyhow::Result<()> {
+    let unknown: Vec<&str> = ids
+        .iter()
+        .copied()
+        .filter(|id| control(id).is_none())
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let named: Vec<String> = unknown.iter().map(|id| format!("`{id}`")).collect();
+    let valid: Vec<&str> = CONTROLS.iter().map(|c| c.id).collect();
+    anyhow::bail!(
+        "unknown control{} {}. Valid controls: {}",
+        if unknown.len() == 1 { "" } else { "s" },
+        named.join(", "),
+        valid.join(", ")
+    );
+}
+
 pub fn phase_controls(phase: u8) -> impl Iterator<Item = &'static ControlDef> {
     CONTROLS.iter().filter(move |c| c.phase == phase)
 }
