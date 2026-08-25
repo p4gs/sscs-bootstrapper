@@ -1,0 +1,122 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:a385638d5b6bab6762c19ef3fcc5e7c834cefd40e1c157025f5fc1b2d3857cfa",
+  "claims": [
+    {
+      "id": "claim_b4161270bd634e65ab85846de61257ab",
+      "statement": "Re-running init cannot clobber local edits, but the rule is not that nothing is overwritten: it is that nothing you are meant to edit is overwritten, split into three classes of file.",
+      "evidence": [
+        {
+          "resource": "repo://src/init.rs#L1-L27",
+          "version": "repo-lines-v1:sha256:2ccc3064ee518cba07d7471a0e7a5c3e28abe5855ce84249c85b9a6627d9a697:eyJzZWxlY3RlZExpbmVDb3VudCI6MjcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjYyM2I0ZjE3NzE2MTRmMzUxMDM2MzE2ZTJkN2NhZTdiOTRkZjAxZDlkY2I2OTE3Njc3YzE3NjhkNWQ5YzA2MjUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjA5ZTkzOTg0OTRlYTZhNDJjYTBkZTAxMjVmYTAzMjZmZDZmZWFmNzIzZjA4ODdhNmM3NDJiNTI2YWEzMTE2YzQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjdmODM4ZWM3NDIwODJkZDRhYWM1Y2JiNTIzMjllYTYzMzExNjA1ODEwYTM1ZjQwNzBhNjUyZDZiOTg5NDQzOWEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_122711e422dd4b2ba19f603b55ee10fc",
+      "statement": "Config, the policy files and every registered artifact are kept if already present, so a second run writes strictly fewer files than the first rather than none.",
+      "evidence": [
+        {
+          "resource": "repo://src/init.rs#L124-L168",
+          "version": "repo-lines-v1:sha256:0d9cf5c9ee06df0200f89925d26e54625a99fe57806aee96234489591f49c3f4:eyJzZWxlY3RlZExpbmVDb3VudCI6NDUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQzYjg1ZmU2NzRmNDIzZTExZDUzYzQxNzQ2YTliZDZlMTI1M2FmZThlMGYwYTI3Nzc0MmQwOTI5MjU4MjEzZDgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImI5NzQ2NDZkZDljNzI2ODc1NjhhZTUyMzJkMzFiZmQxODFlNDkxNWZhNzRjNjhkNjcyMWM5YzMwMGRhN2QyNzkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjJiMWU0ZmY1ZTJmMjQ2MmY3ZjAzNGIzMDkyZmQ0YjI0MmZjMmNmOTgzNjdlNTFmZjUxMmI0MDdhYTY3YjlmMTMifQ"
+        },
+        {
+          "resource": "repo://src/workflows.rs#L604-L615",
+          "version": "repo-lines-v1:sha256:8c900e3a23909b9f5f7af536d7deebca183679c162c4f426eeedff898d4c652d:eyJzZWxlY3RlZExpbmVDb3VudCI6MTIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImYyZGRiOGE4MTNjMWI1NjlhYzJkYzNkODgxNGZlYWQ4YTc1YTM5YTg4MGU1MjI3NzE2NmYzM2EyY2Q3ODVhY2QiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjE5ZTc2MzU1Y2YxMTk5NDgwYzNmOTk4MzZiMTQ4NmM4NDFkODkxZmFhZDkwNGM2MDhlMDkzMDIyZDM3NTdhZWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjdiYzk4ZDZiMGRjNDkyYzUwMTZkZjEwODA1YTNhNTRlYjljMTg0YTVhNjEzN2U3ZjRiZWNmYTBjMjIwNTUwZDAifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_1602670713854d53a813fce3cd76db5b",
+      "statement": "Exactly four files are regenerated unconditionally on every run: the three hook shims and the derived allowed-signers file, so edits to those are discarded by design.",
+      "evidence": [
+        {
+          "resource": "repo://src/hooks.rs#L50-L75",
+          "version": "repo-lines-v1:sha256:ea35b7a1d6bb61ee3bbabaef37bfdf5e562d84d546e55bf5723daa3601741dd4:eyJzZWxlY3RlZExpbmVDb3VudCI6MjYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImMyNjU5YTNiNDU0YWRiNTg4ZmZhNTkxMDlhMzExODViZDlhZWQ5M2U0OTI4YjM2ZWMyOGI2YmJhYTdlNWU5NmYiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImU5NmY4Y2IwODNmYTgwMGE0ZGNkMjk2OTcyMmQ3YjkyNjg2YWRkOWViZTM2NTU0OTJmYTY3MmIxYTdjZWQyNDIiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImU0OWY1YjFjMDcxZDVjNDhiNmRhYzdlOTZlMGQ1YzhhNTcwNTY5NjZmOTY5MWRmZmZjMmY1ZmYwNjFhNDE5MDEifQ"
+        },
+        {
+          "resource": "repo://src/init.rs#L169-L170",
+          "version": "repo-lines-v1:sha256:c2a7033b49a5d97cb372ebc497c327b14eda838a6782fe390f38343eb3528b7d:eyJzZWxlY3RlZExpbmVDb3VudCI6MiwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiODc3MTRmYmQ3Y2M2MzcwYmVkZWNiNTcyZDk5YTVjN2VhYmZhYWNiOWYwM2M4NWNiYmM1NTg3ODU2OGE5MGRlZSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNjVkNzVhYWJiYWQzMGNhMjNlZTc1MzZiNWE3OThlYjhjNWY0OTMyYzU1MjUzMjk0ZjVmZTMxNWEzNGQyZDM0MSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiOTZlZTY0YWYwZDk0ZDYxZTY0YTkxNjcyODNmYWE4M2I1ZjljZWNmZjE5YmMzMGQzNDJiYmJjOWNlZDZjY2IxNiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiMWI4MWJmYjRiYzgwOTBlZDBiOTI4NzM2ODM5MjNlN2JiMTFhNDNlMzNhZWRkOTI5MTgyNGM4NjZhM2ZjNjU1YSJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_c1e9c5738693458fa0b9496a13e9f7de",
+      "statement": "Init asks git itself whether generated output is already ignored, using a check-ignore probe, and bails rather than guessing when git returns an unexpected status.",
+      "evidence": [
+        {
+          "resource": "repo://src/init.rs#L78-L91",
+          "version": "repo-lines-v1:sha256:9689579644f91aae5d1fcb7ec3c6dcb45cea771484e441ff22b49ce0ddad936c:eyJzZWxlY3RlZExpbmVDb3VudCI6MTQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBiZTRiNTQ2Yjc1NTU0OTc0ZGUxMzk4MTBiOGU0YmQ3ZDcxNDExMzJkODEzMTY5ODI1YjNjMjE4N2NmNjE2YjIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjYxMjcxYjE0NjQzYTQ2OTBkZDVjNmJhN2IzY2U0ZjgwZGMyZTA5MDcxYmQwMjE5ZjZjYmUwMDQ2YTM2Yjk0MzAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjZlMzQxYjM0NGQ3MTgwYjBlZjkwMjU3NDczNGFiOGUxOTlmNjcyODE4NWMyYmM4MjRhZjY3YzdlMGU1NThjYjQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_3264032eaad941b0bf27076188f95756",
+      "statement": "The ignore probe uses a neutral placeholder name rather than a real artifact name, because a narrow pre-existing rule would otherwise read as full coverage and leave receipts and VEX documents exposed.",
+      "evidence": [
+        {
+          "resource": "repo://src/init.rs#L46-L55",
+          "version": "repo-lines-v1:sha256:6f84ed6053e1c2bf1450d48443aba5391d220c30a68df67ce787a2f7c663b316:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjM0ZWE4ZDgxMjFmZDZmMzNkMzhiNjFlNmFjOTE4MDNhNzkyNDBhZTA0MDdiOGI4Yzg1NTQ2YTViMjM0MjUxOWMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6Ijg3ZTU2N2VlNGRjM2Y3NmJhZDQ3ZGEyNGM4MDY4MTE1NzMyYjFlNjEzNjIzNjY1NTU3OTEwYmQxODI2MWEwZWIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImJiNjhkZmYyMzcwYjE0MzQ0NmNlNjBmNWY4ZDBiOTg1YTBjZTZmMGNlZGQ1YmQxN2Y5Y2U5YzQzYjhmM2ZmNDUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjgyNjBjODc3ZjFjNTQyMDRhOGI5YmUxMjZjMmYwNmNmYzQwMDc5N2Y2ZjkwZDYzZDQ3MzlhMmJlYmU4YWYzNzcifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_8a9266a68d224021a6b940f8bc33a37a",
+      "statement": "The ignore rule is appended and never glued onto an unterminated final line, so a file saved without a trailing newline cannot have its last rule silently corrupted.",
+      "evidence": [
+        {
+          "resource": "repo://src/init.rs#L96-L105",
+          "version": "repo-lines-v1:sha256:3473df209dda77b1b834b98bc3ed95236451d3c8f3fdd56a6e65702172a751af:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImVjYWZiZjg2YmQ1MzEwMGNkODVkYWE1ODgzYzExYzUzMmMxNDllMWYxMDI5ZjkyYTJmNjA2Y2UwMGU2NGQzNmUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImIxZTAxNzg4NWJkMTlkYTc5OTI0YzQxYzBkYzI1NjE5ZDMyYjdkMjEyZmM5YTQxYmE1ZTc3MGZhYWFlNDZiMTMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjYxYjlhYTdlYTAyOWNhMjkyNmYzMmI3ODBiYmU2ZjRhNDg0ZjZhNjdmMmYyYTM4ZTZmMGM5OGQ1NzljNTIyNzcifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_087ad11e40c54b489230799c52ee0fb8",
+      "statement": "Adding an ignore rule cannot untrack anything, so a repository that already committed generated output keeps tracking it.",
+      "evidence": [
+        {
+          "resource": "repo://src/init.rs#L75-L77",
+          "version": "repo-lines-v1:sha256:61271b14643a4690dd5c6ba7b3ce4f80dc2e09071bd0219f6cbe0046a36b9430:eyJzZWxlY3RlZExpbmVDb3VudCI6MywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiMjhmY2Q4MTc4ODVhMmM0MTkzMTg1YzliNzViYmYzYTMxMDVmYmFjYzE4NWQ4MWQwNjJlYjk3YTU2YWY1YmEwNiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNzlmZTI4MzNjMzEyNWZlNmYwMmZkMjljOWQyOGE5YmJhNTAyZDA1YjllNGU5Mzk0NGU4YTE3NGM4YzRlMTQxNSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiYjkwNWVhZGY2MmUyMTQzMjNhZmVkNzMxZTJkZWE0MGEzN2E0NWNhOTdmYzY3YmIzMGYzNDNmZmUyMTFjY2NmOSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiYWUzNzM1M2NjZGM0NjNiOGJlM2E3OTZjNWRmMmVjYjNjNWRkOTc4NjI3MDRlMWJiZTNiYWEyY2E2ZmZmNjgxOCJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_461a26f6244247beb5c5c0124ee98fed",
+      "statement": "The motivating defect was that the tool directory holds both policy that belongs in history and generated output that does not, so committing a regenerated SBOM buried real policy diffs in review noise.",
+      "evidence": [
+        {
+          "resource": "repo://src/init.rs#L60-L64",
+          "version": "repo-lines-v1:sha256:782596344b10dbb2fe50b8db1b990e47b60ba59c4c67b00367d200161f3e859e:eyJzZWxlY3RlZExpbmVDb3VudCI6NSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiMzM1NzhmMmY3YzcxMjdkMDhjNzgxMDdiOWUwN2IyNjRiNGU3YTA1ZDc2MWExYTQyMDUxZjQ2YWI0NjIyYWE4OCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNDAxMGUzODNlOWY4ZDI2MDk3MzAyY2Q2MjhmNzFlODA1M2ZkZmM4NGE1ODc5MGFkZDI4N2Q5MGEzMGRmNDE0NSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiMjYwNGY3NzkzYjJlNGY4OWJhM2U5YmI1YWFlZTQ4MTAxZTM4OGYyMzJkZGE4OTQ2NWNkNGFiMTlmMjEzOGY4OCIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiMDJjMjQ1MjQwZTAzYzJjMTQzYTg1ZmI3NTQzNjdiNDVhNmZmMjRkNmU2NjNiYjI1NTg3MzRlNDgyMTYzYjZhZiJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_ddc0f6cd40e1405daaf9546b0b24954a",
+      "statement": "There is no upgrade path beyond deletion: init takes no flags, and the run log tells you per file that a kept file must be deleted to be regenerated.",
+      "evidence": [
+        {
+          "resource": "repo://src/workflows.rs#L225-L231",
+          "version": "repo-lines-v1:sha256:851f7aac6b9d6e9a849a6aa9f3bf40ba08df9906431a1ba3951a0de9a8f90c2a:eyJzZWxlY3RlZExpbmVDb3VudCI6NywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiMDg2YTk4NDIyYWQ3ODg2NTBiYzYwYWIxZjdjNWRhODQwOTU1MjFhNzM3NTc0MWU3NDEwOTZjMzYzMjk0MGY1YyIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiZTZiMDQ0OTE0Njk3MjJlODM2M2E5NGU0MDQ0NTM4ZTAxM2EyYTIxN2UzNmIxZTU2OGJhNjBhY2I3YjRjOGYyZSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiYWViYmQyNTE2OWQ4MGUyMGNmOGNiNWRmOTA2NGUxODM3NWU3YzIxNmY5Y2JlZWYzZDczNTQxNjM2MTgyOGYxYyIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiMGM4ODMxZGM0ZmJhYzIyZTg4MGNiZjRkODk5YTA2Y2ExMmRiNjQyYmI3MTA5OTQ5MzEwNzk2NGE4OTBkYmExYyJ9"
+        },
+        {
+          "resource": "repo://tests/agents_md.rs#L505-L537",
+          "version": "repo-lines-v1:sha256:54e3fe2787b9208be4327cf60465b26785caa5aba60faf0cbaea78d08691d8b3:eyJzZWxlY3RlZExpbmVDb3VudCI6MzMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjRhMzdjOWZkOTk4NGM5MjVkNWJhYzkzOWViN2IyN2Q5MDcwMmM1MGM5MDM1OWU0YjYzOWE5ZGQ5ZTJjMTI2NmEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImE1OTM3Njc5MWU2OTQ3NmY3YTA3MTg5NmRjMjViOTEzN2VmODQyM2UzZTk2MzQwY2NmYWMzMzIzZDQyY2E1MWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjI4OWZkYWI1MzI1NzdhNmY4MzI2NDE0ZjljMmI4NDZlMGU3ZWNmODNlMTNhMDU4NTAzYjliZjZmZjA3NWFiNGIifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_02f50494390041108a066aecc30ace3f",
+      "statement": "After upgrading the binary, every already-installed artifact stays at its old version, because nothing compares installed files against newer templates and only the four always-regenerated files pick up changes.",
+      "evidence": [
+        {
+          "resource": "repo://src/workflows.rs#L205-L239",
+          "version": "repo-lines-v1:sha256:db323efa5648da733333ee5e33da6f64d5ec02e228d6e4390740fe484d0d9df9:eyJzZWxlY3RlZExpbmVDb3VudCI6MzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU0NmUzYmFiYjU0ZmIxNjA4ZjAyNjE3MmIyNzA1NTlmMzQyNTI1ZmQ1NDk3ZmJlMDM0OTY4MTNhZTMyZTgzZmUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjM2NjdkMDQ4ODI1M2Y0ZDljNTgwOTNkOGE2OTYzYTlmMjc5OTQ3ZDIzYTQ2YjI2YWRiNjNmYjg4YmNlNTk4YmEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjYyMDY1Y2M4YmI0Y2U3NWQ4ZTZhZjRjOWIxYTkzZGFjMThjZDNlYzRiZTYxZjU5MzhiMmQzMTE5NmIwMWVmZTIifQ"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.3.3",
+    "at": "2026-08-25T03:42:40.117Z"
+  }
+}

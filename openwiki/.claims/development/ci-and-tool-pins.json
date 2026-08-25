@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:8ea2d02b1fd2caad833ed2437f955270e48d9f0f6fa6ab5e981c177869a0c88e",
+  "claims": [
+    {
+      "id": "claim_68265bbcdfe04c9d87fef05999dd8dce",
+      "statement": "The pipeline is three jobs: lint, test, and coverage, each installing the orchestrated tool set through a shared composite action.",
+      "evidence": [
+        {
+          "resource": "repo://.github/workflows/ci.yml#L32-L79",
+          "version": "repo-lines-v1:sha256:f6708a689c6e78044791198f7ba6dbbe3f2ed3e1baf18870b6aae353563c9961:eyJzZWxlY3RlZExpbmVDb3VudCI6NDgsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY4ZmI3Mjc3ZmRkMjBkMmY4NDY2ZmM3M2I1ZTQyNzA0Nzg5YjA5OTkxNjYyODlkY2IxOTM1YzAwNDg1MTZlZGEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJhZjQ4MWU2YzZiNzA5YTA0YTM3MWM3N2ZkMDI4YzYzNWQ1NTk5ZmY2YTg2MDgyNTU5ZjdlZTg3ZWUwZTBiNzYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjJjZGRhZTRlN2E2MzZjMjBmNTUwYWNiNmE1NGYyNzA5YWUyY2I0Y2RhNDE1ZDNhN2U1MjQxZTM3MTg1Njg5MjAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjlhNDcyZmIwMGY2ZDNiMmM5NGYwNGU3NzAwYjRlMjc3YzlkMWZiZTc1ZmNiYTYyOGRmZmQ4N2Y5MjcwYjQ5YjUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_1378c0a63585442ebe19890d763ea18f",
+      "statement": "Tool versions are declared twice — once in the Rust registry and again as environment variables in the CI action — and a parity test makes the registry normative so the two cannot drift.",
+      "evidence": [
+        {
+          "resource": "repo://tests/tool_pin_parity.rs#L1-L86",
+          "version": "repo-lines-v1:sha256:140a6db58aa7110984f72326885ab0d8ab7931d3a9ee1eab1370f634486e5168:eyJzZWxlY3RlZExpbmVDb3VudCI6ODYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY2NmYzOTgxNDQyNTdkNWE3NmJhZGU5ZTQ5MjVkZTE1ZGViOWIyOTVkYTczMjhjOWE3NmM2YzdjNDk1ZTU5ODMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjMxODFiZjllMzE1NGVlZGQ3MGJiYjE4NzRiMmFkNGEwNzAzMjczMmFjOWFmMWE3MTc5M2VkODI2YjU2ZGM5NDcifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_aea5d46e34d34631b7e3a389075694d8",
+      "statement": "Without that parity test CI would test against one version while the tool's own degrade message told users to install another, and both would look correct in isolation.",
+      "evidence": [
+        {
+          "resource": "repo://tests/tool_pin_parity.rs#L1-L15",
+          "version": "repo-lines-v1:sha256:3c62408e8e2c3d5d1a40891ba41c5ca623d3d68b3d875b3df46c0e40bb251bc2:eyJzZWxlY3RlZExpbmVDb3VudCI6MTUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY2NmYzOTgxNDQyNTdkNWE3NmJhZGU5ZTQ5MjVkZTE1ZGViOWIyOTVkYTczMjhjOWE3NmM2YzdjNDk1ZTU5ODMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImU1MzAzOWVkNTlmMzg4YWRiZDY1YTE4MzRjNTczNmZiNDdkNGYwYmQ5YmU4YjM1NWM5MmE5NmFmMDIxNjYyNTYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjowLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImFmYWM1ZDAwYTc0ODVjMTNjZGRlMzNjMDMyZTZlNTc0OWRhMTMxODE4Y2MzZTUwZmU5OWI5ZDM5YmYwYThjMjMifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_c3e8498bac8648ffb7b67bce2eb97b0e",
+      "statement": "Four tools are deliberately omitted from the CI action so their degrade branches stay exercised there, which means adding one silently removes a coverage path.",
+      "evidence": [
+        {
+          "resource": "repo://tests/tool_pin_parity.rs#L88-L106",
+          "version": "repo-lines-v1:sha256:7245faaefcaa50f79828feb456de8e21b63b404f1332fd92be17d6f695320700:eyJzZWxlY3RlZExpbmVDb3VudCI6MTksImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJlMDQwMjVhYTcwODhiZTE3YmY4NTYxOGZhMDAzZWZhZjA2ZjVkYWM2MTViZTNkMGUwNjE2YmE1MDM0ZjhjYjEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImE1OTM3Njc5MWU2OTQ3NmY3YTA3MTg5NmRjMjViOTEzN2VmODQyM2UzZTk2MzQwY2NmYWMzMzIzZDQyY2E1MWUiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjowLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUifQ"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.3.3",
+    "at": "2026-08-25T03:42:40.117Z"
+  }
+}

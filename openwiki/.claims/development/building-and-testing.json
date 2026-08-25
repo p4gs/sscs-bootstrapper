@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:83d1d6712b8e560240191eea72ed56dbb9c8a9d72106e60f361be55a39ff2a24",
+  "claims": [
+    {
+      "id": "claim_09fe35505ff54531946b0a3c14a715b4",
+      "statement": "The test suite creates real git repositories and verifies real signatures, so it is only hermetic when the host's git identity cannot reach the fixtures, which requires disabling command-line, global and system git configuration for the run.",
+      "evidence": [
+        {
+          "resource": "repo://CLAUDE.md",
+          "version": "repo-file-v1:sha256:4df682638b809a9090686638818069ef49216b0288bad5317c35e516397e0477"
+        }
+      ]
+    },
+    {
+      "id": "claim_bf8ce02d443d490591d051f6d55bd462",
+      "statement": "Both identity leaks manifest as mass failures that look like code regressions and are not, because injected command-line configuration outranks every repository-local setting the fixtures make.",
+      "evidence": [
+        {
+          "resource": "repo://CLAUDE.md",
+          "version": "repo-file-v1:sha256:4df682638b809a9090686638818069ef49216b0288bad5317c35e516397e0477"
+        }
+      ]
+    },
+    {
+      "id": "claim_580c86111c7c4bef863ce4b9425ea289",
+      "statement": "Making the helpers self-isolating so the suite is hermetic by construction rather than by invocation discipline is a recorded follow-up that has not been done.",
+      "evidence": [
+        {
+          "resource": "repo://CLAUDE.md",
+          "version": "repo-file-v1:sha256:4df682638b809a9090686638818069ef49216b0288bad5317c35e516397e0477"
+        }
+      ]
+    },
+    {
+      "id": "claim_32b5d19c83a4451c8b2dea1d23b3cbb8",
+      "statement": "Argument parsing and printing are excluded from the coverage gate because they sit over library functions that are themselves covered.",
+      "evidence": [
+        {
+          "resource": "repo://.github/workflows/ci.yml#L83-L85",
+          "version": "repo-lines-v1:sha256:59210049eb11f9e18a4c6b727196adf4b4201d315ed3c13f2f65565438f934a6:eyJzZWxlY3RlZExpbmVDb3VudCI6MywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiOWEzMTJiYjI1MTY2ODQwMWRhNjExODBjMzRkY2MxMzFhZDI2NGIyMDA3NGRhYzA1MWJiM2FiOGZiYTQzZWE3MyIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiMjJkODUzMTI3MjI1OGMyODI4NmYxMjViZWI0Y2NmNzIwMWIxNTk4MTljNjE5M2JjOTA3YzFhZWRkNTg1NGZmYyIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiOWE0NzJmYjAwZjZkM2IyYzk0ZjA0ZTc3MDBiNGUyNzdjOWQxZmJlNzVmY2JhNjI4ZGZmZDg3ZjkyNzBiNDliNSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiN2VkOTg3M2Q5ODkxZGQxMDlhYTE4ZWEwMjU1ZjgyOWEwOWQwN2Q4NWM2Y2VkZGQyNTk4NjJkOTZiMDRkODRhZCJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_8fedc2264d6f40b3913ac76fa50da177",
+      "statement": "The function coverage threshold is set below the line threshold because the coverage tool counts every monomorphization and closure instance per compilation context, and the crate is built both with and without test configuration.",
+      "evidence": [
+        {
+          "resource": "repo://.github/workflows/ci.yml#L88-L96",
+          "version": "repo-lines-v1:sha256:705388665fb215370a7aecb437e71f84ed4cb554016f2ed75fb0633f857b1ccd:eyJzZWxlY3RlZExpbmVDb3VudCI6OSwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiODgxNGI3MTU3OTFhM2E0N2JiMzFjNGNkNzY4MjViMWJhYjIxYzU2OTFkZjljZjA0ZGJkZmUwZmFmMTBkZjI3ZSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNjNmYjc5MGQ1MWEyODBhOWU4ZDA0YTlhZjE0OWRiM2JjNDNlNDE3ZDAxNjliYTMzMzI1NTUyNmYxZjQ1MzkwMiIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNWI0ZmMxODBjNzA1Y2M1ZWQ5N2FiODA1NmMwYzViZjhjNDY3NzZmMTA4Y2IwMjIzYjcyODUwNjVmOWVjMzRhMyIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiM2ZhZTU1ODU4N2FhYTMyNjIzYjk4YjNiOWYxZGFlODAxZTJjYmUyNzBlZDI3MWM4Zjk1ZDZkYjNiYWIzY2MwNSJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_041826971c184c31b0d404417269b5fc",
+      "statement": "The fuzz targets cover exactly the three places the tool parses untrusted text: commit trailers, signer policy and dependency manifests.",
+      "evidence": [
+        {
+          "resource": "repo://fuzz/fuzz_targets/parse_trailers.rs",
+          "version": "repo-file-v1:sha256:a534259eaf58858013c279d3974b185daeba9d828a7a3b9ccf39355bba3ab754"
+        },
+        {
+          "resource": "repo://fuzz/fuzz_targets/parse_signers.rs",
+          "version": "repo-file-v1:sha256:ef781e9430d8b2046c11a315a199dcfc483fadcc755d9c0929bd8a98251f405e"
+        },
+        {
+          "resource": "repo://fuzz/fuzz_targets/parse_deps.rs",
+          "version": "repo-file-v1:sha256:85704bfe84148aee0deeae5c1073ba85420e1dd917c38d0efd98176d71637d70"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.3.3",
+    "at": "2026-08-25T03:42:40.117Z"
+  }
+}

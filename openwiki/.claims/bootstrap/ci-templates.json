@@ -1,0 +1,118 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:7bb5cde93c3999ac077fae702f921d1e860a457b38b203deb0f81f2822eca63f",
+  "claims": [
+    {
+      "id": "claim_eee2b57476af46f498f9f7a7accec6b3",
+      "statement": "Every template is embedded into the binary at compile time, so there is no runtime template lookup and a shipped template cannot be missing.",
+      "evidence": [
+        {
+          "resource": "repo://src/workflows.rs#L15-L22",
+          "version": "repo-lines-v1:sha256:043554404d459d6eb6d68f3f78ff7caa7b588327338dbcd7a2f7a748b489abb2:eyJzZWxlY3RlZExpbmVDb3VudCI6OCwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiNjI0MGU5NGJhODE4NGQ0YjdjMDQ4MmFiYjZlNTU0ODljNGFmZDA2MDc4YjQ0ODllY2MxNWIxZTRlM2UyNGY5MCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNDEyY2EzNDVjY2Y3NWJmOWMwODA2YmNlNjk1YmU4ZGU4MDhiNzk5ODQyNTFhN2E1NGQyMDJjZjYxMDFkZDQ1MSIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiM2NlYmMxNGYxNmExN2VmMTkyZGYyYjE3NjIzNzMwMWU5MWViNzNiYjgwZDZkMGRhNGQyYTc1MzgwMDY3OGEyZiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiODQzNTM3NmVhMzg2YWZmOWNkNGFiNWIwMmNkZDM1ZmU4NjA4ZGUzZTg3NGNjMmRiMTIwZjY3ODQ5ZTZjOTE2NCJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_f0eba138f0d54e21a5dc21f9e787f89d",
+      "statement": "Every artifact must name a registered control, and the registry lookup during installation is the assertion that enforces it.",
+      "evidence": [
+        {
+          "resource": "repo://src/workflows.rs#L212-L217",
+          "version": "repo-lines-v1:sha256:a4c9bf536fe14fa30bbc8b1fc872ff146083e6f1e204c19fb8ac45659d4b0f31:eyJzZWxlY3RlZExpbmVDb3VudCI6NiwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiMGIyNzU0OGM0YTRkYzMyMmM4ZWZlNzAzMjgyYjFjYzlmYjUyYmI0YzEyNTUwNDk4ZDkxOGJhODZiODM0ZTY3OCIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiOTZiNGQ0NzFjNzExMTFmODljYWFkYTg5MWZlMjM3M2FkNjEwZDY0OTYzZmNlZWNmMzljODVkNWZmYTQ5YmVjNiIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNmY1NjMwNGNlMjY2NDBhMGMzZTU2ZjkxNWMxZmM0NTRiZDQzODI4ZDBkZTFlYjFjZjM2ODQwZDQyZDQ4MWM5NSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZWY0ZDkzZTZjMGFhYjVhZGMyMTBhNmY0M2QwOGZjOGQwMTQyYjc2NTE2ZTJjY2M0YjJmZTMzMTUzMzRkM2Q1ZiJ9"
+        },
+        {
+          "resource": "repo://src/workflows.rs#L700-L710",
+          "version": "repo-lines-v1:sha256:23a622ff1ed6b8648f835446f723651446c1701e4757c90fd8b1f67031e0492a:eyJzZWxlY3RlZExpbmVDb3VudCI6MTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjkyYjVlZGY1OTQ5Y2ZlYTY3ODIyY2Y2OTExMzIzNjNkNjhkNmYxZTE2OWY1ZTBkNGY3YzE0ZTVmYTFlNmQ0ZTUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImE4ODVhMTUzYjU5YjQyNDI1ZjE1MDA1ZDcyMzUwNDFhYTE3ZTliMWEzNTNmNTQzNWRkYjc4OGE0YWU2MDU1MWYifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_71aa8ce232ae4216a480e5132934a664",
+      "statement": "Installation never overwrites an existing file and skips artifacts whose control is disabled, logging which case applied per file.",
+      "evidence": [
+        {
+          "resource": "repo://src/workflows.rs#L205-L239",
+          "version": "repo-lines-v1:sha256:db323efa5648da733333ee5e33da6f64d5ec02e228d6e4390740fe484d0d9df9:eyJzZWxlY3RlZExpbmVDb3VudCI6MzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU0NmUzYmFiYjU0ZmIxNjA4ZjAyNjE3MmIyNzA1NTlmMzQyNTI1ZmQ1NDk3ZmJlMDM0OTY4MTNhZTMyZTgzZmUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQxMmNhMzQ1Y2NmNzViZjljMDgwNmJjZTY5NWJlOGRlODA4Yjc5OTg0MjUxYTdhNTRkMjAyY2Y2MTAxZGQ0NTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjM2NjdkMDQ4ODI1M2Y0ZDljNTgwOTNkOGE2OTYzYTlmMjc5OTQ3ZDIzYTQ2YjI2YWRiNjNmYjg4YmNlNTk4YmEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjYyMDY1Y2M4YmI0Y2U3NWQ4ZTZhZjRjOWIxYTkzZGFjMThjZDNlYzRiZTYxZjU5MzhiMmQzMTE5NmIwMWVmZTIifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_910b8b2d92544e9c8f150c24c776d89e",
+      "statement": "Templates are rendered at write time by substituting the repository slug, default branch and project name, and the slug falls back to a literal placeholder when neither config nor remote supplies one.",
+      "evidence": [
+        {
+          "resource": "repo://src/workflows.rs#L188-L209",
+          "version": "repo-lines-v1:sha256:4cb30bdfc3a739a473b729e2c4e1a0b6e29631610483739085e24df8b7345fe5:eyJzZWxlY3RlZExpbmVDb3VudCI6MjIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjA0NDQ5ZDZhMTc2ODQwMzhhNTZiYjkzY2QxNmI2NzNhMWQyYmYxYzlkZDY2ZmVkNzdhMTIzNDQ4ZWFjZDNlODIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImRiNDYyODg2ODQ1YzVlOTNiOTk3YjJkMzk3MDc3NTY1ZDVhMmNiYjEwNTE3N2Y4MmM2ZTgzMjFkZDcwMDg3OGYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImFhZjJmNTdjZTg4YjU1MDJiZWRjMDMyNzQxZWUyZTczYWE2MTM5YmRhNzQyMGRjZTkwOTVjY2RhNTBmMDFjYjYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImNiODQwYmYyMGMxMjFhMzI1MzM0NGU4ZGZkZjY2YTUyOGY5NGY0MGE3MDA4NDM2ZjAxOGIyOWI3M2JmZTQyMzkifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_29c804bb1ead48168011fc467de8697b",
+      "statement": "Every shipped workflow template must pass sscsb's own extended actions audit with no findings above informational, so the tool that audits you is the tool that generated your workflows.",
+      "evidence": [
+        {
+          "resource": "repo://src/workflows.rs#L646-L659",
+          "version": "repo-lines-v1:sha256:4440e0e263e97674ad7dd15ce030243ad1617bb53d2550687b39df70f0888fdc:eyJzZWxlY3RlZExpbmVDb3VudCI6MTQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdmMjM0MjViNDIzNmM1MWFkZDNmYmM4NTg5OTgwOWRhN2JiOWZiMmQ5OTg3NGJkNjU5YzkwYTJmZjljMjAwNGEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjBjYjE2NTA0MTM2NzU3MDE0YTU4ZmI0Y2EwMTgzY2I0Y2IzMDlhZWQyMGY1MzBkY2Q1OTc2YmQ3NzIxNWQwOTYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjM5MTMzYTkxYWIyZDExZjI5NmE3ODVmNDEzMTIxZjA4ZjgzM2ZjYzQ4ZGRjOTIxZTI3ZDI3NzhhZTM4ZmUyZDIifQ"
+        },
+        {
+          "resource": "repo://src/workflows.rs#L1-L6",
+          "version": "repo-lines-v1:sha256:c556663e0cdacd9f200b3109dd10a55b880a8d2889a1937725d3af03c3f561c6:eyJzZWxlY3RlZExpbmVDb3VudCI6NiwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiYzQ0ODk5ZTljNzJmYzAzMTliOWMyZWU2YjFhYmQxYjAxMGQ0OTdjNzg3MWFhZGZiMDc1ZjNkMzUyNTJhZTBiMyIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiNzc4ZTE3NzAyNmRkZjdjODliMDM2YTE2NGM1YTZlMDIxZGMzMmY1YmRlOWI0MjM5NDkxYjc1ZDhkMzMzZjQyMyIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjAsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiZTI5MWY1ZjYwMGFiY2JhZDM1ZjFiZmMzYmYwZTZlZGNjMTVmYTczMDRhMmRjMTY1Y2Q1NTAzZmNmMTA0ZTE1ZiJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_cae8fdcab49243ceb25c7fe3ccfb5e9d",
+      "statement": "Every shipped workflow must embed the pinned runner-hardening step by exact digest, which catches both a workflow that omits it and a version bump applied to some templates but not all.",
+      "evidence": [
+        {
+          "resource": "repo://src/workflows.rs#L661-L673",
+          "version": "repo-lines-v1:sha256:cd1e3491f67056fb6eb7e9e46d78f1ef0d3d8f78ff28ffd6fdc77f9f6e966155:eyJzZWxlY3RlZExpbmVDb3VudCI6MTMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjA3NjI1OGVlN2ZjODY5ZjRkY2ZlOTYyNWIxZTRkMTg0YzIzZTNlOTBkYmJlNmQ4ZmFkNmQyZWIxMjUyZjI5ZjEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjUwMjk0ZTJmOWUyMWJiYjNmMjhhYWRmNGRkN2Y2NDE0OTE5NzkwN2U1Nzc3YTI1NjkzYjc2ODEyYzMwNjAwOWEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_ed747721dbf248649eb746d0d75a7b1e",
+      "statement": "No rendered artifact may retain an unsubstituted placeholder, because a workflow with a literal placeholder in its branch filter would silently never trigger.",
+      "evidence": [
+        {
+          "resource": "repo://src/workflows.rs#L675-L686",
+          "version": "repo-lines-v1:sha256:ef2059e3402593b47eb21edb9fa2741d0e4685661995222aeca1d7a8a21a2ca3:eyJzZWxlY3RlZExpbmVDb3VudCI6MTIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImY2OTA4ODNiZTYwYjc5ZjQ2M2NjNTJiYmYxNGQwMWI5OWVjNjVhMTQxY2VhNjQwNWZmYWY2NmYxZWQ4YjI2ZDEiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjAzZmM2NDVkNTE1NGU2MjYwYjhmNmEzZTcxOWEyMTYyZTQwZTdjNDJjZDg5ODc5ZmM1MDIwNDc1NTExNTU1MDUifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_7e3b1cf1e8f548ea9e4cba8ec59f62c6",
+      "statement": "No template may contain an absolute user home path, which is the same rule the shipped ruleset applies to user code.",
+      "evidence": [
+        {
+          "resource": "repo://src/workflows.rs#L688-L698",
+          "version": "repo-lines-v1:sha256:55c52e978cbfa6fb7a6020cd40c063407fe2006b7c8f5ed9c173476666e07730:eyJzZWxlY3RlZExpbmVDb3VudCI6MTEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImE0NWVhN2FlYWI5YTY4NjZhM2QxYzUzY2IxMGJiNzMzYjAxZmQ4NzIwODk2MzE1MGM5ZTFiYzg5YjdjMDMwYTMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjNiNDZiMjk0MWNhYWVhNzQ5YmMyYjU0MjZmMmFhMTY5YjdhNTk4OTMwM2M1ZGNkYmRlYzBlZTNkNGQxYmUzMjEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_aea29ddffce643329074e736440b92d6",
+      "statement": "Every shipped template must satisfy the same shape check its own verifier applies, which prevents writing a check strict enough to fail every real repository the moment the file is installed.",
+      "evidence": [
+        {
+          "resource": "repo://src/workflows.rs#L761-L773",
+          "version": "repo-lines-v1:sha256:537212571204474bdc19cf67fd0a5ec10d2f78ceeaa90dea581d6d0532c644e6:eyJzZWxlY3RlZExpbmVDb3VudCI6MTMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjkyYjVlZGY1OTQ5Y2ZlYTY3ODIyY2Y2OTExMzIzNjNkNjhkNmYxZTE2OWY1ZTBkNGY3YzE0ZTVmYTFlNmQ0ZTUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImEwYTQ1ODEyMmVmMDMwZmJmMmE3NjZkZGY3NGFkZTQzZjNiYmU0ZmQ0OWRlZTk5NjEyNTA4MGFmZjYxZDczZGEiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjM2NDEyMzZkYmUwMGVkZTI5NGQxYTZjNDIzNGU4MjBiMGFmZTkzMmFkMTc5YmVmYmI4MzM0MGU2MDk0Zjk1YzcifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_bda926dc3bad4a4a99b4ce64bfdaeb50",
+      "statement": "Every enabled template control must pass on a freshly bootstrapped repository, with a floor on how many were checked so the test cannot go vacuous, because a false failure here lands on every user.",
+      "evidence": [
+        {
+          "resource": "repo://src/workflows.rs#L775-L804",
+          "version": "repo-lines-v1:sha256:d417d71b46a36ffe76377250b6803ebe6fbfc36914c8be8dc7e2e722cadede6c:eyJzZWxlY3RlZExpbmVDb3VudCI6MzAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjZjNjZlOWNiOTFkNzJiOTUyNWQ2OTQ3NWI1MTBkYmQ5N2U3MDhlMWJjZmMyZjA4NzNmY2RlMzgxNzNkY2MyOWIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjQ4OTNmNDBlMzc4MWViODk2YzgyZDA0NmEwODA2N2ExMWUzNWNkZjJmMWRmYWYyNmZlYTkwYjhkYjY2NzY0MTMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijk5OWJkZWZlZWFjYTYzNDBlMDI5MGRjODZlODg5Yzg5ZDVlMTg5YWE1YmE0NGI1ODViM2I3MDczNGY0YTYyZDgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImE2MzYxM2E1NTJhNjdmN2ViYzRjOTczMTIxZjNmYmExZDRjYTdkMzNhOGViNzQxOGJlOWRlNGVhYTA5YTk5YjkifQ"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.3.3",
+    "at": "2026-08-25T03:42:40.117Z"
+  }
+}

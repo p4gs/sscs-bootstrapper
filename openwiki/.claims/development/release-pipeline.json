@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:28b1250e3be2625b8e0d7e903da49374f0e742606bd8fbcc0feef12e991fb570",
+  "claims": [
+    {
+      "id": "claim_e83d3163bc6f4ec0983e171ea6af30d9",
+      "statement": "The release pipeline triggers only on a version tag matching a strict pattern, so an arbitrary tag cannot start a release.",
+      "evidence": [
+        {
+          "resource": "repo://.github/workflows/release.yml#L19-L22",
+          "version": "repo-lines-v1:sha256:21bd4c0ef51f2c8c930f91a36f0d742b3d976d90d0a5b94b77a7a8f2a18b145b:eyJzZWxlY3RlZExpbmVDb3VudCI6NCwiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiYjEzYWNiNTRjNjE0MzUxMDc3MTI5ZjE3MzNmYWM4MGE4NzhiNGExZmEwZWZmNDlmZjFiNDM4YWFmMzZlYWZlYiIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiMDI3NzA0YWViNDI0ZTMzZGNlNjM3YWIwYWIzYjAxMmI1YmY4NjYyMDc2ZjgxYTg3OTU3YTYzODc3ZjBlNzQwYiIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiNmYxMGI4YmY1YzIxYTc2MDIzNjFmZjg1Y2NiYzY0ZDg4MWFmNTkzNTgxNzNlNzZlZThlNzJhNGVlODhiMDcyMiIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiN2UyNzQyMjRlOTgyODgxZDk4MWI4YWRkZmRkYzk4ODBiMmYxZDA3ODAzMTVkNzBkNWQ1MTkxYzc1Zjk1YTViMiJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_0b14dc2dc06b4ebe9dd64037c90b0942",
+      "statement": "Binaries are built for three targets in a matrix, and each build verifies the tarball actually contains a runnable binary rather than assuming the archive step succeeded.",
+      "evidence": [
+        {
+          "resource": "repo://.github/workflows/release.yml#L33-L82",
+          "version": "repo-lines-v1:sha256:799d955b6401d09f40504ef3df6872356cbba74963a4517a7c16845208a79047:eyJzZWxlY3RlZExpbmVDb3VudCI6NTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjVhMTNmYzNjNGY4YjNlYzk5ZGIzNzVjYmE1YjhmMTU1ZjNjOTRiZDZhNzkxYjEwYTEwYTI2ODA4ODBiNDY1NTMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjA4YzFiNTk2MjlmZTEwNDIxMjc5ZmNlZmM1NGY2MWFhOTA1NWY4OTQyMTE0ZDNiMGU1OGU2ZTliZDFmZjlkMzYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImNmY2IxMDY1ZTBjNDdlYzFiNmE0NDU4M2RiZGE5ZjM5NmZlMTUzMzgwZDY5OGU1MjAwYWQxNjk2MTNmMDY5ODkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImJjMjk2ZjFjODAxY2I2NGE2MjdlZDYzZTM2MTI1NmRjMDgzNjE0NzY4M2Q1Yjk4MmNlOTQ3ZjUwMGVmNzUxZWEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_c37a4387d6394c8e8a0da303122537e9",
+      "statement": "Only the host-native artifact can be executed on its runner, so a cross-built one is checked structurally and the workflow says so rather than claiming more than was proven.",
+      "evidence": [
+        {
+          "resource": "repo://.github/workflows/release.yml#L68-L81",
+          "version": "repo-lines-v1:sha256:8d5bfc598ed0c6eb263c3721ae0f5a4db4856504ea2a93d723f1ef2ccb126363:eyJzZWxlY3RlZExpbmVDb3VudCI6MTQsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjM2ZjAxNzg2N2E4MjIxNzBkNWEzNjg5NmQwODcxNmQ2YjQzN2I2NGMzYWVlNmRjZjY3YmNiZGQ1NDM2MmE1ZmUiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJmNTU5NzljZTczMDIwMzNlNmIyZmQ3ZDg4ZjUzN2EzYjhlMDkxZWEzMDVjODExZmZhMTI3NGJmNTc2NGVhNWUiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImUwMGQzNDE4YWNkNDA1M2Q5NjdlNzRjMDZkZjI4OWNmMTBkZmViZjM1OTEzZWI5N2YyMzE2YWJiODczZTkyNWYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImNjOTk2YTg4MmNlOWMwN2Q0NjkwNGZmYWRmY2ZjZjM5YmU4NjYwZmM5OGE4YzU2MzE5ZGQ3MGRhMGVmMTYyZTcifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_3b4c5ce37ff6461eabc63491a444627b",
+      "statement": "The release job refuses to publish an incomplete artifact set, so a partial platform matrix cannot ship as a release.",
+      "evidence": [
+        {
+          "resource": "repo://.github/workflows/release.yml#L115-L124",
+          "version": "repo-lines-v1:sha256:a866dc902ee8796039d0ebce0e437696194bc47f4bdee213f78e0083ba386ca8:eyJzZWxlY3RlZExpbmVDb3VudCI6MTAsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImI4M2NkYjNlMWRhYTYzNDIxN2JiYTNkNTEzMjliMTFiNzNlZmI0NGFmZWE2ODFjZmJjYTQ4NmI2OWJmMzExOTMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjIzZGFjNmMyNjhlZjUyYzdlYmVmNzdhODYyMmZiOTIxNjE2NjAwZTgwMWYyNDAzMDZiZWViY2RkMTQzNDVhNTEiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImI3MzY1ODAxNDRiODg1YzU0MTY0YzhmN2Q4NTkzZTkwMmM0MmMwMGJiZGEwYzhlMGI3ZTk4NWNiOGQ2ZGI0MDgiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImQ0YTIxZDY2OWExODNmMDQxNGExM2M1NGQyZDFmYmFlZDI1Yjg5YWIxZGNhODVkMWRmYTQ5ZGUxZjcxZjZhYzAifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_6e7225cdfaab43ff9eaba3be7e255dc9",
+      "statement": "Checksums are computed centrally in one job rather than per runner, because the platforms disagree on which checksum tool exists and a per-runner split would mean two implementations.",
+      "evidence": [
+        {
+          "resource": "repo://.github/workflows/release.yml#L125-L131",
+          "version": "repo-lines-v1:sha256:6f9c45ca9e6038b5478ff1223c585a56755141b0c89509e0357c5559b189c3a0:eyJzZWxlY3RlZExpbmVDb3VudCI6NywiZmlyc3RTZWxlY3RlZExpbmVIYXNoIjoiYjdkYzVkMDk3YTI3ZDM0MDhjNmI5YjNkNzE0NDZhNzI1YmQ4NDg2ZjY1ZTM2ZmUwNWJjMmZhNTE5N2JiYjViYSIsImxhc3RTZWxlY3RlZExpbmVIYXNoIjoiMzI5NGE0MmQyYjQ0MWY5YTAzN2YwMjc4OWVkYWZkZmFiMjA3MDA0MjczMzJhMjIyMTNlYjBkZDhjNzUxNzhhYyIsInByZWNlZGluZ0NvbnRleHRMaW5lQ291bnQiOjMsInByZWNlZGluZ0NvbnRleHRIYXNoIjoiZTNjYzc5YjE3NDA2ZmIwMjBmYjIzOGQzODJjODk4OTMyNzMzZmM5NzJiZjIzZmM2NTE3NzFiNjY0NjlmMmYyMyIsImZvbGxvd2luZ0NvbnRleHRMaW5lQ291bnQiOjMsImZvbGxvd2luZ0NvbnRleHRIYXNoIjoiNTVkYmFhOWViMDZhMTJlZTA5MmUwZWM3YjdmZWJmMDlkMWM3NDJiMDJlMGQwNWMyMzdjZWI5ZTg2Njk5MTcxYSJ9"
+        }
+      ]
+    },
+    {
+      "id": "claim_eec5f7aa3f8e45a08d93931578b92577",
+      "statement": "The release is created as a draft, all assets are uploaded while it is still mutable, and publishing is the final step and the only immutable transition.",
+      "evidence": [
+        {
+          "resource": "repo://.github/workflows/release.yml#L162-L177",
+          "version": "repo-lines-v1:sha256:7f31092fbb3fe91c6a47000daa92f73438705bb3b88392e7effd8b2ebbb10656:eyJzZWxlY3RlZExpbmVDb3VudCI6MTYsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjMxOTY0NDhmZWZhMTk4NTBiNjMwZDZmMDY0YWRmYjI2ZjM4YzczOWE1NzEzYzA2MTAyOWI1YTFhZDhkMGVlMzMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImVhODhlNjg5MTBmYmZjMjY2MmZkNWZkYzA5NDk4NTQzMGMyNGUwNjFlNDhlZGI4ZDBmMjg1OWMwYzA0M2ZjZTYiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImRmOGJmOTg5YjIzY2ZjZWQ4MmFiMjJlMDgzNGQ3N2E3NTA2MDQyNDllNTJiNTRmNzQ3NjJhOTQ2MjQ5MTk5YjAiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImEwNzM1Zjg4MmZjMjkxYTMyNTc2ODJhZjQ4MGNjYmIyZjUzNjUyYzBmMWI3OWExZmNlNjgzYTA5MWY1YTQ1NzQifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_e5cb82862ff24c0391d15688da33b5bc",
+      "statement": "Build provenance and an SBOM are both attested to the artifact digest, and every artifact is keyless-signed with a bundle containing certificate, signature and transparency-log proof.",
+      "evidence": [
+        {
+          "resource": "repo://.github/workflows/release.yml#L131-L162",
+          "version": "repo-lines-v1:sha256:02573eef08b5c1fd70c0f1e3a745523d07da3b3873eb39233185cc1d863ec584:eyJzZWxlY3RlZExpbmVDb3VudCI6MzIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjMyOTRhNDJkMmI0NDFmOWEwMzdmMDI3ODllZGFmZGZhYjIwNzAwNDI3MzMyYTIyMjEzZWIwZGQ4Yzc1MTc4YWMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjMxOTY0NDhmZWZhMTk4NTBiNjMwZDZmMDY0YWRmYjI2ZjM4YzczOWE1NzEzYzA2MTAyOWI1YTFhZDhkMGVlMzMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjQzYWU3YWQyNDA4ZWFhZmUyYTQ2YWEyMWE0MTYyN2ZlNDQ4ZTE3ZjZhZGRjYzRmZTMxMTczNTg2YzZhZjhlYjYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjE1Y2NhYjNlMDYzNWJhNjgwMzY0NTkwZjMwMmYwZTNiODFhNjdmMjcwOWFiY2JlMmIyZmYyMmUyZDI5OWJhOGMifQ"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.3.3",
+    "at": "2026-08-25T03:42:40.117Z"
+  }
+}
