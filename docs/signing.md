@@ -43,7 +43,13 @@ sscsb signing verify                         # report card + recent-history clas
 env-proof `git sign` alias, an SSH keypair for the agent, the `allowed_signers`
 entries, a JSON-merge into the agent harness's settings — backed up and
 validated, never clobbered). It **refuses** to proceed if the agent identity
-would collide with yours (identity blur). The **cloud/web/Codespaces** lanes are
+would collide with yours (identity blur) — comparing signing keys by **key
+material**, not by the path string git happens to have been given, and comparing
+emails case-insensitively, because git accepts a private-key path and its `.pub`
+interchangeably and forges attribute `Human@Example.Invalid` and
+`human@example.invalid` to one person. It also refuses when your global git
+config cannot be read at all, rather than treating an unreadable identity as an
+absent one. The **cloud/web/Codespaces** lanes are
 guided — sscsb prints the exact numbered steps (enroll a passkey, enable
 vigilant mode, authorize the App, turn on Codespaces GPG verification) and, once
 you confirm with `--confirm`, records a dated attestation in
@@ -53,7 +59,12 @@ The **`git sign` alias** deserves a callout: inside an AI-agent session a bare
 `git commit` signs as the *agent* (the session's `GIT_CONFIG_*` env wins). `git
 sign` forces your human key via `-c` overrides — which outrank that env — so it
 signs as *you* whether you run it in your own terminal or the agent runs it for
-your review. It is the seam where a human tap ships code.
+your review. It is the seam where a human tap ships code. Because it is that
+seam, sscsb POSIX-quotes the identity it embeds and parses the finished alias
+with `sh -n` before storing it: an apostrophe in your name (`Pat O'Brien`) used
+to produce an unmatched quote that git stored happily and only failed at the
+moment you reached for `git sign` — pushing you back onto the bare `git commit`
+this alias exists to protect you from.
 
 
 A signature is a claim about *who*. The moment a human's signing key is reachable by

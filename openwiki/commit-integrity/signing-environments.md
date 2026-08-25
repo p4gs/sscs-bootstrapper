@@ -52,7 +52,7 @@ not yet real, and the same reasoning appears in
 |---|---|---|
 | Human local | git global config, key files, alias | Configured |
 | Agent on that machine | the harness settings file's git-config block | Configured |
-| Cloud agent | repository-level settings for an attribution block | Configured |
+| Cloud agent | repository-level settings for a **populated** attribution object | Configured |
 | Forge web editor | one account fact via the forge CLI | **Partial only** |
 | Hosted dev environment | nothing — no read API exists | **Pending only** |
 
@@ -82,13 +82,33 @@ unknowingly produces agent-signed commits.
 ## Identity blur
 
 The agent lane reports **`IDENTITY BLUR`** when the agent's signing key or email
-equals the human's. That exact string is matched by both verifying surfaces, so it is
+is the human's. That exact string is matched by both verifying surfaces, so it is
 load-bearing text rather than a message.
 
+**What "is the human's" means is the whole check**, and through v0.2.0 it was defined
+too narrowly to hold the invariant up. Both comparisons were literal:
+
+- The key check compared `user.signingkey` **path strings**. Git accepts the private
+  key path and the `.pub` path interchangeably, so an agent pointed at `~/.ssh/k`
+  while the human's global said `~/.ssh/k.pub` was signing with the human's own
+  registered key — and the lane read CONFIGURED. A symlink, a `~`-versus-absolute
+  spelling, and a copy at a second path evaded it the same way. The comparison is now
+  on **key material**: the path is `~`-expanded and canonicalized, a private path is
+  mapped to its `.pub` sibling (or derived with `ssh-keygen -y`), and the type-plus-blob
+  is compared with the comment dropped. Equality of material is blur however the path
+  is spelled.
+- The email check was **byte-exact**. Email domains are case-insensitive and forges
+  attribute accordingly, so `Human@Example.Invalid` passed as a distinct identity from
+  `human@example.invalid`. Both comparisons now case-fold.
+
 Converging the agent lane **refuses outright, writing nothing**, if the requested
-agent email equals the human's — the refusal message says that would forge the
-human's identity onto AI commits. It is the one place in this codebase where setup
-declines to do what it was asked.
+agent email is the human's — the refusal message says that would forge the human's
+identity onto AI commits. It is the one place in this codebase where setup declines to
+do what it was asked. It also refuses when the human's global git config **cannot be
+read at all**: a malformed `~/.gitconfig` exits 128 for every read, which used to be
+indistinguishable from "unset", and the refusal is gated on the human email being
+non-empty — so an unreadable identity silently disabled the guard. A guard that cannot
+read the fact it guards now fails closed.
 
 The settings merge that configures the agent is the highest blast-radius write in the
 tool and is layered accordingly: it preserves every unrelated key, **clears stale
@@ -116,6 +136,13 @@ away.
 can.** Where the forge itself reports the underlying protection disabled, the
 attestation is refused. You cannot confirm your way past a fact the tool can read.
 
+That rule is only as strong as the probe underneath it. The cloud lane's guard keys on
+the lane falling short of `Configured`, and the check for its attribution block tested
+**presence** rather than content — so a JSON `null` (or `false`, `[]`, a bare string, or
+an empty object) satisfied it, the lane read CONFIGURED and ATTESTED, and the
+contradiction guard was defeated on the one guided lane whose state is actually
+readable. The block must now be a populated JSON object.
+
 Confirming under `--dry-run` records nothing, and says so.
 
 ## The two verifying surfaces
@@ -132,9 +159,24 @@ control people have to live with.
 ## Honest limits
 
 The implementation is specific, not general: one agent harness, one hardware backend's
-socket path, one hard-coded agent key filename. Generalising is real work in the paths
-and environment types, not a config key — which is exactly why those two seam keys were
-deleted rather than left in place.
+socket path. Generalising is real work in the paths and environment types, not a config
+key — which is exactly why those two seam keys were deleted rather than left in place.
+
+The agent key filename used to be hard-coded, and the string it was hard-coded to was
+one contributor's personal assistant name — which shipped in the public v0.2.0 binary,
+so every user of the tool got a key named after someone else's agent. The basename is
+now slugified from the resolved agent identity, falling back to a neutral
+`sscsb_agent_signing_key`. A machine that already carries the old key keeps using it
+rather than silently rotating to a fresh one and orphaning the key its past commits
+were signed with.
+
+The attestation store is the other thing worth stating plainly. `--confirm` used to
+parse the policy file with `unwrap_or_default()`, so a malformed file became a *blank*
+document that was then written back holding only the lane just confirmed — every other
+lane's attestation destroyed, and the command reporting success. Since the template
+ships commented for hand-editing, a syntax slip was the expected route in. A
+non-empty file that will not parse is now a hard error, matching the contract the JSON
+settings merge in the same module already had.
 
 ## Source map
 
