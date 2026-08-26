@@ -8,6 +8,55 @@ versions.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-25
+
+### Fixed
+
+- **The identity-blur check compared path strings, not keys.** The agent lane's
+  guard tested `user.signingkey` **paths** for equality. Git accepts the
+  private-key path and its `.pub` sibling interchangeably, so an agent pointed at
+  `~/.ssh/key` while the human's global config said `~/.ssh/key.pub` was using
+  **the same key** and no blur was reported: the lane read CONFIGURED, `verify
+  signing-model` returned no failure, and the agent signed with the human's
+  registered key. Symlinks and `~`-versus-absolute spelling evaded it
+  identically. This defeated the module's central invariant — the agent never
+  signs as the human — in shipped code. The comparison is now on key
+  **material**: paths are expanded and canonicalised, a private path resolves to
+  its public half, and the decoded key blob is compared with the comment
+  dropped.
+- **The same defect was encoded in the test suite.** The `fully_configured_machine`
+  fixture gave the human and the agent the same key blob under two filenames, so
+  the fixture asserting the control's PASS verdict was describing a genuinely
+  blurred machine. A path comparison could never notice, which is why the suite
+  could not have caught the source defect.
+- **An agent email differing only in case passed both the probe and the setup
+  refusal.** Comparisons were byte-exact; email attribution is not. Both sites
+  now case-fold.
+- **`signing setup --confirm` destroyed the attestation store** when the policy
+  file failed to parse: the read fell through to a blank document, which was
+  written back containing only the lane just confirmed. Every other lane's
+  attestation was lost and the command reported success. An existing, unparseable
+  file is now a hard error, matching the contract the JSON settings merge in the
+  same module already followed.
+- **`attribution: null` read as a configured cloud lane**, because the check
+  tested presence rather than shape. That also defeated the guard preventing an
+  attestation from papering over a probeable gap. A real, non-empty object is now
+  required.
+- **The `git sign` alias broke for any name or email containing an apostrophe**,
+  silently, after reporting success. That alias is the documented protection
+  against a bare `git commit` signing as the agent, so its breakage pushed the
+  user onto the exact footgun it prevents. Values are now shell-escaped.
+- **A `~`-prefixed `user.signingkey` read as a missing file.** Git expands `~`;
+  a string comparison does not. A working configuration was reported broken.
+- **A personal key basename was hard-coded into the public binary.** The agent
+  key basename is now derived from the agent's own identity. The old name is
+  retained solely so a machine already carrying that key reuses it rather than
+  silently rotating and orphaning the key its past commits were signed with; it
+  never names a new key.
+- **A corrupt global gitconfig silently disabled the blur refusal.** An
+  unreadable value was indistinguishable from an unset one, so a security guard
+  failed open. The two are now distinguished.
+
 ## [0.2.0] - 2026-08-25
 
 ### Fixed
@@ -376,5 +425,6 @@ Harden-Runner, Dependency-Track, and GUAC behind one policy engine.
 - Phase 5 — continuous posture: Dependency-Track, GUAC, OpenVEX, and a
   machine-readable control → SLSA/SSDF/CRA map behind `sscsb report`.
 
+[0.2.1]: https://github.com/p4gs/sscs-bootstrapper/releases/tag/v0.2.1
 [0.2.0]: https://github.com/p4gs/sscs-bootstrapper/releases/tag/v0.2.0
 [0.1.0]: https://github.com/p4gs/sscs-bootstrapper/releases/tag/v0.1.0
