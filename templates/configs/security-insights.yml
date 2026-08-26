@@ -1,8 +1,8 @@
 # OpenSSF Security Insights — machine-readable security posture for this project.
 # Spec: https://github.com/ossf/security-insights-spec (schema v2).
-# sscsb generated this valid starter. The values marked REPLACE-ME / TODO are
-# placeholders — fill them in, then validate with si-tooling (`si validate`).
-# `sscsb verify security-insights` reports Info until the placeholders are gone.
+# sscsb generated this valid starter. Any placeholder values sscsb leaves behind
+# need real information filled in — then validate with si-tooling (`si validate`).
+# `sscsb verify security-insights` reports Info until every placeholder is gone.
 #
 # Only the `header` + `project` blocks are emitted (both validate on their own).
 # Add the optional `repository:` block (status, core-team, license, security

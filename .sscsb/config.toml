@@ -53,8 +53,8 @@ enabled = true
 
 # AI provenance receipts: Optional cryptographic receipts linking commits to AI tool/model/role
 [controls.ai-receipts]
-enabled = false
-sign_with_cosign = false
+enabled = true
+sign_with_cosign = true
 
 # ── Phase 2 — Dependency & vulnerability visibility ──
 
