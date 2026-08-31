@@ -776,6 +776,11 @@ mod tests {
         crate::exec::git(&["config", "user.name", "Dev"], root).unwrap();
         crate::exec::git(&["config", "user.email", "dev@example.com"], root).unwrap();
         crate::exec::git(&["config", "gpg.format", "ssh"], root).unwrap();
+        // Repo-local, so a concurrent `FakeMachine` critical section that points
+        // HOME/GIT_CONFIG_GLOBAL at a fixture gitconfig with `commit.gpgsign =
+        // true` can never make this fixture's unsigned commits try to sign (the
+        // deliberate `-S` commits are unaffected: explicit -S always signs).
+        crate::exec::git(&["config", "commit.gpgsign", "false"], root).unwrap();
         crate::init::bootstrap(root).unwrap();
         let ctx = Ctx::discover(root).unwrap();
         (dir, keydir, ctx)
@@ -800,6 +805,7 @@ mod tests {
         crate::exec::git(&["init", "-b", "main"], root).unwrap();
         crate::exec::git(&["config", "user.name", "Dev"], root).unwrap();
         crate::exec::git(&["config", "user.email", "dev@example.com"], root).unwrap();
+        crate::exec::git(&["config", "commit.gpgsign", "false"], root).unwrap();
         crate::init::bootstrap(root).unwrap();
         let ctx0 = Ctx::discover(root).unwrap();
         crate::config::set_control_enabled(&ctx0.config_path(), "agent-signing", true).unwrap();
