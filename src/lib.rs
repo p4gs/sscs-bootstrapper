@@ -33,6 +33,7 @@ pub mod exec;
 pub mod harden;
 pub mod hooks;
 pub mod init;
+pub mod machine;
 pub mod observability;
 pub mod openssf;
 pub mod platform;
