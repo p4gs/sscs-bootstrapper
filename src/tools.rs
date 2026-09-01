@@ -249,8 +249,20 @@ pub fn detect(spec: &ToolSpec) -> ToolStatus {
     let Some(path) = exec::find_in_path(spec.bin) else {
         return ToolStatus::Missing;
     };
-    let Ok(out) = exec::run(spec.bin, spec.version_args, None) else {
-        return ToolStatus::Missing; // on PATH but unspawnable
+    // A spawn failure for a binary that verifiably exists can be transient: in
+    // a multi-threaded process, another thread's fork can briefly hold a
+    // just-written shim's writable fd across its own fork→exec window, so
+    // exec'ing the shim right then fails ETXTBSY-style. One short retry
+    // separates that window from a genuinely unspawnable file.
+    let out = match exec::run(spec.bin, spec.version_args, None) {
+        Ok(out) => out,
+        Err(_) => {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let Ok(out) = exec::run(spec.bin, spec.version_args, None) else {
+                return ToolStatus::Missing; // on PATH but unspawnable
+            };
+            out
+        }
     };
     let combined = format!("{} {}", out.stdout, out.stderr);
     if !out.success() || combined.trim().is_empty() {
