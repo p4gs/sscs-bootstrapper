@@ -8,6 +8,32 @@ versions.
 
 ## [Unreleased]
 
+### Added
+
+- **The SSCSB Scorecard** (`sscsb score`): the repository's whole control
+  posture as one machine-readable, signable, publishable JSON document.
+  `sscsb score emit` runs every registered control and folds the outcomes
+  into a result document — aggregate 0–10 score over the *determinate*
+  (PASS/FAIL) outcomes only, with DEGRADED controls excluded from the score
+  and charged to an explicit completeness tier (`complete` vs `partial`)
+  instead, so a scan that could not read something is labeled rather than
+  silently penalized (or flattered). Repositories that never ran `sscsb
+  init` are scored against the registry defaults and say so
+  (`"config": "registry-defaults"`), which is what lets the SSCSB Directory
+  scan arbitrary public repos. `--sign` keyless-signs the document (cosign,
+  GitHub OIDC). `sscsb score verify <file> --repo <slug>` is the consuming
+  side: fail-closed structural checks, then Sigstore bundle verification
+  pinned to that repository's canonical `sscsb-scorecard.yml` on its **live**
+  default branch — the OpenSSF-Scorecard trust construction. See
+  `docs/sscsb-scorecard.md`.
+- **New phase-5 control `sscsb-scorecard`** (default **off** — publishing a
+  scorecard is a disclosure decision): installs
+  `.github/workflows/sscsb-scorecard.yml`, which installs a
+  Sigstore-verified sscsb release in CI, scores the repo where
+  `GITHUB_TOKEN` can read settings outsiders cannot, signs the result under
+  the workflow's OIDC identity, and publishes it as the `sscsb-scorecard`
+  artifact for the Directory's collector.
+
 ## [0.2.1] - 2026-08-25
 
 ### Fixed

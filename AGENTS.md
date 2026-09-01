@@ -224,6 +224,8 @@ the local typosquat heuristic running.
 | `sscsb dtrack upload` | Upload the SBOM to Dependency-Track. |
 | `sscsb guac ingest` | Ingest into the GUAC supply-chain graph. |
 | `sscsb oras push <ref> <file>` | Push SBOM/attestation files to an OCI registry. |
+| `sscsb score emit [--output <file>] [--stdout] [--sign]` | Run every control and write the SSCSB Scorecard result document; `--sign` keyless-signs it (cosign, OIDC). Always exits `0` on success — the document is the deliverable, gating is `verify`'s job. |
+| `sscsb score verify <file> --repo <owner/repo>` | Verify a published scorecard result against its Sigstore bundle, pinned to that repo's canonical `sscsb-scorecard.yml` on its live default branch. Exit `1` is a verification verdict; `2` means the check could not run. |
 
 ### Hooks (invoked by git, not by you)
 
@@ -335,6 +337,7 @@ parsing and printing over library functions that are themselves covered.
 - [docs/signing.md](docs/signing.md) — the human/CI/AI key separation
 - [docs/ai-provenance.md](docs/ai-provenance.md) — commit trailers and AI gates
 - [docs/example-walkthrough.md](docs/example-walkthrough.md) — a real bootstrap with real output
+- [docs/sscsb-scorecard.md](docs/sscsb-scorecard.md) — the SSCSB Scorecard result document, publish pipeline, and Directory verification
 
 <!-- OPENWIKI:START -->
 

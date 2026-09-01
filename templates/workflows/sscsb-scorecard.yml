@@ -1,0 +1,67 @@
+# sscsb: SSCSB Scorecard — score this repo's posture in its own CI (the one
+# place repository credentials can read settings), keyless-sign the result,
+# and publish it for the SSCSB Directory to verify and list.
+#
+# The Directory pins verification to THIS workflow path on the default
+# branch: renaming or moving this file changes the signing identity and
+# published results will stop verifying.
+name: SSCSB Scorecard
+on:
+  schedule:
+    - cron: "41 3 * * 1"
+  push:
+    branches: ["{{default_branch}}"]
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  score:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout only
+      id-token: write # keyless-sign the result — the identity the Directory verifies
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Install sscsb (Sigstore-verified release binary)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The first release that ships `sscsb score`. Bump deliberately —
+          # the binary is verified against this exact tag's signing identity.
+          SSCSB_VERSION: v0.3.0
+        run: |
+          set -euo pipefail
+          asset="sscsb-${SSCSB_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p "$RUNNER_TEMP/sscsb"
+          cd "$RUNNER_TEMP/sscsb"
+          gh release download "$SSCSB_VERSION" --repo p4gs/sscs-bootstrapper \
+            --pattern "$asset" --pattern "$asset.sha256" --pattern "$asset.sigstore.json"
+          sha256sum --check "$asset.sha256"
+          cosign verify-blob "$asset" --bundle "$asset.sigstore.json" \
+            --certificate-identity "https://github.com/p4gs/sscs-bootstrapper/.github/workflows/release.yml@refs/tags/${SSCSB_VERSION}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+          tar xzf "$asset"
+          echo "$RUNNER_TEMP/sscsb" >> "$GITHUB_PATH"
+      - name: Score and sign
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sscsb score emit --output sscsb-scorecard.json --sign
+      - name: Publish result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sscsb-scorecard
+          path: |
+            sscsb-scorecard.json
+            sscsb-scorecard.json.sigstore.json
+          if-no-files-found: error

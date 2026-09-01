@@ -153,6 +153,11 @@ pub const ARTIFACTS: &[Artifact] = &[
         content: include_str!("../templates/workflows/wait-for-secrets-snippet.yml"),
     },
     Artifact {
+        control: "sscsb-scorecard",
+        dest: ".github/workflows/sscsb-scorecard.yml",
+        content: include_str!("../templates/workflows/sscsb-scorecard.yml"),
+    },
+    Artifact {
         control: "dependency-track",
         dest: ".sscsb/templates/dependency-track-compose.yml",
         content: include_str!("../templates/configs/dependency-track-compose.yml"),

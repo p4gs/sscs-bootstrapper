@@ -136,6 +136,46 @@ enum Command {
     },
     /// Show the pinned external-tool registry and detection status
     Tools,
+    /// SSCSB Scorecard: emit or verify the repo's posture result document
+    Score {
+        #[command(subcommand)]
+        action: ScoreAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScoreAction {
+    /// Run every control and write the scorecard result document
+    Emit {
+        /// Write here instead of .sscsb/out/score/sscsb-scorecard.json
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Print the document to stdout instead of writing a file
+        #[arg(long)]
+        stdout: bool,
+        /// Keyless-sign the document (cosign sign-blob --bundle; needs an
+        /// OIDC identity — ambient in CI, browser flow locally)
+        #[arg(long)]
+        sign: bool,
+    },
+    /// Verify a published result against its Sigstore bundle and claimed repo
+    Verify {
+        /// Path to the scorecard result document
+        result: PathBuf,
+        /// The `owner/repo` this result must have been signed by
+        #[arg(long)]
+        repo: String,
+        /// Certificate identity override (default: the repo's canonical
+        /// sscsb-scorecard.yml on its live default branch)
+        #[arg(long)]
+        identity: Option<String>,
+        /// OIDC issuer override (default: GitHub Actions)
+        #[arg(long)]
+        issuer: Option<String>,
+        /// Sigstore bundle path (default: <result>.sigstore.json)
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -382,7 +422,34 @@ pub fn run() -> Result<ExitCode> {
         Command::AgentKey { action } => cmd_agent_key(action),
         Command::Signing { action } => cmd_signing(&cwd, action),
         Command::Tools => cmd_tools(),
+        Command::Score { action } => cmd_score(&cwd, action),
     }
+}
+
+fn cmd_score(cwd: &std::path::Path, action: ScoreAction) -> Result<ExitCode> {
+    let ctx = Ctx::discover(cwd)?;
+    let code = match action {
+        ScoreAction::Emit {
+            output,
+            stdout,
+            sign,
+        } => crate::score::cmd_score_emit(&ctx, output.as_deref(), stdout, sign)?,
+        ScoreAction::Verify {
+            result,
+            repo,
+            identity,
+            issuer,
+            bundle,
+        } => crate::score::cmd_score_verify(
+            &ctx,
+            &result,
+            &repo,
+            identity.as_deref(),
+            issuer.as_deref(),
+            bundle.as_deref(),
+        )?,
+    };
+    Ok(ExitCode::from(code))
 }
 
 fn cmd_signing(cwd: &std::path::Path, action: SigningAction) -> Result<ExitCode> {

@@ -215,6 +215,28 @@ impl Config {
         }))
     }
 
+    /// A `Config` synthesized purely from the registry defaults — the same
+    /// TOML `sscsb init` would write, parsed instead of persisted.
+    ///
+    /// `sscsb score emit` must be able to score a repository that has never
+    /// run `sscsb init` (the SSCSB Directory scans arbitrary public repos),
+    /// and "no config file" there means "the registry defaults", not
+    /// "nothing to say". Deriving the synthetic config from
+    /// `default_config_toml` rather than a second hand-rolled table means a
+    /// scored-then-bootstrapped repo cannot change verdicts merely by the
+    /// act of writing the identical config to disk. The `path` is a marker,
+    /// never a file to write to.
+    pub fn defaults() -> Self {
+        let table: toml::Table = default_config_toml(None)
+            .parse()
+            .expect("the generated default config parses (asserted in tests)");
+        Config {
+            table,
+            path: PathBuf::from("<registry-defaults>"),
+            warnings: Vec::new(),
+        }
+    }
+
     fn control_table(&self, id: &str) -> Option<&toml::Table> {
         self.table.get("controls")?.as_table()?.get(id)?.as_table()
     }

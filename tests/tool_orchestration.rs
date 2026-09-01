@@ -955,6 +955,7 @@ fn every_control_can_be_enabled_and_verified() {
         "best-practices-badge",
         "osps-baseline",
         "compliance-map",
+        "sscsb-scorecard",
     ];
 
     for control in ALL {
@@ -1127,5 +1128,77 @@ fn verify_reports_every_control_and_strict_mode_gates_on_degraded() {
         strict.status.code(),
         Some(1),
         "strict verify must gate on degraded controls"
+    );
+}
+
+// ───────────────────────── SSCSB Scorecard (score) ──────────────────────────
+
+/// The full `score` surface through the real binary: emit writes a document
+/// covering every registered control, `--stdout` prints it, and `verify`
+/// fails closed on the structural verdicts (wrong repo, missing bundle)
+/// without needing cosign at all — a missing tool must never mask "this
+/// document is wrong about itself".
+#[test]
+fn score_emit_and_verify_run_via_the_binary() {
+    let dir = rust_repo();
+    let repo = dir.path();
+
+    // Emit to an explicit path; exit 0 even though a fresh repo has FAILs —
+    // the document is the deliverable, gating is `verify`'s job.
+    sscsb(repo)
+        .args(["score", "emit", "--output", "result.json"])
+        .assert()
+        .success();
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(repo.join("result.json")).unwrap())
+            .expect("emitted document parses");
+    assert_eq!(
+        doc["documentType"].as_str().unwrap(),
+        "https://github.com/p4gs/sscs-bootstrapper/scorecard-result/v1"
+    );
+    assert!(
+        doc["controls"].as_array().unwrap().len() > 40,
+        "document must cover the whole registry"
+    );
+
+    // Stdout mode prints the same document.
+    let out = sscsb(repo)
+        .args(["score", "emit", "--stdout"])
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    let printed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout document parses");
+    assert_eq!(printed["schemaVersion"].as_u64(), Some(1));
+
+    // Verify: claimed-repo mismatch is a verdict (exit 1) …
+    let mismatch = sscsb(repo)
+        .args(["score", "verify", "result.json", "--repo", "someone/else"])
+        .output()
+        .expect("runs");
+    assert_eq!(
+        mismatch.status.code(),
+        Some(1),
+        "a document claiming a different repo must FAIL verification: {}",
+        String::from_utf8_lossy(&mismatch.stdout)
+    );
+
+    // … and so is a missing Sigstore bundle, even when the repo matches.
+    let mut patched: serde_json::Value = doc;
+    patched["repo"]["slug"] = serde_json::json!("p4gs/example");
+    std::fs::write(
+        repo.join("claimed.json"),
+        serde_json::to_string(&patched).unwrap(),
+    )
+    .unwrap();
+    let unsigned = sscsb(repo)
+        .args(["score", "verify", "claimed.json", "--repo", "p4gs/example"])
+        .output()
+        .expect("runs");
+    assert_eq!(
+        unsigned.status.code(),
+        Some(1),
+        "an unsigned result is a claim, not evidence: {}",
+        String::from_utf8_lossy(&unsigned.stdout)
     );
 }

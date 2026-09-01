@@ -160,6 +160,12 @@ fn init_creates_config_hooks_policies_and_templates() {
         !repo.join(".github/workflows/gittuf-verify.yml").exists(),
         "gittuf is default-off"
     );
+    // Publishing a scorecard is a disclosure decision, so its workflow only
+    // installs once the owner opts in.
+    assert!(
+        !repo.join(".github/workflows/sscsb-scorecard.yml").exists(),
+        "sscsb-scorecard is default-off"
+    );
     // hooksPath wired.
     let out = git(repo, &["config", "core.hooksPath"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), ".sscsb/hooks");

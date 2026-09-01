@@ -477,6 +477,19 @@ pub const CONTROLS: &[ControlDef] = &[
         tools: &[],
         default_options: &[],
     },
+    // Off by default like the other phase-5 external integrations, but for a
+    // different reason: publishing a scorecard is a DISCLOSURE decision —
+    // the signed result names every failing control in public — and sscsb
+    // does not make that choice for a repository owner.
+    ControlDef {
+        id: "sscsb-scorecard",
+        phase: 5,
+        name: "SSCSB Scorecard publishing (optional)",
+        summary: "Score the repo's posture in its own CI, keyless-sign the result, publish for the SSCSB Directory",
+        default_enabled: false,
+        tools: &[],
+        default_options: &[],
+    },
 ];
 
 pub fn control(id: &str) -> Option<&'static ControlDef> {
@@ -646,7 +659,9 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
                     .into(),
             ],
         ),
-        "wait-for-secrets" => crate::workflows::verify_template_control(ctx, def.id),
+        "wait-for-secrets" | "sscsb-scorecard" => {
+            crate::workflows::verify_template_control(ctx, def.id)
+        }
         "dependency-track" => crate::observability::verify_dtrack_control(ctx, cfg),
         "guac" => crate::observability::verify_guac_control(ctx),
         "openvex" => crate::observability::verify_openvex_control(ctx),

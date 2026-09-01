@@ -4,7 +4,7 @@ description: >-
   Bootstrap and verify software supply chain security in a git repository using
   the `sscsb` CLI — secret scanning, commit signing policy, SBOMs, vulnerability
   scanning, SAST, dependency trust, SLSA provenance, and continuous posture, as
-  44 individually toggleable controls across five phases. USE WHEN harden this
+  45 individually toggleable controls across five phases. USE WHEN harden this
   repo, supply chain security, SSCS, secret scanning, commit signing, SBOM,
   vulnerability scan, dependency trust, typosquat, SLSA provenance, sigstore,
   cosign, OpenSSF Scorecard, OpenVEX, SAST, branch protection, pin GitHub

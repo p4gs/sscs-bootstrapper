@@ -14,6 +14,7 @@ now*, and *can I show someone*.
 | `dependency-track` | Continuous SBOM management platform | Dependency-Track | off |
 | `guac` | Supply-chain knowledge graph | GUAC | off |
 | `oras` | Push SBOMs/attestations to an OCI registry | ORAS | off |
+| `sscsb-scorecard` | Score the repo in its own CI, keyless-sign the result, publish for the SSCSB Directory | (native) + cosign | off |
 
 ## OpenVEX — the one that saves your sanity
 
@@ -124,12 +125,43 @@ OCI registry, as referrer artifacts. The provenance travels with the artifact
 instead of living in a CI run's expiring storage. Anyone who can pull the image can
 pull its SBOM.
 
+## SSCSB Scorecard (optional)
+
+```sh
+sscsb score emit                 # the whole posture as one JSON document
+sscsb enable sscsb-scorecard     # + sscsb init: install the publish workflow
+```
+
+`sscsb score emit` runs every control and folds the outcomes into a single
+result document: per-control verdicts, an aggregate 0–10 score over the
+*determinate* outcomes only, and a completeness tier. DEGRADED controls —
+tool missing, no credentials, no GitHub repo configured — are excluded from
+the score and counted against completeness instead, so a scan that could not
+read something is labeled `partial` rather than quietly scored as if it had.
+A repo scanned from the outside (the SSCSB Directory's queue does this) is
+almost always `partial`; the same repo scored by its own CI — where
+`GITHUB_TOKEN` can read settings nobody else can — earns `complete`. That
+gap is the honest pitch for installing the publish workflow.
+
+The `sscsb-scorecard` control installs `.github/workflows/sscsb-scorecard.yml`:
+score in CI, keyless-sign the result (cosign, GitHub OIDC), publish it as a
+workflow artifact. `sscsb score verify` is the consuming side — it pins the
+signature to that exact repository's canonical workflow on its live default
+branch before believing a word of the document. The full architecture,
+including what the Directory checks before listing a result, is in
+[sscsb-scorecard.md](sscsb-scorecard.md).
+
+Off by default for a different reason than the infrastructure controls:
+publishing a scorecard is a *disclosure* decision — the signed result names
+every failing control in public — and sscsb does not make that choice for a
+repository owner.
+
 ## What "off by default" means here
 
-Three of Phase 5's five controls are off. That is a deliberate reading of who this
-is for: a solo developer does not need a knowledge graph, and shipping one that
-sits unconfigured and permanently `DEGRADED` would be noise pretending to be
-posture.
+Phase 5's infrastructure controls — Dependency-Track, GUAC, ORAS — are off.
+That is a deliberate reading of who this is for: a solo developer does not
+need a knowledge graph, and shipping one that sits unconfigured and
+permanently `DEGRADED` would be noise pretending to be posture.
 
 The two that are **on** — OpenVEX and the compliance map — need no infrastructure at
 all, and are the two that make the other four phases legible: *here is what is

@@ -408,6 +408,16 @@
       "notes": "This map plus `sscsb report` turns enabled controls into auditable, machine-readable framework-coverage evidence.",
       "osps": []
     },
+    "sscsb-scorecard": {
+      "name": "SSCSB Scorecard publishing",
+      "phase": 5,
+      "slsa": [],
+      "ssdf": ["PS.3.2"],
+      "cra": ["Article 13 (manufacturer obligations — documented conformity evidence)"],
+      "badge": [],
+      "notes": "Publishes the repo's signed, verifiable posture document — integrity-verification information made available to consumers (PS.3.2), scored in the repo's own CI where settings are readable.",
+      "osps": []
+    },
     "gittuf": {
       "name": "gittuf — signed, forge-independent policy over refs (RSL)",
       "phase": 1,

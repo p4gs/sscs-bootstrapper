@@ -18,6 +18,7 @@
 //! - [`deps`] — package trust (existence, approval, typosquat heuristics)
 //! - [`sbom`] / [`scan`] / [`sast`] — Syft / Trivy+OSV / OpenGrep+Semgrep
 //! - [`provenance`] — slsa-verifier, DSSE/in-toto, cosign, AI receipts
+//! - [`score`] — the SSCSB Scorecard result document (`sscsb score emit|verify`)
 //! - [`observability`] — Dependency-Track, GUAC, OpenVEX, ORAS
 //! - [`compliance`] — control → SLSA/SSDF/CRA/Badge map and `sscsb report`
 
@@ -40,6 +41,7 @@ pub mod provenance;
 pub mod sast;
 pub mod sbom;
 pub mod scan;
+pub mod score;
 pub mod scorecard;
 pub mod signers;
 pub mod signing_setup;
