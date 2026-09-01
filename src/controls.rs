@@ -526,7 +526,11 @@ pub fn phase_controls(phase: u8) -> impl Iterator<Item = &'static ControlDef> {
     CONTROLS.iter().filter(move |c| c.phase == phase)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serialized names are the machine-output wire format (`--format json`):
+/// lowercase, pinned by tests in `machine.rs` — renaming a variant is a
+/// schema change, not a refactor.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Outcome {
     Pass,
     Fail,
@@ -572,7 +576,7 @@ impl Outcome {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct VerifyResult {
     pub control: &'static str,
     pub outcome: Outcome,

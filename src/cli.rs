@@ -6,7 +6,8 @@ use crate::config;
 use crate::context::Ctx;
 use crate::controls::{self, Outcome};
 use crate::{
-    compliance, deps, hooks, init, observability, provenance, sast, sbom, scan, signers, tools,
+    compliance, deps, hooks, init, machine, observability, provenance, sast, sbom, scan, signers,
+    tools,
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -31,7 +32,11 @@ enum Command {
     /// Bootstrap the current repo: config, hooks, policies, CI templates
     Init,
     /// Show every control with enabled state and tool availability
-    Status,
+    Status {
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
     /// Enable a control in .sscsb/config.toml
     Enable { control: String },
     /// Disable a control in .sscsb/config.toml
@@ -43,6 +48,9 @@ enum Command {
         /// Exit non-zero on DEGRADED as well as FAIL
         #[arg(long)]
         strict: bool,
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text")]
+        format: String,
     },
     /// Render control → framework coverage (SLSA/SSDF/CRA/Badge)
     Report {
@@ -357,10 +365,14 @@ pub fn run() -> Result<ExitCode> {
     let cwd = std::env::current_dir()?;
     match cli.command {
         Command::Init => cmd_init(&cwd),
-        Command::Status => cmd_status(&cwd),
+        Command::Status { format } => cmd_status(&cwd, &format),
         Command::Enable { control } => cmd_toggle(&cwd, &control, true),
         Command::Disable { control } => cmd_toggle(&cwd, &control, false),
-        Command::Verify { controls, strict } => cmd_verify(&cwd, &controls, strict),
+        Command::Verify {
+            controls,
+            strict,
+            format,
+        } => cmd_verify(&cwd, &controls, strict, &format),
         Command::Report { format } => cmd_report(&cwd, &format),
         Command::Harden {
             control,
@@ -436,8 +448,15 @@ fn cmd_init(cwd: &std::path::Path) -> Result<ExitCode> {
     ok()
 }
 
-fn cmd_status(cwd: &std::path::Path) -> Result<ExitCode> {
+fn cmd_status(cwd: &std::path::Path, format: &str) -> Result<ExitCode> {
+    if !matches!(format, "text" | "json") {
+        anyhow::bail!("unknown --format `{format}` — expected `text` or `json`");
+    }
     let ctx = Ctx::discover(cwd)?;
+    if format == "json" {
+        println!("{}", machine::status_json(&ctx)?);
+        return ok();
+    }
     let cfg = ctx.config.as_ref();
     println!(
         "sscsb status — repo: {} (branch: {}, platform: {})",
@@ -501,7 +520,18 @@ fn cmd_toggle(cwd: &std::path::Path, control: &str, enabled: bool) -> Result<Exi
     ok()
 }
 
-fn cmd_verify(cwd: &std::path::Path, only: &[String], strict: bool) -> Result<ExitCode> {
+fn cmd_verify(
+    cwd: &std::path::Path,
+    only: &[String],
+    strict: bool,
+    format: &str,
+) -> Result<ExitCode> {
+    // An unknown format is a usage error (exit 2) BEFORE any control runs —
+    // same contract as an unknown control id, and deliberately not the lax
+    // anything-not-json-is-text fallthrough `report` has.
+    if !matches!(format, "text" | "json") {
+        anyhow::bail!("unknown --format `{format}` — expected `text` or `json`");
+    }
     let ctx = Ctx::discover(cwd)?;
     let cfg = ctx.require_config()?;
     // Before ANY control runs: an id nobody recognises is a usage error (exit
@@ -509,25 +539,34 @@ fn cmd_verify(cwd: &std::path::Path, only: &[String], strict: bool) -> Result<Ex
     // partially-valid invocation cannot half-run and still report success.
     let named: Vec<&str> = only.iter().map(String::as_str).collect();
     controls::reject_unknown_controls(&named)?;
+    // Collect first, render second: text and JSON must describe the SAME run,
+    // and the exit code is computed from the same collected results.
+    let results: Vec<controls::VerifyResult> = controls::CONTROLS
+        .iter()
+        .filter(|def| only.is_empty() || only.iter().any(|o| o == def.id))
+        .map(|def| controls::verify_control(&ctx, cfg, def))
+        .collect();
     let mut failed = 0u32;
     let mut degraded = 0u32;
-    for def in controls::CONTROLS {
-        if !only.is_empty() && !only.iter().any(|o| o == def.id) {
-            continue;
-        }
-        let result = controls::verify_control(&ctx, cfg, def);
-        println!("[{:8}] {}", result.outcome.symbol(), result.control);
-        for m in &result.messages {
-            println!("           {m}");
-        }
+    for result in &results {
         match result.outcome {
             Outcome::Fail => failed += 1,
             Outcome::Degraded => degraded += 1,
             _ => {}
         }
     }
-    println!();
-    println!("verify: {failed} failed, {degraded} degraded");
+    if format == "json" {
+        println!("{}", machine::verify_json(&results, strict)?);
+    } else {
+        for result in &results {
+            println!("[{:8}] {}", result.outcome.symbol(), result.control);
+            for m in &result.messages {
+                println!("           {m}");
+            }
+        }
+        println!();
+        println!("verify: {failed} failed, {degraded} degraded");
+    }
     if failed > 0 || (strict && degraded > 0) {
         fail(1)
     } else {

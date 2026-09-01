@@ -1578,3 +1578,98 @@ fn a_docs_only_repository_with_no_remote_is_answered_honestly() {
     sscsb(repo).arg("status").assert().success();
     sscsb(repo).arg("report").assert().success();
 }
+
+// ── verify/status --format json ──────────────────────────────────────────────
+
+#[test]
+fn verify_format_json_emits_parseable_schema_v1_at_exit_zero() {
+    let dir = throwaway_repo();
+    init_sscsb(dir.path());
+    // Restrict to a control that passes on a fresh bootstrap so exit is 0.
+    let out = sscsb(dir.path())
+        .args(["verify", "pr-template", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let doc: serde_json::Value = serde_json::from_slice(&out).expect("stdout is JSON");
+    assert_eq!(doc["schema_version"], 1);
+    assert_eq!(doc["command"], "verify");
+    assert_eq!(doc["results"][0]["control"], "pr-template");
+    assert_eq!(doc["results"][0]["outcome"], "pass");
+    assert_eq!(doc["summary"]["passed"], 1);
+}
+
+#[test]
+fn verify_format_json_keeps_exit_one_on_failure_with_failed_count_in_summary() {
+    let dir = throwaway_repo();
+    init_sscsb(dir.path());
+    // Gut a template-backed control's artifact: pre-existing-but-broken → FAIL.
+    std::fs::write(
+        dir.path().join(".github/workflows/codeql.yml"),
+        "not: [valid",
+    )
+    .unwrap();
+    let out = sscsb(dir.path())
+        .args(["verify", "codeql", "--format", "json"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let doc: serde_json::Value = serde_json::from_slice(&out).expect("stdout is JSON");
+    assert!(doc["summary"]["failed"].as_u64().unwrap() >= 1);
+    assert_eq!(doc["results"][0]["outcome"], "fail");
+}
+
+#[test]
+fn verify_rejects_unknown_format_with_exit_two_before_running_anything() {
+    let dir = throwaway_repo();
+    init_sscsb(dir.path());
+    sscsb(dir.path())
+        .args(["verify", "--format", "yaml"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("unknown --format"));
+}
+
+#[test]
+fn verify_unknown_control_still_exits_two_in_json_mode_and_runs_nothing() {
+    let dir = throwaway_repo();
+    init_sscsb(dir.path());
+    let out = sscsb(dir.path())
+        .args(["verify", "pr-template", "not-a-control", "--format", "json"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    // No JSON document was emitted — the run refused before verifying.
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&out).is_err(),
+        "unexpected JSON on a refused run: {}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+#[test]
+fn status_format_json_round_trips_and_bogus_format_exits_two() {
+    let dir = throwaway_repo();
+    init_sscsb(dir.path());
+    let out = sscsb(dir.path())
+        .args(["status", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let doc: serde_json::Value = serde_json::from_slice(&out).expect("stdout is JSON");
+    assert_eq!(doc["command"], "status");
+    assert_eq!(doc["config_present"], true);
+    assert!(doc["controls"].as_array().unwrap().len() >= 40);
+    sscsb(dir.path())
+        .args(["status", "--format", "yaml"])
+        .assert()
+        .code(2);
+}

@@ -8,6 +8,20 @@ versions.
 
 ## [Unreleased]
 
+### Added
+
+- **`sscsb verify --format json` and `sscsb status --format json`.** Machine-
+  readable output for the two commands whose results external consumers (CI
+  pipelines, the upcoming public scan directory) need to parse. The document is
+  schema-versioned (`schema_version: 1`); outcome strings are the five pinned
+  lowercase literals `pass|fail|degraded|disabled|info`; each verify row also
+  carries the control's registered `artifacts` paths so a consumer's
+  artifact→control map can never drift from the binary that scanned. Exit-code
+  semantics are identical in both formats, and an unknown `--format` is a usage
+  error (exit `2`) before any control runs — not a silent fallthrough to text.
+  All JSON assembly lives in the new `src/machine.rs`, inside the coverage
+  gate; `report --format json` (the static control dictionary) is unchanged.
+
 ## [0.2.1] - 2026-08-25
 
 ### Fixed
