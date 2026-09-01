@@ -82,13 +82,15 @@ enabled = true
 registry_check = true
 typosquat_check = true
 
-# Grype (optional): SBOM-first vulnerability scanning where Syft+Grype is preferred
+# Grype (optional): SBOM-first vulnerability scanning where Syft+Grype is preferred.
+# Enabled 2026-09-01 (max-hardening pass): second engine over the same SBOM —
+# deliberate redundancy with Trivy, not a replacement.
 [controls.grype]
-enabled = false
+enabled = true
 
 # Socket Firewall (optional): Malicious-package detection/blocking at install time
 [controls.socket-firewall]
-enabled = false
+enabled = true
 
 # ── Phase 3 — Provenance, signing & credential federation ──
 
@@ -134,7 +136,11 @@ enabled = true
 [controls.harden-runner]
 enabled = true
 
-# Witness (optional): Richer in-toto attestation capture and policy around build steps
+# Witness (optional): Richer in-toto attestation capture and policy around build steps.
+# OFF (documented, max-hardening pass 2026-09-01): binary not installed, and
+# release.yml's attestation-store path already binds build provenance + SBOM to
+# the shipped digests — per-step in-toto capture adds forensic replay this
+# 3-target build does not need. Revisit if the build pipeline grows stages.
 [controls.witness]
 enabled = false
 
@@ -147,7 +153,9 @@ engine = "opengrep"
 pre_commit = false
 rules = ".sscsb/rules"
 
-# Sighthound (optional): Ultra-fast local pre-commit SAST layer
+# Sighthound (optional): Ultra-fast local pre-commit SAST layer.
+# OFF (documented 2026-09-01): binary not installed; OpenGrep covers pre-commit
+# + CI SAST and the pre-commit path is already fast on this codebase.
 [controls.sighthound]
 enabled = false
 
@@ -168,19 +176,27 @@ enabled = true
 [controls.secure-repo]
 enabled = true
 
-# wait-for-secrets (optional): Human-in-the-loop secret injection for high-sensitivity workflows
+# wait-for-secrets (optional): Human-in-the-loop secret injection for high-sensitivity workflows.
+# OFF (documented 2026-09-01): every credentialed step is keyless (Fulcio OIDC /
+# octo-sts) — there is no long-lived secret left for a human to inject.
 [controls.wait-for-secrets]
 enabled = false
 
 # ── Phase 5 — Observability & governance ──
 
-# Dependency-Track: Continuous SBOM management platform (self-hosted); sscsb uploads BOMs
+# Dependency-Track: Continuous SBOM management platform (self-hosted); sscsb uploads BOMs.
+# OFF (documented 2026-09-01): a standing service sized for fleets; this repo's
+# vuln exposure is re-scanned on every CI run and release. Owner infra decision
+# if the estate ever wants cross-repo SBOM history.
 [controls.dependency-track]
 enabled = false
 url = ""
 project_name = ""
 
-# GUAC ingestion: Supply-chain knowledge graph over SBOMs, attestations, and VEX
+# GUAC ingestion: Supply-chain knowledge graph over SBOMs, attestations, and VEX.
+# OFF (documented 2026-09-01): another standing service; one repo's graph is
+# readable straight from the SBOM. Same owner-infra revisit condition as
+# dependency-track.
 [controls.guac]
 enabled = false
 
@@ -188,11 +204,24 @@ enabled = false
 [controls.openvex]
 enabled = true
 
-# ORAS OCI storage (optional): Push SBOMs/attestations to an OCI registry as reference artifacts
+# ORAS OCI storage (optional): Push SBOMs/attestations to an OCI registry as reference artifacts.
+# OFF (documented 2026-09-01): sscsb ships tarballs via GitHub Releases + Homebrew,
+# no OCI image exists for referrers to attach to.
 [controls.oras]
 enabled = false
 
 # Compliance map & report: Machine-readable control → SLSA/SSDF/CRA/Badge map behind `sscsb report`
 [controls.compliance-map]
 enabled = true
+
+# Bumblebee endpoint exposure scan: known-compromised packages, MCP servers,
+# extensions and agent skills on THIS machine (the surface the 2024-2026 worm
+# campaigns actually landed on). Catalog = brew's stable opt symlink to the
+# threat_intel set the package ships (glassworm, mini-shai-hulud, nx-console…);
+# macOS/brew-specific by nature — on a machine without it the control reports
+# the missing catalog visibly rather than silently passing.
+[controls.bumblebee]
+enabled = true
+profile = "baseline"
+catalog = "/opt/homebrew/opt/bumblebee/share/bumblebee/threat_intel"
 
