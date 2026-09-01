@@ -8,6 +8,8 @@ versions.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-01
+
 ### Added
 
 - **`sscsb verify --format json` and `sscsb status --format json`.** Machine-
