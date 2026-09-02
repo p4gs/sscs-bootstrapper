@@ -170,7 +170,7 @@ sscsb status                      # what's on, what's installed
 sscsb disable grype               # off means off — the code will not run
 sscsb enable dependency-track
 sscsb verify secrets commit-signing
-sscsb verify --strict             # DEGRADED (missing tool) also exits non-zero
+sscsb verify --strict             # DEGRADED also exits non-zero — the check could not be performed
 ```
 
 Secure defaults are on. Off by default are the ones that need infrastructure you
