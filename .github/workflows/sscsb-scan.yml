@@ -1,0 +1,48 @@
+# Authenticated sscsb scan via the published action (p4gs/sscsb-action@v1).
+# Runs in THIS repo's own CI, so GitHub-side checks see full permissions —
+# the record uploads as the `sscsb-scan-record` artifact; submission to the
+# directory (tools.sensiblesecurity.xyz/sscsb/) goes via an
+# `action-scan-result` issue referencing the run (submit is off: cross-repo
+# issue creation needs a token this workflow deliberately does not hold).
+name: SSCSB Scan
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * 1" # weekly, Monday 09:17 UTC
+  push:
+    branches: ["main"]
+    paths: [".github/workflows/sscsb-scan.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sscsb-scan
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: SSCS Bootstrapper Scan
+        id: scan
+        uses: p4gs/sscsb-action@4f0634d514d5a70dca35201fac5f0dfd94da81a9 # v1
+        with:
+          sscsb-version: latest
+          submit: "false"
+      - name: Report
+        env:
+          GRADE: ${{ steps.scan.outputs.grade }}
+          PCT: ${{ steps.scan.outputs.overall-percent }}
+        run: echo "::notice::sscsb grade $GRADE ($PCT%) — record uploaded as sscsb-scan-record"
