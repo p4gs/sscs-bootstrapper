@@ -8,6 +8,112 @@ versions.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-02
+
+### Fixed
+
+- **Four provenance controls were graded by filename, not by evidence.**
+  `sigstore-signing`, `slsa-provenance`, `github-attestations` and
+  `sbom-attestation` verified by asking whether the modular workflow `sscsb
+  init` installs (`release-sign.yml`, `release-slsa.yml`, `release-attest.yml`,
+  `release-attest-sbom.yml`) existed and parsed. A repository on the
+  draft-then-publish `release-immutability` path performs the Cosign signing,
+  the build-provenance attestation, the SBOM attestation and the
+  slsa-github-generator call **inside `release.yml`**, over the exact artifact
+  it ships — the modular workflows cannot coexist with an immutable release.
+  Such a repository was told to run `sscsb init`, and the only way to silence
+  that was to disable the controls, which every downstream consumer then read
+  as "not implemented".
+
+  When — and only when — the modular artifact is **absent**, `verify` now
+  looks for the control's real step in the repository's workflows. Exactly
+  what it checks (see `docs/phase-3.md` § Consolidated evidence):
+  the candidate files are the ones **committed at HEAD** (`git ls-tree -r
+  --name-only HEAD -- .github/workflows`, each read with `git show
+  HEAD:<path>` — a file that is only on disk, only `git add`ed, or edited in
+  the working tree is never evidence and is named as such, and a working
+  tree that differs from HEAD is reported; only outside a git repository
+  does it read the directory, and the message then says committed-ness was
+  not established); the file is shape-sound (one YAML document, at least one
+  job, no inert job, every `needs:` resolvable); its `on:` carries an
+  automatic trigger (`push`, `release`, `schedule`, `pull_request`,
+  `workflow_run`) or is `workflow_call` reached from a committed workflow
+  that has one — a trigger's `branches`/`tags`/`paths` filters are **not
+  evaluated** and the message says so (`on \`push\` (tags filter not
+  evaluated)`), except that an empty `branches:`/`tags:` list fails; neither
+  the proving job nor the proving step has a constant-false `if:` (`false`,
+  `'false'`, `"false"`, `${{ false }}`; no other expression is evaluated);
+  the action is pinned to a 40-hex commit SHA (the slsa-github-generator's
+  `vX.Y.Z` tag pin excepted); the step is bound to an artifact (`subject-*`
+  for both attestation actions, plus `sbom-path` for the SBOM; a non-empty
+  `base64-subjects` / `base64-subjects-as-file` for the generator; for
+  Cosign the `run:` body is **tokenised as shell** and the command word —
+  after `VAR=…`, `sudo`/`env`/`time`, `do` and the like — must be `cosign`
+  followed by `sign-blob`/`sign` with `--bundle` a word of that same
+  command, so an `echo` that prints the command, a trailing `#` comment, or
+  a `--bundle` on the next command of a chain is not signing; with the
+  `sigstore/cosign-installer` step **preceding** the signing step, every
+  cosign-bearing step judged); and the job's effective `permissions:` (job
+  level replaces workflow level, as GitHub applies them) grant what the step
+  needs — `id-token: write` for signing, `attestations: write` + `id-token:
+  write` for the attestations, `actions: read` + `id-token: write` +
+  `contents: write` for the generator. Every shortfall **fails** with the
+  precise defect named. Nothing here claims the workflow has run; that
+  remains the release's, and `provenance-verify`'s, business.
+- **`init` and `verify` now agree.** `sscsb init` consults the same
+  recognizer before writing a modular template: a control already proven by
+  consolidated evidence committed at HEAD is skipped with a log line naming
+  the proving file (`skip .github/workflows/release-sign.yml
+  (sigstore-signing proven by .github/workflows/release.yml)`). Previously, a
+  pipeline that runs `init` before `verify` had the template written into the
+  clone first, so `verify` graded an init-created file and never reached the
+  committed evidence.
+- **The shipped `release.yml` / `deploy-gate.yml` templates carried the old
+  design** — no generator job, a `workflow_dispatch`-only gate, and a header
+  claiming the slsa-github-generator is incompatible with release
+  immutability. They are now the pipeline this repository runs (below),
+  verbatim outside two marked `sscsb:customize-*` regions (the build job and
+  the tarball count it yields — `git archive` and `1` in the template, a Rust
+  matrix and `3` here), and a test holds the two in byte parity outside
+  those regions; `deploy-gate.yml` has no region and is byte-identical. The
+  `release-slsa.yml` header and the compliance map now say what is actually
+  true: only that workflow's after-publish attachment conflicts with
+  immutability, not the generator.
+- **`verify --format json` rows now report the file the verdict actually rests
+  on.** `artifacts` used to be the registered template paths unconditionally,
+  so a control proven by consolidated evidence pointed reclassifiers at a file
+  the repository never contained. When consolidated evidence proved the
+  control, the row carries that file (e.g. `.github/workflows/release.yml`);
+  otherwise it is the registry parity it always was. Additive within
+  `schema_version: 1` — the field's shape and meaning, "the committed evidence
+  for this verdict", are unchanged. Any downstream directory reflects these
+  rows once its action scans with this version.
+
+### Changed (this repository's own release pipeline)
+
+- `.github/workflows/release.yml` now generates **SLSA Build L3 provenance**
+  via `slsa-framework/slsa-github-generator` (`generator_generic_slsa3.yml@v2.1.0`,
+  `upload-assets: false`) over the sha256 subjects of the shipped tarballs,
+  and uploads the resulting `*.intoto.jsonl` to the **draft** release with the
+  other assets before the single publish. The earlier premise that the
+  generator is incompatible with release immutability was wrong; the
+  `slsa-provenance` control is re-enabled in `.sscsb/config.toml`.
+- `.github/workflows/deploy-gate.yml` is now a `workflow_call` reusable gate
+  that `release.yml` runs between provenance and publish (`publish` `needs:`
+  it): checksum sidecars, every Cosign bundle against an anchored,
+  regex-escaped identity of `release.yml@refs/tags/<tag>`, `gh attestation
+  verify` for `https://slsa.dev/provenance/v1` and `https://cyclonedx.org/bom`
+  with `--signer-workflow` and `--source-ref`, and `slsa-verifier
+  verify-artifact` with `--source-uri`, `--source-tag` and the pinned
+  `--builder-id`. `workflow_dispatch` with a tag remains as a manual
+  re-verify of a published release. The first tag pushed after this change is
+  the pipeline's first real run; every gate is fail-closed.
+- `.sscsb/config.toml` pins `builder_id` under `[controls.provenance-verify]`
+  to the same `generator_generic_slsa3.yml@refs/tags/v2.1.0` that
+  `release.yml` calls and `deploy-gate.yml` verifies against, so `sscsb
+  provenance verify` needs no `--builder-id` here and the three cannot drift
+  silently.
+
 ## [0.3.0] - 2026-09-01
 
 ### Added

@@ -146,6 +146,103 @@ public repos on all plans, private repos need GitHub Enterprise Cloud, so
 `sscsb disable sbom-attestation` is the honest configuration on a private
 free-plan repo.
 
+## Consolidated evidence (when the step lives in `release.yml`)
+
+The modular workflows above are one shape, not the only one. A repository on
+the draft-then-publish `release-immutability` path cannot use them —
+`release-sign.yml` uploads signatures *after* publish, which an immutable
+release forbids; `release-attest.yml` would attest a separately rebuilt
+archive whose digest is not the one shipped; `release-slsa.yml` attaches the
+generator's provenance to the release after publish — so it signs, attests
+and generates provenance inside `release.yml` instead, over the exact
+artifacts it uploads to the draft, and publishes once. That repository has
+implemented `sigstore-signing`, `github-attestations`, `sbom-attestation` and
+`slsa-provenance`; it has simply not installed the templates.
+
+`sscsb verify` grades the evidence, not the filename. When, and only when, a
+control's modular workflow is **absent**, it looks for the control's real
+step in the repository's workflows. Exactly what it checks, and nothing more:
+
+1. **Committed (HEAD).** Candidates are `git ls-tree -r --name-only HEAD --
+   .github/workflows`, and each one is read with `git show HEAD:<path>` — the
+   content a fresh clone of the repository carries. A file that only exists
+   on disk, or was only `git add`ed to the index, or holds the step only as
+   a working-tree edit, is never evidence; the verdict names the uncommitted
+   file, and says when the working tree differs from what it examined. Only
+   outside a git repository does `sscsb` fall back to reading the directory,
+   and the message then states that committed-ness was not established.
+2. **Shape-sound.** The file holds exactly one YAML document (a trailing
+   `---` is not a second one), declares at least one job, no job is inert
+   (neither `steps:` nor `uses:`), and every `needs:` names a job in the same
+   file — a second document or a ghost `needs:` is a hard error GitHub raises
+   for the whole file.
+3. **Fires unattended.** `on:` includes `push`, `release`, `schedule`,
+   `pull_request` or `workflow_run` — or it is `workflow_call` and a
+   committed workflow with one of those triggers calls it via `uses: ./<path>`
+   from a job that is not switched off. A `workflow_dispatch`-only workflow,
+   or one with no `on:` at all, is a procedure a human runs, not a control.
+   A trigger's `branches` / `tags` / `paths` (and `-ignore`) filters are
+   **not evaluated** — the message says `on \`push\` (tags filter not
+   evaluated)` rather than claiming the workflow fires — with one exception
+   `sscsb` can judge without a glob engine: an **empty** `branches:` or
+   `tags:` list matches no ref at all, and fails.
+4. **Not switched off.** Neither the proving job nor the proving step carries
+   a constant-false `if:` — `false`, `'false'`, `"false"` or `${{ false }}`.
+   Any other expression is left alone; the gate models the switch left off,
+   not the expression language.
+5. **Pinned.** The action is pinned to a 40-hex commit SHA, through the same
+   helpers `actions-audit` uses. The one exception is the slsa-github-generator
+   at a `vX.Y.Z` tag, per its documented trust model.
+6. **Bound to an artifact, in the right order.** The step names what it
+   binds to, and for Cosign the installer precedes the signer.
+7. **Granted.** The job's *effective* `permissions:` — the job-level block if
+   there is one, else the workflow level, exactly as GitHub resolves them —
+   include the scopes the step needs.
+
+| Control | Evidence looked for (steps parsed from YAML, never grepped from text) | Job must be granted |
+|---------|---------------------|---------------------|
+| `sigstore-signing` | a `run:` body tokenised as shell (quotes, `\` escapes and continuations, `#` comments outside quotes, commands split on newline / `;` / `&&` / `\|\|` / `\|` / `&`) in which a command's **command word** — after leading `VAR=…` assignments, `sudo` / `env` / `time` and compound openers such as `do` — is `cosign`, its next word is `sign-blob` or `sign`, and `--bundle` (or `--bundle=…`) is a word of **that** command; preceded in the same job by a SHA-pinned `sigstore/cosign-installer`; every cosign-bearing step is judged and any defective one fails the job | `id-token: write` |
+| `github-attestations` | SHA-pinned `actions/attest-build-provenance` with `subject-path` / `subject-digest` / `subject-checksums` | `attestations: write` + `id-token: write` |
+| `sbom-attestation` | SHA-pinned `actions/attest` (or `actions/attest-sbom`) with `sbom-path` **and** a `subject-*` input | `attestations: write` + `id-token: write` |
+| `slsa-provenance` | a job `uses:` the `slsa-framework/slsa-github-generator` reusable workflow at a `vX.Y.Z` tag or a SHA, with a non-empty `base64-subjects` or `base64-subjects-as-file` | `actions: read` (read or write) + `id-token: write` + `contents: write` |
+
+A step that falls short of any gate **fails** with the precise defect: the
+mutable ref is named, the missing scope is named, the manual-only trigger is
+quoted, the empty ref filter is named, the constant-false `if:` is quoted,
+the out-of-order installer names both step positions, the generator call
+without subjects is told its provenance is bound to nothing. `cosign
+verify-blob` in a deploy gate is verification, not signing; `echo "cosign
+sign-blob … --bundle"` prints a command and runs none; a `#`-commented
+command — whole-line or trailing — runs nothing; and the consolidated path
+never rescues a modular file that is present but broken — it answers "the
+template is absent", nothing else.
+
+What this does **not** prove: that the workflow has ever run, that the run
+succeeded, or that a release carries the resulting bundles and attestations.
+Those are properties of releases, which `provenance-verify` (the deploy gate)
+checks per release; `verify` reads committed configuration. Nor does it
+evaluate a trigger's `branches` / `tags` / `paths` filters against any ref
+(only an empty list is judged), or any `if:` expression beyond the literal
+`false` spellings above — a workflow filtered to a branch that never receives
+a tag, or gated on an expression that is always false at runtime, passes
+these gates and is reported with the filter or expression left unevaluated.
+
+`init` and `verify` agree. `sscsb init` consults the same recognizer before
+writing a modular template: when a control in this set is already proven by
+committed (HEAD) evidence, the template is skipped and the log says which
+file proved it (`skip .github/workflows/release-sign.yml (sigstore-signing
+proven by .github/workflows/release.yml)`). Without evidence, the template is
+written as before. This matters because the scan pipeline runs `init` before
+`verify` on a fresh clone, where HEAD is all there is.
+
+The `--format json` row for a control proven this way reports the file the
+verdict examined in `artifacts` (for example `.github/workflows/release.yml`)
+rather than the template that was never installed. The text output says the
+same: `release-sign.yml not installed — verified by consolidated evidence in
+.github/workflows/release.yml instead`. What any downstream directory makes of
+that is the directory's own classification; it reflects this scanner's rows
+once its action scans with `sscsb` 0.3.1 or later.
+
 ## Verification before promotion
 
 Provenance you never check is a file. The gate is the control:

@@ -29,11 +29,27 @@ struct VerifyEntry<'a> {
     name: &'static str,
     outcome: &'a Outcome,
     messages: &'a [String],
-    /// Committed-artifact paths this control's `init` installs (repo-relative).
-    /// Load-bearing for external reclassifiers: exported from the same
-    /// `workflows::ARTIFACTS` table the binary installs from, so a consumer's
-    /// artifact→control map can never drift from the version that scanned.
-    artifacts: Vec<&'static str>,
+    /// Repo-relative paths of the committed files this control's verdict
+    /// rests on. Load-bearing for external reclassifiers, which ask whether
+    /// each path pre-existed in the repository before the scanner's own
+    /// `init` ran.
+    ///
+    /// By default these are the artifacts the control's `init` installs,
+    /// exported from the same `workflows::ARTIFACTS` table the binary installs
+    /// from, so a consumer's artifact→control map can never drift from the
+    /// version that scanned. When a control was instead proven by consolidated
+    /// evidence — its real step found in another workflow COMMITTED at HEAD,
+    /// such as `release.yml`, the modular template being absent, and that
+    /// step passing every gate `workflows::Consolidated` lists (committed at
+    /// HEAD, shape-sound, automatic trigger, no constant-false `if:`,
+    /// SHA-pinned, artifact-bound, installer-before-signer, effective
+    /// permissions granted) — the row reports THAT file, because it is the
+    /// file the verdict examined and the one a consumer can check for
+    /// pre-existence. Additive within schema v1:
+    /// the field's shape and meaning ("the committed evidence") are unchanged.
+    /// This field states what was examined; what a downstream directory makes
+    /// of it is that directory's classification, not a claim made here.
+    artifacts: Vec<&'a str>,
     /// External tools this control detects (registry order).
     tools: &'static [&'static str],
 }
@@ -90,10 +106,14 @@ pub fn verify_json(results: &[VerifyResult], strict: bool) -> Result<String> {
             name: def.name,
             outcome: &r.outcome,
             messages: &r.messages,
-            artifacts: workflows::artifacts_for(def.id)
-                .into_iter()
-                .map(|a| a.dest)
-                .collect(),
+            artifacts: if r.evidence.is_empty() {
+                workflows::artifacts_for(def.id)
+                    .into_iter()
+                    .map(|a| a.dest)
+                    .collect()
+            } else {
+                r.evidence.iter().map(String::as_str).collect()
+            },
             tools: def.tools,
         });
     }
@@ -277,6 +297,15 @@ mod tests {
         }
     }
 
+    fn artifacts_of(row: &serde_json::Value) -> Vec<&str> {
+        row["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect()
+    }
+
     /// `artifacts` is the load-bearing field for external reclassifiers: it
     /// must expose exactly the ARTIFACTS table's dest paths for the control.
     #[test]
@@ -290,12 +319,7 @@ mod tests {
             .iter()
             .find(|r| r["control"] == "codeql")
             .expect("codeql row present");
-        let paths: Vec<&str> = codeql["artifacts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
+        let paths = artifacts_of(codeql);
         assert!(paths.contains(&".github/workflows/codeql.yml"), "{paths:?}");
         // And for every row: exact parity with artifacts_for().
         for row in rows {
@@ -304,13 +328,48 @@ mod tests {
                 .into_iter()
                 .map(|a| a.dest)
                 .collect();
-            let actual: Vec<&str> = row["artifacts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap())
+            assert_eq!(artifacts_of(row), expected, "artifacts drift for `{id}`");
+        }
+    }
+
+    /// When a control is proven by consolidated evidence — its modular
+    /// template absent, its real step living in `release.yml` — the row must
+    /// name the file the verdict examined, not the template that was never
+    /// installed: a reclassifier checking pre-existence would otherwise mark
+    /// a genuinely implemented control as a gap. Every OTHER row keeps exact
+    /// registry parity, so the override is scoped to the evidence it rests on.
+    #[test]
+    fn artifacts_field_reports_the_consolidated_evidence_file_when_it_proved_the_control() {
+        let (_d, ctx, cfg) = bootstrapped_ctx();
+        std::fs::remove_file(ctx.root.join(".github/workflows/release-sign.yml")).unwrap();
+        std::fs::write(
+            ctx.root.join(".github/workflows/release.yml"),
+            crate::testutil::signed_release_workflow(),
+        )
+        .unwrap();
+        // Only content committed at HEAD is evidence — `git add` alone is not.
+        crate::exec::git(&["add", "--", ".github/workflows/release.yml"], &ctx.root).unwrap();
+        crate::exec::git(
+            &["commit", "-q", "-m", "test: release.yml", "--no-verify"],
+            &ctx.root,
+        )
+        .unwrap();
+        let results = full_verify(&ctx, &cfg);
+        let doc: serde_json::Value =
+            serde_json::from_str(&verify_json(&results, false).unwrap()).unwrap();
+        let rows = doc["results"].as_array().unwrap();
+        for row in rows {
+            let id = row["control"].as_str().unwrap();
+            if id == "sigstore-signing" {
+                assert_eq!(row["outcome"], "pass", "{}", row["messages"]);
+                assert_eq!(artifacts_of(row), vec![".github/workflows/release.yml"]);
+                continue;
+            }
+            let expected: Vec<&str> = workflows::artifacts_for(id)
+                .into_iter()
+                .map(|a| a.dest)
                 .collect();
-            assert_eq!(actual, expected, "artifacts drift for `{id}`");
+            assert_eq!(artifacts_of(row), expected, "artifacts drift for `{id}`");
         }
     }
 

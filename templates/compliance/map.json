@@ -255,7 +255,7 @@
       "ssdf": ["PS.1.1", "PS.3.1"],
       "cra": ["Annex I Part II §7 (secure distribution of updates)"],
       "badge": ["signed_releases"],
-      "notes": "Every asset attaches to a DRAFT and the release publishes ONCE, so nothing is modified after it becomes immutable (GitHub release immutability). Provenance + SBOM go to the attestation store (immutability-safe). Trade-off: slsa-github-generator L3 provenance attaches to the release, which conflicts with immutability — use release-slsa.yml (L3, mutable) OR this (immutable, store-based). Opt-in; the setting itself is UI-only (no REST API).",
+      "notes": "Every asset attaches to a DRAFT and the release publishes ONCE, so nothing is modified after it becomes immutable (GitHub release immutability). Build provenance + SBOM go to the attestation store (immutability-safe); the slsa-github-generator's L3 provenance is emitted as a run artifact (`upload-assets: false`), verified by deploy-gate.yml, and uploaded to the DRAFT before publish — the generator is compatible with immutable releases, only release-slsa.yml's after-publish attachment is not. Opt-in; the setting itself is UI-only (no REST API).",
       "osps": []
     },
     "octo-sts": {
