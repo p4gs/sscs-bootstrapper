@@ -616,7 +616,20 @@ fn check_shape(dest: &str, content: &str) -> ShapeVerdict {
 /// 4. **Not switched off.** Neither the proving job nor the proving step
 ///    carries a constant-false `if:` (`false`, `'false'`, `"false"`,
 ///    `${{ false }}`) or `continue-on-error: true`; a signing command is not
-///    negated with `!`, not followed by `|| true` / `|| :`, and not preceded
+///    negated with `!` outside a condition, not in a compound command's
+///    CONDITION (`if cosign …; then`, `while`/`until cosign …; do`) whose
+///    failure path leaves the step passing — the arm taken when the signing
+///    fails, or the command after the compound, ending it with a literal
+///    non-zero `exit`/`return`, `false` or `kill` is what makes
+///    `if cosign …; then echo signed; else exit 1; fi` and
+///    `if ! cosign …; then exit 1; fi` sound — not followed by a `||` branch
+///    that leaves the step passing (`|| true`, `|| :`, `|| exit 0`,
+///    `|| { echo warn; }`) — immediately or at the end of the AND-OR list it
+///    opens with `&&` — not
+///    backgrounded with `&` (unless a bare `wait $!` immediately follows),
+///    not reached with `errexit` turned off by an
+///    earlier `set +e` without a later command that propagates the captured
+///    status (`exit "$rc"`, `[ "$rc" -eq 0 ] || exit 1`), and not preceded
 ///    by a function or alias named `cosign`; and a `run:` body is judged
 ///    only under a POSIX shell (no `shell:`, `bash`, `sh`, or a `bash … {0}`
 ///    / `sh … {0}` template). Any other expression is not evaluated.
@@ -879,8 +892,16 @@ fn constant_false(cond: &Yaml) -> Option<String> {
 /// command's exit status means for the verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sep {
-    /// Newline, `;`, `&`, `&&` or end of input.
+    /// Newline, `;` or end of input — a real command terminator.
     Other,
+    /// `&&` — the next command runs only when this one succeeds, and the
+    /// list's own terminator (a `||` further along it) is what decides the
+    /// step's status.
+    And,
+    /// A single unpaired `&` — the command is detached into the background,
+    /// so the shell's status is the `&` itself (always 0) and `set -e` never
+    /// sees the command fail.
+    Background,
     /// `||` — the next command runs only when this one fails.
     Or,
     /// `|` — this command's output feeds the next one, and without
@@ -974,8 +995,12 @@ impl Tokeniser {
 /// backslash escapes the next character and backslash-newline continues the
 /// line; an unquoted `#` at the start of a word begins a comment that runs
 /// to the end of the line; newline, `;`, `&`, `&&`, `|` and `||` end a
-/// command, but the `&` of a redirection (`2>&1`, `>&2`, `&>log`) is part
-/// of its word; `(` and `)` are words of their own; a heredoc (`<<WORD`,
+/// command — a single unpaired `&` as [`Sep::Background`], `&&` as
+/// [`Sep::And`] — but
+/// the `&` of a redirection (`2>&1`, `>&2`, `&>log`) is part of its word;
+/// `(` and `)` are words of their own, and an adjacent pair is one word
+/// (`((` / `))`), which is what tells bash's arithmetic evaluation from a
+/// nested subshell; a heredoc (`<<WORD`,
 /// `<< 'WORD'`, `<<-WORD`, bare or glued, quotes stripped) makes every line
 /// after the current one data up to the line equal to `WORD`, so a signing
 /// line inside a `cat <<EOF` or the `: <<'COMMENT'` idiom is not a command.
@@ -1057,12 +1082,25 @@ fn shell_commands(script: &str) -> Vec<ShellCommand> {
                 t.end_command(match (c, doubled) {
                     ('|', true) => Sep::Or,
                     ('|', false) => Sep::Pipe,
-                    _ => Sep::Other,
+                    // A single unpaired `&` backgrounds the command; `&&`
+                    // does not — it opens an AND-OR list instead.
+                    ('&', false) => Sep::Background,
+                    // The only pair left is `&&`.
+                    _ => Sep::And,
                 });
             }
+            // `((` and `))` are words of their own, and so are a lone `(` and
+            // `)`: bash reads an ADJACENT pair as arithmetic evaluation and a
+            // separated one as a nested subshell (`(( x ))` vs `( ( x ) )`),
+            // which is the only thing that tells them apart.
             '(' | ')' => {
                 t.end_word();
-                t.words.push(c.to_string());
+                let doubled = chars.next_if_eq(&c).is_some();
+                t.words.push(if doubled {
+                    format!("{c}{c}")
+                } else {
+                    c.to_string()
+                });
             }
             c if c.is_whitespace() => t.end_word(),
             c => {
@@ -1104,9 +1142,28 @@ fn command_word(words: &[String]) -> Option<(&str, &[String])> {
     command_index(words).map(|i| (words[i].as_str(), &words[i + 1..]))
 }
 
+/// Where a leading `case` ARM pattern ends: the index just past the `)` the
+/// tokeniser emits of its own accord for the `release)` in
+/// `case "$MODE" in release) cosign …; esac`. Without this the pattern word
+/// reads as the command word and the signing behind it is never seen at all.
+///
+/// A `)` with no `(` before it in the same command closes a pattern list and
+/// nothing else: a subshell OPENS with `(`, which [`COMMAND_PREFIX_WORDS`]
+/// already skips, and a function definition (`cosign ( )`) has its `(` first
+/// too. An arm with nothing after the `)` (`*) ;;`) names no command, so the
+/// pattern is left alone and [`command_index`] answers as it did before.
+fn case_arm_pattern_end(words: &[String]) -> usize {
+    match words.iter().position(|w| w == ")") {
+        Some(close) if close + 1 < words.len() && !words[..close].iter().any(|w| w == "(") => {
+            close + 1
+        }
+        _ => 0,
+    }
+}
+
 /// The index of the command word in `words` — see [`command_word`].
 fn command_index(words: &[String]) -> Option<usize> {
-    let mut i = 0;
+    let mut i = case_arm_pattern_end(words);
     while i < words.len() {
         let w = words[i].as_str();
         if is_shell_assignment(w) {
@@ -1126,10 +1183,28 @@ fn command_index(words: &[String]) -> Option<usize> {
     None
 }
 
+/// The [`COMMAND_PREFIX_WORDS`] that open a compound command's CONDITION
+/// rather than its body. `do`, `then` and `else` open the body — a command
+/// there owns the step's status as any other does — but a command reached
+/// through one of these is the test the conditional consumes.
+const CONDITION_KEYWORDS: &[&str] = &["if", "elif", "while", "until"];
+
 /// Whether a `!` precedes the command word: the pipeline's exit status is
 /// inverted, so a signing that fails reads as success.
 fn negated(words: &[String]) -> bool {
     command_index(words).is_some_and(|i| words[..i].iter().any(|w| w == "!"))
+}
+
+/// Whether the prefix words [`command_index`] skipped included a
+/// [`CONDITION_KEYWORDS`] opener: the command sits in a compound command's
+/// condition (`if cosign …; then`, `while cosign …; do`), where its exit
+/// status is the test the conditional branches on and never the step's.
+fn in_condition(words: &[String]) -> bool {
+    command_index(words).is_some_and(|i| {
+        words[..i]
+            .iter()
+            .any(|w| CONDITION_KEYWORDS.contains(&w.as_str()))
+    })
 }
 
 /// Whether this command defines a shell function or alias named `cosign`
@@ -1152,24 +1227,38 @@ fn redefines_cosign(words: &[String]) -> bool {
 struct SigningShortfalls {
     /// A `cosign sign`/`sign-blob` without `--bundle` on its own command line.
     unbundled: bool,
-    /// A signing command word preceded by `!` — its exit status is inverted.
+    /// A signing command word preceded by `!` OUTSIDE a condition — its exit
+    /// status is inverted, so a failed signing reads as success. In condition
+    /// position the `!` is the conditional's own test and this stays unset;
+    /// `in_condition` judges that shape instead.
     negated: bool,
+    /// A signing command in a compound command's CONDITION (`if cosign …`,
+    /// `while cosign …`, `until cosign …`, `if ! cosign …`) whose failure
+    /// path does not fail the step: the conditional consumes the exit status,
+    /// and the arm the shell takes when the signing fails does not propagate
+    /// it — nor, where that arm falls through, does the command after the
+    /// compound (see [`condition_failure_propagates`]).
+    in_condition: bool,
     /// A signing command followed by `|| <word>` where the word does not
-    /// fail the step — the word that swallows the failure.
+    /// fail the step — the word that swallows the failure. The `||` may end
+    /// the signing command itself or terminate the AND-OR list it opens with
+    /// `&&` (`cosign … && echo ok || true`).
     failure_ignored: Option<String>,
     /// A signing command followed by `|` with no `set -o pipefail` earlier
     /// in the body — its exit status is the pipeline's last command's.
     piped: bool,
+    /// A signing command ended by a single unpaired `&` with no immediately
+    /// following `wait $!` — it runs in the background and nothing collects
+    /// its status, so the shell's is the `&`'s (always 0).
+    backgrounded: bool,
+    /// A signing command reached with `errexit` turned off earlier in the
+    /// body (`set +e`, `set +o errexit`, `shopt -o -u errexit`) and no later
+    /// command that propagates the captured status (see
+    /// [`captured_status_propagates`]) — a non-zero status ends nothing.
+    errexit_off: bool,
     /// The body defines a function or alias named `cosign`.
     redefined: bool,
 }
-
-/// After `||`, the command words that propagate a failure rather than
-/// swallow it — `exit` / `return` leave the script or function with a
-/// status the author chose, `false` fails outright, `kill` ends the process
-/// — plus the two openers of a compound command (`{ …; }` / `( … )`), whose
-/// inside sscsb does not follow.
-const FAILURE_PROPAGATING_WORDS: &[&str] = &["exit", "return", "false", "kill", "{", "("];
 
 /// Whether this command is a `set` that turns `pipefail` on.
 fn sets_pipefail(command: &ShellCommand) -> bool {
@@ -1177,6 +1266,974 @@ fn sets_pipefail(command: &ShellCommand) -> bool {
         command_word(&command.words),
         Some(("set", args)) if options_set_pipefail(args.iter().map(String::as_str))
     )
+}
+
+/// Whether `errexit` is off when the command at `i` runs: the last `set` or
+/// `shopt` before it that touched `errexit` turned it off. GitHub starts
+/// every POSIX `run:` body with `-e` on (`bash -e {0}`, `sh -e {0}`, and the
+/// built-in `bash --noprofile --norc -eo pipefail {0}`), so the walk starts
+/// from "on" and only a `set +e` / `set +o errexit` / `shopt -o -u errexit`
+/// in the body flips it — a later `set -e` / `shopt -o -s errexit` flips it
+/// back, exactly as the `pipefail` walk honours ordering.
+fn errexit_off_before(commands: &[ShellCommand], i: usize) -> bool {
+    let mut off = false;
+    for command in &commands[..i] {
+        let toggle = match command_word(&command.words) {
+            Some(("set", args)) => options_toggle_errexit(args.iter().map(String::as_str)),
+            Some(("shopt", args)) => shopt_toggle_errexit(args.iter().map(String::as_str)),
+            _ => None,
+        };
+        if let Some(on) = toggle {
+            off = !on;
+        }
+    }
+    off
+}
+
+/// Whether a `shopt` argument list turns `errexit` on (`Some(true)`), off
+/// (`Some(false)`), or leaves it alone (`None`). `shopt -o` addresses the
+/// `set -o` option namespace, so `shopt -o -u errexit` is `set +o errexit`
+/// and `shopt -o -s errexit` is `set -o errexit` — in either flag order,
+/// and in a single cluster (`shopt -ou errexit`). Without `-o` the name is
+/// a bash-only shell option (`shopt -u nullglob`) and `errexit` is not one
+/// of them; without `-s`/`-u` the command only prints the setting.
+fn shopt_toggle_errexit<'a>(words: impl IntoIterator<Item = &'a str>) -> Option<bool> {
+    let mut set_o = false;
+    let mut names_errexit = false;
+    let mut state = None;
+    for word in words {
+        match word.strip_prefix('-') {
+            Some(cluster) if !cluster.is_empty() && !cluster.starts_with('-') => {
+                set_o |= cluster.contains('o');
+                if cluster.contains('u') {
+                    state = Some(false);
+                }
+                if cluster.contains('s') {
+                    state = Some(true);
+                }
+            }
+            _ => names_errexit |= word == "errexit",
+        }
+    }
+    (set_o && names_errexit).then_some(state).flatten()
+}
+
+/// Whether an option list turns `errexit` on (`Some(true)`), off
+/// (`Some(false)`), or leaves it alone (`None`): `-e` / `+e` and any short
+/// cluster containing `e` (`-euo`, `+ex`), plus `-o errexit` / `+o errexit`
+/// where the option name is the next word. The last one in the list wins,
+/// as the shell applies them left to right. A bare `--` ends the options:
+/// everything after it is a positional operand, so `set -- +e` sets `$1` to
+/// the literal `+e` and leaves `errexit` alone.
+fn options_toggle_errexit<'a>(words: impl IntoIterator<Item = &'a str>) -> Option<bool> {
+    let words: Vec<&str> = words.into_iter().collect();
+    let mut state = None;
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i];
+        if word == "--" {
+            break;
+        }
+        let on = word.starts_with('-') && !word.starts_with("--");
+        let off = word.starts_with('+') && !word.starts_with("++");
+        if on || off {
+            if word.contains('e') {
+                state = Some(on);
+            }
+            if word.contains('o') {
+                // `-o NAME` / `+o NAME`: the name is the next word, and it
+                // is the option's argument either way.
+                if let Some(name) = words.get(i + 1) {
+                    if *name == "errexit" {
+                        state = Some(on);
+                    }
+                    i += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    state
+}
+
+/// Whether an `exit` / `return` argument is a literal non-zero status. Only
+/// a literal counts: `$?`, `$STATUS` and any other word could be zero, and
+/// an unknown status is treated as swallowing (fail closed). `exit 256`
+/// leaves status 0 and so does not propagate.
+fn nonzero_status(word: &str) -> bool {
+    word.parse::<i64>()
+        .is_ok_and(|status| status.rem_euclid(256) != 0)
+}
+
+/// Whether a command, run as the `||` branch after a failed signing, still
+/// fails the step: `exit` / `return` with a literal non-zero status (or no
+/// status at all, which re-raises `$?`), `false`, or `kill`. Everything else
+/// — `true`, `:`, `echo`, `continue`, `exit 0`, `return 0`, `exit $?` —
+/// swallows the failure. Unknown is swallowing, and so is a branch with no
+/// command word at all (every word a `NAME=VALUE` assignment): the
+/// assignments run and leave status 0.
+///
+/// The argument-less case answers for the position this predicate names — a
+/// command reached BECAUSE something failed, where `$?` is that failure: a
+/// `||` branch, or the arm a compound takes on a failing condition. It is
+/// NOT a claim about a bare `exit` anywhere in a body. Reached through `&&`
+/// the same word inherits the preceding test's SUCCESS and ends the shell
+/// green, which is why that one position is read as abandoning instead
+/// ([`abandons_shell_where_reached`]).
+fn command_propagates(words: &[String]) -> bool {
+    if negated(words) {
+        return false;
+    }
+    let Some((word, args)) = command_word(words) else {
+        return false;
+    };
+    match word {
+        "false" | "kill" => true,
+        "exit" | "return" => match args.first() {
+            None => true,
+            Some(status) => nonzero_status(status),
+        },
+        _ => false,
+    }
+}
+
+/// The words of the last command inside the `{ … }` / `( … )` group opened
+/// by `commands[i]`, or `None` when the group is empty, never closed, or
+/// closed by the wrong bracket — all of which are read as swallowing.
+fn group_last_command(commands: &[ShellCommand], i: usize) -> Option<Vec<String>> {
+    let closer = match commands.get(i)?.words.first()?.as_str() {
+        "{" => "}",
+        "(" => ")",
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    let mut last: Option<Vec<String>> = None;
+    for command in &commands[i..] {
+        let mut inner: Vec<String> = Vec::new();
+        let mut closed = false;
+        for word in &command.words {
+            match word.as_str() {
+                "{" | "(" => {
+                    depth += 1;
+                    if depth > 1 {
+                        inner.push(word.clone());
+                    }
+                }
+                "}" | ")" => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        if word != closer {
+                            return None;
+                        }
+                        closed = true;
+                        break;
+                    }
+                    inner.push(word.clone());
+                }
+                _ => inner.push(word.clone()),
+            }
+        }
+        if !inner.is_empty() {
+            last = Some(inner);
+        }
+        if closed {
+            return last;
+        }
+    }
+    None
+}
+
+/// The word of the `||` branch at `commands[i]` that swallows a failed
+/// signing, or `None` when the branch still fails the step. A `{ … }` /
+/// `( … )` group is judged by its LAST command — the status the group
+/// leaves behind — and named by its opener when that command swallows.
+///
+/// Every path fails closed: a group that is empty, never closed, or closed
+/// by the wrong bracket ([`group_last_command`] → `None`) is swallowing, a
+/// branch whose command word is unknown ([`command_propagates`] → `false`)
+/// is swallowing, and a branch made only of `NAME=VALUE` assignments —
+/// `|| FAILED=1`, `|| RC=$?` — is swallowing too, named as it was written.
+/// The one `None` left is a `||` with no command after it at all, which is
+/// a parse error the shell rejects rather than a suppression.
+fn or_branch_swallows(commands: &[ShellCommand], i: usize) -> Option<String> {
+    let next = commands.get(i)?;
+    let first = next.words.first().map(String::as_str);
+    if let Some(opener @ ("{" | "(")) = first {
+        return match group_last_command(commands, i) {
+            Some(last) if command_propagates(&last) => None,
+            _ => Some(opener.to_string()),
+        };
+    }
+    if command_propagates(&next.words) {
+        return None;
+    }
+    // A branch with words but no command word runs its assignments and exits
+    // 0. Name it as written, so the defect quotes the author's own line.
+    let Some((word, args)) = command_word(&next.words) else {
+        return Some(next.words.join(" "));
+    };
+    // `|| exit 0` and `|| return 0` are named with their status, so the
+    // defect reads as what was written.
+    Some(match (word, args.first()) {
+        ("exit" | "return", Some(status)) => format!("{word} {status}"),
+        _ => word.to_string(),
+    })
+}
+
+/// The reserved words that open a compound command closed by a terminator
+/// word, and the terminators that close them. Tracked as a nesting depth so
+/// a compound nested inside an arm is not mistaken for the arm itself.
+const COMPOUND_OPENERS: &[&str] = &["if", "while", "until", "for", "select", "case"];
+const COMPOUND_CLOSERS: &[&str] = &["fi", "done", "esac"];
+
+/// The reserved word this command OPENS a compound with, or `None` when it
+/// is a simple command. The word has to reach the command-word position
+/// through the prefix words alone (`then if [ -f x ]`, `! until …`), so an
+/// `echo if` — where `if` is an argument, not a keyword — opens nothing.
+///
+/// Two starting points, because a `case` written on ONE line carries both its
+/// own keyword and its first arm: `case "$MODE" in skip) echo s ;; esac`
+/// tokenises as a single command whose words run from `case` through the
+/// arm's `echo`. The keyword in FRONT is read first, so the one-liner opens a
+/// compound exactly as the multi-line spelling does; only when there is none
+/// is the word behind the arm pattern ([`case_arm_pattern_end`]) tried, which
+/// is where an arm like `release) if [ -f x ]; then …` keeps its opener.
+fn opens_compound(words: &[String]) -> Option<&str> {
+    opener_at(words, 0).or_else(|| opener_at(words, case_arm_pattern_end(words)))
+}
+
+/// The compound opener reachable from `i` through the prefix words alone.
+fn opener_at(words: &[String], mut i: usize) -> Option<&str> {
+    while let Some(word) = words.get(i) {
+        if compound_closer(word).is_some() {
+            return Some(word);
+        }
+        if !is_shell_assignment(word) && !COMMAND_PREFIX_WORDS.contains(&word.as_str()) {
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether this command is a compound's TERMINATOR (`fi`, `done`, `esac`),
+/// which a shell only ever accepts as the first word of a command — so an
+/// `echo done` closes nothing.
+fn closes_compound(words: &[String]) -> bool {
+    words
+        .first()
+        .is_some_and(|w| COMPOUND_CLOSERS.contains(&w.as_str()))
+}
+
+/// The terminator word that closes the compound `opener` opens.
+fn compound_closer(opener: &str) -> Option<&'static str> {
+    match opener {
+        "if" => Some("fi"),
+        "while" | "until" | "for" | "select" => Some("done"),
+        "case" => Some("esac"),
+        _ => None,
+    }
+}
+
+/// The commands of a compound command, split by the arm they sit in.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CompoundArms {
+    /// The reserved word that opened the compound (`if`, `while`, `until`,
+    /// `for`, `select`, `case`) — which arm a failing condition takes
+    /// depends on it.
+    opener: String,
+    /// Command indices in the `then` arm, at the compound's OWN nesting
+    /// depth. A NESTED compound is represented by its OPENER — the one
+    /// command of it at this depth — and its inner commands belong to
+    /// neither arm; [`reached_at_depth`] steps the rest of it over.
+    then_arm: Vec<usize>,
+    /// Command indices in the `else` arm, at the compound's own depth, a
+    /// nested compound represented by its opener.
+    else_arm: Vec<usize>,
+    /// Command indices in a loop's `do` body, at the compound's own depth, a
+    /// nested compound represented by its opener.
+    body: Vec<usize>,
+    /// Every command from the opener through the terminator, at any depth —
+    /// what a `break` or an abandoning `exit` has to be looked for in, since
+    /// either escapes the loop from inside a nested compound just as well.
+    span: Vec<usize>,
+    /// The command immediately after the compound's terminator, if any.
+    after: Option<usize>,
+}
+
+/// The arms of the compound command opened at `commands[i]`, or `None` when
+/// the walk cannot pin them down: no opener word, a terminator that does not
+/// match the opener, an `elif` (a second condition this walk does not model),
+/// or a compound never closed at all. Every `None` is read as "not
+/// established", so the caller keeps failing.
+///
+/// An `if` populates [`CompoundArms::then_arm`] and
+/// [`CompoundArms::else_arm`]; a `while`/`until`/`for` loop has no
+/// `then`/`else` and populates [`CompoundArms::body`] with its `do` body
+/// instead. [`CompoundArms::after`] and [`CompoundArms::span`] are populated
+/// either way.
+fn compound_arms(commands: &[ShellCommand], i: usize) -> Option<CompoundArms> {
+    let opener = commands
+        .get(i)?
+        .words
+        .iter()
+        .find(|w| compound_closer(w).is_some())?;
+    let closer = compound_closer(opener)?;
+    let mut arms = CompoundArms {
+        opener: opener.clone(),
+        ..CompoundArms::default()
+    };
+    let mut depth = 0usize;
+    let mut arm: Option<Arm> = None;
+    for (j, command) in commands.iter().enumerate().skip(i) {
+        let before = depth;
+        let mut arm_here = arm;
+        let mut closed = false;
+        arms.span.push(j);
+        for word in &command.words {
+            let word = word.as_str();
+            if COMPOUND_OPENERS.contains(&word) {
+                depth += 1;
+            } else if COMPOUND_CLOSERS.contains(&word) {
+                if depth == 1 {
+                    if word != closer {
+                        return None;
+                    }
+                    closed = true;
+                }
+                depth = depth.saturating_sub(1);
+            } else if depth == 1 {
+                match word {
+                    "then" => {
+                        arm = Some(Arm::Then);
+                        arm_here = arm;
+                    }
+                    "else" => {
+                        arm = Some(Arm::Else);
+                        arm_here = arm;
+                    }
+                    "do" => {
+                        arm = Some(Arm::Body);
+                        arm_here = arm;
+                    }
+                    "elif" => return None,
+                    _ => {}
+                }
+            }
+        }
+        if closed {
+            arms.after = (j + 1 < commands.len()).then_some(j + 1);
+            return Some(arms);
+        }
+        // Every command the arm reaches at the compound's OWN depth, which
+        // includes a NESTED compound at its opener: `before == 1` alone, not
+        // `before == 1 && depth == 1`, because the opener leaves the depth
+        // raised (`then if [ -f b ]` ends at depth 2) and dropping it made a
+        // nested compound's ability to end the shell invisible to
+        // [`sequence_outcome`]. What it spans is left to the walker
+        // ([`reached_at_depth`]), which steps the whole compound over from
+        // its opener exactly as it does at any other depth. A `before == 1`
+        // command that CLOSED this compound already returned above, so the
+        // depth here is never zero.
+        if before == 1 {
+            match arm_here {
+                Some(Arm::Then) => arms.then_arm.push(j),
+                Some(Arm::Else) => arms.else_arm.push(j),
+                Some(Arm::Body) => arms.body.push(j),
+                None => {}
+            }
+        }
+    }
+    None
+}
+
+/// Which arm of a compound command a command sits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arm {
+    Then,
+    Else,
+    Body,
+}
+
+/// What reaching a sequence of commands does to the step's status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceOutcome {
+    /// A propagating command is reached unconditionally: the step fails.
+    Propagates,
+    /// An `exit`/`return` that does NOT propagate (`exit 0`, `exit $?`, a
+    /// status this recognizer cannot evaluate) is reached first: the shell
+    /// ENDS here, so nothing written after the sequence is reachable and the
+    /// step is left passing.
+    Terminates,
+    /// The sequence runs off its end without deciding anything, so whatever
+    /// the shell reaches next still applies.
+    FallsThrough,
+}
+
+/// What reaching this sequence of commands does to the step's status. The
+/// commands are walked in order and the first `exit`/`return` decides: one
+/// that propagates ([`command_propagates`] — a literal non-zero status, or
+/// none at all, plus `false` and `kill`) fails the step
+/// ([`SequenceOutcome::Propagates`]), and one that does not (`exit 0`,
+/// `exit $?`, a status this recognizer cannot evaluate) ENDS the shell
+/// ([`SequenceOutcome::Terminates`]) rather than letting a later line stand
+/// in for it. A `break` ends the walk the same way: control leaves for the
+/// enclosing loop's continuation, so nothing written after it in this
+/// sequence is reached either. A nested COMPOUND that can end the shell
+/// ([`compound_abandons_shell`] — an abandoning `exit` in one of its own
+/// arms, or an extent this walk cannot pin down) terminates the sequence for
+/// the same reason: the shell may never come back out of it, so nothing
+/// written after it may stand in for it. Only commands the shell reaches
+/// unconditionally count: one that follows `&&`, `||`, `|` or `&` is
+/// conditional on what ran before it, so it is skipped — but a conditionally
+/// reached command that can END the shell (`[ -f skip ] && exit 0`) stops the
+/// sequence all the same ([`ReachedWalk::abandoned`]), because nothing after
+/// it is reached on the path that took it.
+fn sequence_outcome(commands: &[ShellCommand], sequence: &[usize]) -> SequenceOutcome {
+    let walk = reached_at_depth(commands, sequence);
+    for j in walk.reached {
+        let words = &commands[j].words;
+        if command_propagates(words) {
+            return SequenceOutcome::Propagates;
+        }
+        if matches!(command_word(words), Some(("exit" | "return" | "break", _))) {
+            return SequenceOutcome::Terminates;
+        }
+        if opens_compound(words).is_some() && compound_abandons_shell(commands, j) {
+            return SequenceOutcome::Terminates;
+        }
+    }
+    if walk.abandoned {
+        // The walk ran out at a command it could not credit — one reached
+        // through `&&` / `||` / `|` / `&` — that can end the shell anyway.
+        // The sequence must not be read as falling through into whatever
+        // follows it.
+        return SequenceOutcome::Terminates;
+    }
+    SequenceOutcome::FallsThrough
+}
+
+/// Whether the compound command opened at `commands[j]` can END the shell
+/// with the step passing: an [`abandons_shell_where_reached`] `exit` /
+/// `return` anywhere in its span, at any depth — the same look the condition
+/// gate takes at a loop's retry path, since an `exit 0` nested two arms deep
+/// leaves the shell exactly as a bare one does. A compound whose extent
+/// cannot be pinned down ([`compound_arms`] → `None`) is read as one that
+/// can: unknown fails closed.
+fn compound_abandons_shell(commands: &[ShellCommand], j: usize) -> bool {
+    match compound_arms(commands, j) {
+        Some(arms) => arms
+            .span
+            .iter()
+            .any(|&k| abandons_shell_where_reached(commands, k)),
+        None => true,
+    }
+}
+
+/// What [`reached_at_depth`] found walking a sequence.
+struct ReachedWalk {
+    /// The commands the shell reaches unconditionally, in order.
+    reached: Vec<usize>,
+    /// Whether the walk ended at a command it could NOT credit — one reached
+    /// through `&&` / `||` / `|` / `&` — that can end the shell all the same.
+    /// Nothing after such a command is reached on the path that takes it, so
+    /// a sequence ending this way must not be read as falling through.
+    abandoned: bool,
+}
+
+/// The commands the shell reaches UNCONDITIONALLY as it walks `sequence`, at
+/// that sequence's own nesting depth.
+///
+/// One walker, two callers, so a status consultation is only ever credited
+/// where an arm's propagating command would be: [`sequence_outcome`] grades a
+/// compound's arm with it, and [`captured_status_propagates`] walks the rest
+/// of the `run:` body with it.
+///
+/// - A command reached only through `&&`, `||`, `|` or `&` is conditional on
+///   what ran before it, so it is skipped and the walk goes on — UNLESS it can
+///   end the shell ([`abandons_shell_where_reached`], or
+///   [`compound_abandons_shell`] for a compound opened there), in which case
+///   the walk ends. The asymmetry is deliberate: a conditionally reached
+///   command proves nothing, so it can never COUNT as a consultation or as an
+///   arm's verdict, but `[ -f dist/skip ] && exit 0` still leaves the shell on
+///   the path that takes it, and nothing written after it is reached on that
+///   path. A BARE `[ -f dist/skip ] && exit` leaves it just as green, because
+///   the `$?` it re-raises after `&&` is the test's success. The walk records
+///   that it ended this way in [`ReachedWalk::abandoned`] rather than yielding
+///   the command.
+/// - A compound command opened at this depth (`if`, `while`, `until`, `for`,
+///   `select`, `case`) is yielded at its OPENER — the command carrying the
+///   condition, which is the only part of it at this depth — and every command
+///   it spans is then skipped: nothing inside an arm is reached
+///   unconditionally from out here. Stepping over it that way is only sound
+///   when the shell is certain to come back out, so a compound that can END
+///   the shell instead ([`compound_abandons_shell`]) ends the walk — as does
+///   one whose extent cannot be pinned down at all ([`compound_arms`] →
+///   `None`: an `elif`, a mismatched or missing terminator), since the walk
+///   no longer knows where this depth resumes.
+/// - A terminator word (`fi`, `done`, `esac`) at this depth belongs to an
+///   ENCLOSING compound — the nested ones were skipped whole — so control is
+///   leaving this depth and the walk ends there.
+/// - The walk ends at the first `exit` / `return` / `break`, which is yielded
+///   last: it is reached, and nothing written after it here is.
+///
+/// The arm index lists [`compound_arms`] builds hold only commands at the
+/// compound's own depth already — a nested compound among them appearing at
+/// its opener, which this walk steps over or stops at exactly as it does one
+/// found anywhere else.
+fn reached_at_depth(commands: &[ShellCommand], sequence: &[usize]) -> ReachedWalk {
+    let mut reached: Vec<usize> = Vec::new();
+    let mut skip_through: Option<usize> = None;
+    for &j in sequence {
+        if skip_through.is_some_and(|end| j <= end) {
+            continue;
+        }
+        if j > 0 && commands[j - 1].sep != Sep::Other {
+            // Conditionally reached: it cannot be credited, but it can still
+            // END the shell — `[ -f dist/skip ] && exit 0` before the
+            // re-raise publishes unsigned artifacts on the skip path — and
+            // then nothing after it is reached either. A BARE `exit` there
+            // does the same: after `&&` the status it inherits is the test's
+            // success ([`abandons_shell_where_reached`]).
+            if abandons_shell_where_reached(commands, j) {
+                return ReachedWalk {
+                    reached,
+                    abandoned: true,
+                };
+            }
+            if opens_compound(&commands[j].words).is_some() {
+                if compound_abandons_shell(commands, j) {
+                    return ReachedWalk {
+                        reached,
+                        abandoned: true,
+                    };
+                }
+                // It comes back out whether or not it runs, so it is stepped
+                // over WHOLE, exactly as one reached unconditionally is —
+                // nothing inside it belongs to this depth. `compound_arms`
+                // is known to answer here: a compound it cannot pin down is
+                // one `compound_abandons_shell` has already reported.
+                if let Some(end) = compound_arms(commands, j).and_then(|a| a.span.last().copied()) {
+                    skip_through = Some(end);
+                }
+            }
+            continue;
+        }
+        let words = &commands[j].words;
+        if closes_compound(words) {
+            break;
+        }
+        if opens_compound(words).is_some() {
+            reached.push(j);
+            // A compound is only STEPPED OVER when the shell is certain to
+            // come back out of it. One that can end the shell instead
+            // ([`compound_abandons_shell`]) ends the walk: everything after
+            // its terminator is written on the assumption that the arm which
+            // exits was not taken, and crediting it is how an `if
+            // [ "$SKIP" = true ]; then exit 0; fi` before the re-raise
+            // swallowed every signing failure.
+            if compound_abandons_shell(commands, j) {
+                break;
+            }
+            match compound_arms(commands, j).and_then(|arms| arms.span.last().copied()) {
+                Some(end) => skip_through = Some(end),
+                None => break,
+            }
+            continue;
+        }
+        reached.push(j);
+        if matches!(command_word(words), Some(("exit" | "return" | "break", _))) {
+            break;
+        }
+    }
+    ReachedWalk {
+        reached,
+        abandoned: false,
+    }
+}
+
+/// Whether a sequence of commands necessarily leaves the step failing.
+fn sequence_propagates(commands: &[ShellCommand], sequence: &[usize]) -> bool {
+    sequence_outcome(commands, sequence) == SequenceOutcome::Propagates
+}
+
+/// Whether the command at `j` ENDS the shell with the step passing — an
+/// `exit`/`return` that does not propagate (`exit 0`, `exit $?`, a status
+/// this recognizer cannot evaluate). Inside a loop body this is the escape
+/// nothing written after the loop can undo.
+fn abandons_shell(commands: &[ShellCommand], j: usize) -> bool {
+    let words = &commands[j].words;
+    matches!(command_word(words), Some(("exit" | "return", _))) && !command_propagates(words)
+}
+
+/// Whether the command at `j` ends the shell with the step passing ON THE
+/// PATH THAT REACHES IT — [`abandons_shell`], plus the one shape it cannot
+/// see on its own: an argument-less `exit` / `return` reached through `&&`.
+///
+/// A bare `exit` re-raises `$?`, which is why [`command_propagates`] reads it
+/// as propagating. That is true wherever the command is reached BECAUSE
+/// something failed — `[ "$rc" -eq 0 ] || exit` inherits the test's failure,
+/// an `else` arm inherits the failing condition's — and INVERTED after `&&`,
+/// where the branch runs only because the test SUCCEEDED, so the status it
+/// inherits is 0. `set +e`, sign, `rc=$?`, `[ -f dist/skip ] && exit`,
+/// `exit "$rc"` therefore ends green with the signing failed (bash and sh
+/// both exit 0 with the marker present), and so do its `&& return` and
+/// `until`-body / `else`-arm spellings.
+///
+/// Only the `&&` spelling: the `||` twin is genuinely sound and must keep
+/// propagating, so the inversion is scoped to the separator that causes it.
+/// A bare `exit` reached UNCONDITIONALLY is untouched too — nothing inverts
+/// there, and [`sequence_outcome`] still reads it as propagating.
+fn abandons_shell_where_reached(commands: &[ShellCommand], j: usize) -> bool {
+    abandons_shell(commands, j) || bare_exit_after_and(commands, j)
+}
+
+/// Whether the command at `j` is an argument-less `exit` / `return` the shell
+/// reaches through `&&`, whose inherited `$?` is the preceding command's
+/// SUCCESS rather than any failure.
+fn bare_exit_after_and(commands: &[ShellCommand], j: usize) -> bool {
+    j > 0
+        && commands[j - 1].sep == Sep::And
+        && matches!(
+            command_word(&commands[j].words),
+            Some(("exit" | "return", args)) if args.is_empty()
+        )
+}
+
+/// Whether the command at `j` is a `break` — which leaves the loop and hands
+/// control to whatever follows it. Looked for at ANY depth inside the loop:
+/// a `break` nested in an `if` escapes the loop exactly as a bare one does,
+/// and a `break` that only leaves an INNER loop is over-counted on purpose,
+/// which fails closed.
+fn breaks_loop(commands: &[ShellCommand], j: usize) -> bool {
+    matches!(command_word(&commands[j].words), Some(("break", _)))
+}
+
+/// Whether the compound command whose CONDITION the signing at `commands[i]`
+/// tests still fails the step when the signing fails.
+///
+/// The arm the shell takes when the signing fails is consulted FIRST, and
+/// only when it falls through does the command after the compound's
+/// terminator get a say: an arm that ENDS the shell without propagating
+/// (`else echo warn; exit 0; fi`) makes everything written after the
+/// terminator unreachable, so a propagating command there must not stand in
+/// for it ([`SequenceOutcome`]).
+///
+/// Which arm that is depends on the opener:
+///
+/// - `if cosign …; then … else …; fi` — the `else` arm, or the `then` arm
+///   when the test is negated (`if ! cosign …; then exit 1; fi`); either
+///   way the command after `fi` runs when the arm falls through.
+/// - `while cosign …; do …; done` — a failing condition ENDS the loop, so
+///   the failure arm is the command after `done` and the body is never it.
+/// - `until cosign …; do …; done` (and `while ! cosign …; do …; done`) — a
+///   failing condition runs the BODY, and the loop is left on that path only
+///   by a `break` or an abandoning `exit`. So the body is the failure arm:
+///   a body that propagates before anything in it escapes fails the step,
+///   and a body that neither propagates nor escapes cannot let the step pass
+///   with a failed signing either — it retries until the signing succeeds. A
+///   body holding an abandoning `exit`/`return` fails; a body holding a
+///   `break` hands the verdict to the command after `done`.
+///
+/// Anything this walk cannot establish structurally — an `elif` chain, an
+/// arm that only records the failure in a variable — comes back `false`,
+/// and the condition defect stands.
+fn condition_failure_propagates(commands: &[ShellCommand], i: usize, negated: bool) -> bool {
+    let Some(arms) = compound_arms(commands, i) else {
+        return false;
+    };
+    let after_propagates = || {
+        arms.after
+            .is_some_and(|j| sequence_propagates(commands, &[j]))
+    };
+    // A loop whose failing condition runs the body: `until cosign …; do`,
+    // and its `while ! cosign …; do` twin.
+    if matches!(arms.opener.as_str(), "while" | "until") && ((arms.opener == "until") != negated) {
+        if sequence_outcome(commands, &arms.body) == SequenceOutcome::Propagates {
+            // The body fails the step before anything in it can escape.
+            return true;
+        }
+        if compound_abandons_shell(commands, i) {
+            // An `exit 0` on the retry path ends the shell with the step
+            // passing, and nothing after `done` can undo that.
+            return false;
+        }
+        if arms.span.iter().any(|&j| breaks_loop(commands, j)) {
+            // The loop can be left with the signing still failing, so the
+            // command after `done` is what decides.
+            return after_propagates();
+        }
+        // Nothing escapes: the loop is left only when the signing succeeds
+        // or on a propagating command inside it, so a failed signing never
+        // reaches a passing step.
+        return true;
+    }
+    let taken = match arms.opener.as_str() {
+        "if" if negated => &arms.then_arm,
+        "if" => &arms.else_arm,
+        // A plain `while cosign …; do`: the failing condition ends the loop
+        // and the body is not the failure path, so only `after` speaks.
+        "while" | "until" => &[][..],
+        _ => return false,
+    };
+    match sequence_outcome(commands, taken) {
+        SequenceOutcome::Propagates => true,
+        SequenceOutcome::Terminates => false,
+        SequenceOutcome::FallsThrough => after_propagates(),
+    }
+}
+
+/// The parameter a word names — `$rc`, `${rc}` (the quotes of `"$rc"` are
+/// already gone by tokenisation) — or `None` when the word is not a plain
+/// parameter expansion. `$?`, `$1`, `${rc:-}` and `$(cmd)` all come back
+/// `None`: only a name this walk could have seen assigned counts.
+fn parameter_name(word: &str) -> Option<&str> {
+    let name = word.strip_prefix('$')?;
+    let name = match name.strip_prefix('{') {
+        Some(inner) => inner.strip_suffix('}')?,
+        None => name,
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .filter(|c| c.is_ascii_alphabetic() || *c == '_')?;
+    chars
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        .then_some(name)
+}
+
+/// The words that declare variables and take `NAME=VALUE` operands, so
+/// `local rc=$?` binds the status exactly as a bare `rc=$?` does.
+const DECLARATION_WORDS: &[&str] = &["local", "declare", "typeset", "export", "readonly"];
+
+/// The words of this command that assign a SHELL variable. A command with no
+/// command word is its own assignments (`rc=$?`), and a `local` / `declare` /
+/// `typeset` / `export` / `readonly` takes them as operands. The leading
+/// `VAR=value` of `VAR=value cmd` is not one: it is exported into that
+/// command's environment only, and never becomes a shell variable.
+fn shell_assignments(words: &[String]) -> &[String] {
+    match command_word(words) {
+        Some((word, args)) if DECLARATION_WORDS.contains(&word) => args,
+        Some(_) => &[],
+        None => words,
+    }
+}
+
+/// Whether this command consults one of the names `captured` holds — the
+/// shape a captured exit status is checked with. Only a parameter the walk
+/// saw assigned from the SIGNING's `$?` counts: a test of any other parameter
+/// says nothing about the signing.
+///
+/// Four spellings, because a guard written the idiomatic way is not a
+/// different guard: `[ "$rc" -ne 0 ]` and `test "$rc" -ne 0`, bash's
+/// `[[ "$rc" -ne 0 ]]` (which must close with its own `]]`), and the
+/// arithmetic `(( rc != 0 ))` (which must close with its own `))`) and
+/// `let "rc != 0"`.
+fn tests_captured_status(words: &[String], captured: &[&str]) -> bool {
+    let names_parameter = |args: &[String]| {
+        args.iter()
+            .filter_map(|a| parameter_name(a))
+            .any(|name| captured.contains(&name))
+    };
+    // Inside arithmetic a parameter is named bare as often as with a `$`
+    // (`(( rc != 0 ))`, `(( $rc != 0 ))`), needs no spaces around its
+    // operators (`((rc!=0))`), and `let "rc != 0"` leaves the whole
+    // expression in one word — so each word is split into the identifiers it
+    // holds and any one of them may be the captured name.
+    let names_operand = |args: &[String]| {
+        args.iter()
+            .flat_map(|w| w.split(|c: char| !c.is_ascii_alphanumeric() && c != '_'))
+            .any(|name| captured.contains(&name))
+    };
+    match command_word(words) {
+        Some(("[" | "test", args)) => names_parameter(args),
+        // `[[ … ]]` and `(( … ))` are bash's own; an unclosed one is not a
+        // test at all, and a `( ( … ) )` nested subshell is not arithmetic —
+        // the tokeniser keeps the adjacent pair apart from the separated one.
+        Some(("[[", args)) => args.last().is_some_and(|w| w == "]]") && names_parameter(args),
+        Some(("((", args)) => args.last().is_some_and(|w| w == "))") && names_operand(args),
+        Some(("let", args)) => names_operand(args),
+        _ => false,
+    }
+}
+
+/// Whether this command is an `exit` / `return` whose status is one of the
+/// names `captured` holds — `exit "$rc"`, `return $rc` — which makes the
+/// step's status the signing's by construction. Only the captured parameter
+/// counts: `exit 0` and `exit 1` say nothing about the signing, and a
+/// negated command's status is not the one it names.
+fn propagates_captured_status(words: &[String], captured: &[&str]) -> bool {
+    !negated(words)
+        && matches!(
+            command_word(words),
+            Some(("exit" | "return", args))
+                if args
+                    .first()
+                    .and_then(|a| parameter_name(a))
+                    .is_some_and(|name| captured.contains(&name))
+        )
+}
+
+/// Whether a command AFTER the signing at `commands[i]` propagates the
+/// status the body captured while `errexit` was off.
+///
+/// The status is only the SIGNING's in `$?` until the next command runs, so
+/// the walk first establishes WHICH parameter carries it: an assignment from
+/// `$?` in the command immediately after the signing (`rc=$?`, `RC=$?`, and
+/// the `local rc=$?` / `declare` / `typeset` / `export` / `readonly`
+/// spellings), reached unconditionally. A name so bound is invalidated the
+/// moment anything else is assigned to it, `rc=0` included. A parameter that
+/// cannot be traced to `$?` of the signing command does not count — which is
+/// what makes `set +e`, sign, `other=$?`, `exit "$other"` keep the defect.
+///
+/// Three shapes then propagate that parameter, all of which end the step on
+/// a failed signing:
+///
+/// - `exit "$rc"` / `return $rc` — the captured status becomes the step's.
+///   Only the captured parameter counts; `exit 0` and `exit 1` say nothing
+///   about the signing.
+/// - `[ "$rc" -eq 0 ] || exit 1` / `test "$rc" -ne 0 && exit 1`, and the
+///   `[[ "$rc" -ne 0 ]]` / `(( rc != 0 ))` / `let` spellings of the same
+///   ([`tests_captured_status`]) — a test of the captured parameter whose
+///   branch fails the step, either by propagating in its own right
+///   ([`or_branch_swallows`]) or by re-raising the captured parameter
+///   (`|| exit "$rc"` — [`propagates_captured_status`]). Which way the test
+///   reads is not evaluated, so either operator counts.
+/// - `if [ "$rc" -ne 0 ]; then exit 1; fi` — that same test in a condition,
+///   either of whose arms fails the step.
+///
+/// And only where the shell REACHES the consultation, at the signing's own
+/// depth ([`reached_at_depth`]): a consultation inside a nested compound's
+/// arm, one written after an `exit` that has already ended the shell, and one
+/// reached only through `&&` / `||` / `|` / `&` are each no consultation at
+/// all. The invalidation walk is the mirror image — an assignment that
+/// rebinds the name counts wherever it is written, reached or not, because a
+/// rebinding that cannot be ruled out has to be assumed.
+///
+/// Everything else — a status stashed and never consulted, a check written
+/// with a construct not listed here — comes back `false`, and the
+/// `errexit`-off defect stands.
+fn captured_status_propagates(commands: &[ShellCommand], i: usize) -> bool {
+    // Only a command the shell REACHES may be credited with the consultation,
+    // and only at the signing's own depth: the same model
+    // `condition_failure_propagates` grades an arm with
+    // ([`reached_at_depth`]). A consultation inside a nested compound's arm,
+    // one written after an `exit` that has already ended the shell, and one
+    // reached only through `&&` / `||` / `|` / `&` are each unreachable here.
+    let reached = reached_at_depth(commands, &(i + 1..commands.len()).collect::<Vec<_>>()).reached;
+    let mut captured: Vec<&str> = Vec::new();
+    for (j, command) in commands.iter().enumerate().skip(i + 1) {
+        let words = &command.words;
+        // The status of the signing command survives only into the command
+        // that immediately follows it, and only when the shell reaches that
+        // command unconditionally.
+        let captures_here = j == i + 1 && commands[i].sep == Sep::Other;
+        for word in shell_assignments(words) {
+            if !is_shell_assignment(word) {
+                continue;
+            }
+            let Some((name, value)) = word.split_once('=') else {
+                continue;
+            };
+            captured.retain(|held| *held != name);
+            if captures_here && value == "$?" {
+                captured.push(name);
+            }
+        }
+        // An assignment ANYWHERE after the capture invalidates the name it
+        // rebinds — that walk is deliberately not limited to what the shell
+        // reaches, since a rebinding the walk cannot rule out is one it must
+        // assume. Crediting a consultation is the opposite: it needs proof.
+        if !reached.contains(&j) {
+            continue;
+        }
+        if negated(words) {
+            continue;
+        }
+        if propagates_captured_status(words, &captured) {
+            return true;
+        }
+        if !tests_captured_status(words, &captured) {
+            continue;
+        }
+        // The branch of a captured-status test fails the step either by
+        // being a propagating command in its own right
+        // ([`or_branch_swallows`] → `None`) or by re-raising the captured
+        // parameter — `|| exit "$rc"`, the most idiomatic spelling there is,
+        // which `command_propagates` cannot see because `$rc` is not a
+        // literal non-zero status. It propagates by construction: the shell's
+        // status becomes the signing's.
+        // The one branch shape that is unsound in BOTH readings of the test,
+        // and so is decided here rather than left to the disclosed
+        // "which way a test reads is not evaluated" limit: a BARE `exit` /
+        // `return` after `&&`. It re-raises the TEST's success, so
+        // `[ "$rc" -eq 0 ] && exit` exits 0 when the signing succeeded and
+        // falls through when it failed, and `[ "$rc" -ne 0 ] && exit` exits 0
+        // even on failure. After `||` the same bare `exit` re-raises the
+        // test's FAILURE and is sound, which is why the guard names `&&` only.
+        if matches!(command.sep, Sep::Or | Sep::And)
+            && !bare_exit_after_and(commands, j + 1)
+            && (or_branch_swallows(commands, j + 1).is_none()
+                || commands
+                    .get(j + 1)
+                    .is_some_and(|branch| propagates_captured_status(&branch.words, &captured)))
+        {
+            return true;
+        }
+        if in_condition(words) {
+            if let Some(arms) = compound_arms(commands, j) {
+                if sequence_propagates(commands, &arms.then_arm)
+                    || sequence_propagates(commands, &arms.else_arm)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The index of the `||` branch that terminates the AND-OR list the command
+/// at `i` opens with `&&`, or `None` when the list is terminated by a real
+/// command terminator instead.
+///
+/// `cosign … && echo ok || true` runs the `|| true` when the SIGNING fails
+/// too — `&&` short-circuits to the list's `||` branch — so that branch
+/// swallows the signing failure exactly as an immediate `|| true` would,
+/// and reading only the separator that ends the signing command misses it.
+/// The walk follows `&&` links (`&& a && b || true`) and stops at the first
+/// command whose separator is not `&&`: a newline, `;` or end of input
+/// ([`Sep::Other`]) ends the list with the signing status intact, and a `&`
+/// ([`Sep::Background`]) or `|` ([`Sep::Pipe`]) is a different construct this
+/// walk does not model.
+fn and_or_tail_branch(commands: &[ShellCommand], i: usize) -> Option<usize> {
+    let mut k = i;
+    while matches!(commands.get(k)?.sep, Sep::And) {
+        k += 1;
+    }
+    matches!(commands.get(k)?.sep, Sep::Or).then_some(k + 1)
+}
+
+/// Whether the command at `i` is a bare `wait $!` on the job just
+/// backgrounded — `wait "$!"` and `wait $!` both tokenise to the single word
+/// `$!` — which propagates THAT job's exit status, so `-e` sees a failed
+/// signing after all.
+///
+/// Fail-closed everywhere else: `wait` with no argument (which waits for
+/// every job and yields 0), `wait $PID` or `wait %1` (a PID this recognizer
+/// cannot tie to the signing command), a negated `! wait $!`, and a `wait $!`
+/// that is itself piped, backgrounded or followed by a `||` branch all leave
+/// the backgrounding defect standing.
+fn waits_on_backgrounded_signing(commands: &[ShellCommand], i: usize) -> bool {
+    let Some(command) = commands.get(i) else {
+        return false;
+    };
+    command.sep == Sep::Other
+        && !negated(&command.words)
+        && matches!(
+            command_word(&command.words),
+            Some(("wait", [pid])) if pid == "$!"
+        )
 }
 
 /// What the `cosign sign` invocations in a step's `run:` body amount to:
@@ -1191,9 +2248,23 @@ fn sets_pipefail(command: &ShellCommand) -> bool {
 /// and a `--bundle` on the next command of a `;`/`&&`/`|` chain are none of
 /// them signing with a bundle. `cosign verify-blob` (the deploy-gate side)
 /// is not a signing invocation and does not match. A signing command that
-/// is negated with `!`, followed by `||` and anything other than `exit` /
-/// `return` / `false` / `kill` / `{` / `(` (so `|| true`, `|| :`, `|| echo
-/// warn`, `|| continue` all swallow), piped into another command with no
+/// is negated with `!` outside a condition, sitting in a compound command's
+/// CONDITION (see [`in_condition`] — `if cosign …; then`,
+/// `while`/`until cosign …; do`) whose failure path leaves the step passing
+/// (see [`condition_failure_propagates`] — the arm taken when the signing
+/// fails must propagate, and only where it falls through does the command
+/// after the compound get a say),
+/// followed by a `||` branch that does not fail the
+/// step (see [`or_branch_swallows`] — `|| true`, `|| :`, `|| echo warn`,
+/// `|| continue`, `|| exit 0`, `|| FAILED=1`, `|| { echo warn; }` all
+/// swallow) either immediately or at the end of the AND-OR list it opens with
+/// `&&` (see [`and_or_tail_branch`] — `&& echo ok || true`), backgrounded with
+/// a single unpaired `&` and not immediately waited on with `wait $!`
+/// (see [`waits_on_backgrounded_signing`]), reached with `errexit`
+/// turned off by an earlier `set +e` / `set +o errexit` /
+/// `shopt -o -u errexit` and no later command that propagates the captured
+/// status (see [`captured_status_propagates`]), piped into another command
+/// with no
 /// `set -o pipefail` before it, or preceded in the same body by a function
 /// or alias named `cosign`, is reported as such.
 fn cosign_sign_in_run(run: &str) -> Option<SigningShortfalls> {
@@ -1218,28 +2289,44 @@ fn cosign_sign_in_run(run: &str) -> Option<SigningShortfalls> {
         {
             shortfalls.unbundled = true;
         }
-        if negated(&command.words) {
+        let negated = negated(&command.words);
+        if in_condition(&command.words) {
+            // In condition position the `!` IS the conditional's test, not a
+            // status inversion, so the negation gate stays quiet and the
+            // compound is judged instead — for a negated test the `then` arm
+            // is the one taken on failure.
+            if !condition_failure_propagates(&commands, i, negated) {
+                shortfalls.in_condition = true;
+            }
+        } else if negated {
             shortfalls.negated = true;
+        }
+        if errexit_off_before(&commands, i) && !captured_status_propagates(&commands, i) {
+            shortfalls.errexit_off = true;
         }
         match command.sep {
             Sep::Or => {
-                if let Some(next) = commands.get(i + 1) {
-                    // `{` and `(` are compound openers the command-word walk
-                    // steps over; here they are the answer.
-                    let first = next.words.first().map(String::as_str);
-                    let word = if matches!(first, Some("{" | "(")) {
-                        first
-                    } else {
-                        command_word(&next.words).map(|(w, _)| w)
-                    };
-                    if let Some(word) = word.filter(|w| !FAILURE_PROPAGATING_WORDS.contains(w)) {
-                        shortfalls.failure_ignored = Some(word.to_string());
+                if let Some(word) = or_branch_swallows(&commands, i + 1) {
+                    shortfalls.failure_ignored = Some(word);
+                }
+            }
+            // `&&` short-circuits to the branch that terminates the AND-OR
+            // list, so that branch swallows a failed signing too.
+            Sep::And => {
+                if let Some(branch) = and_or_tail_branch(&commands, i) {
+                    if let Some(word) = or_branch_swallows(&commands, branch) {
+                        shortfalls.failure_ignored = Some(word);
                     }
                 }
             }
             Sep::Pipe => {
                 if !commands[..i].iter().any(sets_pipefail) {
                     shortfalls.piped = true;
+                }
+            }
+            Sep::Background => {
+                if !waits_on_backgrounded_signing(&commands, i + 1) {
+                    shortfalls.backgrounded = true;
                 }
             }
             Sep::Other => {}
@@ -1458,10 +2545,32 @@ fn sigstore_job_evidence(doc: &Yaml, job_id: &str, job: &Yaml, at: &str) -> JobE
                  inverted, so a failed signing reads as success"
             ));
         }
+        if shortfalls.in_condition {
+            defects.push(format!(
+                "{step_at}: the signing command is in the condition of `if`/`while` — its exit \
+                 status is consumed by the conditional, and the branch taken when it fails does \
+                 not fail the step (nor, where that branch falls through to it, the command \
+                 after the compound)"
+            ));
+        }
         if let Some(word) = &shortfalls.failure_ignored {
             defects.push(format!(
                 "{step_at}: the signing command is followed by `|| {word}` — a failed signing \
                  is swallowed and the step succeeds with an unsigned artifact"
+            ));
+        }
+        if shortfalls.backgrounded {
+            defects.push(format!(
+                "{step_at}: the signing command is backgrounded with `&` — its exit status is \
+                 never the step's"
+            ));
+        }
+        if shortfalls.errexit_off {
+            defects.push(format!(
+                "{step_at}: `set +e` (or `set +o errexit`, or `shopt -o -u errexit`) precedes \
+                 the signing command in the `run:` body and no later command propagates the \
+                 captured status — a failed signing does not end the step, and the body's last \
+                 command decides its status"
             ));
         }
         if shortfalls.piped && !shell_sets_pipefail(shell) {
@@ -4942,11 +6051,11 @@ mod tests {
                 Sep::Other,
                 Sep::Pipe,
                 Sep::Other,
-                Sep::Other,
+                Sep::And,
                 Sep::Other,
                 Sep::Other
             ],
-            "one `|` (echo into grep) and no `||` anywhere in this script"
+            "one `|` (echo into grep), one `&&`, and no `||` anywhere in this script"
         );
         assert_eq!(
             cosign_sign_in_run(script),
@@ -4968,6 +6077,22 @@ mod tests {
                 .failure_ignored
                 .as_deref(),
             Some("true")
+        );
+        // A single unpaired `&` is its own separator; `&&` is [`Sep::And`]
+        // and the `&` of a redirection is part of its word.
+        let backgrounded = shell_commands("a & b && c\nd 2>&1 & e &>log");
+        assert_eq!(
+            backgrounded
+                .iter()
+                .map(|c| (c.words.clone(), c.sep))
+                .collect::<Vec<_>>(),
+            vec![
+                (vec!["a".to_string()], Sep::Background),
+                (vec!["b".to_string()], Sep::And),
+                (vec!["c".to_string()], Sep::Other),
+                (vec!["d".to_string(), "2>&1".to_string()], Sep::Background),
+                (vec!["e".to_string(), "&>log".to_string()], Sep::Other),
+            ]
         );
         assert_eq!(cosign_sign_in_run("echo cosign sign-blob --bundle"), None);
         assert_eq!(
@@ -5091,6 +6216,113 @@ mod tests {
                 format!("{COSIGN_SIGN_BUNDLED} || FAILED=1 true"),
                 "the signing command is followed by `|| true`",
             ),
+            // A branch made only of `NAME=VALUE` assignments has no command
+            // word at all: the assignments run, the branch exits 0, and the
+            // failure is swallowed. The message quotes the branch as written.
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || FAILED=1"),
+                "the signing command is followed by `|| FAILED=1` — a failed signing is \
+                 swallowed and the step succeeds with an unsigned artifact",
+            ),
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || RC=$?"),
+                "the signing command is followed by `|| RC=$?` — a failed signing is swallowed",
+            ),
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || VAR=1 other=2"),
+                "the signing command is followed by `|| VAR=1 other=2` — a failed signing is \
+                 swallowed",
+            ),
+            // `|| exit 0` / `|| return 0` leave the step passing: only a
+            // NON-ZERO status propagates, and the message quotes the status
+            // that was written.
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || exit 0"),
+                "the signing command is followed by `|| exit 0` — a failed signing is \
+                 swallowed and the step succeeds with an unsigned artifact",
+            ),
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || return 0"),
+                "the signing command is followed by `|| return 0` — a failed signing is \
+                 swallowed",
+            ),
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || exit $?"),
+                "the signing command is followed by `|| exit $?`",
+            ),
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || exit 256"),
+                "the signing command is followed by `|| exit 256`",
+            ),
+            // A `{ …; }` / `( … )` group is judged by the status it leaves
+            // behind — its LAST command.
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || {{ echo warn; }}"),
+                "the signing command is followed by `|| {` — a failed signing is swallowed",
+            ),
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || ( echo warn )"),
+                "the signing command is followed by `|| (` — a failed signing is swallowed",
+            ),
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || {{ echo warn; exit 0; }}"),
+                "the signing command is followed by `|| {`",
+            ),
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || ( echo warn"),
+                "the signing command is followed by `|| (`",
+            ),
+            // A single unpaired `&` detaches the command: the shell's status
+            // is the `&`'s, which is always 0, so `-e` never sees a failure.
+            (
+                format!("{COSIGN_SIGN_BUNDLED} &"),
+                "the signing command is backgrounded with `&` — its exit status is never \
+                 the step's",
+            ),
+            (
+                format!("{COSIGN_SIGN_BUNDLED} & wait"),
+                "the signing command is backgrounded with `&`",
+            ),
+            // `set +e` / `set +o errexit` earlier in the body turns off the
+            // fail-fast GitHub starts every POSIX `run:` with.
+            (
+                format!("set +e\n            {COSIGN_SIGN_BUNDLED}\n            echo done"),
+                "`set +e` (or `set +o errexit`, or `shopt -o -u errexit`) precedes the signing \
+                 command in the `run:` body and no later command propagates the captured \
+                 status — a failed signing does not end the step, and the body's last command \
+                 decides its status",
+            ),
+            (
+                format!("set +o errexit\n            {COSIGN_SIGN_BUNDLED}"),
+                "precedes the signing command in the `run:` body",
+            ),
+            (
+                format!("set -e\n            set +e\n            {COSIGN_SIGN_BUNDLED}"),
+                "precedes the signing command in the `run:` body",
+            ),
+            // `shopt -o` addresses the `set -o` namespace, so `shopt -o -u
+            // errexit` turns fail-fast off exactly as `set +e` does — in
+            // either flag order, and as one cluster.
+            (
+                format!("shopt -o -u errexit\n            {COSIGN_SIGN_BUNDLED}"),
+                "`set +e` (or `set +o errexit`, or `shopt -o -u errexit`) precedes the signing \
+                 command",
+            ),
+            (
+                format!("shopt -u -o errexit\n            {COSIGN_SIGN_BUNDLED}"),
+                "precedes the signing command in the `run:` body",
+            ),
+            (
+                format!("shopt -ou errexit\n            {COSIGN_SIGN_BUNDLED}"),
+                "precedes the signing command in the `run:` body",
+            ),
+            (
+                format!(
+                    "set -euo pipefail\n            shopt -o -s errexit\n            \
+                     shopt -o -u errexit\n            {COSIGN_SIGN_BUNDLED}"
+                ),
+                "precedes the signing command in the `run:` body",
+            ),
             // A pipe hands the step the LAST command's exit status: without
             // `pipefail` a failed signing whose output `tee` copied is a
             // success.
@@ -5152,6 +6384,34 @@ mod tests {
             format!("{COSIGN_SIGN_BUNDLED} || false"),
             format!("{COSIGN_SIGN_BUNDLED} || kill -TERM $$"),
             format!("{COSIGN_SIGN_BUNDLED} || ( echo failed; exit 1 )"),
+            format!("{COSIGN_SIGN_BUNDLED} || exit 2"),
+            format!("{COSIGN_SIGN_BUNDLED} || return 255"),
+            format!("{COSIGN_SIGN_BUNDLED} || {{ echo warn; false; }}"),
+            format!("{COSIGN_SIGN_BUNDLED} || ( echo warn; kill $$ )"),
+            // `&&` is not a background `&`, and neither is the `&` of a
+            // redirection — that hole stays closed.
+            format!("{COSIGN_SIGN_BUNDLED} && echo signed"),
+            format!("{COSIGN_SIGN_BUNDLED} 2>&1"),
+            format!("{COSIGN_SIGN_BUNDLED} >&2"),
+            format!("{COSIGN_SIGN_BUNDLED} &>sign.log"),
+            // A later `set -e` re-enables fail-fast, and `set -uo pipefail`
+            // — the shipped template's own line — never touched it.
+            format!("set +e\n            set -e\n            {COSIGN_SIGN_BUNDLED}"),
+            format!("set -uo pipefail\n            {COSIGN_SIGN_BUNDLED}"),
+            format!("{COSIGN_SIGN_BUNDLED}\n            set +e"),
+            // `shopt -o -s errexit` puts fail-fast back, and a `shopt`
+            // without `-o` (or without `-s`/`-u`) never touched it.
+            format!(
+                "shopt -o -u errexit\n            shopt -o -s errexit\n            \
+                 {COSIGN_SIGN_BUNDLED}"
+            ),
+            format!("shopt -u nullglob\n            {COSIGN_SIGN_BUNDLED}"),
+            format!("shopt -p -o errexit\n            {COSIGN_SIGN_BUNDLED}"),
+            format!("shopt -o -u nounset\n            {COSIGN_SIGN_BUNDLED}"),
+            // `--` ends `set`'s options: `set -- +e` assigns `$1`, it does
+            // not turn `errexit` off.
+            format!("set -euo pipefail\n            set -- +e\n            {COSIGN_SIGN_BUNDLED}"),
+            format!("set -e\n            set -- +e -x\n            {COSIGN_SIGN_BUNDLED}"),
             format!("set -o pipefail\n            {COSIGN_SIGN_BUNDLED} | tee -a sign.log"),
             format!("set -euo pipefail\n            {COSIGN_SIGN_BUNDLED} | tee -a sign.log"),
             format!("printf '%s\\n' \"$f\" | {COSIGN_SIGN_BUNDLED}"),
@@ -5261,6 +6521,1731 @@ mod tests {
                 "`|| {propagating}` propagates the failure"
             );
         }
+    }
+
+    /// Gate (c), the three runtime suppressions the `||`-word whitelist and
+    /// the `&`-as-`;` tokenisation used to let through: a backgrounded
+    /// signing command, a `set +e` before it, and an `||` branch that ends
+    /// with a zero (or unknown) status. Judged at the recognizer level, so
+    /// the exact shortfall is pinned, not just the verdict.
+    #[test]
+    fn backgrounding_errexit_off_and_zero_status_or_branches_are_shortfalls() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+
+        // (1) `&` detaches the command from `-e`, exactly as `||` does.
+        assert!(shortfalls(&format!("{COSIGN_SIGN_BUNDLED} &")).backgrounded);
+        assert!(shortfalls(&format!("{COSIGN_SIGN_BUNDLED} & echo done")).backgrounded);
+        for kept in [
+            format!("{COSIGN_SIGN_BUNDLED} && echo done"),
+            format!("{COSIGN_SIGN_BUNDLED} 2>&1"),
+            format!("{COSIGN_SIGN_BUNDLED} >&2"),
+            format!("{COSIGN_SIGN_BUNDLED} &>log"),
+            format!("{COSIGN_SIGN_BUNDLED}; echo done"),
+        ] {
+            assert!(
+                !shortfalls(&kept).backgrounded,
+                "{kept:?} does not background the signing command"
+            );
+        }
+
+        // (2) `set +e` before it, honouring order — a later `set -e` undoes
+        // it, and a `set +e` AFTER the signing command changes nothing.
+        for off in [
+            "set +e",
+            "set +o errexit",
+            "set -e\nset +e",
+            "set +ex",
+            "set -euo pipefail\nset +e",
+            "shopt -o -u errexit",
+            "shopt -u -o errexit",
+            "shopt -ou errexit",
+            "shopt -o -s errexit\nshopt -o -u errexit",
+            "set -e\nshopt -o -u errexit",
+        ] {
+            assert!(
+                shortfalls(&format!("{off}\n{COSIGN_SIGN_BUNDLED}")).errexit_off,
+                "{off:?} turns errexit off"
+            );
+        }
+        for on in [
+            "set -e",
+            "set +e\nset -e",
+            "set +e\nset -o errexit",
+            "set -uo pipefail",
+            "set +o pipefail",
+            "set +x",
+            "shopt -s nullglob",
+            "shopt -u errexit",
+            "shopt -o -p errexit",
+            "shopt -o -u nounset",
+            "shopt -o -u errexit\nshopt -o -s errexit",
+            "shopt -o -u errexit\nset -e",
+            "set -- +e",
+            "set -euo pipefail\nset -- +e",
+        ] {
+            assert!(
+                !shortfalls(&format!("{on}\n{COSIGN_SIGN_BUNDLED}")).errexit_off,
+                "{on:?} leaves errexit on"
+            );
+        }
+        assert!(!shortfalls(&format!("{COSIGN_SIGN_BUNDLED}\nset +e")).errexit_off);
+        assert_eq!(options_toggle_errexit(["-x"]), None);
+        assert_eq!(options_toggle_errexit(["--"]), None);
+        assert_eq!(options_toggle_errexit(["+o"]), None, "no option name");
+        assert_eq!(options_toggle_errexit(["-o", "errexit"]), Some(true));
+        assert_eq!(options_toggle_errexit(["+o", "errexit"]), Some(false));
+        // `--` ends the option list: everything after it is an operand.
+        assert_eq!(options_toggle_errexit(["--", "+e"]), None);
+        assert_eq!(options_toggle_errexit(["--", "-o", "errexit"]), None);
+        assert_eq!(options_toggle_errexit(["-e", "--", "+e"]), Some(true));
+        // `shopt` reaches `errexit` only through `-o`, and only with a
+        // `-s`/`-u` that says which way.
+        assert_eq!(shopt_toggle_errexit(["-o", "-u", "errexit"]), Some(false));
+        assert_eq!(shopt_toggle_errexit(["-u", "-o", "errexit"]), Some(false));
+        assert_eq!(shopt_toggle_errexit(["-ou", "errexit"]), Some(false));
+        assert_eq!(shopt_toggle_errexit(["-o", "-s", "errexit"]), Some(true));
+        assert_eq!(shopt_toggle_errexit(["-u", "errexit"]), None, "no `-o`");
+        assert_eq!(
+            shopt_toggle_errexit(["-o", "errexit"]),
+            None,
+            "no `-s`/`-u`"
+        );
+        assert_eq!(shopt_toggle_errexit(["-o", "-u", "nounset"]), None);
+        assert_eq!(shopt_toggle_errexit(["-s", "nullglob"]), None);
+
+        // (3) Only a non-zero literal status propagates, and a group is
+        // judged by the status its LAST command leaves.
+        for swallowing in [
+            ("|| exit 0", "exit 0"),
+            ("|| return 0", "return 0"),
+            ("|| exit 00", "exit 00"),
+            ("|| exit 256", "exit 256"),
+            ("|| exit $?", "exit $?"),
+            ("|| return $status", "return $status"),
+            ("|| { echo warn; }", "{"),
+            ("|| ( echo warn )", "("),
+            ("|| { echo warn; exit 0; }", "{"),
+            ("|| ( echo warn; ! false )", "("),
+            ("|| ( echo warn", "("),
+            ("|| { echo warn )", "{"),
+            ("|| {", "{"),
+        ] {
+            let (branch, named) = swallowing;
+            assert_eq!(
+                shortfalls(&format!("{COSIGN_SIGN_BUNDLED} {branch}"))
+                    .failure_ignored
+                    .as_deref(),
+                Some(named),
+                "`{branch}` swallows the failure"
+            );
+        }
+        for propagating in [
+            "|| exit 2",
+            "|| exit -1",
+            "|| return 255",
+            "|| { echo warn; false; }",
+            "|| ( echo warn; kill $$ )",
+            "|| { { echo warn; }; exit 1; }",
+        ] {
+            assert_eq!(
+                shortfalls(&format!("{COSIGN_SIGN_BUNDLED} {propagating}")).failure_ignored,
+                None,
+                "`{propagating}` still fails the step"
+            );
+        }
+        // A `||` branch with no command word at all — every word a
+        // `NAME=VALUE` assignment — runs the assignments and exits 0, so it
+        // swallows the failure and is named exactly as it was written.
+        for (branch, named) in [
+            ("|| FAILED=1", "FAILED=1"),
+            ("|| RC=$?", "RC=$?"),
+            ("|| VAR=1 other=2", "VAR=1 other=2"),
+            ("|| _rc=$?", "_rc=$?"),
+        ] {
+            assert_eq!(
+                shortfalls(&format!("{COSIGN_SIGN_BUNDLED} {branch}"))
+                    .failure_ignored
+                    .as_deref(),
+                Some(named),
+                "`{branch}` swallows the failure"
+            );
+        }
+    }
+
+    /// Gate (c), CONDITION position: `if`, `elif`, `while` and `until` are
+    /// transparent prefixes to [`command_word`], so a signing command reached
+    /// through one of them used to read as the step's signing command. It is
+    /// not: the conditional consumes its exit status, so
+    /// `if cosign sign-blob f --bundle b; then :; fi` passed with an unsigned
+    /// artifact. The BODY openers (`then`, `do`, `else`) are unaffected — a
+    /// signing command there does own the step's status.
+    #[test]
+    fn a_signing_command_in_a_conditions_position_is_defective() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+        let condition_needle = "the signing command is in the condition of `if`/`while` — its \
+                                exit status is consumed by the conditional, and the branch taken \
+                                when it fails does not fail the step (nor, where that branch \
+                                falls through to it, the command after the compound)";
+
+        for body in [
+            format!("if {COSIGN_SIGN_BUNDLED}; then :; fi"),
+            format!("if false; then :; elif {COSIGN_SIGN_BUNDLED}; then :; fi"),
+            format!("while {COSIGN_SIGN_BUNDLED}; do break; done"),
+            format!("until {COSIGN_SIGN_BUNDLED}; do break; done"),
+            // The keyword survives the wrappers `command_index` also skips.
+            format!("if env COSIGN_YES=1 {COSIGN_SIGN_BUNDLED}; then :; fi"),
+        ] {
+            let s = shortfalls(&body);
+            assert!(s.in_condition, "{body:?} signs in a condition");
+            assert!(!s.negated, "{body:?} is not negated");
+        }
+
+        // A body opener is not a condition opener: `then`, `do` and `else`
+        // leave the signing command owning the step's status.
+        for body in [
+            format!("if [ -f f ]; then {COSIGN_SIGN_BUNDLED}; fi"),
+            format!("for f in dist/*; do {COSIGN_SIGN_BUNDLED}; done"),
+            format!("if [ -f f ]; then :; else {COSIGN_SIGN_BUNDLED}; fi"),
+            format!("while read -r f; do {COSIGN_SIGN_BUNDLED}; done"),
+            COSIGN_SIGN_BUNDLED.to_string(),
+        ] {
+            assert!(
+                !shortfalls(&body).in_condition,
+                "{body:?} signs in a body, not a condition"
+            );
+        }
+
+        // In condition position the `!` IS the conditional's test, so the
+        // negation gate stays quiet — a `!` there inverts nothing the step
+        // sees. `if ! cosign …; then :; fi` still fails, once, as a
+        // condition defect.
+        let negated_in_condition = shortfalls(&format!("if ! {COSIGN_SIGN_BUNDLED}; then :; fi"));
+        assert!(!negated_in_condition.negated);
+        assert!(negated_in_condition.in_condition);
+
+        // In a workflow: the condition shape fails, once, with its own
+        // message; the negated one fails once with the negation message and
+        // never mentions the condition.
+        for (cmd, needle, absent) in [
+            (
+                format!("if {COSIGN_SIGN_BUNDLED}; then :; fi"),
+                condition_needle,
+                "negated with `!`",
+            ),
+            (
+                format!("while {COSIGN_SIGN_BUNDLED}; do break; done"),
+                condition_needle,
+                "negated with `!`",
+            ),
+            (
+                format!("until {COSIGN_SIGN_BUNDLED}; do break; done"),
+                condition_needle,
+                "negated with `!`",
+            ),
+            // A `!` in the condition is the test, not a status inversion:
+            // this fails as a condition defect and never claims the status
+            // was inverted.
+            (
+                format!("if ! {COSIGN_SIGN_BUNDLED}; then :; fi"),
+                condition_needle,
+                "negated with `!`",
+            ),
+            // Outside a condition the `!` still inverts the status, and the
+            // negation message is the one that lands.
+            (
+                format!("! {COSIGN_SIGN_BUNDLED}"),
+                "the signing command is negated with `!` — its exit status is inverted, so a \
+                 failed signing reads as success",
+                condition_needle,
+            ),
+        ] {
+            let (_d, ctx) = consolidated_repo(
+                "sigstore-signing",
+                &release_workflow(
+                    RELEASE_JOB_PERMISSIONS,
+                    &cosign_sign_steps(COSIGN_INSTALLER_SHA, &cmd),
+                ),
+            );
+            let result = verify_template_control(&ctx, "sigstore-signing");
+            assert_eq!(
+                result.outcome,
+                Outcome::Fail,
+                "{cmd:?} must fail: {:?}",
+                result.messages
+            );
+            assert_message(&result, needle);
+            assert_no_message(&result, absent);
+            assert_eq!(
+                result
+                    .messages
+                    .iter()
+                    .filter(|m| m.contains(needle))
+                    .count(),
+                1,
+                "{cmd:?} must name the defect once: {:?}",
+                result.messages
+            );
+        }
+    }
+
+    /// Gate (c), CONDITION position, the sound half: a conditional that
+    /// CHECKS the signing and fails the step on the failing path is the
+    /// canonical "check and fail" idiom, not a suppression. The gate reports
+    /// the condition only when the failure path is silent, so
+    /// `if cosign …; then echo signed; else exit 1; fi` and its negated twin
+    /// `if ! cosign …; then exit 1; fi` pass.
+    #[test]
+    fn a_condition_whose_failure_path_fails_the_step_is_sound() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+
+        for body in [
+            // The `else` arm runs when the signing fails.
+            format!("if {COSIGN_SIGN_BUNDLED}; then echo signed; else exit 1; fi"),
+            format!("if {COSIGN_SIGN_BUNDLED}; then echo signed; else echo failed; exit 1; fi"),
+            format!("if {COSIGN_SIGN_BUNDLED}; then echo signed; else false; fi"),
+            // Negated: the `then` arm is the one taken on failure, and the
+            // `!` is the conditional's test, not a status inversion.
+            format!("if ! {COSIGN_SIGN_BUNDLED}; then exit 1; fi"),
+            format!("if ! {COSIGN_SIGN_BUNDLED}; then echo failed; exit 1; fi"),
+            format!("if ! {COSIGN_SIGN_BUNDLED}; then return 3; fi"),
+            // Multi-line, as a real workflow writes it.
+            format!(
+                "if {COSIGN_SIGN_BUNDLED}; then\n  echo signed\nelse\n  \
+                 echo 'signing failed'\n  exit 1\nfi"
+            ),
+            // The command AFTER the compound ends the step either way.
+            format!("if {COSIGN_SIGN_BUNDLED}; then echo signed; fi\nexit 1"),
+        ] {
+            let s = shortfalls(&body);
+            assert!(
+                !s.in_condition,
+                "{body:?} fails the step when signing fails"
+            );
+            assert!(!s.negated, "{body:?} does not invert the step's status");
+        }
+
+        // And the shapes where no propagation can be established keep
+        // failing — an arm that only records the failure, a loop, an `elif`
+        // chain, an `exit 0` that reaches the arm's `exit 1` first, and a
+        // propagating command the shell reaches only conditionally.
+        for body in [
+            format!("if {COSIGN_SIGN_BUNDLED}; then echo signed; fi"),
+            format!("if {COSIGN_SIGN_BUNDLED}; then echo signed; else FAILED=1; fi"),
+            format!("if ! {COSIGN_SIGN_BUNDLED}; then echo failed; fi"),
+            format!("if ! {COSIGN_SIGN_BUNDLED}; then exit 0; exit 1; fi"),
+            format!("if ! {COSIGN_SIGN_BUNDLED}; then echo failed && exit 1; fi"),
+            format!("while {COSIGN_SIGN_BUNDLED}; do break; done"),
+            format!("until {COSIGN_SIGN_BUNDLED}; do break; done\nexit 0"),
+            format!("if false; then :; elif {COSIGN_SIGN_BUNDLED}; then exit 1; fi"),
+            // An arm's own nested compound is not the arm: the inner
+            // `exit 1` is reached only when the inner test passes.
+            format!("if {COSIGN_SIGN_BUNDLED}; then :; else if [ -f f ]; then exit 1; fi; fi"),
+            // Never closed, so the compound's shape is not established.
+            format!("if {COSIGN_SIGN_BUNDLED}; then echo signed; else exit 1"),
+        ] {
+            assert!(
+                shortfalls(&body).in_condition,
+                "{body:?} leaves the step passing on a failed signing"
+            );
+        }
+
+        // In a workflow, the sound shape produces no defect at all.
+        for cmd in [
+            format!("if {COSIGN_SIGN_BUNDLED}; then echo signed; else exit 1; fi"),
+            format!("if ! {COSIGN_SIGN_BUNDLED}; then exit 1; fi"),
+        ] {
+            let (_d, ctx) = consolidated_repo(
+                "sigstore-signing",
+                &release_workflow(
+                    RELEASE_JOB_PERMISSIONS,
+                    &cosign_sign_steps(COSIGN_INSTALLER_SHA, &cmd),
+                ),
+            );
+            let result = verify_template_control(&ctx, "sigstore-signing");
+            assert_eq!(
+                result.outcome,
+                Outcome::Pass,
+                "{cmd:?} must pass: {:?}",
+                result.messages
+            );
+        }
+    }
+
+    /// Gate (c), `errexit` off: the captured status must be the SIGNING's.
+    ///
+    /// The first narrowing accepted an `exit`/`return` on ANY parameter and a
+    /// `[ … ]` / `test` on ANY parameter, which established nothing: taking
+    /// this repo's own signing loop, dropping its `|| { …; exit 1; }` guard
+    /// and wrapping it in `set +e` … `RC=0` … `exit "$RC"` swallowed every
+    /// signing failure while the control reported PASS. The parameter now has
+    /// to be one the walk saw assigned from `$?` of the signing command.
+    #[test]
+    fn only_a_parameter_assigned_from_the_signings_status_counts() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+
+        // The evasion the lens demonstrated, verbatim in shape: the guard is
+        // gone, `set +e` detaches the loop from `-e`, and the `exit "$RC"`
+        // reports a status no signing ever touched.
+        let evasion = format!(
+            "set +e\nset -uo pipefail\nshopt -s nullglob\nRC=0\nfor f in dist/*; do\n  \
+             {COSIGN_SIGN_BUNDLED}\ndone\nexit \"$RC\""
+        );
+        assert!(
+            shortfalls(&evasion).errexit_off,
+            "`RC` is never assigned from the signing's `$?`: {evasion:?}"
+        );
+
+        // A parameter captured from something OTHER than the signing's `$?`
+        // — `other=$?` reads the status of the `set -e` before it.
+        for tail in [
+            "other=$?\nexit \"$other\"",
+            "other=$?\n[ \"$other\" -eq 0 ] || exit 1",
+            "other=$?\nif [ \"$other\" -ne 0 ]; then exit 1; fi",
+        ] {
+            let body = format!("set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e\n{tail}");
+            assert!(
+                shortfalls(&body).errexit_off,
+                "{tail:?} propagates a status that is not the signing's"
+            );
+        }
+
+        // A name bound to the signing's status and then overwritten is no
+        // longer that status.
+        for tail in [
+            "rc=0\nexit \"$rc\"",
+            "rc=$?\nexit \"$rc\"",
+            "rc=0\n[ \"$rc\" -eq 0 ] || exit 1",
+        ] {
+            let body = format!("set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e\n{tail}");
+            assert!(
+                shortfalls(&body).errexit_off,
+                "{tail:?} overwrites the captured status before consulting it"
+            );
+        }
+
+        // And the capture itself must be the command immediately after the
+        // signing, reached unconditionally: `$?` holds the signing's status
+        // only until the next command runs.
+        for body in [
+            format!("set +e\n{COSIGN_SIGN_BUNDLED}\nset -e\nrc=$?\nexit \"$rc\""),
+            format!("set +e\n{COSIGN_SIGN_BUNDLED} && rc=$?\nexit \"$rc\""),
+        ] {
+            assert!(
+                shortfalls(&body).errexit_off,
+                "{body:?} does not capture the signing's own status"
+            );
+        }
+
+        // The declaration spellings bind the status exactly as a bare
+        // assignment does.
+        for capture in ["rc=$?", "local rc=$?", "declare rc=$?", "typeset rc=$?"] {
+            let body = format!("set +e\n{COSIGN_SIGN_BUNDLED}\n{capture}\nset -e\nexit \"$rc\"");
+            assert!(
+                !shortfalls(&body).errexit_off,
+                "{capture:?} captures the signing's status"
+            );
+        }
+
+        // `${rc}` names the same parameter `$rc` does; `$?` and `$1` name
+        // nothing this walk saw assigned.
+        assert_eq!(parameter_name("$rc"), Some("rc"));
+        assert_eq!(parameter_name("${rc}"), Some("rc"));
+        assert_eq!(parameter_name("${RC_1}"), Some("RC_1"));
+        assert_eq!(parameter_name("$?"), None);
+        assert_eq!(parameter_name("$1"), None);
+        assert_eq!(parameter_name("${rc:-}"), None);
+        assert_eq!(parameter_name("rc"), None);
+        assert_eq!(parameter_name("$"), None);
+        assert_eq!(parameter_name("${rc"), None);
+
+        // Wired end to end: the evasion fails the control, naming the
+        // `set +e` defect.
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &format!(
+                    "      - uses: sigstore/cosign-installer@{COSIGN_INSTALLER_SHA}\n\
+                     \x20     - run: |\n\x20         {}",
+                    evasion.replace('\n', "\n          ")
+                ),
+            ),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert_message(
+            &result,
+            "precedes the signing command in the `run:` body and no later command propagates the \
+             captured status",
+        );
+    }
+
+    /// Gate (c), `errexit` off: the consultation has to be one the shell
+    /// REACHES.
+    ///
+    /// The captured-status walk used to be flat — every command after the
+    /// signing, at any depth, behind any operator — so a recognised
+    /// consultation the shell can never run cleared the defect. It now uses
+    /// the same [`reached_at_depth`] model the condition gate grades an arm
+    /// with.
+    #[test]
+    fn a_captured_status_consultation_the_shell_cannot_reach_does_not_count() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+        let capture = format!("set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e");
+
+        for tail in [
+            // Inside a nested compound's arm: the shell reaches it only when
+            // that compound's own condition says so.
+            "if [ -f dist/marker ]; then\n  [ \"$rc\" -ne 0 ] && exit 1\nfi",
+            "if [ -f dist/marker ]; then\n  exit \"$rc\"\nfi",
+            "for f in dist/*; do\n  [ \"$rc\" -ne 0 ] && exit 1\ndone",
+            "while [ -f dist/marker ]; do\n  exit \"$rc\"\ndone",
+            // After an unconditional `exit 0`, which ends the shell.
+            "exit 0\nexit \"$rc\"",
+            "exit 0\n[ \"$rc\" -ne 0 ] && exit 1",
+            "return 0\nexit \"$rc\"",
+            // Behind `&&` / `||` / `|` / `&`: conditional on what ran before.
+            "true && exit \"$rc\"",
+            "true && [ \"$rc\" -ne 0 ] && exit 1",
+            "false || exit \"$rc\"",
+            "echo done | exit \"$rc\"",
+            "sleep 1 & exit \"$rc\"",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert!(
+                shortfalls(&body).errexit_off,
+                "{tail:?} is not reached with the signing's status still in hand"
+            );
+        }
+
+        // What the walk skipped over is skipped WHOLE: a consultation written
+        // after the nested compound's terminator is reached again.
+        for tail in [
+            "if [ -f dist/marker ]; then echo found; fi\nexit \"$rc\"",
+            "for f in dist/*; do echo \"$f\"; done\n[ \"$rc\" -ne 0 ] && exit 1",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert!(
+                !shortfalls(&body).errexit_off,
+                "{tail:?} consults the captured status where the shell reaches it"
+            );
+        }
+
+        // A keyword is only a keyword where the shell reads one: `echo done`
+        // closes no compound and `echo if` opens none, so neither ends the
+        // walk and the consultation after them still counts.
+        for tail in [
+            "echo done\nexit \"$rc\"",
+            "echo \"done\"\n[ \"$rc\" -ne 0 ] && exit 1",
+            "echo if\nexit \"$rc\"",
+            "echo esac\nexit \"$rc\"",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert!(
+                !shortfalls(&body).errexit_off,
+                "{tail:?} is an argument, not a compound boundary"
+            );
+        }
+
+        // A compound whose extent cannot be pinned down ends the walk, so a
+        // consultation after it is not credited: unknown fails closed.
+        for tail in [
+            "if [ -f a ]; then echo a; elif [ -f b ]; then echo b; fi\nexit \"$rc\"",
+            "if [ -f a ]; then echo a\nexit \"$rc\"",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert!(
+                shortfalls(&body).errexit_off,
+                "{tail:?} sits after a compound this walk cannot pin down"
+            );
+        }
+
+        // A consultation OUTSIDE the compound the signing sits in: the walk
+        // ends at that compound's terminator, because the last iteration's
+        // status is not every iteration's.
+        for body in [
+            format!(
+                "set +e\nshopt -s nullglob\nfor f in dist/*; do\n  {COSIGN_SIGN_BUNDLED}\n  \
+                 rc=$?\ndone\nexit \"$rc\""
+            ),
+            format!(
+                "set +e\nshopt -s nullglob\nfor f in dist/*; do\n  {COSIGN_SIGN_BUNDLED}\n  \
+                 rc=$?\ndone\n[ \"$rc\" -ne 0 ] && exit 1"
+            ),
+        ] {
+            assert!(
+                shortfalls(&body).errexit_off,
+                "{body:?} consults only the LAST iteration's status"
+            );
+        }
+
+        // Wired end to end: the unreachable consultation fails the control.
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &format!(
+                    "      - uses: sigstore/cosign-installer@{COSIGN_INSTALLER_SHA}\n\
+                     \x20     - run: |\n\x20         {}",
+                    format!("{capture}\nexit 0\nexit \"$rc\"").replace('\n', "\n          ")
+                ),
+            ),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert_message(
+            &result,
+            "precedes the signing command in the `run:` body and no later command propagates the \
+             captured status",
+        );
+    }
+
+    /// Gate (c), `errexit` off: a guard written the idiomatic way is the same
+    /// guard.
+    ///
+    /// `[ … ]` was the only test spelling the walk knew, so `[[ … ]]` and the
+    /// arithmetic `(( … ))` / `let` — the forms most bash is actually written
+    /// in — failed a sound body.
+    #[test]
+    fn the_captured_status_may_be_guarded_with_any_test_spelling() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+        let capture = format!("set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e");
+
+        for tail in [
+            "[ \"$rc\" -ne 0 ] && exit 1",
+            "test \"$rc\" -ne 0 && exit 1",
+            "[[ \"$rc\" -ne 0 ]] && exit 1",
+            "[[ $rc -ne 0 ]] || exit 1",
+            "if [[ \"$rc\" -ne 0 ]]; then exit 1; fi",
+            "(( rc != 0 )) && exit 1",
+            "((rc!=0)) && exit 1",
+            "(( $rc != 0 )) && exit 1",
+            "if (( rc != 0 )); then exit 1; fi",
+            "let \"rc != 0\" && exit 1",
+            "let rc && exit 1",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert!(
+                !shortfalls(&body).errexit_off,
+                "{tail:?} re-raises the captured signing status"
+            );
+        }
+
+        // Each spelling still has to name the CAPTURED parameter, and still
+        // has to have a branch that fails the step.
+        for tail in [
+            "[[ \"$other\" -ne 0 ]] && exit 1",
+            "(( other != 0 )) && exit 1",
+            "let \"other != 0\" && exit 1",
+            "[[ \"$rc\" -ne 0 ]] && echo warn",
+            "(( rc != 0 )) && echo warn",
+            // An unclosed `[[` / `((` is not a test at all.
+            "[[ \"$rc\" -ne 0 && exit 1",
+            "(( rc != 0 && exit 1",
+            // A SEPARATED pair is a nested subshell, not arithmetic: it runs
+            // `echo`, leaves 0 behind, and re-raises nothing.
+            "( ( echo $rc ) )",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert!(
+                shortfalls(&body).errexit_off,
+                "{tail:?} does not re-raise the captured signing status"
+            );
+        }
+    }
+
+    /// A signing command inside a `case` ARM is a signing command.
+    ///
+    /// The tokeniser emits `release)` as the words `release` and `)`, so the
+    /// PATTERN read as the command word and the `cosign` behind it was never
+    /// seen — the body signed conditionally and no gate applied at all.
+    #[test]
+    fn a_signing_command_in_a_case_arm_is_seen() {
+        let body =
+            format!("case \"$MODE\" in\n  release)\n    {COSIGN_SIGN_BUNDLED}\n    ;;\nesac");
+        assert_eq!(
+            cosign_sign_in_run(&body),
+            Some(SigningShortfalls::default()),
+            "a bundled signing in a case arm is judged, and `-e` still fails the step"
+        );
+
+        // And it is judged: the arm's own suppression is caught as any
+        // other's is.
+        let unbundled = "cosign sign-blob \"$f\" --yes";
+        for (arm, expected) in [
+            (
+                format!("release)\n    {COSIGN_SIGN_BUNDLED} || true"),
+                SigningShortfalls {
+                    failure_ignored: Some("true".to_string()),
+                    ..SigningShortfalls::default()
+                },
+            ),
+            (
+                format!("release)\n    {unbundled}"),
+                SigningShortfalls {
+                    unbundled: true,
+                    ..SigningShortfalls::default()
+                },
+            ),
+            (
+                format!("release)\n    {COSIGN_SIGN_BUNDLED} &"),
+                SigningShortfalls {
+                    backgrounded: true,
+                    ..SigningShortfalls::default()
+                },
+            ),
+        ] {
+            let body = format!("case \"$MODE\" in\n  {arm}\n    ;;\nesac");
+            assert_eq!(
+                cosign_sign_in_run(&body),
+                Some(expected),
+                "case arm {arm:?} is judged like any other signing"
+            );
+        }
+
+        // A `(` before the `)` is a subshell or a function definition, never
+        // an arm pattern, so those readings are untouched — and an arm with
+        // nothing after its `)` names no command, so the pattern stands.
+        let command_word_of = |script: &str| {
+            let words = shell_commands(script)[0].words.clone();
+            command_index(&words).map(|i| words[i].clone())
+        };
+        assert_eq!(command_word_of("( exit 1 )").as_deref(), Some("exit"));
+        assert_eq!(
+            command_word_of("cosign ( ) { :; }").as_deref(),
+            Some("cosign")
+        );
+        assert_eq!(command_word_of("*)").as_deref(), Some("*"));
+        assert_eq!(
+            command_word_of("release) cosign sign").as_deref(),
+            Some("cosign")
+        );
+    }
+
+    /// Gate (c), CONDITION position: an arm that ENDS the shell is not a
+    /// silent arm.
+    ///
+    /// The first narrowing ORed the taken arm with the command after the
+    /// terminator, so `if cosign …; then echo signed; exit 0; else echo warn;
+    /// exit 0; fi` followed by `exit 1` passed — although the step exits 0 on
+    /// BOTH paths and the `exit 1` is unreachable. The arm is now consulted
+    /// first, and only an arm that falls through lets the follow-on speak.
+    #[test]
+    fn an_arm_that_ends_the_shell_is_not_rescued_by_the_command_after_it() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+
+        for body in [
+            // The evasion: both arms exit 0, so `exit 1` is unreachable.
+            format!(
+                "if {COSIGN_SIGN_BUNDLED}; then echo signed; exit 0; else echo warn; exit 0; \
+                 fi\nexit 1"
+            ),
+            // The failure arm alone is enough to make it unreachable.
+            format!(
+                "if {COSIGN_SIGN_BUNDLED}; then echo signed; else echo warn; exit 0; fi\nexit 1"
+            ),
+            // Negated: the `then` arm is the one taken on failure.
+            format!("if ! {COSIGN_SIGN_BUNDLED}; then echo warn; exit 0; fi\nexit 1"),
+            // An `exit $?` after `set +e` is a status this walk cannot
+            // evaluate, so it terminates rather than propagates.
+            format!("if {COSIGN_SIGN_BUNDLED}; then :; else exit $?; fi\nexit 1"),
+        ] {
+            assert!(
+                shortfalls(&body).in_condition,
+                "{body:?} leaves the step passing on a failed signing"
+            );
+        }
+
+        // An arm that genuinely FALLS THROUGH still lets the command after
+        // the terminator decide — that is the shape the narrowing was for.
+        for body in [
+            format!("if {COSIGN_SIGN_BUNDLED}; then echo signed; fi\nexit 1"),
+            format!("if {COSIGN_SIGN_BUNDLED}; then echo signed; else echo warn; fi\nexit 1"),
+        ] {
+            assert!(
+                !shortfalls(&body).in_condition,
+                "{body:?} fails the step when signing fails"
+            );
+        }
+
+        // Wired end to end: the evasion fails the control.
+        let cmd = format!(
+            "if {COSIGN_SIGN_BUNDLED}; then echo signed; exit 0; else echo warn; exit 0; \
+             fi\nexit 1"
+        );
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &cosign_sign_steps(COSIGN_INSTALLER_SHA, &cmd.replace('\n', "\n            ")),
+            ),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+    }
+
+    /// Gate (c), CONDITION position, loops: a bounded retry whose signing
+    /// sits in an `until` condition is sound, because the loop is left only
+    /// when the signing succeeds or when the exhaustion path fails the step.
+    /// `while cosign …; do break; done` is not, and still fails.
+    #[test]
+    fn a_bounded_retry_in_an_until_condition_is_sound() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+
+        for body in [
+            // The canonical bounded retry: exhaustion exits non-zero.
+            format!(
+                "n=0\nuntil {COSIGN_SIGN_BUNDLED}; do n=$((n+1)); if [ \"$n\" -ge 3 ]; then \
+                 exit 1; fi; sleep 2; done"
+            ),
+            // Its `while !` twin.
+            format!(
+                "n=0\nwhile ! {COSIGN_SIGN_BUNDLED}; do n=$((n+1)); [ \"$n\" -lt 3 ] || exit 1; \
+                 sleep 2; done"
+            ),
+            // An unbounded retry never lets a failed signing through either.
+            format!("until {COSIGN_SIGN_BUNDLED}; do sleep 2; done"),
+            // A `break` hands the verdict to the command after `done`.
+            format!("until {COSIGN_SIGN_BUNDLED}; do break; done\nexit 1"),
+            // A body that propagates BEFORE anything in it escapes fails
+            // the step whatever comes later in the body.
+            format!("until {COSIGN_SIGN_BUNDLED}; do exit 1; break; done"),
+            // A plain `while` ENDS on a failing condition, so the command
+            // after `done` is the failure arm.
+            format!("while {COSIGN_SIGN_BUNDLED}; do :; done\nexit 1"),
+        ] {
+            assert!(
+                !shortfalls(&body).in_condition,
+                "{body:?} fails the step when signing fails"
+            );
+        }
+
+        for body in [
+            // The retry gives up silently.
+            format!("until {COSIGN_SIGN_BUNDLED}; do break; done"),
+            format!("until {COSIGN_SIGN_BUNDLED}; do break; done\nexit 0"),
+            format!(
+                "n=0\nuntil {COSIGN_SIGN_BUNDLED}; do n=$((n+1)); if [ \"$n\" -ge 3 ]; then \
+                 break; fi; done\necho gave up"
+            ),
+            // An `exit 0` on the retry path ends the shell with the step
+            // passing, and nothing after `done` can undo it.
+            format!(
+                "until {COSIGN_SIGN_BUNDLED}; do if [ -f stop ]; then exit 0; fi; done\nexit 1"
+            ),
+            // A nested `break` escapes the loop exactly as a bare one does.
+            format!("until {COSIGN_SIGN_BUNDLED}; do if true; then break; fi; done"),
+            // The `break` comes FIRST, so the `exit 1` after it is never
+            // reached and the loop is left with the signing still failing.
+            format!("until {COSIGN_SIGN_BUNDLED}; do break; exit 1; done"),
+            // A plain `while` whose loop simply ends.
+            format!("while {COSIGN_SIGN_BUNDLED}; do break; done"),
+            format!("while {COSIGN_SIGN_BUNDLED}; do :; done\necho done"),
+            // `until ! cosign …` runs its body on SUCCESS, so `after` is the
+            // failure arm — and it says nothing here.
+            format!("until ! {COSIGN_SIGN_BUNDLED}; do exit 1; done"),
+        ] {
+            assert!(
+                shortfalls(&body).in_condition,
+                "{body:?} leaves the step passing on a failed signing"
+            );
+        }
+
+        // Wired end to end: the bounded retry passes the control.
+        let cmd = format!(
+            "n=0\nuntil {COSIGN_SIGN_BUNDLED}; do n=$((n+1)); if [ \"$n\" -ge 3 ]; then exit 1; \
+             fi; sleep 2; done"
+        );
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &cosign_sign_steps(COSIGN_INSTALLER_SHA, &cmd.replace('\n', "\n            ")),
+            ),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+    }
+
+    /// The whole probe set the two-directional lens ran, in one place: the
+    /// sound idioms a gate that grades OTHER people's repositories must not
+    /// fail, and the evasions it must not let through. Each half is asserted
+    /// as the WHOLE shortfall record, so a narrowing that quiets one defect
+    /// by raising another cannot pass this.
+    #[test]
+    fn the_sound_idioms_pass_and_the_evasions_fail() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+
+        for sound in [
+            format!("if {COSIGN_SIGN_BUNDLED}; then echo signed; else exit 1; fi"),
+            format!("if ! {COSIGN_SIGN_BUNDLED}; then exit 1; fi"),
+            format!("set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e\n[ \"$rc\" -eq 0 ] || exit 1"),
+            // The same guard re-raising the captured status itself, which is
+            // how most people write it.
+            format!(
+                "set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e\n[ \"$rc\" -eq 0 ] || exit \"$rc\""
+            ),
+            format!("set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e\nexit \"$rc\""),
+            format!("{COSIGN_SIGN_BUNDLED} &\nwait $!"),
+            format!("{COSIGN_SIGN_BUNDLED} && echo ok || exit 1"),
+            format!(
+                "n=0\nuntil {COSIGN_SIGN_BUNDLED}; do n=$((n+1)); if [ \"$n\" -ge 3 ]; then \
+                 exit 1; fi; sleep 2; done"
+            ),
+            // A compound stepped over on the way to the re-raise, whose arms
+            // all come back out of it: the re-raise IS reached.
+            format!(
+                "set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e\nif [ \"${{SKIP:-}}\" = \"true\" \
+                 ]; then\n  echo skipping\nfi\nexit \"$rc\""
+            ),
+            // A conditionally reached command that does NOT end the shell
+            // must not end the walk either.
+            format!(
+                "set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e\n[ -f dist/note ] && echo \
+                 note\nexit \"$rc\""
+            ),
+            // A one-line `case` every arm comes back out of is stepped over
+            // whole, exactly as the multi-line spelling is.
+            format!(
+                "set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e\ncase \"${{MODE:-}}\" in skip) \
+                 echo skipping ;; esac\nexit \"$rc\""
+            ),
+        ] {
+            assert_eq!(
+                shortfalls(&sound),
+                SigningShortfalls::default(),
+                "sound idiom must not be failed: {sound:?}"
+            );
+        }
+
+        for unsound in [
+            // The `set +e` evasion built out of this repo's own loop.
+            format!(
+                "set +e\nRC=0\nfor f in dist/*; do\n  {COSIGN_SIGN_BUNDLED}\ndone\nexit \"$RC\""
+            ),
+            // Both arms end the shell, so the `exit 1` is unreachable.
+            format!(
+                "if {COSIGN_SIGN_BUNDLED}; then echo signed; exit 0; else echo warn; exit 0; \
+                 fi\nexit 1"
+            ),
+            // The parameter carries a status that is not the signing's.
+            format!("set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e\nother=$?\nexit \"$other\""),
+            format!("if {COSIGN_SIGN_BUNDLED}; then echo signed; fi"),
+            format!("while {COSIGN_SIGN_BUNDLED}; do break; done"),
+            format!("! {COSIGN_SIGN_BUNDLED}"),
+            format!("set +e\n{COSIGN_SIGN_BUNDLED}\necho done"),
+            format!("{COSIGN_SIGN_BUNDLED} && echo ok || true"),
+            format!("{COSIGN_SIGN_BUNDLED} &"),
+            format!("{COSIGN_SIGN_BUNDLED} || FAILED=1"),
+            // A compound that ENDS the shell before the re-raise: on the
+            // flag path the step passes with the signing failed.
+            format!(
+                "set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e\nif [ \"${{SKIP_SIGNING:-}}\" = \
+                 \"true\" ]; then\n  exit 0\nfi\nexit \"$rc\""
+            ),
+            // The ONE-LINER spelling of that same skip path, and its `||`
+            // twin: conditionally reached, and it ends the shell all the same.
+            format!(
+                "set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e\n[ -f dist/skip ] && exit 0\nexit \
+                 \"$rc\""
+            ),
+            format!(
+                "set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e\n[ \"${{DRY_RUN:-}}\" = \"1\" ] || \
+                 exit 0\nexit \"$rc\""
+            ),
+            // The same one-liner as an `else` arm, and as an `until` body.
+            format!(
+                "if {COSIGN_SIGN_BUNDLED}; then echo signed; else [ -f dist/skip ] && exit 0; \
+                 fi\nexit 1"
+            ),
+            format!("until {COSIGN_SIGN_BUNDLED}; do [ -f dist/stop ] && exit 0; done\nexit 1"),
+            // A one-line `case` whose arm ends the shell.
+            format!(
+                "set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e\ncase \"${{MODE:-}}\" in skip) \
+                 exit 0 ;; esac\nexit \"$rc\""
+            ),
+        ] {
+            assert_ne!(
+                shortfalls(&unsound),
+                SigningShortfalls::default(),
+                "evasion must not pass: {unsound:?}"
+            );
+        }
+    }
+
+    /// Gate (c), `errexit` off: a compound the walk steps OVER must be one
+    /// the shell is certain to come back out of.
+    ///
+    /// The reachability walk pushed a nested compound's opener, jumped to its
+    /// terminator and carried on as if every arm fell through — so a
+    /// compound whose arm ENDS the shell was invisible, and the re-raise
+    /// written after it was credited though the shell may never run it. The
+    /// committed shape: `set +e`, sign, `rc=$?`, an `if` on a skip flag that
+    /// `exit 0`s, then `exit "$rc"`. It graded PASS while swallowing every
+    /// signing failure on the flag path.
+    #[test]
+    fn a_compound_that_can_end_the_shell_is_not_stepped_over() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+        let capture = format!("set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e");
+
+        for tail in [
+            // The demonstrated evasion, and the same arm in each compound
+            // that can hold one.
+            "if [ \"${SKIP_SIGNING:-}\" = \"true\" ]; then exit 0; fi\nexit \"$rc\"",
+            "while [ -f dist/skip ]; do exit 0; done\nexit \"$rc\"",
+            "for f in dist/skip; do exit 0; done\nexit \"$rc\"",
+            "until [ -f dist/skip ]; do exit 0; done\nexit \"$rc\"",
+            // `return 0` ends a sourced body just as `exit 0` ends a shell.
+            "if [ \"${SKIP_SIGNING:-}\" = \"true\" ]; then return 0; fi\nexit \"$rc\"",
+            // An `exit $?` is a status this walk cannot evaluate, so it is
+            // read as ending the shell too.
+            "if [ \"${SKIP_SIGNING:-}\" = \"true\" ]; then exit $?; fi\nexit \"$rc\"",
+            // Two levels deep: the span is searched at ANY depth.
+            "if [ -f a ]; then if [ -f b ]; then exit 0; fi; fi\nexit \"$rc\"",
+            "for f in dist/*; do if [ -f skip ]; then exit 0; fi; done\nexit \"$rc\"",
+            // The `else` half of the arm, and a `case` arm.
+            "if [ -f a ]; then echo a; else exit 0; fi\nexit \"$rc\"",
+            "case \"${MODE:-}\" in skip) exit 0 ;; esac\nexit \"$rc\"",
+            // The other two recognised consultations are stopped the same
+            // way — the walk ends, not just one shape of credit.
+            "if [ -f skip ]; then exit 0; fi\n[ \"$rc\" -eq 0 ] || exit 1",
+            "if [ -f skip ]; then exit 0; fi\nif [ \"$rc\" -ne 0 ]; then exit 1; fi",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert!(
+                shortfalls(&body).errexit_off,
+                "{tail:?} can end the shell before the re-raise is reached"
+            );
+        }
+
+        // A compound the shell is certain to come back out of is still
+        // stepped over WHOLE, so the re-raise after it still counts: the
+        // narrowing must not fail every body that contains an `if`.
+        for tail in [
+            "if [ -f dist/marker ]; then echo found; fi\nexit \"$rc\"",
+            "if [ -f a ]; then echo a; else echo b; fi\nexit \"$rc\"",
+            // An arm that exits NON-zero fails the step on that path, so it
+            // is no escape and the walk carries on.
+            "if [ -f skip ]; then exit 1; fi\nexit \"$rc\"",
+            "if [ -f a ]; then if [ -f b ]; then exit 1; fi; fi\nexit \"$rc\"",
+            "for f in dist/*; do echo \"$f\"; done\n[ \"$rc\" -eq 0 ] || exit 1",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert!(
+                !shortfalls(&body).errexit_off,
+                "{tail:?} always comes back out, so the re-raise is reached"
+            );
+        }
+
+        // The same rule inside a compound's ARM, which is the half the arm
+        // index lists used to drop: a nested compound now appears there at
+        // its opener, so `sequence_outcome` can judge it. An `else` arm that
+        // can end the shell must not let the `exit 1` after `fi` stand in
+        // for it.
+        assert!(
+            shortfalls(&format!(
+                "if {COSIGN_SIGN_BUNDLED}; then echo signed; else if [ -f skip ]; then exit 0; \
+                 fi; fi\nexit 1"
+            ))
+            .in_condition,
+            "an `else` arm that can end the shell is not rescued by the command after `fi`"
+        );
+        // And an arm whose nested compound always comes back out still hands
+        // the verdict to that command.
+        assert!(
+            !shortfalls(&format!(
+                "if {COSIGN_SIGN_BUNDLED}; then echo signed; else if [ -f skip ]; then echo \
+                 skip; fi; fi\nexit 1"
+            ))
+            .in_condition,
+            "an `else` arm that falls through lets the command after `fi` decide"
+        );
+
+        // The residual this narrowing deliberately does NOT close, pinned so
+        // the disclosure in `docs/phase-3.md` stays true: only an abandoning
+        // `exit` / `return` makes a compound one the walk refuses to step
+        // over. A bare `break` ends the walk, but one nested inside an `if`
+        // does not — so the re-raise after it is credited although the
+        // `break` path leaves the loop with the signing failed.
+        let looped = |tail: &str| {
+            format!(
+                "set +e\nfor f in dist/*; do\n  {COSIGN_SIGN_BUNDLED}\n  rc=$?\n  {tail}\n  exit \
+                 \"$rc\"\ndone\necho done"
+            )
+        };
+        assert!(
+            shortfalls(&looped("break")).errexit_off,
+            "a bare `break` ends the walk before the re-raise"
+        );
+        // The disclosed body, verbatim as `docs/phase-3.md` prints it: the
+        // `break` path leaves the loop with `$rc` never re-raised, falls off
+        // `done` into `echo done`, and the step ends green with an unsigned
+        // artifact. It passes, and the disclosure says so.
+        assert_eq!(
+            shortfalls(&looped("if [ -f dist/skip ]; then break; fi")),
+            SigningShortfalls::default(),
+            "a nested `break` is stepped over — disclosed in docs/phase-3.md, not gated"
+        );
+        // The `&&` spelling of that same `break` is stepped over too: only an
+        // abandoning `exit` / `return` ends the walk from a conditionally
+        // reached command, and a `break` is neither.
+        assert_eq!(
+            shortfalls(&looped("[ -f dist/skip ] && break")),
+            SigningShortfalls::default(),
+            "a conditionally reached `break` is disclosed on the same terms"
+        );
+
+        // Wired end to end: the committed YAML fails the control, naming the
+        // `set +e` defect.
+        let evasion = format!(
+            "{capture}\nif [ \"${{SKIP_SIGNING:-}}\" = \"true\" ]; then\n  exit 0\nfi\nexit \
+             \"$rc\""
+        );
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &format!(
+                    "      - uses: sigstore/cosign-installer@{COSIGN_INSTALLER_SHA}\n\
+                     \x20     - run: |\n\x20         {}",
+                    evasion.replace('\n', "\n          ")
+                ),
+            ),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert_message(
+            &result,
+            "precedes the signing command in the `run:` body and no later command propagates the \
+             captured status",
+        );
+    }
+
+    /// Gate (c): a command reached through `&&` / `||` / `|` / `&` still ENDS
+    /// the walk when it can end the SHELL.
+    ///
+    /// The round-12 narrowing closed the compound spelling of the skip path
+    /// (`if [ -f dist/skip ]; then exit 0; fi` before the re-raise) and left
+    /// the one-liner open: `[ -f dist/skip ] && exit 0` was skipped as
+    /// "conditionally reached" and the walk carried straight on to credit the
+    /// `exit "$rc"` after it, so the step graded PASS while publishing
+    /// unsigned artifacts on the skip path.
+    ///
+    /// The asymmetry the fix keeps: a conditionally reached command still
+    /// cannot COUNT — as a consultation, or as an arm's verdict — because the
+    /// shell may never run it. It can only END the walk, which is fail-closed.
+    #[test]
+    fn a_conditionally_reached_command_that_ends_the_shell_ends_the_walk() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+        let capture = format!("set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e");
+
+        for tail in [
+            // The demonstrated evasion and its operators: `&&`, `||`, and the
+            // `return` / `exit $?` spellings of the same abandonment.
+            "[ -f dist/skip ] && exit 0\nexit \"$rc\"",
+            "[ -f dist/skip ] || exit 0\nexit \"$rc\"",
+            "[ -f dist/skip ] && return 0\nexit \"$rc\"",
+            "[ -f dist/skip ] && exit $?\nexit \"$rc\"",
+            "[ \"${DRY_RUN:-}\" = \"1\" ] && exit 0\nexit \"$rc\"",
+            // The other two recognised consultations are stopped the same way.
+            "[ -f dist/skip ] && exit 0\n[ \"$rc\" -eq 0 ] || exit 1",
+            "[ -f dist/skip ] && exit 0\nif [ \"$rc\" -ne 0 ]; then exit 1; fi",
+            // A compound OPENED behind `&&` is judged by the same predicate.
+            "[ -f dist/skip ] && if [ -f a ]; then exit 0; fi\nexit \"$rc\"",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert!(
+                shortfalls(&body).errexit_off,
+                "{tail:?} can end the shell before the re-raise is reached"
+            );
+        }
+
+        // A conditionally reached command that does NOT abandon leaves the
+        // walk running, so the re-raise after it is still credited: the
+        // narrowing must not fail every body that contains a `&&`.
+        for tail in [
+            "[ -f x ] && echo note\nexit \"$rc\"",
+            "[ -f x ] || echo note\n[ \"$rc\" -eq 0 ] || exit 1",
+            // An `exit 1` behind `&&` fails the step on the path that takes
+            // it, so it is no escape and the walk carries on.
+            "[ -f dist/skip ] && exit 1\nexit \"$rc\"",
+            // A compound behind `&&` that always comes back out.
+            "[ -f x ] && if [ -f a ]; then echo a; fi\nexit \"$rc\"",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert!(
+                !shortfalls(&body).errexit_off,
+                "{tail:?} does not end the shell, so the re-raise is reached"
+            );
+        }
+
+        // And the guard idioms — whose own branch is a conditionally reached
+        // `exit` — are credited exactly as before: the walk ends AT the
+        // branch, after the test it hangs off has already been yielded.
+        for tail in [
+            "[ \"$rc\" -eq 0 ] || exit \"$rc\"",
+            "[ \"$rc\" -eq 0 ] || exit 1",
+            "[[ \"$rc\" -ne 0 ]] && exit 1",
+            "(( rc != 0 )) && exit 1",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert_eq!(
+                shortfalls(&body),
+                SigningShortfalls::default(),
+                "{tail:?} re-raises the captured signing status"
+            );
+        }
+
+        // The same one-liner inside a compound's ARM, where it makes the arm
+        // one that ends the shell rather than one that falls through into the
+        // command after the terminator.
+        assert!(
+            shortfalls(&format!(
+                "if {COSIGN_SIGN_BUNDLED}; then echo signed; else [ -f dist/skip ] && exit 0; \
+                 fi\nexit 1"
+            ))
+            .in_condition,
+            "an `else` arm that can end the shell is not rescued by the `exit 1` after `fi`"
+        );
+        // And in an `until` retry's body, which is that loop's failure arm.
+        assert!(
+            shortfalls(&format!(
+                "until {COSIGN_SIGN_BUNDLED}; do [ -f dist/stop ] && exit 0; done\nexit 1"
+            ))
+            .in_condition,
+            "an `until` body that can end the shell gives up on a failed signing"
+        );
+
+        // Wired end to end: the one-liner fails the control, naming the
+        // `set +e` defect.
+        let evasion = format!("{capture}\n[ -f dist/skip ] && exit 0\nexit \"$rc\"");
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &format!(
+                    "      - uses: sigstore/cosign-installer@{COSIGN_INSTALLER_SHA}\n\
+                     \x20     - run: |\n\x20         {}",
+                    evasion.replace('\n', "\n          ")
+                ),
+            ),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert_message(
+            &result,
+            "precedes the signing command in the `run:` body and no later command propagates the \
+             captured status",
+        );
+    }
+
+    /// Gate (c): a BARE `exit` / `return` reached through `&&` ends the shell
+    /// green, and must not be credited as propagating.
+    ///
+    /// [`command_propagates`] answers for a command reached BECAUSE something
+    /// failed — a `||` branch, or the arm a compound takes on a failing
+    /// condition — where an argument-less `exit` re-raises that failure. After
+    /// `&&` the inheritance is inverted: the branch runs only because the test
+    /// SUCCEEDED, so `$?` is 0. The round-13 walk read the bare word as
+    /// propagating in both positions, so `[ -f dist/skip ] && exit` was
+    /// neither an abandonment nor a verdict, the walk carried on, and the
+    /// `exit "$rc"` after it was credited — a PASS on a body real shells run
+    /// to a green exit with the signing failed.
+    ///
+    /// The ground truth is not reasoned, it is RUN: with `dist/skip` present
+    /// and the signing failing, `bash -e` and `sh -e` both exit 0 for each of
+    /// the four failing shapes below, and both exit 1 for the sound `||` twin.
+    #[test]
+    fn a_bare_exit_reached_through_and_ends_the_shell() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+        let capture = format!("set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e");
+
+        // (a) and (b): the demonstrated evasion and its `return` spelling.
+        for tail in [
+            "[ -f dist/skip ] && exit\nexit \"$rc\"",
+            "[ -f dist/skip ] && return\nexit \"$rc\"",
+            // The other two recognised consultations are stopped the same way.
+            "[ -f dist/skip ] && exit\n[ \"$rc\" -eq 0 ] || exit 1",
+            "[ -f dist/skip ] && exit\nif [ \"$rc\" -ne 0 ]; then exit 1; fi",
+            // Spacing and quoting are the tokeniser's business, not a shape.
+            "[ \"${DRY_RUN:-}\" = \"1\" ] && exit\nexit \"$rc\"",
+            // The third site: a bare `exit` as the BRANCH of the captured-
+            // status test itself. Unsound in both readings — `-eq 0 && exit`
+            // exits 0 when the signing succeeded and falls through when it
+            // failed; `-ne 0 && exit` re-raises the test's success and exits
+            // 0 even on failure — so it is decided here rather than left to
+            // the disclosed "which way a test reads" limit.
+            "[ \"$rc\" -eq 0 ] && exit",
+            "[ \"$rc\" -ne 0 ] && exit",
+            "[[ \"$rc\" -ne 0 ]] && exit",
+            "(( rc != 0 )) && exit",
+            "[ \"$rc\" -eq 0 ] && return",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert!(
+                shortfalls(&body).errexit_off,
+                "{tail:?} exits 0 on the path that takes the bare `exit`"
+            );
+        }
+
+        // (c): the same bare `&& exit` as an `until` retry's body, which is
+        // that loop's failure arm.
+        assert!(
+            shortfalls(&format!(
+                "until {COSIGN_SIGN_BUNDLED}; do [ -f dist/stop ] && exit; done\nexit 1"
+            ))
+            .in_condition,
+            "an `until` body whose bare `exit` ends the shell gives up on a failed signing"
+        );
+        // (d): and as an `else` arm, where the `exit 1` after `fi` must not
+        // stand in for it.
+        assert!(
+            shortfalls(&format!(
+                "if {COSIGN_SIGN_BUNDLED}; then echo signed; else [ -f dist/skip ] && exit; \
+                 fi\nexit 1"
+            ))
+            .in_condition,
+            "an `else` arm whose bare `exit` ends the shell is not rescued by the `exit 1` \
+             after `fi`"
+        );
+
+        // (i): the `||` twin is the sound one and must keep passing — after
+        // `||` the bare `exit` inherits the test's FAILURE, which is the whole
+        // reason the fix is scoped to `&&`. Its literal and captured-status
+        // spellings, and the `&&`-with-a-status guards, go with it.
+        for tail in [
+            "[ \"$rc\" -eq 0 ] || exit",
+            "[ \"$rc\" -eq 0 ] || return",
+            "[ \"$rc\" -eq 0 ] || exit \"$rc\"",
+            "[ \"$rc\" -eq 0 ] || exit 1",
+            "[[ \"$rc\" -ne 0 ]] && exit 1",
+            "(( rc != 0 )) && exit 1",
+            "exit \"$rc\"",
+            // (r): a harmless conditional between the capture and the
+            // re-raise still leaves the walk running.
+            "[ -f x ] && echo note\nexit \"$rc\"",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert_eq!(
+                shortfalls(&body),
+                SigningShortfalls::default(),
+                "{tail:?} leaves the step failing when the signing failed"
+            );
+        }
+
+        // (o) and (p): a bounded `until` retry and a sound `if`/`else` are
+        // untouched — neither holds an argument-less `exit`.
+        for body in [
+            format!(
+                "n=0\nuntil {COSIGN_SIGN_BUNDLED}; do n=$((n+1)); if [ \"$n\" -ge 3 ]; then \
+                 exit 1; fi; sleep 2; done"
+            ),
+            format!("if {COSIGN_SIGN_BUNDLED}; then echo ok; else exit 1; fi"),
+        ] {
+            assert_eq!(
+                shortfalls(&body),
+                SigningShortfalls::default(),
+                "{body:?} fails the step when the signing fails"
+            );
+        }
+
+        // Wired end to end: the bare one-liner fails the control, naming the
+        // `set +e` defect.
+        let evasion = format!("{capture}\n[ -f dist/skip ] && exit\nexit \"$rc\"");
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &format!(
+                    "      - uses: sigstore/cosign-installer@{COSIGN_INSTALLER_SHA}\n\
+                     \x20     - run: |\n\x20         {}",
+                    evasion.replace('\n', "\n          ")
+                ),
+            ),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert_message(
+            &result,
+            "precedes the signing command in the `run:` body and no later command propagates the \
+             captured status",
+        );
+    }
+
+    /// Gate (c): a `case` written on ONE line is the same compound as the
+    /// multi-line spelling.
+    ///
+    /// `case "$MODE" in skip) echo s ;; esac` tokenises as a single command
+    /// carrying both the `case` keyword and its first arm, and
+    /// [`case_arm_pattern_end`] stepped the keyword over on the way to the
+    /// arm's command word — so [`opens_compound`] saw no compound at all, the
+    /// walk read the command as simple and then STOPPED at the `esac` behind
+    /// it. The disclosure in `docs/phase-3.md` says a `case` is stepped over
+    /// whole; it now is, in both spellings.
+    #[test]
+    fn a_one_line_case_opens_the_same_compound_as_the_multi_line_spelling() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+        let capture = format!("set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e");
+
+        // The keyword in front is read even though the arm's command sits
+        // behind the `)`.
+        assert_eq!(
+            opens_compound(
+                &["case", "${MODE:-}", "in", "skip", ")", "echo", "s"].map(String::from)
+            ),
+            Some("case")
+        );
+        // An arm whose own command opens a compound still answers with that
+        // opener, which is what the arm-pattern skip is for.
+        assert_eq!(
+            opens_compound(&["release", ")", "if", "[", "-f", "x", "]"].map(String::from)),
+            Some("if")
+        );
+        assert_eq!(
+            opens_compound(&["skip", ")", "echo", "s"].map(String::from)),
+            None
+        );
+
+        for (one_line, multi_line, stepped_over) in [
+            // A `case` every arm comes back out of is stepped over whole, so
+            // the re-raise after `esac` is reached.
+            (
+                "case \"${MODE:-}\" in skip) echo skipping ;; esac\nexit \"$rc\"",
+                "case \"${MODE:-}\" in\n  skip) echo skipping ;;\nesac\nexit \"$rc\"",
+                true,
+            ),
+            // An arm that ends the shell ends the walk instead.
+            (
+                "case \"${MODE:-}\" in skip) exit 0 ;; esac\nexit \"$rc\"",
+                "case \"${MODE:-}\" in\n  skip) exit 0 ;;\nesac\nexit \"$rc\"",
+                false,
+            ),
+            // A `case` ON the captured status is stepped over rather than
+            // matched, so it is no consultation — the disclosed trade.
+            (
+                "case \"$rc\" in 0) ;; *) exit 1 ;; esac",
+                "case \"$rc\" in\n  0) ;;\n  *) exit 1 ;;\nesac",
+                false,
+            ),
+        ] {
+            for tail in [one_line, multi_line] {
+                let body = format!("{capture}\n{tail}");
+                assert_eq!(
+                    shortfalls(&body) == SigningShortfalls::default(),
+                    stepped_over,
+                    "{tail:?} must grade the same in either spelling"
+                );
+            }
+        }
+    }
+
+    /// Gate (c), `errexit` off: the branch of a captured-status test may
+    /// re-raise the captured status itself.
+    ///
+    /// `[ "$rc" -eq 0 ] || exit 1` passed and `[ "$rc" -eq 0 ] || exit "$rc"`
+    /// — the same guard, spelled the way most people write it — failed,
+    /// because `command_propagates` sees only a literal non-zero status. An
+    /// `exit` on the captured parameter propagates by construction.
+    #[test]
+    fn the_test_s_branch_may_re_raise_the_captured_status_itself() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+        let capture = format!("set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e");
+
+        for tail in [
+            "[ \"$rc\" -eq 0 ] || exit \"$rc\"",
+            "[ \"$rc\" -eq 0 ] || exit $rc",
+            "[ \"$rc\" -eq 0 ] || return \"$rc\"",
+            "test \"$rc\" -eq 0 || exit \"$rc\"",
+            "[[ \"$rc\" -ne 0 ]] && exit \"$rc\"",
+            "(( rc != 0 )) && exit \"${rc}\"",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert!(
+                !shortfalls(&body).errexit_off,
+                "{tail:?} re-raises the captured signing status"
+            );
+        }
+
+        // The branch still has to name the CAPTURED parameter, and a negated
+        // one does not report the status it names.
+        for tail in [
+            "[ \"$rc\" -eq 0 ] || exit \"$other\"",
+            "[ \"$rc\" -eq 0 ] || ! exit \"$rc\"",
+            "[ \"$rc\" -eq 0 ] || echo \"$rc\"",
+            "[ \"$rc\" -eq 0 ] || exit 0",
+        ] {
+            let body = format!("{capture}\n{tail}");
+            assert!(
+                shortfalls(&body).errexit_off,
+                "{tail:?} does not re-raise the captured signing status"
+            );
+        }
+
+        // Wired end to end: the idiomatic guard passes the control.
+        let cmd = format!("{capture}\n[ \"$rc\" -eq 0 ] || exit \"$rc\"");
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &cosign_sign_steps(COSIGN_INSTALLER_SHA, &cmd.replace('\n', "\n            ")),
+            ),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+    }
+
+    /// This repository's OWN signing step is the reference sound body: it
+    /// must keep passing every gate, unmodified, exactly as shipped.
+    #[test]
+    fn this_repositorys_own_signing_step_is_sound() {
+        let workflow = include_str!("../.github/workflows/release.yml");
+        let docs = YamlLoader::load_from_str(workflow).expect("release.yml parses");
+        let mut judged = 0usize;
+        for job in docs[0]["jobs"].as_hash().expect("jobs").values() {
+            for step in job["steps"].as_vec().into_iter().flatten() {
+                let Some(run) = step["run"].as_str() else {
+                    continue;
+                };
+                let Some(shortfalls) = cosign_sign_in_run(run) else {
+                    continue;
+                };
+                judged += 1;
+                assert_eq!(
+                    shortfalls,
+                    SigningShortfalls::default(),
+                    "the shipped signing step must meet every gate: {run}"
+                );
+            }
+        }
+        assert_eq!(judged, 1, "release.yml has exactly one signing step");
+    }
+
+    /// Gate (c), `errexit` off, the sound half: the status-capture idiom
+    /// (`set +e` / sign / `rc=$?` / `set -e` / check `$rc`) turns fail-fast
+    /// off on purpose and then propagates the status by hand. The gate
+    /// reports `set +e` only when nothing later consults the captured status.
+    #[test]
+    fn a_captured_status_that_is_propagated_is_sound() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+        let captured = |tail: &str| {
+            format!(
+                "set +e\n{COSIGN_SIGN_BUNDLED}\nrc=$?\nset -e\n{tail}",
+                tail = tail
+            )
+        };
+
+        for tail in [
+            "[ \"$rc\" -eq 0 ] || exit 1",
+            "[ $rc -ne 0 ] && exit 1\nexit 0",
+            "test \"$rc\" -eq 0 || exit 1",
+            "test \"$rc\" -eq 0 || false",
+            "exit \"$rc\"",
+            "exit $rc",
+            "return $rc",
+            "if [ \"$rc\" -ne 0 ]; then exit 1; fi",
+            "if [ \"$rc\" -eq 0 ]; then echo signed; else exit 1; fi",
+            // The check may come after other work.
+            "echo \"cosign exited $rc\"\n[ \"$rc\" -eq 0 ] || exit 1",
+        ] {
+            assert!(
+                !shortfalls(&captured(tail)).errexit_off,
+                "{tail:?} propagates the captured status"
+            );
+        }
+
+        for tail in [
+            // Captured and never consulted.
+            "echo done",
+            "echo \"cosign exited $rc\"",
+            // Consulted, but the failing path leaves the step passing.
+            "[ \"$rc\" -eq 0 ] || echo warn",
+            "[ \"$rc\" -eq 0 ] || exit 0",
+            "if [ \"$rc\" -ne 0 ]; then echo warn; fi",
+            // A literal status says nothing about the signing.
+            "exit 0",
+            "exit 1",
+            // A test of something other than a captured parameter.
+            "[ -f dist/x.sigstore.json ] || exit 1",
+            // The check itself is negated away.
+            "! exit $rc",
+        ] {
+            assert!(
+                shortfalls(&captured(tail)).errexit_off,
+                "{tail:?} does not propagate the captured status"
+            );
+        }
+
+        // Wired end to end: the canonical idiom passes the control.
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &cosign_sign_steps(
+                    COSIGN_INSTALLER_SHA,
+                    &captured("[ \"$rc\" -eq 0 ] || exit 1").replace('\n', "\n            "),
+                ),
+            ),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+    }
+
+    /// Gate (c), the AND-OR tail: `&&` short-circuits to the branch that
+    /// TERMINATES the list, so `cosign … && echo ok || true` runs the
+    /// `|| true` when the signing fails. Reading only the separator that ends
+    /// the signing command saw `&&` and stopped.
+    #[test]
+    fn a_swallowing_branch_at_the_end_of_an_and_or_list_is_defective() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+
+        for (tail, named) in [
+            ("&& echo ok || true", "true"),
+            ("&& echo ok || :", ":"),
+            ("&& echo ok || echo warn", "echo"),
+            ("&& a && b || true", "true"),
+            ("&& a && b && c || exit 0", "exit 0"),
+            ("&& echo ok || { echo warn; }", "{"),
+            ("&& echo ok || FAILED=1", "FAILED=1"),
+        ] {
+            assert_eq!(
+                shortfalls(&format!("{COSIGN_SIGN_BUNDLED} {tail}"))
+                    .failure_ignored
+                    .as_deref(),
+                Some(named),
+                "`{tail}` swallows the signing failure"
+            );
+        }
+
+        // The list's terminator still fails the step, or the list ends at a
+        // real command terminator with the signing status intact.
+        for tail in [
+            "&& echo ok || exit 1",
+            "&& a && b || { echo warn; exit 1; }",
+            "&& echo ok",
+            "&& echo ok\necho next",
+            "&& echo ok; echo next",
+            "&& echo ok | tee log",
+            "&& echo ok &",
+        ] {
+            assert_eq!(
+                shortfalls(&format!("{COSIGN_SIGN_BUNDLED} {tail}")).failure_ignored,
+                None,
+                "`{tail}` leaves the signing failure attributable"
+            );
+        }
+
+        // A `||` belonging to a LATER command of the list is not the signing
+        // command's: `cosign …; other || true` starts a new list.
+        assert_eq!(
+            shortfalls(&format!("{COSIGN_SIGN_BUNDLED}\nother || true")).failure_ignored,
+            None
+        );
+
+        // In a workflow, with the message the immediate `|| true` gets.
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &cosign_sign_steps(
+                    COSIGN_INSTALLER_SHA,
+                    &format!("{COSIGN_SIGN_BUNDLED} && echo ok || true"),
+                ),
+            ),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert_message(
+            &result,
+            "the signing command is followed by `|| true` — a failed signing is swallowed and \
+             the step succeeds with an unsigned artifact",
+        );
+
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &cosign_sign_steps(
+                    COSIGN_INSTALLER_SHA,
+                    &format!("{COSIGN_SIGN_BUNDLED} && echo ok || exit 1"),
+                ),
+            ),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+    }
+
+    /// Gate (c), the backgrounded signing that IS sound: `wait $!` collects
+    /// the job's exit status, so `-e` sees a failed signing after all. Every
+    /// other backgrounded shape — including a bare `wait`, which yields 0 —
+    /// still fails.
+    #[test]
+    fn a_backgrounded_signing_waited_on_by_pid_is_sound() {
+        let shortfalls = |body: &str| cosign_sign_in_run(body).expect("body signs");
+
+        for sound in [
+            format!("{COSIGN_SIGN_BUNDLED} & wait $!"),
+            format!("{COSIGN_SIGN_BUNDLED} & wait \"$!\""),
+            // The tokeniser drops comments and blank lines, so an intervening
+            // one leaves `wait $!` the next command.
+            format!("{COSIGN_SIGN_BUNDLED} &\n# collect it\nwait $!"),
+            format!("{COSIGN_SIGN_BUNDLED} &\n\nwait $!\necho done"),
+        ] {
+            assert!(
+                !shortfalls(&sound).backgrounded,
+                "{sound:?} propagates the signing status through `wait $!`"
+            );
+        }
+
+        for still_backgrounded in [
+            format!("{COSIGN_SIGN_BUNDLED} &"),
+            format!("{COSIGN_SIGN_BUNDLED} & wait"),
+            format!("{COSIGN_SIGN_BUNDLED} & wait %1"),
+            format!("{COSIGN_SIGN_BUNDLED} & wait $PID"),
+            format!("{COSIGN_SIGN_BUNDLED} & wait $! $OTHER"),
+            format!("{COSIGN_SIGN_BUNDLED} & ! wait $!"),
+            format!("{COSIGN_SIGN_BUNDLED} & wait $! || true"),
+            format!("{COSIGN_SIGN_BUNDLED} & wait $! | tee log"),
+            format!("{COSIGN_SIGN_BUNDLED} & wait $! &"),
+            format!("{COSIGN_SIGN_BUNDLED} & echo done\nwait $!"),
+        ] {
+            assert!(
+                shortfalls(&still_backgrounded).backgrounded,
+                "{still_backgrounded:?} leaves the signing status uncollected"
+            );
+        }
+
+        // In a workflow: the sound pair passes and never mentions
+        // backgrounding; the bare `wait` still fails.
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &cosign_sign_steps(
+                    COSIGN_INSTALLER_SHA,
+                    &format!("{COSIGN_SIGN_BUNDLED} & wait $!"),
+                ),
+            ),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+        assert_no_message(&result, "backgrounded with `&`");
+
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &cosign_sign_steps(
+                    COSIGN_INSTALLER_SHA,
+                    &format!("{COSIGN_SIGN_BUNDLED} & wait"),
+                ),
+            ),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert_message(
+            &result,
+            "the signing command is backgrounded with `&` — its exit status is never the step's",
+        );
     }
 
     /// Gate (c), `continue-on-error`: on the proving job, the proving step,

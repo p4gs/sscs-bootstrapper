@@ -93,9 +93,139 @@ versions.
   one.** Heredoc bodies are data; a signing step under a non-POSIX `shell:`
   (step → job → workflow `defaults.run.shell`) is "not judged"; `continue-on-error:
   true` on the proving job/step/installer (and on the calling job of a
-  `workflow_call`), a `!`-negated signing command, a `||` after it followed
-  by anything other than `exit` / `return` / `false` / `kill` / `{` / `(`
-  (`|| true`, `|| :`, `|| echo warn`, `|| continue` all swallow), a `|`
+  `workflow_call`), a `!`-negated signing command **outside a condition**, a
+  signing command in a compound command's CONDITION (`if cosign …; then`,
+  `elif`, `while`/`until cosign …; do`) **whose failure path leaves the step
+  passing** — a conditional that CHECKS the signing is the canonical "check
+  and fail" idiom, not a suppression, so `if cosign …; then echo signed;
+  else exit 1; fi` and `if ! cosign …; then exit 1; fi` both PASS: the gate
+  reads the arm the shell takes when the signing fails FIRST (the `else`
+  arm, or the `then` arm when the test is negated) and stays quiet when it
+  propagates (`exit`/`return` with a literal non-zero status or none,
+  `false`, `kill`); the command after the compound's terminator is consulted
+  only when that arm FALLS THROUGH, because an arm that ends the shell
+  without propagating makes everything after the terminator unreachable, so
+  `if cosign …; then echo signed; exit 0; else echo warn; exit 0; fi`
+  followed by `exit 1` keeps FAILING while
+  `if cosign …; then echo signed; fi` followed by `exit 1` passes. For a
+  loop the failure arm depends on the opener: a plain
+  `while cosign …; do …; done` ENDS on a failing condition, so only the
+  command after `done` speaks; an `until cosign …; do …; done` (and its
+  `while ! cosign …` twin) runs its BODY on a failing condition, so the body
+  is the failure arm and the loop is left on that path only by a `break` or
+  a non-propagating `exit` — which is why the bounded retry
+  `n=0; until cosign …; do n=$((n+1)); if [ "$n" -ge 3 ]; then exit 1; fi;
+  sleep 2; done` PASSES while `until cosign …; do break; done` fails.
+  In condition position the `!` is the conditional's own test, not a status
+  inversion, so the negation message — which would be factually wrong there
+  — is never emitted and the condition defect is reported instead;
+  `if cosign …; then echo signed; fi`, `while cosign …; do break; done` and
+  `if ! cosign …; then echo failed; fi` all still fail, and an `elif` chain,
+  an unclosed compound, an arm whose propagating command is reached
+  only through `&&`/`||`/`|`/`&`, an arm where an `exit 0` comes first, and
+  a compound nested inside an arm all fail closed (a `break` is the one word
+  read deeper, and only inside a loop) —, a `||` branch after it
+  that leaves the step passing — immediately or at the end of the AND-OR
+  list it opens with `&&`, since `&&` short-circuits to that branch, so
+  `cosign … && echo ok || true` swallows exactly as `cosign … || true` does
+  while `… && echo ok || exit 1` does not; only `exit` / `return` with a literal
+  non-zero status (or none at all, which re-raises `$?` — in `||` position
+  the failure that sent the shell down the branch), `false`,
+  `kill`, and a `{ …; }` / `( … )` group whose LAST command is one of those
+  still fail it, so `|| true`, `|| :`, `|| echo warn`, `|| continue`,
+  `|| exit 0`, `|| return 0`, `|| exit $?`, `|| { echo warn; }` and
+  `|| ( echo warn )` all swallow, as does a branch of nothing but
+  `NAME=VALUE` assignments (`|| FAILED=1`, `|| RC=$?`, named as written),
+  and an unreadable or unclosed group fails
+  closed — so a branch that RETRIES the signing (`cosign … || cosign …`) is
+  read as swallowing too, deliberately: a sound retry has to be written as a
+  loop whose exhaustion fails the step (`cosign … && signed=1 && break` per
+  attempt, then `[ -n "${signed:-}" ] || exit 1`), which these gates accept —
+  a single unpaired `&` after it (which detaches it from `-e`
+  exactly as `||` does; `&&` and the `&` of `2>&1` / `>&2` / `&>log` are
+  not backgrounding) unless a bare `wait $!` / `wait "$!"` is the very next
+  command, which collects that job's status (a bare `wait`, a `wait $PID`,
+  and a `wait $!` that is itself negated, piped, backgrounded or `||`-ed
+  still fail), a `set +e` / `set +o errexit` / `shopt -o -u errexit`
+  before it in the body (`shopt -o` addresses the `set -o` namespace, in
+  either flag order and as one cluster; a later `set -e` /
+  `shopt -o -s errexit` turns fail-fast back on, order is honoured as it is
+  for `pipefail`, and `set --` ends the option list so `set -- +e` is an
+  operand, not a toggle) **with no later command that propagates the
+  captured status** — the status-capture idiom (`set +e`, sign, `rc=$?`,
+  `set -e`, `[ "$rc" -eq 0 ] || exit 1`) turns fail-fast off on purpose and
+  re-raises the failure by hand, so it PASSES; the parameter that carries
+  the status must be one assigned from `$?` in the command IMMEDIATELY after
+  the signing, reached unconditionally (`rc=$?`, `RC=$?`, and the `local` /
+  `declare` / `typeset` / `export` / `readonly` spellings), and it is lost
+  the moment anything else is assigned to that name — a parameter that
+  cannot be traced to the signing's own `$?` does not count, so
+  `set +e`, sign, `rc=$?`, `set -e`, `other=$?`, `exit "$other"` and a
+  `RC=0` … `exit "$RC"` wrapped around an unguarded signing loop both keep
+  FAILING; the recognised shapes are then
+  `exit "$rc"` / `return $rc` (that **captured parameter**, never a literal
+  — `exit 1` says nothing about the signing), a test on it whose
+  `||`
+  or `&&` branch fails the step (which way the test reads is not evaluated,
+  so either operator counts, and the branch may equally re-raise the captured
+  parameter itself — `[ "$rc" -eq 0 ] || exit "$rc"` propagates by
+  construction and now PASSES, where before only the literal `|| exit 1`
+  did), and that test in a condition whose arm fails
+  the step (`if [ "$rc" -ne 0 ]; then exit 1; fi`) — the test may be spelled
+  `[ … ]`, `test …`, `[[ … ]]` (its own `]]` required), `(( rc != 0 ))` (its
+  own `))`) or `let`, since an idiomatic guard is the same guard, and a
+  SEPARATED `( ( … ) )` is a nested subshell rather than arithmetic, told
+  apart exactly as bash tells them apart; **and the consultation counts only
+  where the shell reaches it**, at the signing's own depth — one inside a
+  nested compound's arm, one after an unconditional `exit` that already
+  ended the shell, and one behind `&&` / `||` / `|` / `&` are each no
+  consultation at all, on the same reachability model the condition gate
+  grades an arm with (a rebinding of the captured name, by contrast, counts
+  wherever it is written: unknown fails closed on both sides). **That skip is
+  one-directional**: a conditionally reached command never COUNTS, but one
+  that can END the shell stops the walk there anyway, so the one-liner
+  `set +e`, sign, `rc=$?`, `[ -f dist/skip ] && exit 0`, `exit "$rc"` keeps
+  FAILING — with its `||`, `&& return 0`, `&& exit $?` and
+  `[ "${DRY_RUN:-}" = "1" ] && exit 0` spellings, and the same one-liner in
+  an `else` arm or an `until` retry's body — while
+  `[ -f dist/skip ] && exit 1`, which fails the step on the path that takes
+  it, leaves the walk running. **A BARE `exit` / `return` after `&&` abandons
+  the shell too**: an argument-less `exit` re-raises `$?`, which is the
+  FAILURE only where the command is reached because something failed (a `||`
+  branch, or the arm a compound takes on a failing condition), and after `&&`
+  the branch runs only because the test SUCCEEDED, so the status re-raised is
+  0 — `set +e`, sign, `rc=$?`, `[ -f dist/skip ] && exit`, `exit "$rc"` now
+  keeps FAILING (with its `&& return` spelling, and the same one-liner in an
+  `else` arm or an `until` retry's body), while the sound `||` twin
+  `[ "$rc" -eq 0 ] || exit` keeps PASSING, since there the inherited status
+  is the failing one. The rule holds wherever an argument-less `exit` decides
+  a verdict, including the branch of the captured-status test itself:
+  `[ "$rc" -eq 0 ] && exit` and `[ "$rc" -ne 0 ] && exit` both keep the
+  defect. That one is decided rather than disclosed because, unlike the
+  direction a test reads, a bare `exit` after `&&` is unsound in BOTH
+  readings; `&& exit "$rc"` and `&& exit 1` are unaffected. **A nested
+  compound is stepped over only when the shell must come back out of it** —
+  one that can END the shell instead, an abandoning `exit` / `return`
+  anywhere in its span at any depth, ends the walk, so `set +e`, sign,
+  `rc=$?`, `if [ "${SKIP_SIGNING:-}" = "true" ]; then exit 0; fi`,
+  `exit "$rc"` keeps FAILING (with its `while` / `for` / `until` / `case`
+  twins and the same arm nested two deep); and the arm index lists now carry
+  a nested compound at its opener, so the same rule closes an `else` arm that
+  ends the shell from inside one; a status
+  captured and
+  never consulted (`set +e`, sign, `echo done`), a check whose failing path
+  still passes (`|| echo warn`), a `case` on the captured status
+  (`case "$rc" in 0) ;; *) exit 1 ;; esac` — sound, and failed anyway,
+  because an arm's pattern is only skipped so the command behind it can be
+  read, never matched against a value), which now grades identically in
+  **either `case` spelling** — a one-liner
+  `case "$MODE" in skip) echo s ;; esac` carries its keyword and its first
+  arm as one command, and used to open no compound at all, so the walk read
+  it as a simple command and then stopped at the `esac` behind it — and a
+  test of anything but
+  the captured
+  parameter each
+  keep the defect, a `|`
   after it with no `set -o pipefail` before it in the body and a shell that
   does not set it (the built-in `bash` does; `sh` and no `shell:` do not),
   and a `cosign` function/alias in the body are each named; a `shell:` is
@@ -108,9 +238,44 @@ versions.
   at a `vX.Y.Z` tag (a SHA pin is refused) is the generator; a test holds the
   generator tag identical across `.sscsb/config.toml`, both `release.yml`s,
   `release-slsa.yml`, both `deploy-gate.yml`s and the docs. Beyond these, no
-  further gates: `with:`/`run:` text as written, `$(…)`, control flow,
-  `/usr/bin/cosign`, a `cosign` shim placed on `$GITHUB_PATH` by an earlier
-  step, filter globs, non-literal `if:`, whether the workflow ever ran, and
+  further gates: `with:`/`run:` text as written, `$(…)`, control flow beyond
+  the failure path of the compound whose CONDITION holds the signing —
+  including an `if`/`else` BODY or a `case` ARM the signing line sits in
+  (the signing there IS seen — the arm's `release)` pattern is skipped so the
+  command word is `cosign` and every gate applies — but whether the arm is
+  ever taken is not asked), a signing command
+  reached later in the same condition list (`if other && cosign …; then`),
+  and the `errexit` exemption for `&&` / `||` lists, which loses a
+  `cosign … && echo ok` failure when further commands follow it —
+  `/usr/bin/cosign`, a `cosign` shim placed on `$GITHUB_PATH` (or a `cosign`
+  function exported through `$BASH_ENV`) by an earlier step, a non-literal
+  option word (`OPTS=+e; set $OPTS` — the value is text, not a toggle), a
+  custom `shell:` template that omits `-e` (`bash {0}`, `sh {0}` — the body
+  is graded as if fail-fast were on) and a `trap` that rewrites the step's
+  status, a suppression applied to a `{ …; }` / `( … )` group from the
+  outside (`( … ) &`, `{ …; } || true` — the recognizer reads the separator
+  that ends the signing command itself, and walks a `&&` list forward to its
+  terminating branch, but never the group's, on one line or across many), a
+  sound body that re-raises a failed signing outside the enumerated
+  condition and captured-status shapes (a `trap`, a flag checked in a later
+  STEP, a helper function that exits, a status relayed through a second
+  variable — `rc=$?; status=$rc; exit "$status"` — since the walk follows a
+  captured status' loss but never its copy: fail-closed, as with the retry),
+  an `until` retry whose body can only loop, which is graded sound because a
+  failed signing never reaches a green step even though the way it never
+  does may be the job's timeout rather than an exit, and whose `break` is
+  counted at any depth so a `break` that leaves only an INNER loop is
+  over-counted, the rest of the class that `break` belongs to — a command
+  that ends or diverts the shell without being an `exit` / `return` this walk
+  can see: a `trap` that rewrites the status, `exec CMD` (which REPLACES the
+  shell process, so `[ -f dist/skip ] && exec true` before the re-raise, and
+  `exec true` as an `else` arm, both PASS while exiting 0 with the signing
+  failed), and `eval STRING` (whose string is never parsed, so
+  `eval "exit 0"` passes and the sound `eval "exit \$rc"` is failed) — an
+  AND-OR list backgrounded or
+  piped as a whole (`cosign … && echo ok &`), a `wait` on anything but a
+  literal `$!` immediately after (`pid=$!; wait "$pid"`),
+  filter globs, non-literal `if:`, whether the workflow ever ran, and
   the runner OS (`runs-on:` is not read — a step with no `shell:` is judged
   as POSIX) are disclosed, not claimed.
 - **The Octo STS trust policy `sscsb init` installs never matched GitHub's
