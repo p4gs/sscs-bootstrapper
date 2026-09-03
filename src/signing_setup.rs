@@ -225,7 +225,7 @@ fn git_global(key: &str) -> Option<String> {
 /// does not. Without this a perfectly working `user.signingkey` stored as
 /// `~/.ssh/key.pub` reads as pointing at a missing file, dropping the lane to
 /// PARTIAL and inviting the user to "fix" something that was never broken.
-fn expand_home(raw: &str, home: &Path) -> PathBuf {
+pub(crate) fn expand_home(raw: &str, home: &Path) -> PathBuf {
     let raw = raw.trim();
     for prefix in ["~/", "$HOME/", "${HOME}/"] {
         if let Some(rest) = raw.strip_prefix(prefix) {
@@ -244,7 +244,7 @@ fn expand_home(raw: &str, home: &Path) -> PathBuf {
 /// The blob is base64-decoded rather than merely split out, so that an
 /// arbitrary two-word line — a private-key armour header, a `known_hosts`
 /// entry — cannot masquerade as key material.
-fn ssh_public_key_material(text: &str) -> Option<String> {
+pub(crate) fn ssh_public_key_material(text: &str) -> Option<String> {
     let mut parts = text.split_whitespace();
     let kind = parts.next()?;
     let blob = parts.next()?;
@@ -266,7 +266,7 @@ fn ssh_public_key_material(text: &str) -> Option<String> {
 /// half. The `-P ""` is load-bearing — without it ssh-keygen prompts on the
 /// terminal for a passphrase-protected key and would hang a probe; with it,
 /// an encrypted key fails fast and this returns `None`.
-fn signing_key_material(raw: &str, home: &Path) -> Option<String> {
+pub(crate) fn signing_key_material(raw: &str, home: &Path) -> Option<String> {
     let expanded = expand_home(raw, home);
     // Canonicalize so a symlink and its target resolve to one file.
     let path = std::fs::canonicalize(&expanded).unwrap_or(expanded);

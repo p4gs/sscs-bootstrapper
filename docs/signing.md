@@ -114,6 +114,31 @@ An AI may draft any change. By default it may not sign at all, and it may **neve
 push to a protected branch. That is the boundary, and it is enforced in code, not in
 a guideline.
 
+### Two namespaces, both named
+
+Generated lines carry `namespaces="git,sscsb-scan-record"` — for `human`-class
+signers. SSHSIG signatures are namespaced so a signature minted for one protocol
+cannot be replayed as another: `git` is the namespace commit signatures are
+minted in, and `sscsb-scan-record` is the one
+[`sscsb scan --local`](local-scan.md) signs a scan record in. The same
+committed file is the anchor for both, which is the point — a repository that
+approves you as a signer says which things you are approved to sign, and says it
+out loud rather than by omitting a restriction. A repository anchored before the
+local lane existed carries `namespaces="git"` alone; `sscsb init` regenerates it,
+and the file must be committed for either use.
+
+**`ci` and `ai` signers get `namespaces="git"` and nothing else.** A local scan
+record is a maintainer's attested word about a machine nobody else can inspect,
+and it is the one lane whose local-environment verdicts count with no
+independent corroboration — so only a `class = "human"` signer may assert one.
+CI does not need the grant (it has the action lane, which proves strictly more,
+under an identity GitHub's OIDC issuer burns into the certificate), and granting
+it to an `ai` key would contradict the invariant this whole page rests on: an
+AI-class signer never signs. Withholding the namespace makes that refusal
+structural — `ssh-keygen -Y verify -n sscsb-scan-record` fails against the
+committed anchor, so both `sscsb` and the public directory refuse without either
+having to re-implement the rule.
+
 ### The one thing `agent-signing` changes (and the one it doesn't)
 
 There is a real, legitimate reason to want an agent's commits *signed*: on a feature

@@ -2092,14 +2092,22 @@ mod tests {
 
     #[test]
     fn run_scan_surfaces_a_clear_error_when_the_vex_path_does_not_exist() {
-        let (_d, ctx) = repo_with_cargo_lock();
-        let cfg = ctx.require_config().unwrap();
-        if !tools::is_available("trivy") && !tools::is_available("osv-scanner") {
-            return; // covered by the no-scanner-available branch elsewhere
-        }
-        let missing = ctx.root.join("does-not-exist.vex.json");
-        let err = run_scan(&ctx, cfg, Some(&missing)).unwrap_err();
-        assert!(format!("{err:#}").contains("reading VEX"));
+        // The availability guard and the call it guards BOTH resolve scanners
+        // by bare name off `PATH`, so they must observe one PATH. Without the
+        // lock a sibling test that strips PATH between them flips the guard's
+        // answer, `run_scan` reports "no vulnerability scanner available"
+        // instead of the VEX read error, and this fails as if the message had
+        // regressed. See the composition rules in `testutil`.
+        crate::testutil::with_env(|_| {
+            let (_d, ctx) = repo_with_cargo_lock();
+            let cfg = ctx.require_config().unwrap();
+            if !tools::is_available("trivy") && !tools::is_available("osv-scanner") {
+                return; // covered by the no-scanner-available branch elsewhere
+            }
+            let missing = ctx.root.join("does-not-exist.vex.json");
+            let err = run_scan(&ctx, cfg, Some(&missing)).unwrap_err();
+            assert!(format!("{err:#}").contains("reading VEX"));
+        });
     }
 
     #[test]

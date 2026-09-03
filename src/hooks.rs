@@ -278,6 +278,10 @@ pub fn parse_signers(text: &str) -> Result<Vec<Signer>> {
 /// are NEVER emitted: with agent-signing OFF (the default), an AI key can never
 /// produce a "good" signature. This is the historical, agent-unaware behavior —
 /// kept byte-identical so enabling nothing changes nothing.
+///
+/// Every emitted line carries an explicit `namespaces=` grant, and the grant is
+/// class-dependent: `git` for all, plus [`crate::local_scan::NAMESPACE`] for
+/// `human` signers only — see [`allowed_signers_content_inner`].
 pub fn allowed_signers_content(signers: &[Signer]) -> String {
     allowed_signers_content_inner(signers, false)
 }
@@ -299,7 +303,42 @@ fn allowed_signers_content_inner(signers: &[Signer], include_agents: bool) -> St
             continue;
         }
         if let Some(key) = &s.ssh_public_key {
-            let _ = writeln!(out, "{} namespaces=\"git\" {}", s.principal, key.trim());
+            // The namespace grant is EXPLICIT for every signer, and it is not
+            // the same grant for every class.
+            //
+            // `git` — what commit signatures are minted in — goes to all three
+            // classes: a `ci` key signs release commits, and an emitted `ai`
+            // key exists precisely so an agent commit can verify as `%G?=G` on
+            // a feature branch (the protected-branch gate still rejects it on
+            // class, in `check_signing_for_range`).
+            //
+            // The local-scan namespace (`crate::local_scan::NAMESPACE`) goes to
+            // `human` signers ONLY. A local scan record is a MAINTAINER's
+            // attested word about a machine nobody else can inspect; granting
+            // it to a `ci` key would let the action lane assert through the
+            // weaker lane it already bypasses, and granting it to an `ai` key
+            // would contradict this policy's own load-bearing invariant, stated
+            // in `crate::signers`: an ai-class signer never signs anything that
+            // authorizes. Withholding the namespace makes that structural —
+            // `ssh-keygen -Y verify -n sscsb-scan-record` fails against the
+            // committed anchor, so the directory refuses the record rather than
+            // trusting this file to be read correctly by four programs.
+            //
+            // Naming the namespaces at all keeps the grant a positive statement
+            // rather than the absence of a restriction: dropping `namespaces=`
+            // would silently permit every namespace OpenSSH will ever define.
+            let namespaces = if s.class == SignerClass::Human {
+                format!("git,{}", crate::local_scan::NAMESPACE)
+            } else {
+                "git".to_string()
+            };
+            let _ = writeln!(
+                out,
+                "{} namespaces=\"{}\" {}",
+                s.principal,
+                namespaces,
+                key.trim()
+            );
         }
     }
     out
@@ -2317,6 +2356,65 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         let on = allowed_signers_content_with_agents(&signers, true);
         assert!(on.contains("human@example.com"));
         assert!(on.contains("agent@ci.example.com"));
+    }
+
+    #[test]
+    fn the_scan_record_namespace_is_granted_to_human_signers_only() {
+        // The grant in `allowed_signers` is the ONLY thing that decides whether
+        // `ssh-keygen -Y verify -n sscsb-scan-record` can succeed against this
+        // repository, so it is where the "only a maintainer may assert a local
+        // record" rule has to live. A `ci` or `ai` key that carried the
+        // namespace would be able to mint a record the directory accepts —
+        // directly contradicting `crate::signers`'s stated invariant that an
+        // ai-class signer never signs anything that authorizes.
+        let toml = "[[signer]]\nprincipal = \"human@example.com\"\nclass = \"human\"\nssh_public_key = \"ssh-ed25519 AAAAHUMAN human@example.com\"\n\n\
+                    [[signer]]\nprincipal = \"ci@example.com\"\nclass = \"ci\"\nssh_public_key = \"ssh-ed25519 AAAACI ci@example.com\"\n\n\
+                    [[signer]]\nprincipal = \"agent@ci.example.com\"\nclass = \"ai\"\nbackend = \"github-app\"\nssh_public_key = \"ssh-ed25519 AAAAAGENT agent@ci.example.com\"\n";
+        let signers = parse_signers(toml).unwrap();
+        // include_agents=true so the ai line is emitted at all — the point is
+        // that even when it IS emitted, it does not carry the scan namespace.
+        let content = allowed_signers_content_with_agents(&signers, true);
+        let line_for = |principal: &str| {
+            content
+                .lines()
+                .find(|l| l.starts_with(principal))
+                .unwrap_or_else(|| panic!("no line for {principal}:\n{content}"))
+                .to_string()
+        };
+
+        let human = line_for("human@example.com");
+        assert!(
+            human.contains(&format!(
+                "namespaces=\"git,{}\"",
+                crate::local_scan::NAMESPACE
+            )),
+            "a human signer gets git AND the scan namespace: {human}"
+        );
+
+        for principal in ["ci@example.com", "agent@ci.example.com"] {
+            let line = line_for(principal);
+            assert!(
+                line.contains("namespaces=\"git\""),
+                "{principal} keeps the git namespace: {line}"
+            );
+            assert!(
+                !line.contains(crate::local_scan::NAMESPACE),
+                "{principal} must NOT be granted the local-scan namespace: {line}"
+            );
+        }
+
+        // And the parser the directory + the tool both use agrees, rather than
+        // this being an assertion about a substring.
+        let parsed = crate::local_scan::parse_allowed_signers(&content);
+        for a in &parsed {
+            let is_human = a.principals.iter().any(|p| p == "human@example.com");
+            assert!(a.permits("git"), "every class keeps `git`: {a:?}");
+            assert_eq!(
+                a.permits(crate::local_scan::NAMESPACE),
+                is_human,
+                "the scan namespace is human-only: {a:?}"
+            );
+        }
     }
 
     #[test]

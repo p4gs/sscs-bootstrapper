@@ -18,6 +18,7 @@
 //! - [`deps`] — package trust (existence, approval, typosquat heuristics)
 //! - [`sbom`] / [`scan`] / [`sast`] — Syft / Trivy+OSV / OpenGrep+Semgrep
 //! - [`provenance`] — slsa-verifier, DSSE/in-toto, cosign, AI receipts
+//! - [`local_scan`] — the local lane: a signed, workstation-produced scan record
 //! - [`observability`] — Dependency-Track, GUAC, OpenVEX, ORAS
 //! - [`compliance`] — control → SLSA/SSDF/CRA/Badge map and `sscsb report`
 
@@ -33,6 +34,7 @@ pub mod exec;
 pub mod harden;
 pub mod hooks;
 pub mod init;
+pub mod local_scan;
 pub mod machine;
 pub mod observability;
 pub mod openssf;

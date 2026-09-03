@@ -72,12 +72,8 @@ struct VerifyDoc<'a> {
     summary: VerifySummary,
 }
 
-/// Render `verify` results as the v1 JSON document.
-///
-/// Every entry's `control` id must exist in the registry — an unknown id here
-/// is a programming error upstream (verify iterates the registry), so this
-/// fails loudly rather than emitting a row a consumer cannot classify.
-pub fn verify_json(results: &[VerifyResult], strict: bool) -> Result<String> {
+/// Build the entry rows and the summary for the `verify` document.
+fn entries_and_summary(results: &[VerifyResult]) -> Result<(Vec<VerifyEntry<'_>>, VerifySummary)> {
     let mut entries = Vec::with_capacity(results.len());
     let mut summary = VerifySummary {
         passed: 0,
@@ -117,12 +113,292 @@ pub fn verify_json(results: &[VerifyResult], strict: bool) -> Result<String> {
             tools: def.tools,
         });
     }
+    Ok((entries, summary))
+}
+
+/// Render `verify` results as the v1 JSON document.
+///
+/// Every entry's `control` id must exist in the registry — an unknown id here
+/// is a programming error upstream (verify iterates the registry), so this
+/// fails loudly rather than emitting a row a consumer cannot classify.
+pub fn verify_json(results: &[VerifyResult], strict: bool) -> Result<String> {
+    let (entries, summary) = entries_and_summary(results)?;
     let doc = VerifyDoc {
         schema_version: SCHEMA_VERSION,
         command: "verify",
         strict,
         results: entries,
         summary,
+    };
+    Ok(serde_json::to_string_pretty(&doc)?)
+}
+
+// ─────────────────── the local lane's directory scan record ─────────────────
+//
+// A local record is not a `verify` document with a block bolted on: it IS a
+// directory `ScanRecord`, the same shape `site/src/schema.ts` validates for
+// every other lane, with the additive `local` block carrying the lane binding.
+//
+// That is forced by the contract in `docs/local-scan.md`: the signature makes
+// the bytes unreshapeable afterwards, so the shape has to be right AT SIGNING
+// TIME. A record the directory has to reshape before it can validate it is a
+// record whose signature covers different bytes than the ones it publishes.
+
+/// One `controls[]` row — contract line `control-fields`.
+#[derive(Serialize)]
+struct DirectoryControl<'a> {
+    id: &'static str,
+    phase: u8,
+    in_scope: bool,
+    raw_outcome: &'a Outcome,
+    scan_outcome: &'static str,
+    reclassified: bool,
+    reason: Option<&'static str>,
+    messages: &'a [String],
+}
+
+/// One `score.phases[]` row.
+#[derive(Serialize)]
+struct DirectoryPhase {
+    phase: u8,
+    pass: u32,
+    fail: u32,
+    gap: u32,
+    unverified: u32,
+    info: u32,
+    percent: Option<f64>,
+}
+
+/// The `score` block — contract line `score-fields`.
+#[derive(Serialize)]
+struct DirectoryScore {
+    grade: &'static str,
+    provisional: bool,
+    overall_percent: Option<f64>,
+    evidence_coverage_percent: f64,
+    phases: Vec<DirectoryPhase>,
+}
+
+/// The `repo` block — contract line `repo-fields`.
+#[derive(Serialize)]
+struct DirectoryRepo<'a> {
+    owner: &'a str,
+    name: &'a str,
+    url: &'a str,
+    default_branch: &'a str,
+    commit: &'a str,
+    description: &'static str,
+}
+
+/// The `scanner` block. A workstation has no workflow run; the fields exist
+/// because the shape requires them, and the lane is established by the
+/// directory's own verified sidecar, never by a URL a submitter chose.
+#[derive(Serialize)]
+struct DirectoryScanner {
+    sscsb_version: &'static str,
+    workflow_run_id: u64,
+    workflow_run_url: &'static str,
+}
+
+/// The signed document — contract line `record-fields`.
+#[derive(Serialize)]
+struct LocalScanRecord<'a> {
+    schema_version: u32,
+    methodology_version: u32,
+    repo: DirectoryRepo<'a>,
+    scanned_at: &'a str,
+    scanner: DirectoryScanner,
+    request_issue: Option<u64>,
+    controls: Vec<DirectoryControl<'a>>,
+    score: DirectoryScore,
+    local: &'a crate::local_scan::LocalBlock,
+}
+
+/// Round to one decimal, the site's `round1`.
+fn round1(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
+}
+
+/// The site's `gradeFor`. A+ requires exactly 100.
+fn grade_for(overall: f64) -> &'static str {
+    if overall == 100.0 {
+        "A+"
+    } else if overall >= 90.0 {
+        "A"
+    } else if overall >= 80.0 {
+        "B"
+    } else if overall >= 70.0 {
+        "C"
+    } else if overall >= 60.0 {
+        "D"
+    } else {
+        "F"
+    }
+}
+
+/// Coverage below this: no letter at all. Mirrors `COVERAGE_FLOOR_NA`.
+const COVERAGE_FLOOR_NA: f64 = 50.0;
+/// Coverage below this (but at/above the NA floor): the letter is provisional.
+const COVERAGE_FLOOR_PROVISIONAL: f64 = 75.0;
+
+/// Whether a control is in the directory's scope for this repository.
+///
+/// The site's rule, mirrored: scope is the registry's default-on set UNION the
+/// set the repository's own config enables. A repository that switches a
+/// default-on control OFF therefore keeps it in the denominator and scores a
+/// gap, rather than shrinking the denominator by opting out.
+fn in_scope(cfg: &Config, def: &controls::ControlDef) -> bool {
+    def.default_enabled || cfg.control_enabled_or_default(def.id)
+}
+
+/// The directory's `scan_outcome` for one row, with the reason it carries.
+///
+/// This is a DIRECT reading of what the tool observed on this machine. The
+/// scanner-init reclassification the directory applies to its own external
+/// scans has no analogue here (nothing installed anything seconds ago), and
+/// the evidence-class rules that decide what a row may COUNT for are the
+/// directory's, applied at merge time against every source it holds — not
+/// something a self-report gets to assert about itself.
+fn scan_outcome_for(scoped: bool, raw: &Outcome) -> (&'static str, Option<&'static str>) {
+    if !scoped {
+        return (
+            "info",
+            Some("optional control not enabled by this repository"),
+        );
+    }
+    match raw {
+        Outcome::Pass => ("pass", None),
+        Outcome::Fail => ("fail", None),
+        Outcome::Degraded => (
+            "unverified",
+            Some("the control could not be performed on this machine — an unperformed check is never a verdict"),
+        ),
+        Outcome::Disabled => (
+            "gap",
+            Some("a default-on control this repository switched off in .sscsb/config.toml"),
+        ),
+        Outcome::Info => ("info", None),
+    }
+}
+
+/// The site's `computeScore`, mirrored so the signed record is a complete and
+/// independently checkable `ScanRecord`.
+///
+/// The directory RECOMPUTES the listing's score from every evidence source it
+/// holds and never displays this copy as the grade — but a record that omitted
+/// the block, or filled it with zeroes, would not be a valid record and could
+/// not be validated by anyone offline.
+fn score_of(rows: &[DirectoryControl<'_>]) -> DirectoryScore {
+    let scoped: Vec<&DirectoryControl<'_>> = rows.iter().filter(|r| r.in_scope).collect();
+    let mut phases = Vec::with_capacity(5);
+    for phase in 1u8..=5 {
+        let inp = |o: &str| {
+            scoped
+                .iter()
+                .filter(|r| r.phase == phase && r.scan_outcome == o)
+                .count() as u32
+        };
+        let (pass, fail, gap) = (inp("pass"), inp("fail"), inp("gap"));
+        let countable = pass + fail + gap;
+        phases.push(DirectoryPhase {
+            phase,
+            pass,
+            fail,
+            gap,
+            unverified: inp("unverified"),
+            info: inp("info"),
+            percent: if countable == 0 {
+                None
+            } else {
+                Some(round1(100.0 * f64::from(pass) / f64::from(countable)))
+            },
+        });
+    }
+    let total_pass: u32 = phases.iter().map(|p| p.pass).sum();
+    let total_countable: u32 = phases.iter().map(|p| p.pass + p.fail + p.gap).sum();
+    let overall = if total_countable == 0 {
+        None
+    } else {
+        Some(round1(
+            100.0 * f64::from(total_pass) / f64::from(total_countable),
+        ))
+    };
+    let coverage = if scoped.is_empty() {
+        0.0
+    } else {
+        round1(100.0 * f64::from(total_countable) / scoped.len() as f64)
+    };
+    let (grade, provisional) = match overall {
+        Some(o) if coverage >= COVERAGE_FLOOR_NA => {
+            (grade_for(o), coverage < COVERAGE_FLOOR_PROVISIONAL)
+        }
+        _ => ("NA", false),
+    };
+    DirectoryScore {
+        grade,
+        provisional,
+        overall_percent: overall,
+        evidence_coverage_percent: coverage,
+        phases,
+    }
+}
+
+/// Render the local-lane record: a directory `ScanRecord` in the shape the
+/// site's `validateScanRecord` accepts, plus the additive `local` block that
+/// binds it to a repository, a commit and a signer.
+///
+/// These are the bytes that get signed and the bytes that get committed. There
+/// is no second serialization anywhere in the lane.
+pub fn local_record_json(
+    cfg: &Config,
+    results: &[VerifyResult],
+    local: &crate::local_scan::LocalBlock,
+) -> Result<String> {
+    let mut rows = Vec::with_capacity(results.len());
+    for r in results {
+        let def = controls::control(r.control).ok_or_else(|| {
+            anyhow::anyhow!(
+                "verify produced a result for unknown control `{}`",
+                r.control
+            )
+        })?;
+        let scoped = in_scope(cfg, def);
+        let (scan_outcome, reason) = scan_outcome_for(scoped, &r.outcome);
+        rows.push(DirectoryControl {
+            id: def.id,
+            phase: def.phase,
+            in_scope: scoped,
+            raw_outcome: &r.outcome,
+            scan_outcome,
+            reclassified: reason.is_some() && scoped,
+            reason,
+            messages: &r.messages,
+        });
+    }
+    let score = score_of(&rows);
+    let doc = LocalScanRecord {
+        schema_version: crate::local_scan::SCHEMA_VERSION,
+        methodology_version: crate::local_scan::METHODOLOGY_VERSION,
+        repo: DirectoryRepo {
+            owner: &local.repo.owner,
+            name: &local.repo.name,
+            url: &local.repo.url,
+            default_branch: &local.repo.default_branch,
+            commit: &local.repo.commit,
+            // The directory reads a repository's description from GitHub
+            // itself. A workstation has no business asserting one.
+            description: "",
+        },
+        scanned_at: &local.generated_at,
+        scanner: DirectoryScanner {
+            sscsb_version: local.sscsb_version,
+            workflow_run_id: 0,
+            workflow_run_url: "",
+        },
+        request_issue: None,
+        controls: rows,
+        score,
+        local,
     };
     Ok(serde_json::to_string_pretty(&doc)?)
 }
@@ -241,6 +517,243 @@ mod tests {
             assert_eq!(row["phase"], def.phase);
             assert_eq!(row["name"], def.name);
         }
+    }
+
+    /// A [`crate::local_scan::LocalBlock`] fixture, so the record tests read
+    /// as assertions rather than as construction.
+    fn block_fixture() -> crate::local_scan::LocalBlock {
+        crate::local_scan::LocalBlock {
+            record_version: crate::local_scan::RECORD_VERSION,
+            lane: "local",
+            namespace: crate::local_scan::NAMESPACE,
+            generated_at: "2026-01-01T00:00:00Z".into(),
+            sscsb_version: env!("CARGO_PKG_VERSION"),
+            repo: crate::local_scan::RecordRepo {
+                owner: "o".into(),
+                name: "r".into(),
+                url: "https://github.com/o/r".into(),
+                default_branch: "main".into(),
+                branch: "main".into(),
+                commit: "0".repeat(40),
+            },
+            worktree: crate::local_scan::RecordWorktree {
+                clean: true,
+                tracked_changes: Vec::new(),
+            },
+            signer: crate::local_scan::RecordSigner {
+                principal: "you@example.test".into(),
+                key: "ssh-ed25519 AAAA".into(),
+                fingerprint: "SHA256:x".into(),
+                program: "ssh-keygen".into(),
+            },
+            allowed_signers: crate::local_scan::RecordAnchor {
+                path: crate::local_scan::ANCHOR_PATH.into(),
+                sha256: "0".repeat(64),
+            },
+        }
+    }
+
+    /// The signed bytes must be a directory `ScanRecord` — every field the
+    /// site's `validateScanRecord` requires, present at signing time.
+    ///
+    /// This is the blocker the lane died on: the tool signed a `verify
+    /// --format json` document and the directory validated a `ScanRecord`, so
+    /// nothing the tool produced could ever be ingested. The signature makes
+    /// the bytes unreshapeable afterwards, so the shape has to be right here.
+    #[test]
+    fn a_local_record_is_a_directory_scan_record_with_one_added_block() {
+        let (_d, ctx, cfg) = bootstrapped_ctx();
+        let results = full_verify(&ctx, &cfg);
+        let block = block_fixture();
+        let doc: serde_json::Value =
+            serde_json::from_str(&local_record_json(&cfg, &results, &block).unwrap()).unwrap();
+
+        // contract line `record-fields`
+        for field in [
+            "schema_version",
+            "methodology_version",
+            "repo",
+            "scanned_at",
+            "scanner",
+            "request_issue",
+            "controls",
+            "score",
+        ] {
+            assert!(doc.get(field).is_some(), "record is missing `{field}`");
+        }
+        assert_eq!(doc["schema_version"], crate::local_scan::SCHEMA_VERSION);
+        assert_eq!(
+            doc["methodology_version"],
+            crate::local_scan::METHODOLOGY_VERSION
+        );
+        // contract line `repo-fields`
+        for field in [
+            "owner",
+            "name",
+            "url",
+            "default_branch",
+            "commit",
+            "description",
+        ] {
+            assert!(
+                doc["repo"].get(field).is_some(),
+                "repo is missing `{field}`"
+            );
+        }
+        assert_eq!(doc["repo"]["commit"].as_str().unwrap().len(), 40);
+        // contract line `score-fields`
+        for field in [
+            "grade",
+            "provisional",
+            "overall_percent",
+            "evidence_coverage_percent",
+            "phases",
+        ] {
+            assert!(doc["score"].get(field).is_some(), "score missing `{field}`");
+        }
+        assert_eq!(doc["score"]["phases"].as_array().unwrap().len(), 5);
+        // contract line `control-fields`
+        let rows = doc["controls"].as_array().unwrap();
+        assert_eq!(rows.len(), controls::CONTROLS.len());
+        let scan_outcomes = ["pass", "fail", "gap", "unverified", "info"];
+        let raw_outcomes = ["pass", "fail", "degraded", "disabled", "info"];
+        for row in rows {
+            for field in [
+                "id",
+                "phase",
+                "in_scope",
+                "raw_outcome",
+                "scan_outcome",
+                "reclassified",
+                "reason",
+                "messages",
+            ] {
+                assert!(row.get(field).is_some(), "control row missing `{field}`");
+            }
+            assert!(scan_outcomes.contains(&row["scan_outcome"].as_str().unwrap()));
+            assert!(raw_outcomes.contains(&row["raw_outcome"].as_str().unwrap()));
+            assert!(row["messages"].is_array());
+        }
+        // The additive lane block, and nothing that pretends to be a CI run.
+        assert_eq!(doc["local"]["lane"], "local");
+        assert_eq!(doc["local"]["namespace"], crate::local_scan::NAMESPACE);
+        assert_eq!(doc["scanner"]["workflow_run_id"], 0);
+        assert_eq!(doc["scanner"]["workflow_run_url"], "");
+        assert_eq!(doc["request_issue"], serde_json::Value::Null);
+    }
+
+    /// Every row the record emits comes from the same registry walk `verify
+    /// --format json` reports, so a control cannot be scored one way through
+    /// CI and another way from a workstation.
+    #[test]
+    fn a_local_record_reports_the_same_rows_and_raw_outcomes_as_verify_json() {
+        let (_d, ctx, cfg) = bootstrapped_ctx();
+        let results = full_verify(&ctx, &cfg);
+        let plain: serde_json::Value =
+            serde_json::from_str(&verify_json(&results, false).unwrap()).unwrap();
+        let block = block_fixture();
+        let doc: serde_json::Value =
+            serde_json::from_str(&local_record_json(&cfg, &results, &block).unwrap()).unwrap();
+
+        let rows = doc["controls"].as_array().unwrap();
+        let plain_rows = plain["results"].as_array().unwrap();
+        assert_eq!(rows.len(), plain_rows.len());
+        for (row, want) in rows.iter().zip(plain_rows) {
+            assert_eq!(row["id"], want["control"]);
+            assert_eq!(row["phase"], want["phase"]);
+            assert_eq!(row["raw_outcome"], want["outcome"]);
+            assert_eq!(row["messages"], want["messages"]);
+        }
+    }
+
+    /// A repository that switches a default-on control OFF keeps it in the
+    /// denominator and scores a gap — it does not shrink the denominator by
+    /// opting out, which would be self-graded coverage.
+    #[test]
+    fn disabling_a_default_on_control_scores_a_gap_rather_than_leaving_scope() {
+        let (dir, ctx, _cfg) = bootstrapped_ctx();
+        let target = controls::CONTROLS
+            .iter()
+            .find(|d| d.default_enabled)
+            .expect("the registry has default-on controls");
+        crate::config::set_control_enabled(&ctx.config_path(), target.id, false).unwrap();
+        let cfg = Config::load(dir.path()).unwrap().unwrap();
+        let results: Vec<VerifyResult> = controls::CONTROLS
+            .iter()
+            .map(|def| controls::verify_control(&ctx, &cfg, def))
+            .collect();
+        let block = block_fixture();
+        let doc: serde_json::Value =
+            serde_json::from_str(&local_record_json(&cfg, &results, &block).unwrap()).unwrap();
+        let row = doc["controls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == target.id)
+            .unwrap();
+        assert_eq!(row["in_scope"], true, "{} left scope", target.id);
+        assert_eq!(row["raw_outcome"], "disabled");
+        assert_eq!(row["scan_outcome"], "gap");
+    }
+
+    /// The record's own score is the site's arithmetic, mirrored: unverified
+    /// and info rows are in NO denominator, and A+ requires exactly 100.
+    #[test]
+    fn the_records_score_mirrors_the_directorys_arithmetic() {
+        assert_eq!(grade_for(100.0), "A+");
+        assert_eq!(grade_for(99.9), "A");
+        assert_eq!(grade_for(90.0), "A");
+        assert_eq!(grade_for(89.9), "B");
+        assert_eq!(grade_for(80.0), "B");
+        assert_eq!(grade_for(70.0), "C");
+        assert_eq!(grade_for(60.0), "D");
+        assert_eq!(grade_for(59.9), "F");
+        assert_eq!(round1(57.14285), 57.1);
+
+        let rows = |specs: &[(u8, bool, &'static str)]| -> Vec<DirectoryControl<'static>> {
+            specs
+                .iter()
+                .map(|(phase, scoped, outcome)| DirectoryControl {
+                    id: "x",
+                    phase: *phase,
+                    in_scope: *scoped,
+                    raw_outcome: &Outcome::Pass,
+                    scan_outcome: outcome,
+                    reclassified: false,
+                    reason: None,
+                    messages: &[],
+                })
+                .collect()
+        };
+
+        // 3 pass + 1 gap countable of 8 scoped: 75% overall, 50% coverage.
+        let s = score_of(&rows(&[
+            (1, true, "pass"),
+            (1, true, "pass"),
+            (1, true, "pass"),
+            (1, true, "gap"),
+            (2, true, "unverified"),
+            (2, true, "unverified"),
+            (2, true, "unverified"),
+            (2, true, "info"),
+        ]));
+        assert_eq!(s.overall_percent, Some(75.0));
+        assert_eq!(s.evidence_coverage_percent, 50.0);
+        assert_eq!(s.grade, "C");
+        assert!(s.provisional, "50% coverage is under the provisional floor");
+        assert_eq!(s.phases[1].percent, None, "no countable rows in phase 2");
+
+        // Nothing countable at all: no letter, not an F.
+        let none = score_of(&rows(&[(1, true, "unverified"), (2, true, "info")]));
+        assert_eq!(none.grade, "NA");
+        assert_eq!(none.overall_percent, None);
+        assert!(!none.provisional);
+
+        // Out-of-scope rows are in no denominator, including coverage's.
+        let scoped_only = score_of(&rows(&[(1, true, "pass"), (1, false, "info")]));
+        assert_eq!(scoped_only.evidence_coverage_percent, 100.0);
+        assert_eq!(scoped_only.grade, "A+");
+        assert!(!scoped_only.provisional);
     }
 
     /// The five outcome literals are the wire format external consumers pin.

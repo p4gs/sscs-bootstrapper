@@ -8,6 +8,86 @@ versions.
 
 ## [Unreleased]
 
+### Added
+
+- **`sscsb scan --local` — the local lane.** About a third of the controls
+  are checks on a *development environment* — `commit-signing`,
+  `agent-signing`, `signing-model`, `ai-trailers`, `ai-dep-gate`, `ai-receipts`,
+  `package-trust`, `bumblebee`, `grype`, `socket-firewall`, `witness`,
+  `sighthound`, `guac`, `openvex` and `oras`, of which ten or eleven are in
+  scope for a typical repository — so a repository scan can only score them
+  `unverified`, which is why a repository with a perfect posture reads
+  *provisional* in the public directory.
+
+  `--local` runs the full control set where those checks are observable and
+  writes a **directory `ScanRecord`** — the public directory's own schema,
+  `schema_version` 1 and `methodology_version` 1, every required field present
+  — to the **committed** path `.sscsb/scan-record.local.json`, with one added
+  `local` block binding it to the repository, the commit and the signer. It
+  signs those exact bytes with the key git already signs commits with —
+  `gpg.format`, `user.signingkey`, `gpg.ssh.program`, so a 1Password-,
+  Secure-Enclave- or YubiKey-backed key signs untouched. The detached SSHSIG
+  lands at `.sscsb/scan-record.local.json.sig` and is re-verified before the
+  command reports success. Both files are meant to be committed and pushed:
+  the submission is a *pointer*, and the directory reads the record, the
+  signature and the anchor out of the public repository, so nothing typed into
+  an issue reaches the bytes it verifies.
+
+  The trust anchor is `.sscsb/policy/allowed_signers` **as committed in the
+  public repository at the recorded commit** — content the submitter does not
+  supply. A verified local record therefore proves exactly that *a holder of a
+  key this repository commits as an approved signer asserted this result at
+  commit X*. It does **not** prove CI produced the result; only the action lane
+  does that. The directory therefore requires an independent record to agree
+  with a local row wherever a repository scan could have observed the control
+  (evidence classes A, A′ and B), and lets a local row stand alone only where
+  no independent observation is possible (class C). Sources that disagree score
+  the control as a **gap** with a contradiction flag, so a flattering local
+  scan costs the repository rather than helping it. `--submit` files the
+  pointer with `gh`; `--dry-run` prints it instead.
+
+  **The lane now has one written contract**: the fenced ```contract block in
+  `docs/local-scan.md` pins the command, the SSHSIG namespace, the committed
+  paths, the record shape and every required field. The tool asserts each line
+  against its own constants and the directory asserts a verbatim mirror, both
+  over the same digest — so the namespace/shape/path/command mismatches that
+  made the first cut of this lane unusable end to end now fail a test instead.
+
+### Changed
+
+- **Generated `allowed_signers` lines now grant two namespaces to `human`-class
+  signers**, `namespaces="git,sscsb-scan-record"` rather than
+  `namespaces="git"`. SSHSIG namespaces stop a signature minted for one protocol
+  being replayed as another, and the second name is the one local scan records
+  are signed in. The grant is additive — commit-signature verification is
+  unchanged — and it is written as a positive statement rather than by dropping
+  the restriction, which would silently permit every namespace OpenSSH ever
+  defines. A repository anchored before this release carries `namespaces="git"`
+  alone and `--local` refuses with the one-line fix (`sscsb init`, commit the
+  anchor) rather than producing a record that will not verify.
+
+  **`ci`- and `ai`-class signers keep `namespaces="git"` and nothing else.** A
+  local scan record is a maintainer's attested word about a machine nobody else
+  can inspect, and it is the one lane whose local-environment verdicts count
+  without independent corroboration — so only a `class = "human"` signer may
+  assert one. CI does not need the grant (the action lane proves strictly more),
+  and granting it to an `ai` key would contradict this policy's own invariant
+  that an AI-class signer never signs. The refusal is structural: the namespace
+  is simply absent from the line, so `ssh-keygen -Y verify -n sscsb-scan-record`
+  fails against the committed anchor and both `sscsb` and the public directory
+  refuse independently.
+
+### Fixed
+
+- **A test read `PATH` without the environment lock and failed as if the code
+  had regressed.** `scan::tests::run_scan_surfaces_a_clear_error_when_the_vex_path_does_not_exist`
+  resolved `trivy`/`osv-scanner` by bare name in its skip guard and again inside
+  `run_scan`, holding no lock across the two. A sibling test stripping `PATH`
+  between them flipped the guard's answer, and `run_scan` reported "no
+  vulnerability scanner available" instead of the VEX read error — surfacing as
+  an unrelated assertion failure under parallel execution. It now holds the lock
+  the `testutil` module docs require of every `PATH`-dependent read.
+
 ## [0.3.1] - 2026-09-02
 
 ### Fixed

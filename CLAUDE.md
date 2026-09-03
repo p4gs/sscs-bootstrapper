@@ -29,6 +29,38 @@ Always run tests as:
 SSH_AUTH_SOCK= GIT_CONFIG_COUNT=0 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null cargo test
 ```
 
+There is a fourth leak that the command above does **not** cover, because it
+comes from PATH rather than from git config. A fixture that calls
+`init::bootstrap()` points `core.hooksPath` at the installed shims, and the
+pre-commit shim fail-closes when the `sscsb` CLI is not on PATH — correct
+product behaviour, and the state of every fresh CI runner. On a developer
+machine `sscsb` *is* on PATH, so such a fixture passes locally and fails only
+in CI. Every fixture commit must therefore pass `--no-verify` (the convention
+already used in `signers`, `hooks`, `openssf`, `deps`, `provenance`); the shims
+have their own tests, and a fixture's setup commit is scaffolding, not subject.
+
+To reproduce a CI runner locally, hide **only** `sscsb` and keep every other
+tool. Do not simply drop `/opt/homebrew/bin` from PATH: `cosign`, `semgrep`,
+`slsa-verifier` and `gitleaks` live there too, CI installs them, and removing
+them manufactures 10 unrelated failures in `hooks`, `provenance` and `sast`
+that will send you chasing the wrong bug. Shadow the directories with a
+symlink farm instead:
+
+```sh
+FARM="$(mktemp -d)/bin"; mkdir -p "$FARM"
+for d in /opt/homebrew/bin "$HOME/.cargo/bin"; do
+  for f in "$d"/*; do b="$(basename "$f")"
+    [ "$b" = sscsb ] && continue; [ -e "$FARM/$b" ] && continue; ln -s "$f" "$FARM/$b"
+  done
+done
+REST="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF /opt/homebrew/bin | grep -vxF "$HOME/.cargo/bin" | paste -sd: -)"
+PATH="$FARM:$REST" SSH_AUTH_SOCK= GIT_CONFIG_COUNT=0 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null cargo test
+```
+
+Sanity-check the farm with `command -v sscsb` (must print nothing) and
+`command -v cosign` (must print a path) before trusting a run. This caught 18
+real failures in `local_scan` that a normal local run reported as green.
+
 Follow-up worth doing properly: have the test helpers (`test_repo()` /
 `exec::git` under `cfg(test)`) set this isolation themselves so the suite is
 hermetic by construction rather than by invocation discipline.
