@@ -256,6 +256,16 @@ Every other control in this phase asks a question about the *repository*. **Bumb
 (`sscsb enable bumblebee`) asks one about the *machine the work happens on*: is anything
 installed here that appears in a catalog of known-compromised releases?
 
+> **These controls are invisible to a repository scan.** `package-trust`,
+> `bumblebee`, `grype` and `socket-firewall` — like `commit-signing` and the AI
+> controls in [phase-1](phase-1.md) — describe a development environment, not a
+> tree of files. Anyone cloning your repository can only score them
+> `unverified`, which is honest and also why a repository with a perfect posture
+> reads *provisional* in the public directory. `sscsb scan --local` runs them
+> where they are observable and signs the result with the key git already signs
+> your commits with, so the finding is attributable rather than merely asserted.
+> See [local-scan.md](local-scan.md).
+
 That is a different surface, and it is the one the 2024-2026 worm campaigns actually
 landed on. Bumblebee inventories npm, PyPI, Go, RubyGems and Composer packages — and,
 more to the point, **MCP server configs, editor extensions, browser extensions, agent

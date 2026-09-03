@@ -5,11 +5,12 @@
 use crate::config;
 use crate::context::Ctx;
 use crate::controls::{self, Outcome};
+use crate::exec;
 use crate::{
-    compliance, deps, hooks, init, machine, observability, provenance, sast, sbom, scan, signers,
-    tools,
+    compliance, deps, hooks, init, local_scan, machine, observability, provenance, sast, sbom,
+    scan, signers, tools,
 };
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -81,7 +82,8 @@ enum Command {
         #[arg(long)]
         format: Option<String>,
     },
-    /// Vulnerability scan (Trivy + OSV-Scanner; optional VEX suppression)
+    /// Vulnerability scan (Trivy + OSV-Scanner; optional VEX suppression), or
+    /// with --local, a signed LOCAL-LANE record for the public directory
     Scan {
         /// OpenVEX document whose not_affected/fixed statements suppress findings
         #[arg(long)]
@@ -89,6 +91,22 @@ enum Command {
         /// Also run Grype against a fresh SBOM (requires grype)
         #[arg(long)]
         grype: bool,
+        /// LOCAL LANE. Run every control here, where the local-environment
+        /// ones are observable, and sign the result with your git signing key.
+        /// Writes .sscsb/scan-record.local.json and .json.sig — COMMIT BOTH.
+        /// See docs/local-scan.md.
+        #[arg(long)]
+        local: bool,
+        /// With --local: file the pointer submission to the directory's queue
+        /// (requires the `gh` CLI, authenticated)
+        #[arg(long)]
+        submit: bool,
+        /// With --local --submit: print the submission instead of filing it
+        #[arg(long)]
+        dry_run: bool,
+        /// With --local: exit non-zero on DEGRADED as well as FAIL
+        #[arg(long)]
+        strict: bool,
     },
     /// Run SAST (OpenGrep default; engine configurable)
     Sast,
@@ -381,7 +399,36 @@ pub fn run() -> Result<ExitCode> {
         } => cmd_harden(&cwd, control.as_deref(), apply, require_reviews),
         Command::Hook { event } => cmd_hook(&cwd, event),
         Command::Sbom { format } => cmd_sbom(&cwd, format.as_deref()),
-        Command::Scan { vex, grype } => cmd_scan(&cwd, vex.as_deref(), grype),
+        Command::Scan {
+            vex,
+            grype,
+            local,
+            submit,
+            dry_run,
+            strict,
+        } => {
+            if local {
+                // `--local` is a different MODE of `scan`, not an extra option
+                // on the vulnerability scan: it runs the control registry, not
+                // Trivy/OSV, so `--vex` and `--grype` have nothing to act on.
+                // Refusing beats silently ignoring flags a maintainer passed.
+                if vex.is_some() || grype {
+                    anyhow::bail!(
+                        "`--local` produces a signed directory record from the CONTROL registry, \
+                         so `--vex` and `--grype` (which shape the Trivy/OSV vulnerability scan) \
+                         have nothing to act on. Run them as their own `sscsb scan`."
+                    );
+                }
+                cmd_scan_local(&cwd, submit, dry_run, strict)
+            } else if submit || dry_run || strict {
+                anyhow::bail!(
+                    "`--submit`, `--dry-run` and `--strict` only apply to `sscsb scan --local`, \
+                     which produces the signed record a submission points at"
+                );
+            } else {
+                cmd_scan(&cwd, vex.as_deref(), grype)
+            }
+        }
         Command::Sast => cmd_sast(&cwd),
         Command::Deps { action } => cmd_deps(&cwd, action),
         Command::Receipt { action } => cmd_receipt(&cwd, action),
@@ -567,6 +614,157 @@ fn cmd_verify(
         println!();
         println!("verify: {failed} failed, {degraded} degraded");
     }
+    if failed > 0 || (strict && degraded > 0) {
+        fail(1)
+    } else {
+        ok()
+    }
+}
+
+/// `sscsb scan --local` — the local lane.
+///
+/// # Why this surface, and not `sscsb verify --local`
+///
+/// The deciding argument is not taxonomy. The directory prints ONE command on
+/// every provisional listing, the issue form repeats it, and the peer-pressure
+/// nudge sends it to maintainers who have never run this tool. A command that
+/// is one word different from the one that exists is worse than an imperfect
+/// verb — and the previous round shipped exactly that: the site rendered
+/// `sscsb scan --local --submit` while the tool implemented `verify --local`,
+/// so the whole lane was unreachable.
+///
+/// So the string is written down once, in the contract block in
+/// `docs/local-scan.md` (line `command`), and both trees are tested against
+/// it. `--local` is a MODE of `scan` rather than an option on it: it is
+/// rejected together with `--vex`/`--grype` instead of silently ignoring them.
+fn cmd_scan_local(
+    cwd: &std::path::Path,
+    submit: bool,
+    dry_run: bool,
+    strict: bool,
+) -> Result<ExitCode> {
+    if dry_run && !submit {
+        anyhow::bail!("`--dry-run` describes what `--submit` would file; pass both");
+    }
+
+    let ctx = Ctx::discover(cwd)?;
+    let cfg = ctx.require_config()?;
+    let home = crate::signing_setup::SigningPaths::real()?.home;
+
+    // Every guard rail runs BEFORE any control does: a maintainer whose key is
+    // not in the anchor should learn that in a second, not after a full scan.
+    let prepared = local_scan::prepare(&ctx, &home)?;
+
+    let results: Vec<controls::VerifyResult> = controls::CONTROLS
+        .iter()
+        .map(|def| controls::verify_control(&ctx, cfg, def))
+        .collect();
+    let mut failed = 0u32;
+    let mut degraded = 0u32;
+    for result in &results {
+        match result.outcome {
+            Outcome::Fail => failed += 1,
+            Outcome::Degraded => degraded += 1,
+            _ => {}
+        }
+    }
+
+    let signed = local_scan::sign_record(&ctx, cfg, &prepared, &results, &home)?;
+    let verified = local_scan::verify_signature(&ctx, &prepared, &signed)?;
+
+    let b = &prepared.block;
+    println!("local scan record — {}/{}", b.repo.owner, b.repo.name);
+    println!("  commit    {}", b.repo.commit);
+    println!(
+        "  signer    {} ({})",
+        b.signer.principal, b.signer.fingerprint
+    );
+    println!("  namespace {}", b.namespace);
+    println!("  record    {}", local_scan::RECORD_PATH);
+    println!("  signature {}", local_scan::SIGNATURE_PATH);
+    println!("  verified  {verified}");
+    println!();
+    println!("verify: {failed} failed, {degraded} degraded");
+    println!();
+    println!(
+        "This record proves that a holder of a key this repository commits as an approved\n\
+         signer asserted this result at the commit above. It does NOT prove your CI produced\n\
+         it — only the action lane does that. Where a repository scan could observe a control,\n\
+         the directory requires an independent record to agree with this one before the row\n\
+         counts; where it could not, this record stands on its own. Sources that disagree\n\
+         score the control as a gap."
+    );
+    println!();
+    println!(
+        "Commit both files — the submission is a POINTER, and the directory reads them from\n\
+         your public repository:\n\
+         \x20   git add {record} {sig}\n\
+         \x20   git commit -m 'chore: publish a signed local scan record'\n\
+         \x20   git push",
+        record = local_scan::RECORD_PATH,
+        sig = local_scan::SIGNATURE_PATH,
+    );
+
+    if submit {
+        let body = local_scan::submission_body(&prepared, &signed);
+        local_scan::check_body_size(&body)?;
+        let title = local_scan::submission_title(&prepared.slug);
+        if dry_run {
+            println!();
+            println!(
+                "--- would file on {} (label `{}`) ---",
+                local_scan::DIRECTORY_REPO,
+                local_scan::SUBMISSION_LABEL
+            );
+            println!("{title}");
+            println!("{body}");
+            return verify_exit(failed, degraded, strict);
+        }
+        let body_path = ctx
+            .root
+            .join(local_scan::OUT_DIR)
+            .join("scan-local-submission.md");
+        std::fs::write(&body_path, &body)?;
+        let body_arg = body_path
+            .to_str()
+            .context("submission body path is not UTF-8")?;
+        let args = local_scan::submit_args(&title, body_arg);
+        let out = exec::run("gh", &args, Some(&ctx.root)).with_context(|| {
+            format!(
+                "could not run `gh` to file the submission. Install the GitHub CLI and run \
+                 `gh auth login`, or open an issue at https://github.com/{}/issues and attach \
+                 {}.",
+                local_scan::DIRECTORY_REPO,
+                body_path.display()
+            )
+        })?;
+        if !out.success() {
+            anyhow::bail!(
+                "`gh issue create` failed ({}): {}\nThe submission body is at {} — you can file it \
+                 by hand at https://github.com/{}/issues.",
+                out.termination(),
+                out.stderr.trim(),
+                body_path.display(),
+                local_scan::DIRECTORY_REPO
+            );
+        }
+        println!();
+        println!("submitted: {}", out.stdout.trim());
+    } else {
+        println!();
+        println!(
+            "Then submit it with `{}` (add --dry-run to preview).",
+            local_scan::COMMAND
+        );
+    }
+
+    verify_exit(failed, degraded, strict)
+}
+
+/// `verify`'s exit contract, shared by both lanes: FAIL is exit 1, and
+/// `--strict` promotes DEGRADED to the same. Producing a record does not
+/// launder a failing posture into a success code.
+fn verify_exit(failed: u32, degraded: u32, strict: bool) -> Result<ExitCode> {
     if failed > 0 || (strict && degraded > 0) {
         fail(1)
     } else {

@@ -51,13 +51,24 @@ impl Ctx {
     }
 
     /// Default branch: origin/HEAD if known, else "main".
+    ///
+    /// The short form of `refs/remotes/origin/HEAD` is `origin/<branch>`, and
+    /// only the `origin/` remote prefix may be removed. Taking the last
+    /// slash-separated segment instead truncates every branch whose name
+    /// contains a slash — `origin/feat/local-scan` became `local-scan` — and
+    /// the wrong name is then written straight into the `branches:` trigger of
+    /// every installed workflow template, where it silently matches nothing.
     pub fn default_branch(&self) -> String {
         exec::git(
             &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
             &self.root,
         )
         .ok()
-        .and_then(|s| s.rsplit('/').next().map(str::to_string))
+        .and_then(|s| {
+            s.strip_prefix("origin/")
+                .map(str::to_string)
+                .filter(|b| !b.is_empty())
+        })
         .unwrap_or_else(|| "main".to_string())
     }
 
@@ -193,5 +204,33 @@ mod tests {
         .unwrap();
         assert!(add.success());
         assert_eq!(ctx.origin_slug().as_deref(), Some("p4gs/sscs-bootstrapper"));
+    }
+
+    #[test]
+    fn a_default_branch_whose_name_contains_a_slash_survives_intact() {
+        // `git symbolic-ref --short refs/remotes/origin/HEAD` prints
+        // `origin/<branch>`; only the remote prefix may come off. Taking the
+        // last segment truncated `origin/feat/local-scan` to `local-scan`,
+        // which then went into the `branches:` trigger of every installed
+        // workflow template and matched nothing.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        for args in [
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/p4gs/sscs-bootstrapper.git",
+            ],
+            vec![
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/feat/local-scan",
+            ],
+        ] {
+            assert!(exec::run("git", &args, Some(dir.path())).unwrap().success());
+        }
+        let ctx = Ctx::discover(dir.path()).unwrap();
+        assert_eq!(ctx.default_branch(), "feat/local-scan");
     }
 }

@@ -20,6 +20,17 @@ Phase 1 puts eleven controls on that boundary; the ten with a backing tool or te
 | `pr-template` | PR template asking what the AI wrote | (native) | on |
 | `ai-receipts` | Cryptographic receipts binding a commit to a tool/model/role | Cosign | off |
 
+> **Six of these are invisible to a repository scan.** `commit-signing`,
+> `agent-signing`, `signing-model` (Phase 1's own reporting control),
+> `ai-trailers`, `ai-dep-gate` and `ai-receipts` ask what a *development
+> environment* does — which key git will
+> sign with, whether the installed hooks actually block a bad trailer. A clone
+> cannot answer that, so the public directory scores them `unverified`.
+> `sscsb scan --local` runs them where they are observable and signs the
+> result with the key git already signs your commits with; the signature
+> verifies against the `allowed_signers` file this repository commits. See
+> [local-scan.md](local-scan.md).
+
 ## How the hooks work
 
 `sscsb init` writes POSIX shell shims into `.sscsb/hooks/` and points git at them

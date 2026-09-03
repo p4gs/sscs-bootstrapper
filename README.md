@@ -211,6 +211,46 @@ one of:
 There are no TODO stubs, no mock integrations, and no control that claims a tool
 works without running it. Where a tool is absent, `sscsb` says so.
 
+### The local lane (`sscsb scan --local`)
+
+About a third of the controls are checks on a *development environment* —
+which key git will sign with, whether the installed hooks actually block, what
+is in the package-trust baseline, which scanners are on your `PATH`. Cloning a
+repository tells you none of that, so the public directory scores them
+`unverified` and leaves them out of every denominator. That is why a repository
+with a perfect posture can still read **provisional**.
+
+`sscsb scan --local` runs the full control set where those checks *are*
+observable, writes a directory scan record to `.sscsb/scan-record.local.json`,
+and signs it with the key git already signs your commits with — `gpg.format`,
+`user.signingkey` and `gpg.ssh.program`, so a 1Password- or hardware-backed key
+works untouched. Both files are **committed**: the submission is a pointer, and
+the directory reads them — and the trust anchor — out of your public
+repository. The detached signature verifies with `ssh-keygen -Y verify` against
+`.sscsb/policy/allowed_signers` **as committed at the recorded commit**.
+
+```sh
+sscsb scan --local                # scan, sign, write both files
+git add .sscsb/scan-record.local.json .sscsb/scan-record.local.json.sig
+git commit -m 'chore: publish a signed local scan record' && git push
+sscsb scan --local --submit       # …then point the directory at them
+```
+
+A verified local record proves that *a holder of a key this repository commits
+as an approved signer asserted this result at commit X*. It does **not** prove
+your CI produced it — only the action lane does that. So where a repository
+scan could observe a control, the directory requires an independent record to
+agree with this one before the row counts at all; where it could not (the
+local-environment controls), this record stands on its own. Sources that
+disagree score the control as a gap.
+
+Only a `class = "human"` signer in `.sscsb/policy/signers.toml` is granted the
+scan namespace. A `ci`- or `ai`-class key cannot assert a local record: `sscsb
+scan --local` refuses to run under one, and a signature it produces in that
+namespace verifies against no principal in the committed anchor. The full contract — the one normative
+statement of the namespace, the paths, the record shape and the command —
+is in [docs/local-scan.md](docs/local-scan.md).
+
 ## Platforms
 
 macOS, Linux, and WSL. The hooks are POSIX shell shims that delegate to the Rust
