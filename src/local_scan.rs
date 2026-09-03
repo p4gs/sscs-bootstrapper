@@ -1478,7 +1478,15 @@ mod tests {
             &["config", "user.signingkey", approved_pub.to_str().unwrap()],
         );
         git(&root, &["add", "-A"]);
-        git(&root, &["commit", "-m", "bootstrap"]);
+        // `--no-verify` because `bootstrap` above installed the hook shims and
+        // pointed `core.hooksPath` at them. The pre-commit shim fail-closes
+        // when the `sscsb` CLI is not on PATH, which is correct product
+        // behaviour and exactly the state of a fresh CI runner — so without
+        // this the fixture passes only on a machine that happens to have the
+        // binary installed. The shims have their own tests in `hooks`; this
+        // commit is scaffolding, not the subject. Matches every other fixture
+        // in the crate.
+        git(&root, &["commit", "-m", "bootstrap", "--no-verify"]);
 
         let ctx = Ctx::discover(&root).unwrap();
         let cfg = Config::load(&root)

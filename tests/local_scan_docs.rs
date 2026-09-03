@@ -384,7 +384,10 @@ fn signing_repo_of_class(class: &str) -> (tempfile::TempDir, tempfile::TempDir, 
         ],
     );
     git(repo, &["add", "-A"]);
-    git(repo, &["commit", "-m", "bootstrap"]);
+    // `--no-verify`: bootstrap pointed `core.hooksPath` at the shims, and the
+    // pre-commit shim fail-closes without the `sscsb` CLI on PATH — correct
+    // behaviour, and the state of a fresh CI runner. Scaffolding, not subject.
+    git(repo, &["commit", "-m", "bootstrap", "--no-verify"]);
     (repo_dir, home_dir, principal)
 }
 
