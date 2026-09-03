@@ -26,6 +26,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+      id-token: write # keyless-sign the scan record (Fulcio/Sigstore OIDC) so the directory can verify it
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
@@ -37,7 +38,7 @@ jobs:
           persist-credentials: false
       - name: SSCS Bootstrapper Scan
         id: scan
-        uses: p4gs/sscsb-action@4f0634d514d5a70dca35201fac5f0dfd94da81a9 # v1
+        uses: p4gs/sscsb-action@4365f191590c96c2239902de7861f46d3e704909 # v1 line, post-#1: signed records + Sigstore-verified install
         with:
           sscsb-version: latest
           submit: "false"
