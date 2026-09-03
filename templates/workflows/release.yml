@@ -250,7 +250,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          if gh release view "$GITHUB_REF_NAME" --json isDraft -q .isDraft 2>/dev/null | grep -qx false; then
+          if gh release view --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" --json isDraft -q .isDraft 2>/dev/null | grep -qx false; then
             echo "::notice::$GITHUB_REF_NAME is already published (immutable) — nothing to do"
             echo "published=true" >> "$GITHUB_OUTPUT"
           else
@@ -303,10 +303,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes \
+          gh release view --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes \
             || { echo "::error::failed to create draft release for $GITHUB_REF_NAME"; exit 1; }
-          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          gh release upload --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" dist/* --clobber
       # The gate certified the bytes in the run's artifact store. Before the
       # release becomes immutable, prove the DRAFT holds exactly those bytes —
       # every file, no more, no less — by downloading it back and comparing.
@@ -334,4 +334,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          gh release edit "$GITHUB_REF_NAME" --draft=false
+          gh release edit --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" --draft=false
