@@ -185,15 +185,83 @@ pub const ARTIFACTS: &[Artifact] = &[
     },
 ];
 
-/// Render template placeholders with repo-specific values.
+/// The numeric GitHub ids a trust policy pins its subject to. GitHub's OIDC
+/// `sub` claim decorates the owner and the repository with their ids —
+/// `repo:OWNER@<owner_id>/REPO@<repo_id>:ref:refs/heads/main` — so a pattern
+/// spelled from names alone never matches what Octo STS is handed; the ids
+/// are also what survives a rename and what a re-created repository of the
+/// same name does NOT share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoIds {
+    pub owner_id: String,
+    pub repo_id: String,
+}
+
+/// The slug `install_all` renders with when the repository has no GitHub
+/// remote and no `github_repo` in its config.
+const PLACEHOLDER_SLUG: &str = "OWNER/REPO";
+
+/// Resolve the owner and repository ids for `slug` through `gh api`
+/// (`repos/<slug>` and `users/<owner>`, each `--jq .id`). `None` when `gh`
+/// is absent, unauthenticated, or the slug is not on GitHub — the caller
+/// then renders the tolerant form and says so.
+pub fn repo_ids(slug: &str, cwd: &Path) -> Option<RepoIds> {
+    let (owner, _) = slug.split_once('/')?;
+    crate::exec::find_in_path("gh")?;
+    let id = |path: &str| -> Option<String> {
+        let out = crate::exec::run("gh", &["api", path, "--jq", ".id"], Some(cwd)).ok()?;
+        let id = out.stdout.trim();
+        (out.success() && !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+            .then(|| id.to_string())
+    };
+    Some(RepoIds {
+        repo_id: id(&format!("repos/{slug}"))?,
+        owner_id: id(&format!("users/{owner}"))?,
+    })
+}
+
+/// Render template placeholders with repo-specific values — the tolerant
+/// form: `{{owner_id}}` / `{{repo_id}}` become `[0-9]+`. See
+/// [`render_with_ids`].
 pub fn render(content: &str, repo_slug: &str, default_branch: &str) -> String {
-    // `{{project}}` = the repo name (slug tail) — used by the ClusterFuzzLite
-    // scaffold for the OSS-Fuzz `$SRC/<project>` build path.
+    render_with_ids(content, repo_slug, default_branch, None)
+}
+
+/// Render template placeholders with repo-specific values.
+///
+/// `{{repo_slug}}`, `{{default_branch}}`; `{{project}}` = the repo name (slug
+/// tail — the ClusterFuzzLite scaffold's OSS-Fuzz `$SRC/<project>` path);
+/// `{{owner}}` = the slug head; `{{repo_escaped}}` = the repo name with `.`
+/// escaped for a regular expression (`p4gs\.github\.io`); `{{owner_id}}` /
+/// `{{repo_id}}` = the GitHub ids when `ids` is known, else `[0-9]+`, so an
+/// Octo STS `subject_pattern` built as `repo:{{owner}}(@{{owner_id}})?/…`
+/// matches GitHub's id-decorated `sub` either way — pinned when the ids are
+/// known, tolerant of any id when they are not.
+pub fn render_with_ids(
+    content: &str,
+    repo_slug: &str,
+    default_branch: &str,
+    ids: Option<&RepoIds>,
+) -> String {
     let project = repo_slug.rsplit('/').next().unwrap_or(repo_slug);
+    let owner = repo_slug.split('/').next().unwrap_or(repo_slug);
+    let any_id = "[0-9]+";
+    let (owner_id, repo_id) = ids
+        .map(|i| (i.owner_id.as_str(), i.repo_id.as_str()))
+        .unwrap_or((any_id, any_id));
     content
         .replace("{{repo_slug}}", repo_slug)
         .replace("{{default_branch}}", default_branch)
         .replace("{{project}}", project)
+        .replace("{{owner}}", owner)
+        .replace("{{repo_escaped}}", &project.replace('.', "\\."))
+        .replace("{{owner_id}}", owner_id)
+        .replace("{{repo_id}}", repo_id)
+}
+
+/// Whether a template needs the GitHub ids to render pinned.
+fn wants_ids(content: &str) -> bool {
+    content.contains("{{owner_id}}") || content.contains("{{repo_id}}")
 }
 
 pub fn artifacts_for(control: &str) -> Vec<&'static Artifact> {
@@ -214,9 +282,13 @@ pub fn install_all(ctx: &Ctx, cfg: &Config) -> Result<Vec<String>> {
     let slug = cfg
         .github_repo()
         .or_else(|| ctx.origin_slug())
-        .unwrap_or_else(|| "OWNER/REPO".to_string());
+        .unwrap_or_else(|| PLACEHOLDER_SLUG.to_string());
     let branch = ctx.default_branch();
     let mut lines = Vec::new();
+    // The GitHub ids are asked for once, and only when a template about to be
+    // written needs them — never for the placeholder slug, which names no
+    // repository.
+    let mut ids: Option<Option<RepoIds>> = None;
     for artifact in ARTIFACTS {
         // Every artifact must name a registered control; the lookup is the
         // assertion, and `control_enabled_or_default` reads that same registry
@@ -253,8 +325,30 @@ pub fn install_all(ctx: &Ctx, cfg: &Config) -> Result<Vec<String>> {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&dest, render(artifact.content, &slug, &branch))?;
+        let resolved = if wants_ids(artifact.content) {
+            ids.get_or_insert_with(|| {
+                (slug != PLACEHOLDER_SLUG)
+                    .then(|| repo_ids(&slug, &ctx.root))
+                    .flatten()
+            })
+            .as_ref()
+        } else {
+            None
+        };
+        std::fs::write(
+            &dest,
+            render_with_ids(artifact.content, &slug, &branch, resolved),
+        )?;
         lines.push(format!("write {}", artifact.dest));
+        if wants_ids(artifact.content) && resolved.is_none() {
+            let owner = slug.split('/').next().unwrap_or(&slug);
+            lines.push(format!(
+                "note {}: owner/repo ids not resolved from the GitHub API — `subject_pattern` \
+                 accepts any `@<id>` decoration until you pin them: `gh api repos/{slug} --jq \
+                 .id` (repo id), `gh api users/{owner} --jq .id` (owner id)",
+                artifact.dest
+            ));
+        }
     }
     Ok(lines)
 }
@@ -510,26 +604,37 @@ fn check_shape(dest: &str, content: &str) -> ShapeVerdict {
 /// 3. **Fires unattended.** `on:` includes an automatic trigger (`push`,
 ///    `release`, `schedule`, `pull_request`, `workflow_run`), or is
 ///    `workflow_call` and a committed workflow WITH such a trigger calls it
-///    via `uses: ./<path>`. A `workflow_dispatch`-only or `on:`-less workflow
-///    is a manual step, not a control. A trigger's `branches` / `tags` /
-///    `paths` filters are NOT evaluated — the message says so — except that
-///    an EMPTY `branches:` or `tags:` list matches no ref at all and fails.
+///    via `uses: ./<path>` from a job that is not switched off, in a file
+///    that is itself shape-sound, whose effective `permissions:` already
+///    grant every scope the called job needs (GitHub refuses a called
+///    workflow that asks for more than its caller holds). A
+///    `workflow_dispatch`-only or `on:`-less workflow is a manual step, not
+///    a control. A trigger's `branches` / `tags` / `paths` / `types` /
+///    `workflows` filters are NOT evaluated — the message says so — except
+///    that an EMPTY list under any of `branches`, `tags`, `types`,
+///    `workflows` or `schedule` matches nothing and fails.
 /// 4. **Not switched off.** Neither the proving job nor the proving step
 ///    carries a constant-false `if:` (`false`, `'false'`, `"false"`,
-///    `${{ false }}`). Any other expression is not evaluated.
-/// 5. **Pinned.** The action is pinned to a 40-hex commit SHA — the
-///    slsa-github-generator's `vX.Y.Z` tag pin excepted, per its documented
-///    trust model (the same helpers `actions-audit` uses, so the two cannot
-///    drift).
+///    `${{ false }}`) or `continue-on-error: true`; a signing command is not
+///    negated with `!`, not followed by `|| true` / `|| :`, and not preceded
+///    by a function or alias named `cosign`; and a `run:` body is judged
+///    only under a POSIX shell (no `shell:`, `bash`, `sh`, or a `bash … {0}`
+///    / `sh … {0}` template). Any other expression is not evaluated.
+/// 5. **Pinned.** The action is pinned to a 40-hex commit SHA — except the
+///    slsa-github-generator, which must be at a `vX.Y.Z` tag and ONLY a tag,
+///    because slsa-verifier identifies the builder by its tag ref and a SHA
+///    pin breaks verification (the same helpers `actions-audit` uses, so the
+///    two cannot drift on what a SHA or a tag is). Only the generic
+///    generator (`generator_generic_slsa3.yml`) is judged.
 /// 6. **Bound to an artifact.** The step names what it attests or signs
 ///    (`subject-*`, `sbom-path`, `base64-subjects` for the generator,
 ///    `--bundle` as an argument of the same `cosign sign-blob` command — the
-///    `run:` body is tokenised as shell, so an `echo` or a `#` comment that
-///    mentions cosign is not a signing command), and for Cosign the installer
-///    step precedes the signing step.
+///    `run:` body is tokenised as shell, so an `echo`, a `#` comment or a
+///    heredoc body that mentions cosign is not a signing command), and for
+///    Cosign the installer step precedes the signing step.
 /// 7. **Granted.** The job's EFFECTIVE `permissions:` (job level, else
-///    workflow level, as GitHub resolves them) include the scopes the step
-///    needs.
+///    workflow level, as GitHub resolves them; an empty job-level block is
+///    an explicit grant of nothing) include the scopes the step needs.
 ///
 /// A modular file that is present but Broken is never rescued this way; the
 /// file that was examined is reported as the control's evidence so a
@@ -589,23 +694,26 @@ impl Consolidated {
                  granted `attestations: write` + `id-token: write`"
             }
             Self::SlsaProvenance => {
-                "a job calling the `slsa-framework/slsa-github-generator` reusable \
-                 workflow (vX.Y.Z tag or SHA) granted `actions: read` + `id-token: write` + \
+                "a job calling the `slsa-framework/slsa-github-generator` \
+                 `generator_generic_slsa3.yml` reusable workflow (the generic generator only, \
+                 at a `vX.Y.Z` tag) granted `actions: read` + `id-token: write` + \
                  `contents: write`"
             }
         }
     }
 
     /// Whether this step (or job-level `uses:`) is the control's deliverable.
-    /// Prefix-matched on the parsed `uses:` value, never on raw text.
+    /// Matched on the parsed `uses:` value, never on raw text.
     fn is_candidate_action(self, uses: &str) -> bool {
         let (action, _) = split_uses(uses);
         match self {
             Self::GithubAttestations => action == "actions/attest-build-provenance",
             Self::SbomAttestation => action == "actions/attest" || action == "actions/attest-sbom",
-            Self::SlsaProvenance => {
-                action.starts_with("slsa-framework/slsa-github-generator/.github/workflows/")
-            }
+            // The generic generator only: it is the one every template calls,
+            // and the one `provenance-verify`'s builder id names. The
+            // container generator and the language builders are different
+            // trusted builders with different subjects and are not judged.
+            Self::SlsaProvenance => action == SLSA_GENERIC_GENERATOR,
             // Signing is a `run:` command, not an action — see `cosign_sign_in_run`.
             Self::SigstoreSigning => false,
         }
@@ -631,9 +739,17 @@ fn split_uses(uses: &str) -> (&str, &str) {
     uses.rsplit_once('@').unwrap_or((uses, ""))
 }
 
-/// The pinning bar every consolidated step must meet — the same one
-/// `actions-audit` enforces, via the same helpers, so the two cannot drift:
-/// a 40-hex commit SHA, or a `vX.Y.Z` tag for the one sanctioned exception.
+/// The one generator workflow the `slsa-provenance` control recognizes.
+const SLSA_GENERIC_GENERATOR: &str =
+    "slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml";
+
+/// The pinning bar every consolidated step must meet — the same helpers
+/// `actions-audit` uses, so the two cannot drift on what a SHA or a tag is:
+/// a 40-hex commit SHA for every action, and a `vX.Y.Z` tag — a tag ONLY —
+/// for the slsa-github-generator, whose trust model identifies the builder
+/// by its tag ref: slsa-verifier validates that ref, so a SHA pin there
+/// produces provenance that cannot be verified (the shipped `release.yml`
+/// header says the same).
 fn pin_defect(uses: &str) -> Option<String> {
     let (action, r) = split_uses(uses);
     if r.is_empty() {
@@ -641,17 +757,24 @@ fn pin_defect(uses: &str) -> Option<String> {
             "`{uses}` has no ref at all — the step is present but its action is unpinned"
         ));
     }
-    if crate::audit::is_full_sha(r) {
-        return None;
-    }
     if crate::audit::is_tag_pin_exception(action) {
         if crate::audit::is_semver_tag(r) {
             return None;
         }
+        if crate::audit::is_full_sha(r) {
+            return Some(format!(
+                "`{uses}` is pinned to the commit SHA `@{r}` — slsa-verifier identifies the \
+                 trusted builder by its `vX.Y.Z` tag ref and refuses a SHA-pinned generator, \
+                 so the provenance it produces cannot be verified; pin it to a `vX.Y.Z` tag"
+            ));
+        }
         return Some(format!(
-            "`{uses}` ref `@{r}` is neither a `vX.Y.Z` tag (the generator's documented \
-             trust model, which slsa-verifier checks) nor a 40-hex commit SHA"
+            "`{uses}` ref `@{r}` is not a `vX.Y.Z` tag — the generator's documented trust \
+             model, which slsa-verifier checks, identifies the builder by its tag"
         ));
+    }
+    if crate::audit::is_full_sha(r) {
+        return None;
     }
     Some(format!(
         "`{uses}` is pinned to `@{r}`, not a 40-hex commit SHA — the step is present but \
@@ -660,10 +783,12 @@ fn pin_defect(uses: &str) -> Option<String> {
 }
 
 /// GitHub semantics: a job-level `permissions:` block REPLACES the workflow
-/// level wholesale; only a job that declares none inherits the top level.
+/// level wholesale; only a job that declares none inherits the top level. An
+/// EMPTY job-level block — `permissions: {}` or a bare `permissions:` — is a
+/// declaration: it grants nothing, and inherits nothing.
 fn effective_permissions<'a>(doc: &'a Yaml, job: &'a Yaml) -> &'a Yaml {
     let own = &job["permissions"];
-    if matches!(own, Yaml::BadValue | Yaml::Null) {
+    if matches!(own, Yaml::BadValue) {
         &doc["permissions"]
     } else {
         own
@@ -750,98 +875,204 @@ fn constant_false(cond: &Yaml) -> Option<String> {
     }
 }
 
-/// Split a `run:` body into simple commands, each as its shell words.
+/// What followed a simple command — the two operators that change what the
+/// command's exit status means for the verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sep {
+    /// Newline, `;`, `&`, `&&` or end of input.
+    Other,
+    /// `||` — the next command runs only when this one fails.
+    Or,
+    /// `|` — this command's output feeds the next one, and without
+    /// `pipefail` the pipeline's exit status is the LAST command's, not
+    /// this one's.
+    Pipe,
+}
+
+/// One simple command of a `run:` body: its shell words and what ended it.
+#[derive(Debug, PartialEq, Eq)]
+struct ShellCommand {
+    words: Vec<String>,
+    sep: Sep,
+}
+
+/// The state of [`shell_commands`] while it walks a script.
+#[derive(Default)]
+struct Tokeniser {
+    commands: Vec<ShellCommand>,
+    words: Vec<String>,
+    word: String,
+    in_word: bool,
+    /// Heredoc bodies to skip once the current line ends, in order:
+    /// `(delimiter, strip leading tabs)` — the second for `<<-`.
+    heredocs: Vec<(String, bool)>,
+    /// A `<<` / `<<-` was just read: the next word is its delimiter.
+    delimiter_next: bool,
+}
+
+impl Tokeniser {
+    fn end_word(&mut self) {
+        if !self.in_word {
+            return;
+        }
+        let word = std::mem::take(&mut self.word);
+        if self.delimiter_next {
+            self.delimiter_next = false;
+            if let Some(last) = self.heredocs.last_mut() {
+                last.0.clone_from(&word);
+            }
+        }
+        self.words.push(word);
+        self.in_word = false;
+    }
+
+    fn end_command(&mut self, sep: Sep) {
+        self.end_word();
+        if !self.words.is_empty() {
+            self.commands.push(ShellCommand {
+                words: std::mem::take(&mut self.words),
+                sep,
+            });
+        }
+    }
+
+    /// The line has ended: every heredoc opened on it now has its body,
+    /// which runs up to a line equal to the delimiter (leading tabs
+    /// stripped for `<<-`). Those lines are data, never commands.
+    fn skip_heredoc_bodies(&mut self, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+        // A `<<` with no delimiter before the newline is a syntax error the
+        // shell would reject; it opens no body.
+        self.delimiter_next = false;
+        self.heredocs.retain(|(delimiter, _)| !delimiter.is_empty());
+        for (delimiter, strip_tabs) in std::mem::take(&mut self.heredocs) {
+            while chars.peek().is_some() {
+                let mut line = String::new();
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                    line.push(c);
+                }
+                let line = if strip_tabs {
+                    line.trim_start_matches('\t')
+                } else {
+                    line.as_str()
+                };
+                if line == delimiter {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Split a `run:` body into simple commands, each as its shell words plus
+/// the operator that ended it.
 ///
 /// Enough of the shell to tell a command from a mention of one, and no more:
 /// single and double quotes group words and hide everything inside them;
 /// backslash escapes the next character and backslash-newline continues the
 /// line; an unquoted `#` at the start of a word begins a comment that runs
 /// to the end of the line; newline, `;`, `&`, `&&`, `|` and `||` end a
-/// command; `(` and `)` are words of their own. Nothing is expanded — `$f`
-/// stays `$f` — because the question is what the author wrote, not what it
-/// would evaluate to.
-fn shell_commands(script: &str) -> Vec<Vec<String>> {
-    let mut commands: Vec<Vec<String>> = Vec::new();
-    let mut words: Vec<String> = Vec::new();
-    let mut word = String::new();
-    let mut in_word = false;
+/// command, but the `&` of a redirection (`2>&1`, `>&2`, `&>log`) is part
+/// of its word; `(` and `)` are words of their own; a heredoc (`<<WORD`,
+/// `<< 'WORD'`, `<<-WORD`, bare or glued, quotes stripped) makes every line
+/// after the current one data up to the line equal to `WORD`, so a signing
+/// line inside a `cat <<EOF` or the `: <<'COMMENT'` idiom is not a command.
+/// `<<<` is a here-string, not a heredoc. Nothing is expanded — `$f` stays
+/// `$f` — because the question is what the author wrote, not what it would
+/// evaluate to.
+fn shell_commands(script: &str) -> Vec<ShellCommand> {
+    let mut t = Tokeniser::default();
     let mut chars = script.chars().peekable();
-
-    fn end_word(word: &mut String, in_word: &mut bool, words: &mut Vec<String>) {
-        if *in_word {
-            words.push(std::mem::take(word));
-            *in_word = false;
-        }
-    }
-    fn end_command(
-        word: &mut String,
-        in_word: &mut bool,
-        words: &mut Vec<String>,
-        commands: &mut Vec<Vec<String>>,
-    ) {
-        end_word(word, in_word, words);
-        if !words.is_empty() {
-            commands.push(std::mem::take(words));
-        }
-    }
-
     while let Some(c) = chars.next() {
         match c {
             '\'' => {
-                in_word = true;
+                t.in_word = true;
                 for q in chars.by_ref() {
                     if q == '\'' {
                         break;
                     }
-                    word.push(q);
+                    t.word.push(q);
                 }
             }
             '"' => {
-                in_word = true;
+                t.in_word = true;
                 while let Some(q) = chars.next() {
                     match q {
                         '"' => break,
                         '\\' => {
                             if let Some(e) = chars.next() {
-                                word.push(e);
+                                t.word.push(e);
                             }
                         }
-                        _ => word.push(q),
+                        _ => t.word.push(q),
                     }
                 }
             }
             '\\' => match chars.next() {
                 Some('\n') | None => {}
                 Some(e) => {
-                    in_word = true;
-                    word.push(e);
+                    t.in_word = true;
+                    t.word.push(e);
                 }
             },
-            '#' if !in_word => {
+            '#' if !t.in_word => {
                 while chars.peek().is_some_and(|n| *n != '\n') {
                     chars.next();
                 }
             }
-            '\n' | ';' => end_command(&mut word, &mut in_word, &mut words, &mut commands),
-            '&' | '|' => {
-                if chars.peek() == Some(&c) {
+            '<' if chars.peek() == Some(&'<') => {
+                chars.next();
+                if chars.peek() == Some(&'<') {
+                    // `<<<` is a here-string: a word, not a heredoc.
                     chars.next();
+                    t.in_word = true;
+                    t.word.push_str("<<<");
+                } else {
+                    t.end_word();
+                    let strip_tabs = chars.next_if_eq(&'-').is_some();
+                    t.words
+                        .push(if strip_tabs { "<<-" } else { "<<" }.to_string());
+                    t.heredocs.push((String::new(), strip_tabs));
+                    t.delimiter_next = true;
                 }
-                end_command(&mut word, &mut in_word, &mut words, &mut commands);
+            }
+            '\n' => {
+                t.end_command(Sep::Other);
+                t.skip_heredoc_bodies(&mut chars);
+            }
+            ';' => t.end_command(Sep::Other),
+            // `2>&1`, `>&2`, `<&0`: the `&` belongs to the redirection, and
+            // so does bash's `&>file` — neither ends the command, so a `||`
+            // or `|` after them still attaches to this command.
+            '&' if t.in_word && t.word.ends_with(['>', '<']) => t.word.push('&'),
+            '&' if chars.peek() == Some(&'>') => {
+                t.end_word();
+                t.in_word = true;
+                t.word.push('&');
+            }
+            '&' | '|' => {
+                let doubled = chars.next_if_eq(&c).is_some();
+                t.end_command(match (c, doubled) {
+                    ('|', true) => Sep::Or,
+                    ('|', false) => Sep::Pipe,
+                    _ => Sep::Other,
+                });
             }
             '(' | ')' => {
-                end_word(&mut word, &mut in_word, &mut words);
-                words.push(c.to_string());
+                t.end_word();
+                t.words.push(c.to_string());
             }
-            c if c.is_whitespace() => end_word(&mut word, &mut in_word, &mut words),
+            c if c.is_whitespace() => t.end_word(),
             c => {
-                in_word = true;
-                word.push(c);
+                t.in_word = true;
+                t.word.push(c);
             }
         }
     }
-    end_command(&mut word, &mut in_word, &mut words, &mut commands);
-    commands
+    t.end_command(Sep::Other);
+    t.commands
 }
 
 /// Words that may precede the command word without changing which program
@@ -870,6 +1101,11 @@ fn is_shell_assignment(word: &str) -> bool {
 /// `for f in dist/*; do cosign sign-blob …` and `env COSIGN_YES=1 cosign …`
 /// both name `cosign`.
 fn command_word(words: &[String]) -> Option<(&str, &[String])> {
+    command_index(words).map(|i| (words[i].as_str(), &words[i + 1..]))
+}
+
+/// The index of the command word in `words` — see [`command_word`].
+fn command_index(words: &[String]) -> Option<usize> {
     let mut i = 0;
     while i < words.len() {
         let w = words[i].as_str();
@@ -884,30 +1120,92 @@ fn command_word(words: &[String]) -> Option<(&str, &[String])> {
                 }
             }
         } else {
-            return Some((w, &words[i + 1..]));
+            return Some(i);
         }
     }
     None
 }
 
-/// Whether one `cosign sign` invocation in a step's `run:` body produces a
-/// bundle: `Some(true)` when every signing command carries `--bundle`,
-/// `Some(false)` when at least one signs without it, `None` when the body
-/// does not sign at all.
+/// Whether a `!` precedes the command word: the pipeline's exit status is
+/// inverted, so a signing that fails reads as success.
+fn negated(words: &[String]) -> bool {
+    command_index(words).is_some_and(|i| words[..i].iter().any(|w| w == "!"))
+}
+
+/// Whether this command defines a shell function or alias named `cosign`
+/// (`cosign() {`, `function cosign`, `alias cosign=…`), so that a later
+/// `cosign sign-blob` in the same body runs the author's code, not the
+/// installed binary.
+fn redefines_cosign(words: &[String]) -> bool {
+    let word = |i: usize| words.get(i).map(String::as_str);
+    match word(0) {
+        Some("cosign") => word(1) == Some("(") && word(2) == Some(")"),
+        Some("function") => word(1) == Some("cosign"),
+        Some("alias") => words[1..].iter().any(|w| w.starts_with("cosign=")),
+        _ => false,
+    }
+}
+
+/// How a `run:` body that signs falls short — every field `false`/`None`
+/// is a body whose signing commands all meet the bar.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SigningShortfalls {
+    /// A `cosign sign`/`sign-blob` without `--bundle` on its own command line.
+    unbundled: bool,
+    /// A signing command word preceded by `!` — its exit status is inverted.
+    negated: bool,
+    /// A signing command followed by `|| <word>` where the word does not
+    /// fail the step — the word that swallows the failure.
+    failure_ignored: Option<String>,
+    /// A signing command followed by `|` with no `set -o pipefail` earlier
+    /// in the body — its exit status is the pipeline's last command's.
+    piped: bool,
+    /// The body defines a function or alias named `cosign`.
+    redefined: bool,
+}
+
+/// After `||`, the command words that propagate a failure rather than
+/// swallow it — `exit` / `return` leave the script or function with a
+/// status the author chose, `false` fails outright, `kill` ends the process
+/// — plus the two openers of a compound command (`{ …; }` / `( … )`), whose
+/// inside sscsb does not follow.
+const FAILURE_PROPAGATING_WORDS: &[&str] = &["exit", "return", "false", "kill", "{", "("];
+
+/// Whether this command is a `set` that turns `pipefail` on.
+fn sets_pipefail(command: &ShellCommand) -> bool {
+    matches!(
+        command_word(&command.words),
+        Some(("set", args)) if options_set_pipefail(args.iter().map(String::as_str))
+    )
+}
+
+/// What the `cosign sign` invocations in a step's `run:` body amount to:
+/// `Some(shortfalls)` when the body signs, `None` when it does not sign at
+/// all.
 ///
 /// The body is tokenised as shell ([`shell_commands`]): a signing command is
 /// one whose command word ([`command_word`]) is `cosign` and whose next word
 /// is `sign-blob` or `sign`, and it is bundled when `--bundle` (or
 /// `--bundle=…`) is one of THAT command's words. So `echo "cosign sign-blob
-/// … --bundle"`, a `# cosign sign-blob --bundle` comment, and a `--bundle`
-/// on the next command of a `;`/`&&`/`|` chain are none of them signing with
-/// a bundle. `cosign verify-blob` (the deploy-gate side) is not a signing
-/// invocation and does not match.
-fn cosign_sign_in_run(run: &str) -> Option<bool> {
+/// … --bundle"`, a `# cosign sign-blob --bundle` comment, a heredoc body,
+/// and a `--bundle` on the next command of a `;`/`&&`/`|` chain are none of
+/// them signing with a bundle. `cosign verify-blob` (the deploy-gate side)
+/// is not a signing invocation and does not match. A signing command that
+/// is negated with `!`, followed by `||` and anything other than `exit` /
+/// `return` / `false` / `kill` / `{` / `(` (so `|| true`, `|| :`, `|| echo
+/// warn`, `|| continue` all swallow), piped into another command with no
+/// `set -o pipefail` before it, or preceded in the same body by a function
+/// or alias named `cosign`, is reported as such.
+fn cosign_sign_in_run(run: &str) -> Option<SigningShortfalls> {
+    let commands = shell_commands(run);
     let mut signs = false;
-    let mut all_bundled = true;
-    for command in shell_commands(run) {
-        let Some(("cosign", args)) = command_word(&command) else {
+    let mut shortfalls = SigningShortfalls::default();
+    for (i, command) in commands.iter().enumerate() {
+        if redefines_cosign(&command.words) {
+            shortfalls.redefined = true;
+            continue;
+        }
+        let Some(("cosign", args)) = command_word(&command.words) else {
             continue;
         };
         if !matches!(args.first().map(String::as_str), Some("sign-blob" | "sign")) {
@@ -918,10 +1216,126 @@ fn cosign_sign_in_run(run: &str) -> Option<bool> {
             .iter()
             .any(|a| a == "--bundle" || a.starts_with("--bundle="))
         {
-            all_bundled = false;
+            shortfalls.unbundled = true;
+        }
+        if negated(&command.words) {
+            shortfalls.negated = true;
+        }
+        match command.sep {
+            Sep::Or => {
+                if let Some(next) = commands.get(i + 1) {
+                    // `{` and `(` are compound openers the command-word walk
+                    // steps over; here they are the answer.
+                    let first = next.words.first().map(String::as_str);
+                    let word = if matches!(first, Some("{" | "(")) {
+                        first
+                    } else {
+                        command_word(&next.words).map(|(w, _)| w)
+                    };
+                    if let Some(word) = word.filter(|w| !FAILURE_PROPAGATING_WORDS.contains(w)) {
+                        shortfalls.failure_ignored = Some(word.to_string());
+                    }
+                }
+            }
+            Sep::Pipe => {
+                if !commands[..i].iter().any(sets_pipefail) {
+                    shortfalls.piped = true;
+                }
+            }
+            Sep::Other => {}
         }
     }
-    signs.then_some(all_bundled)
+    signs.then_some(shortfalls)
+}
+
+/// The shell a `run:` step executes under, as GitHub resolves it: the step's
+/// `shell:`, else the job's `defaults.run.shell`, else the workflow's. `None`
+/// is the runner default.
+fn effective_shell<'a>(doc: &'a Yaml, job: &'a Yaml, step: &'a Yaml) -> Option<&'a str> {
+    [
+        &step["shell"],
+        &job["defaults"]["run"]["shell"],
+        &doc["defaults"]["run"]["shell"],
+    ]
+    .into_iter()
+    .find_map(|s| s.as_str().map(str::trim).filter(|s| !s.is_empty()))
+}
+
+/// Whether a `run:` body under this shell is judged as POSIX shell: no
+/// `shell:` at all, the built-in `bash` or `sh`, or GitHub's documented
+/// custom-shell shape — `bash`/`sh`, then options (each starting with `-`;
+/// a short cluster ending in `o` takes the next word as its `set -o` option
+/// name, as in `-eo pipefail`), and exactly one bare `{0}` placeholder for
+/// the script (`bash -e {0}`, `bash --noprofile --norc -eo pipefail {0}`).
+/// Anything else runs something other than the body as written, and the
+/// tokeniser has no opinion about it: `pwsh`, `python`, `cmd`, a custom
+/// template such as `true {0}`, a template that smuggles a command in front
+/// of the script (`bash -c 'exit 0; {0}'`), an extra bare word beside the
+/// placeholder, or options with no `{0}` at all (the runner then starts
+/// `bash -e` with no script and the body never runs).
+fn is_posix_shell(shell: Option<&str>) -> bool {
+    let Some(shell) = shell else {
+        return true;
+    };
+    let mut words = shell.split_whitespace();
+    let Some(program) = words.next() else {
+        return true;
+    };
+    if !matches!(program, "bash" | "sh") {
+        return false;
+    }
+    let mut placeholders = 0usize;
+    let mut options = 0usize;
+    let mut option_name_next = false;
+    for word in words {
+        if word.trim_matches(['"', '\'']) == "{0}" {
+            placeholders += 1;
+            option_name_next = false;
+        } else if word.starts_with('-') {
+            options += 1;
+            option_name_next = !word.starts_with("--") && word.ends_with('o');
+        } else if option_name_next {
+            option_name_next = false;
+        } else {
+            return false;
+        }
+    }
+    placeholders == 1 || (placeholders == 0 && options == 0)
+}
+
+/// Whether an option list turns `pipefail` on: `-o pipefail`, or a short
+/// cluster containing `o` (`-eo`, `-euo`) immediately followed by
+/// `pipefail`.
+fn options_set_pipefail<'a>(words: impl IntoIterator<Item = &'a str>) -> bool {
+    let words: Vec<&str> = words.into_iter().collect();
+    words.windows(2).any(|pair| {
+        pair[0].starts_with('-')
+            && !pair[0].starts_with("--")
+            && pair[0].contains('o')
+            && pair[1] == "pipefail"
+    })
+}
+
+/// Whether the shell itself runs the body with `pipefail` on: the built-in
+/// `bash` (GitHub runs it as `bash --noprofile --norc -eo pipefail {0}`),
+/// or a custom template whose own options set it. The built-in `sh` and no
+/// `shell:` at all (`bash -e {0}`) do not.
+fn shell_sets_pipefail(shell: Option<&str>) -> bool {
+    match shell {
+        Some("bash") => true,
+        Some(template) => options_set_pipefail(template.split_whitespace()),
+        None => false,
+    }
+}
+
+/// `continue-on-error: true` on a job or a step, as YAML `true` or the
+/// string `'true'`. Any expression is left alone.
+fn continues_on_error(node: &Yaml) -> bool {
+    match &node["continue-on-error"] {
+        Yaml::Boolean(b) => *b,
+        Yaml::String(s) => s.trim() == "true",
+        _ => false,
+    }
 }
 
 /// What one job proves about a consolidated control.
@@ -957,29 +1371,40 @@ fn step_label(index: usize, step: &Yaml) -> String {
     }
 }
 
-/// A job whose `if:` is constant-false runs none of its steps.
-fn job_switched_off(job: &Yaml, at: &str) -> Option<String> {
-    constant_false(&job["if"])
-        .map(|v| format!("{at}: job `if: {v}` is constant-false — the job never runs"))
+/// A job whose `if:` is constant-false runs none of its steps, and a job
+/// whose `continue-on-error: true` fails nothing when its steps fail.
+fn job_switched_off(job: &Yaml, at: &str) -> Vec<String> {
+    let mut defects = Vec::new();
+    if let Some(v) = constant_false(&job["if"]) {
+        defects.push(format!(
+            "{at}: job `if: {v}` is constant-false — the job never runs"
+        ));
+    }
+    if continues_on_error(job) {
+        defects.push(format!(
+            "{at}: job `continue-on-error: true` — a failed job does not fail the run, so the \
+             release proceeds without what this job was to produce"
+        ));
+    }
+    defects
 }
 
 fn sigstore_job_evidence(doc: &Yaml, job_id: &str, job: &Yaml, at: &str) -> JobEvidence {
     let steps = job_steps(job);
-    let signing: Vec<(usize, &Yaml, bool)> = steps
+    let signing: Vec<(usize, &Yaml, SigningShortfalls)> = steps
         .iter()
         .enumerate()
         .filter_map(|(i, s)| {
             s["run"]
                 .as_str()
                 .and_then(cosign_sign_in_run)
-                .map(|bundled| (i, *s, bundled))
+                .map(|shortfalls| (i, *s, shortfalls))
         })
         .collect();
     if signing.is_empty() {
         return JobEvidence::Absent;
     }
-    let mut defects = Vec::new();
-    defects.extend(job_switched_off(job, at));
+    let mut defects = job_switched_off(job, at);
     let installer = steps.iter().enumerate().find_map(|(i, s)| {
         step_uses(s)
             .filter(|u| split_uses(u).0 == "sigstore/cosign-installer")
@@ -1000,22 +1425,66 @@ fn sigstore_job_evidence(doc: &Yaml, job_id: &str, job: &Yaml, at: &str) -> JobE
                     step_label(i, s)
                 ));
             }
+            if continues_on_error(s) {
+                defects.push(format!(
+                    "{at} {}: `continue-on-error: true` on the installer — a failed install is \
+                     ignored and signing runs against whatever the runner happened to have",
+                    step_label(i, s)
+                ));
+            }
         }
     }
     // Every cosign-bearing step is judged; one that falls short is reported
     // even when a sibling step in the same job is sound.
-    for (i, step, bundled) in &signing {
+    for (i, step, shortfalls) in &signing {
         let step_at = format!("{at} {}", step_label(*i, step));
-        if !bundled {
+        let shell = effective_shell(doc, job, step);
+        if !is_posix_shell(shell) {
+            defects.push(format!(
+                "{step_at}: step runs under shell `{}` — not judged as a POSIX signing command",
+                shell.unwrap_or_default()
+            ));
+        }
+        if shortfalls.unbundled {
             defects.push(format!(
                 "{step_at}: `cosign sign` runs without `--bundle` on the same command line — \
                  no Sigstore bundle (certificate + signature + Rekor proof) is produced for \
                  consumers to verify"
             ));
         }
+        if shortfalls.negated {
+            defects.push(format!(
+                "{step_at}: the signing command is negated with `!` — its exit status is \
+                 inverted, so a failed signing reads as success"
+            ));
+        }
+        if let Some(word) = &shortfalls.failure_ignored {
+            defects.push(format!(
+                "{step_at}: the signing command is followed by `|| {word}` — a failed signing \
+                 is swallowed and the step succeeds with an unsigned artifact"
+            ));
+        }
+        if shortfalls.piped && !shell_sets_pipefail(shell) {
+            defects.push(format!(
+                "{step_at}: the signing command's output is piped — its exit status is not \
+                 the step's (no `set -o pipefail` precedes it in the body, and the shell \
+                 does not set it)"
+            ));
+        }
+        if shortfalls.redefined {
+            defects.push(format!(
+                "{step_at}: the `run:` body defines a function or alias named `cosign` — the \
+                 signing command is not the installed cosign"
+            ));
+        }
         if let Some(v) = constant_false(&step["if"]) {
             defects.push(format!(
                 "{step_at}: `if: {v}` is constant-false — the signing step never runs"
+            ));
+        }
+        if continues_on_error(step) {
+            defects.push(format!(
+                "{step_at}: `continue-on-error: true` — a failed signing does not fail the job"
             ));
         }
         if let Some((ii, _, _)) = installer {
@@ -1058,8 +1527,7 @@ fn attest_job_evidence(kind: Consolidated, doc: &Yaml, job: &Yaml, at: &str) -> 
     if candidates.is_empty() {
         return JobEvidence::Absent;
     }
-    let mut defects = Vec::new();
-    defects.extend(job_switched_off(job, at));
+    let mut defects = job_switched_off(job, at);
     let mut proven = Vec::new();
     for (i, uses, step) in candidates {
         if let Some(d) = pin_defect(uses) {
@@ -1068,6 +1536,12 @@ fn attest_job_evidence(kind: Consolidated, doc: &Yaml, job: &Yaml, at: &str) -> 
         if let Some(v) = constant_false(&step["if"]) {
             defects.push(format!(
                 "{at} {}: `if: {v}` is constant-false — the attestation step never runs",
+                step_label(i, step)
+            ));
+        }
+        if continues_on_error(step) {
+            defects.push(format!(
+                "{at} {}: `continue-on-error: true` — a failed attestation does not fail the job",
                 step_label(i, step)
             ));
         }
@@ -1117,12 +1591,25 @@ fn slsa_job_evidence(doc: &Yaml, job: &Yaml, at: &str) -> JobEvidence {
     let Some(uses) = job["uses"]
         .as_str()
         .map(str::trim)
-        .filter(|u| Consolidated::SlsaProvenance.is_candidate_action(u))
+        .filter(|u| !u.is_empty())
     else {
         return JobEvidence::Absent;
     };
-    let mut defects = Vec::new();
-    defects.extend(job_switched_off(job, at));
+    if !Consolidated::SlsaProvenance.is_candidate_action(uses) {
+        // Another workflow of the generator's repository — the container
+        // generator, a language builder — is the generator's step in name,
+        // but not the one this recognizer judges.
+        if crate::audit::is_tag_pin_exception(split_uses(uses).0) {
+            return JobEvidence::Defective(vec![format!(
+                "{at}: `{uses}` is not `{SLSA_GENERIC_GENERATOR}` — only the generic \
+                 generator, the one the templates call, is judged; the container and \
+                 language-builder workflows of slsa-github-generator are out of scope and \
+                 are not evidence"
+            )]);
+        }
+        return JobEvidence::Absent;
+    }
+    let mut defects = job_switched_off(job, at);
     if let Some(d) = pin_defect(uses) {
         defects.push(format!("{at}: {d}"));
     }
@@ -1209,6 +1696,8 @@ const TRIGGER_FILTERS: &[&str] = &[
     "tags-ignore",
     "paths",
     "paths-ignore",
+    "types",
+    "workflows",
 ];
 
 /// The filter keys the author put under `on: <trigger>:`.
@@ -1221,14 +1710,31 @@ fn trigger_filters(doc: &Yaml, trigger: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// The one filter shape that can be judged without evaluating a glob: a
-/// `branches:` or `tags:` list with nothing in it matches no ref at all, so
-/// the trigger never fires. Returns the offending key.
-fn empty_ref_filter(doc: &Yaml, trigger: &str) -> Option<&'static str> {
-    ["branches", "tags"].into_iter().find(|k| {
-        matches!(&doc["on"][trigger][*k], Yaml::Null)
-            || matches!(&doc["on"][trigger][*k], Yaml::Array(a) if a.is_empty())
-    })
+/// A YAML node that is a list with nothing in it — `[]`, or a bare key.
+fn empty_list(node: &Yaml) -> bool {
+    matches!(node, Yaml::Null) || matches!(node, Yaml::Array(a) if a.is_empty())
+}
+
+/// The one filter shape that can be judged without evaluating a glob or a
+/// cron: a list with nothing in it matches nothing, so the trigger never
+/// fires. An empty `branches:` / `tags:` matches no ref, an empty `types:`
+/// no activity, an empty `workflows:` no upstream workflow, and a
+/// `schedule:` with no cron entries schedules nothing. Returns the reason,
+/// phrased to follow "`on: <trigger>`".
+fn dead_trigger(doc: &Yaml, trigger: &str) -> Option<String> {
+    let cfg = &doc["on"][trigger];
+    if trigger == "schedule" && !matches!(cfg, Yaml::Array(a) if !a.is_empty()) {
+        return Some("lists no cron entries — nothing is scheduled".to_string());
+    }
+    [
+        ("branches", "it matches no ref"),
+        ("tags", "it matches no ref"),
+        ("types", "it matches no activity type"),
+        ("workflows", "it names no workflow to run after"),
+    ]
+    .into_iter()
+    .find(|(key, _)| empty_list(&cfg[*key]))
+    .map(|(key, why)| format!("has an empty `{key}:` filter — {why}"))
 }
 
 /// `push`, or `push (tags filter not evaluated)` — the trigger named
@@ -1250,7 +1756,7 @@ fn automatic_trigger(doc: &Yaml) -> Option<String> {
     trigger_names(doc)
         .into_iter()
         .filter(|t| AUTOMATIC_TRIGGERS.contains(&t.as_str()))
-        .find(|t| empty_ref_filter(doc, t).is_none())
+        .find(|t| dead_trigger(doc, t).is_none())
 }
 
 /// One workflow file as the recognizer sees it: committed, readable, parsed.
@@ -1450,13 +1956,47 @@ fn committed_workflows(ctx: &Ctx) -> WorkflowSet {
     WorkflowSet { files, notes }
 }
 
-/// How a `workflow_call`-only workflow fires: the first committed workflow
-/// with an automatic trigger whose (not switched-off) job calls it as
-/// `uses: ./<rel>`. One level only — a caller that is itself call-only does
-/// not count.
-fn automatic_caller(files: &[WorkflowFile], rel: &str) -> Option<String> {
+/// What the search for a `workflow_call` workflow's caller found.
+struct CallerSearch {
+    /// How it fires, when a sound, automatically triggered, live caller
+    /// whose grant covers the called job exists.
+    via: Option<String>,
+    /// Callers that call it but cannot run it: the calling job's effective
+    /// grant is short of what the called proving job requires.
+    defects: Vec<String>,
+}
+
+/// Whether any document of `wf` has a job that calls `local`.
+fn calls(wf: &WorkflowFile, local: &str) -> bool {
+    wf.docs.iter().any(|doc| {
+        doc["jobs"].as_hash().is_some_and(|jobs| {
+            jobs.values()
+                .any(|job| job["uses"].as_str().map(str::trim) == Some(local))
+        })
+    })
+}
+
+/// How a `workflow_call`-only workflow fires: the first committed,
+/// shape-sound workflow with an automatic trigger whose (not switched-off)
+/// job calls it as `uses: ./<rel>` and whose effective `permissions:`
+/// already grant every scope the called proving job needs — GitHub refuses a
+/// called workflow's job that asks for more than its caller holds, so a
+/// caller short of a scope runs nothing. One level only — a caller that is
+/// itself call-only does not count. A caller that is not a sound workflow
+/// is skipped, and the reason lands in `notes`.
+fn automatic_caller(
+    files: &[WorkflowFile],
+    rel: &str,
+    kind: Consolidated,
+    notes: &mut Vec<String>,
+) -> CallerSearch {
     let local = format!("./{rel}");
-    for wf in files.iter().filter(|w| w.rel != rel) {
+    let mut defects = Vec::new();
+    for wf in files.iter().filter(|w| w.rel != rel && calls(w, &local)) {
+        if let ShapeVerdict::Broken(m) = check_workflow(&wf.rel, &wf.content) {
+            notes.push(format!("{m} — not counted as a caller of {rel}"));
+            continue;
+        }
         for doc in &wf.docs {
             let Some(trigger) = automatic_trigger(doc) else {
                 continue;
@@ -1465,57 +2005,92 @@ fn automatic_caller(files: &[WorkflowFile], rel: &str) -> Option<String> {
                 continue;
             };
             for (id, job) in jobs {
-                if job["uses"].as_str().map(str::trim) == Some(local.as_str())
-                    && constant_false(&job["if"]).is_none()
+                if job["uses"].as_str().map(str::trim) != Some(local.as_str())
+                    || constant_false(&job["if"]).is_some()
                 {
-                    return Some(format!(
-                        "fires via `{}` job `{}` (on {}), which calls it as a reusable \
-                         workflow",
+                    continue;
+                }
+                let job_id = id.as_str().unwrap_or("<non-string job id>");
+                // The calling job is the proving job's outer shell: if ITS
+                // failure does not fail the run, neither does the called
+                // job's, however sound that job is.
+                if continues_on_error(job) {
+                    defects.push(format!(
+                        "{rel}: called from `{}` job `{job_id}` (on {}), whose \
+                         `continue-on-error: true` means a failed call does not fail the run \
+                         — the release proceeds without what this workflow was to produce",
                         wf.rel,
-                        id.as_str().unwrap_or("<non-string job id>"),
                         describe_trigger(doc, &trigger)
                     ));
+                    continue;
                 }
+                let missing =
+                    missing_scopes(effective_permissions(doc, job), kind.required_scopes());
+                if missing.is_empty() {
+                    return CallerSearch {
+                        via: Some(format!(
+                            "fires via `{}` job `{job_id}` (on {}), which calls it as a \
+                             reusable workflow",
+                            wf.rel,
+                            describe_trigger(doc, &trigger)
+                        )),
+                        defects,
+                    };
+                }
+                defects.push(format!(
+                    "{rel}: called from `{}` job `{job_id}` (on {}), whose effective \
+                     `permissions:` (job level, else workflow level) do not grant {} — GitHub \
+                     refuses a called workflow's job that asks for more than its caller \
+                     holds, so the call runs nothing",
+                    wf.rel,
+                    describe_trigger(doc, &trigger),
+                    missing.join(" + ")
+                ));
             }
         }
     }
-    None
+    CallerSearch { via: None, defects }
 }
 
-/// Gate 3: `Ok(how it fires)` or `Err(the manual-only defect)`.
+/// Gate 3: `Ok(how it fires)` or `Err(the defects that keep it from firing)`.
 fn trigger_verdict(
     doc: &Yaml,
     rel: &str,
     files: &[WorkflowFile],
     kind: Consolidated,
-) -> Result<String, String> {
+    notes: &mut Vec<String>,
+) -> Result<String, Vec<String>> {
     if let Some(t) = automatic_trigger(doc) {
         return Ok(format!("fires on {}", describe_trigger(doc, &t)));
     }
     let names = trigger_names(doc);
-    // An automatic trigger whose ref filter is an empty list is present in
-    // name only — GitHub has nothing to match it against.
-    if let Some((t, key)) = names
+    // An automatic trigger whose filter is an empty list is present in name
+    // only — GitHub has nothing to match it against.
+    if let Some((t, why)) = names
         .iter()
         .filter(|t| AUTOMATIC_TRIGGERS.contains(&t.as_str()))
-        .find_map(|t| empty_ref_filter(doc, t).map(|k| (t, k)))
+        .find_map(|t| dead_trigger(doc, t).map(|why| (t, why)))
     {
-        return Err(format!(
-            "{rel}: `on: {t}` has an empty `{key}:` filter — it matches no ref, so the trigger \
-             never fires — it carries {} but nothing runs it unattended",
+        return Err(vec![format!(
+            "{rel}: `on: {t}` {why}, so the trigger never fires — it carries {} but nothing \
+             runs it unattended",
             kind.wanted()
-        ));
+        )]);
     }
     if names.iter().any(|t| t == "workflow_call") {
-        if let Some(via) = automatic_caller(files, rel) {
+        let found = automatic_caller(files, rel, kind, notes);
+        if let Some(via) = found.via {
             return Ok(via);
         }
-        return Err(format!(
+        if !found.defects.is_empty() {
+            return Err(found.defects);
+        }
+        return Err(vec![format!(
             "{rel}: manual-only trigger — `on:` has `workflow_call` but no committed workflow \
              with an automatic trigger (push/release/schedule/pull_request/workflow_run) calls \
              it via `uses: ./{rel}` — it carries {} but nothing runs it unattended",
             kind.wanted()
-        ));
+        )]);
     }
     let listed = if names.is_empty() {
         "`on:` is absent".to_string()
@@ -1529,12 +2104,12 @@ fn trigger_verdict(
                 .join(", ")
         )
     };
-    Err(format!(
+    Err(vec![format!(
         "{rel}: manual-only trigger — {listed}, none of \
          push/release/schedule/pull_request/workflow_run — it carries {} but nothing runs it \
          unattended",
         kind.wanted()
-    ))
+    )])
 }
 
 /// The repository-wide verdict on one consolidated control.
@@ -1604,10 +2179,10 @@ fn consolidated_evidence(ctx: &Ctx, kind: Consolidated, modular: &str) -> Consol
             }
             // A workflow nothing runs unattended proves nothing, however
             // sound its steps.
-            let fires = match trigger_verdict(doc, rel, &set.files, kind) {
+            let fires = match trigger_verdict(doc, rel, &set.files, kind, &mut notes) {
                 Ok(fires) => fires,
                 Err(d) => {
-                    defects.push(d);
+                    defects.extend(d);
                     continue;
                 }
             };
@@ -3081,7 +3656,7 @@ mod tests {
         "      actions: read\n      id-token: write\n      contents: write";
 
     #[test]
-    fn slsa_provenance_is_proven_by_a_tag_or_sha_pinned_generator_job() {
+    fn slsa_provenance_is_proven_by_a_tag_pinned_generic_generator_job() {
         let (_d, ctx) = consolidated_repo(
             "slsa-provenance",
             &slsa_workflow("v2.1.0", SLSA_JOB_PERMISSIONS),
@@ -3094,20 +3669,89 @@ mod tests {
             "release.yml job `provenance`: generates SLSA L3 provenance via \
              `slsa-framework/slsa-github-generator/.github/workflows/\
              generator_generic_slsa3.yml@v2.1.0` under `actions: read` + `id-token: write` + \
-             `contents: write`; fires on `release`",
+             `contents: write`; fires on `release` (types filter not evaluated)",
         );
+    }
 
-        // A SHA is also accepted (the generator's own docs allow it; only
-        // slsa-verifier's builder-id matching prefers the tag).
+    /// Gate (e): the generator's trust model identifies the builder by its
+    /// tag ref — slsa-verifier validates that ref — so a SHA pin, the right
+    /// answer for every other action, is the wrong one here and produces
+    /// provenance nothing can verify. The shipped workflow headers say so;
+    /// the recognizer now agrees with them.
+    #[test]
+    fn a_sha_pinned_generator_fails_naming_the_tag_requirement() {
         let sha = "5a775b367a56d5bd118a224a811bba288150a563";
-        std::fs::write(
-            ctx.root.join(RELEASE),
-            slsa_workflow(sha, SLSA_JOB_PERMISSIONS),
-        )
-        .unwrap();
-        commit(&ctx, RELEASE);
+        let (_d, ctx) =
+            consolidated_repo("slsa-provenance", &slsa_workflow(sha, SLSA_JOB_PERMISSIONS));
         let result = verify_template_control(&ctx, "slsa-provenance");
-        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(result.evidence.is_empty());
+        assert_message(
+            &result,
+            &format!(
+                "release.yml job `provenance`: `slsa-framework/slsa-github-generator/.github/\
+                 workflows/generator_generic_slsa3.yml@{sha}` is pinned to the commit SHA \
+                 `@{sha}` — slsa-verifier identifies the trusted builder by its `vX.Y.Z` tag \
+                 ref and refuses a SHA-pinned generator, so the provenance it produces cannot \
+                 be verified; pin it to a `vX.Y.Z` tag"
+            ),
+        );
+        // Every other action still wants the SHA, and the helper says so.
+        assert_eq!(
+            pin_defect(&format!("actions/attest@{sha}")),
+            None,
+            "a SHA is the bar for every other action"
+        );
+    }
+
+    /// Gate (e): only the generic generator is judged. The container
+    /// generator (and the language builders) are different trusted builders
+    /// with different subjects; a job calling one is named as out of scope,
+    /// never quietly accepted as the control.
+    #[test]
+    fn a_container_generator_fails_with_the_narrowing_message() {
+        let container = slsa_workflow("v2.1.0", SLSA_JOB_PERMISSIONS).replace(
+            "generator_generic_slsa3.yml",
+            "generator_container_slsa3.yml",
+        );
+        assert!(
+            container.contains("generator_container_slsa3.yml"),
+            "fixture premise"
+        );
+        let (_d, ctx) = consolidated_repo("slsa-provenance", &container);
+        let result = verify_template_control(&ctx, "slsa-provenance");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(result.evidence.is_empty());
+        assert_message(
+            &result,
+            "release.yml job `provenance`: `slsa-framework/slsa-github-generator/.github/\
+             workflows/generator_container_slsa3.yml@v2.1.0` is not \
+             `slsa-framework/slsa-github-generator/.github/workflows/\
+             generator_generic_slsa3.yml` — only the generic generator, the one the templates \
+             call, is judged; the container and language-builder workflows of \
+             slsa-github-generator are out of scope and are not evidence",
+        );
+        assert_message(&result, "does not meet the bar");
+        // The missing-evidence message names the same narrowing.
+        assert!(
+            Consolidated::SlsaProvenance.wanted().contains(
+                "`generator_generic_slsa3.yml` reusable workflow (the generic generator only"
+            ),
+            "{}",
+            Consolidated::SlsaProvenance.wanted()
+        );
+        // A job calling some unrelated reusable workflow is simply absent.
+        assert!(!Consolidated::SlsaProvenance.is_candidate_action(
+            "slsa-framework/slsa-github-generator/.github/workflows/builder_go_slsa3.yml@v2.1.0"
+        ));
+        assert!(matches!(
+            slsa_job_evidence(
+                &Yaml::Null,
+                &YamlLoader::load_from_str("uses: ./.github/workflows/deploy-gate.yml").unwrap()[0],
+                "x"
+            ),
+            JobEvidence::Absent
+        ));
     }
 
     #[test]
@@ -3120,9 +3764,9 @@ mod tests {
         assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
         assert_message(
             &result,
-            "generator_generic_slsa3.yml@main` ref `@main` is neither a `vX.Y.Z` tag (the \
-             generator's documented trust model, which slsa-verifier checks) nor a 40-hex \
-             commit SHA",
+            "generator_generic_slsa3.yml@main` ref `@main` is not a `vX.Y.Z` tag — the \
+             generator's documented trust model, which slsa-verifier checks, identifies the \
+             builder by its tag",
         );
 
         std::fs::write(
@@ -3412,10 +4056,13 @@ mod tests {
 
         // An uncommitted caller does not count.
         let caller = ".github/workflows/tag.yml";
+        // The calling job holds the scope the called signing job needs —
+        // the short-caller case is its own test.
         let caller_body = |cond: &str| {
             format!(
                 "name: Tag\non:\n  push:\n    tags: [\"v*\"]\npermissions:\n  contents: read\n\
-                 jobs:\n  release:\n{cond}    uses: ./.github/workflows/release.yml\n"
+                 jobs:\n  release:\n{cond}    permissions:\n      contents: read\n      \
+                 id-token: write\n    uses: ./.github/workflows/release.yml\n"
             )
         };
         std::fs::write(ctx.root.join(caller), caller_body("")).unwrap();
@@ -3440,6 +4087,302 @@ mod tests {
             "; fires via `.github/workflows/tag.yml` job `release` (on `push` (tags filter not \
              evaluated)), which calls it as a reusable workflow",
         );
+    }
+
+    fn call_only_release_workflow() -> String {
+        let callee = signed_release_workflow().replace(
+            "on:\n  push:\n    tags: [\"v*\"]\n",
+            "on:\n  workflow_call:\n",
+        );
+        assert!(callee.contains("workflow_call"), "fixture premise");
+        callee
+    }
+
+    const CALLER: &str = ".github/workflows/tag.yml";
+
+    /// A sound, automatically triggered caller of `release.yml` whose job
+    /// carries `job_permissions` (six-space-indented scopes, or empty for
+    /// no block at all).
+    fn caller_workflow(job_permissions: &str) -> String {
+        let block = if job_permissions.is_empty() {
+            String::new()
+        } else {
+            format!("    permissions:\n{job_permissions}\n")
+        };
+        format!(
+            "name: Tag\non:\n  push:\n    tags: [\"v*\"]\npermissions:\n  contents: read\n\
+             jobs:\n  release:\n{block}    uses: ./.github/workflows/release.yml\n"
+        )
+    }
+
+    const CALLER_JOB_PERMISSIONS: &str = "      contents: read\n      id-token: write";
+
+    /// Gate (b), the caller's own soundness: a caller GitHub would reject —
+    /// a ghost `needs:`, two YAML documents — calls nothing, so it is not
+    /// counted as a caller, and the verdict's notes say why it was skipped.
+    #[test]
+    fn a_broken_caller_is_not_counted_and_the_reason_is_noted() {
+        let (_d, ctx) = consolidated_repo("sigstore-signing", &call_only_release_workflow());
+        let sound = caller_workflow(CALLER_JOB_PERMISSIONS);
+
+        // A ghost `needs:` in the caller.
+        let ghost = sound.replace("  release:\n", "  release:\n    needs: build\n");
+        assert!(ghost.contains("needs: build"), "fixture premise");
+        std::fs::write(ctx.root.join(CALLER), ghost).unwrap();
+        commit(&ctx, CALLER);
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(result.evidence.is_empty());
+        assert_message(
+            &result,
+            ".github/workflows/tag.yml: job `release` needs `build`, which is not a job in \
+             this workflow — GitHub rejects the whole workflow — not counted as a caller of \
+             .github/workflows/release.yml",
+        );
+        assert_message(
+            &result,
+            "release.yml: manual-only trigger — `on:` has `workflow_call` but no committed \
+             workflow with an automatic trigger",
+        );
+
+        // Two YAML documents in the caller.
+        std::fs::write(ctx.root.join(CALLER), format!("{sound}---\n{sound}")).unwrap();
+        commit(&ctx, CALLER);
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert_message(
+            &result,
+            ".github/workflows/tag.yml holds 2 YAML documents — a GitHub Actions workflow \
+             file is exactly one document, so GitHub cannot run it — not counted as a caller \
+             of .github/workflows/release.yml",
+        );
+
+        // The sound caller, unchanged otherwise, is counted.
+        std::fs::write(ctx.root.join(CALLER), &sound).unwrap();
+        commit(&ctx, CALLER);
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+        assert_no_message(&result, "not counted as a caller");
+    }
+
+    /// Gate (b), the caller's `continue-on-error`: the calling job is the
+    /// proving job's outer shell — when ITS failure does not fail the run,
+    /// the called job's cannot either, however sound that job is. Treated
+    /// exactly like `continue-on-error: true` on the proving job, and the
+    /// defect names the caller and its job.
+    #[test]
+    fn a_caller_job_with_continue_on_error_is_defective() {
+        let (_d, ctx) = consolidated_repo("sigstore-signing", &call_only_release_workflow());
+        let sound = caller_workflow(CALLER_JOB_PERMISSIONS);
+        let lenient = sound.replace("  release:\n", "  release:\n    continue-on-error: true\n");
+        assert!(
+            lenient.contains("continue-on-error: true"),
+            "fixture premise"
+        );
+        std::fs::write(ctx.root.join(CALLER), lenient).unwrap();
+        commit(&ctx, CALLER);
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(result.evidence.is_empty());
+        assert_message(
+            &result,
+            "release.yml: called from `.github/workflows/tag.yml` job `release` (on `push` \
+             (tags filter not evaluated)), whose `continue-on-error: true` means a failed \
+             call does not fail the run — the release proceeds without what this workflow \
+             was to produce",
+        );
+        assert_no_message(&result, "manual-only trigger");
+
+        // `continue-on-error: false` (and an expression, which is not
+        // evaluated) leave the caller counted.
+        for literal in ["false", "${{ github.event_name == 'push' }}"] {
+            let strict = sound.replace(
+                "  release:\n",
+                &format!("  release:\n    continue-on-error: {literal}\n"),
+            );
+            std::fs::write(ctx.root.join(CALLER), strict).unwrap();
+            commit(&ctx, CALLER);
+            let result = verify_template_control(&ctx, "sigstore-signing");
+            assert_eq!(
+                result.outcome,
+                Outcome::Pass,
+                "`continue-on-error: {literal}` on the caller: {:?}",
+                result.messages
+            );
+            assert_no_message(&result, "continue-on-error");
+        }
+    }
+
+    /// Gate (b), the caller's grant: GitHub refuses a called workflow's job
+    /// that asks for more than the calling job holds, so a caller whose
+    /// effective `permissions:` lack a scope the proving job needs runs
+    /// nothing — and the defect names the caller, its job, and the scope.
+    #[test]
+    fn a_caller_whose_grant_is_short_of_the_called_job_is_defective() {
+        let (_d, ctx) = consolidated_repo("sigstore-signing", &call_only_release_workflow());
+        let short = "release.yml: called from `.github/workflows/tag.yml` job `release` (on \
+                     `push` (tags filter not evaluated)), whose effective `permissions:` (job \
+                     level, else workflow level) do not grant `id-token: write` — GitHub \
+                     refuses a called workflow's job that asks for more than its caller \
+                     holds, so the call runs nothing";
+
+        // A job-level block without `id-token: write`.
+        std::fs::write(
+            ctx.root.join(CALLER),
+            caller_workflow("      contents: read"),
+        )
+        .unwrap();
+        commit(&ctx, CALLER);
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(result.evidence.is_empty());
+        assert_message(&result, short);
+        assert_no_message(&result, "manual-only trigger");
+
+        // No job-level block: the caller's workflow-level `contents: read`
+        // is what the job holds, and it is short too.
+        std::fs::write(ctx.root.join(CALLER), caller_workflow("")).unwrap();
+        commit(&ctx, CALLER);
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert_message(&result, short);
+
+        // The scope granted at the job level: counted.
+        std::fs::write(
+            ctx.root.join(CALLER),
+            caller_workflow(CALLER_JOB_PERMISSIONS),
+        )
+        .unwrap();
+        commit(&ctx, CALLER);
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+        assert_message(
+            &result,
+            "; fires via `.github/workflows/tag.yml` job `release` (on `push` (tags filter \
+             not evaluated)), which calls it as a reusable workflow",
+        );
+
+        // `write-all` at the caller's workflow level, inherited: counted.
+        std::fs::write(
+            ctx.root.join(CALLER),
+            caller_workflow("").replace(
+                "permissions:\n  contents: read\n",
+                "permissions: write-all\n",
+            ),
+        )
+        .unwrap();
+        commit(&ctx, CALLER);
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+    }
+
+    /// Gate (b), the other sub-keys: `types` and `workflows` are named as
+    /// not evaluated like the ref and path filters; an empty `types:`, an
+    /// empty `workflow_run.workflows:`, or a `schedule:` with no cron
+    /// entries matches nothing, and fails.
+    #[test]
+    fn types_workflows_and_schedule_are_judged_only_when_empty() {
+        let on = |trigger: &str| {
+            let body =
+                signed_release_workflow().replace("on:\n  push:\n    tags: [\"v*\"]\n", trigger);
+            assert!(body.contains(trigger), "fixture premise");
+            body
+        };
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &on("on:\n  workflow_run:\n    workflows: [CI]\n    types: [completed]\n"),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+        assert_message(
+            &result,
+            "; fires on `workflow_run` (types, workflows filters not evaluated)",
+        );
+
+        for (trigger, defect) in [
+            (
+                "on:\n  release:\n    types: []\n",
+                "release.yml: `on: release` has an empty `types:` filter — it matches no \
+                 activity type, so the trigger never fires",
+            ),
+            (
+                "on:\n  workflow_run:\n    workflows: []\n    types: [completed]\n",
+                "release.yml: `on: workflow_run` has an empty `workflows:` filter — it names \
+                 no workflow to run after, so the trigger never fires",
+            ),
+            (
+                "on:\n  schedule: []\n",
+                "release.yml: `on: schedule` lists no cron entries — nothing is scheduled, so \
+                 the trigger never fires",
+            ),
+            (
+                "on:\n  schedule:\n",
+                "release.yml: `on: schedule` lists no cron entries — nothing is scheduled",
+            ),
+        ] {
+            std::fs::write(ctx.root.join(RELEASE), on(trigger)).unwrap();
+            commit(&ctx, RELEASE);
+            let result = verify_template_control(&ctx, "sigstore-signing");
+            assert_eq!(
+                result.outcome,
+                Outcome::Fail,
+                "{trigger:?} must fail: {:?}",
+                result.messages
+            );
+            assert!(result.evidence.is_empty());
+            assert_message(&result, defect);
+            assert_message(&result, "but nothing runs it unattended");
+        }
+
+        // A real cron entry fires.
+        std::fs::write(
+            ctx.root.join(RELEASE),
+            on("on:\n  schedule:\n    - cron: \"0 4 * * 1\"\n"),
+        )
+        .unwrap();
+        commit(&ctx, RELEASE);
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+        assert_message(&result, "; fires on `schedule`");
+        assert_no_message(&result, "not evaluated");
+    }
+
+    /// Gate (g): a job-level `permissions: {}` — or a bare `permissions:` —
+    /// is a declaration that grants nothing, not an omission that inherits
+    /// the workflow level. A workflow-level `write-all` above it changes
+    /// nothing.
+    #[test]
+    fn an_empty_job_level_permissions_block_grants_nothing() {
+        for block in ["    permissions: {}\n", "    permissions:\n"] {
+            let body = signed_release_workflow()
+                .replace(
+                    "permissions:\n  contents: read\n",
+                    "permissions: write-all\n",
+                )
+                .replace(
+                    &format!("    permissions:\n{RELEASE_JOB_PERMISSIONS}\n"),
+                    block,
+                );
+            assert!(
+                body.contains("permissions: write-all") && body.contains(block),
+                "fixture premise: {body}"
+            );
+            let (_d, ctx) = consolidated_repo("sigstore-signing", &body);
+            let result = verify_template_control(&ctx, "sigstore-signing");
+            assert_eq!(
+                result.outcome,
+                Outcome::Fail,
+                "{block:?} must grant nothing: {:?}",
+                result.messages
+            );
+            assert!(result.evidence.is_empty());
+            assert_message(
+                &result,
+                "release.yml job `release`: `cosign sign-blob` runs in a job not granted \
+                 `id-token: write` — the effective `permissions:` (job level, else workflow \
+                 level) do not include it",
+            );
+        }
     }
 
     /// Gate (c): a constant-false `if:` on the proving job is the switch left
@@ -3968,7 +4911,7 @@ mod tests {
         let cmds = shell_commands(script);
         let words: Vec<Vec<&str>> = cmds
             .iter()
-            .map(|c| c.iter().map(String::as_str).collect())
+            .map(|c| c.words.iter().map(String::as_str).collect())
             .collect();
         assert_eq!(
             words,
@@ -3989,11 +4932,43 @@ mod tests {
             ]
         );
         assert_eq!(
-            command_word(&cmds[0]).map(|(w, _)| w),
+            command_word(&cmds[0].words).map(|(w, _)| w),
             Some("cosign"),
             "leading assignments are skipped"
         );
-        assert_eq!(cosign_sign_in_run(script), Some(true));
+        assert_eq!(
+            cmds.iter().map(|c| c.sep).collect::<Vec<_>>(),
+            vec![
+                Sep::Other,
+                Sep::Pipe,
+                Sep::Other,
+                Sep::Other,
+                Sep::Other,
+                Sep::Other
+            ],
+            "one `|` (echo into grep) and no `||` anywhere in this script"
+        );
+        assert_eq!(
+            cosign_sign_in_run(script),
+            Some(SigningShortfalls::default())
+        );
+        // The `&` of a redirection does not end the command: the `|| true`
+        // after `2>&1` still swallows THIS command's failure, and `&>log`
+        // is one word.
+        let redirected = shell_commands("cosign sign-blob x --bundle b 2>&1 || true\ncmd &>log");
+        assert_eq!(
+            redirected[0].words,
+            vec!["cosign", "sign-blob", "x", "--bundle", "b", "2>&1"]
+        );
+        assert_eq!(redirected[0].sep, Sep::Or);
+        assert_eq!(redirected[2].words, vec!["cmd", "&>log"]);
+        assert_eq!(
+            cosign_sign_in_run("cosign sign-blob x --bundle b 2>&1 || true")
+                .unwrap()
+                .failure_ignored
+                .as_deref(),
+            Some("true")
+        );
         assert_eq!(cosign_sign_in_run("echo cosign sign-blob --bundle"), None);
         assert_eq!(
             cosign_sign_in_run("cosign verify-blob x --bundle y"),
@@ -4001,10 +4976,514 @@ mod tests {
             "verification is not signing"
         );
         assert_eq!(
-            cosign_sign_in_run("cosign sign-blob x --yes\ncosign sign-blob y --bundle b"),
-            Some(false),
+            cosign_sign_in_run("cosign sign-blob x --yes\ncosign sign-blob y --bundle b")
+                .map(|s| s.unbundled),
+            Some(true),
             "one unbundled command fails the step"
         );
+    }
+
+    /// Gate (d), heredocs: everything between `<<WORD` and the line equal to
+    /// `WORD` is data. A signing line inside a heredoc body is not a
+    /// command, whichever spelling opened the heredoc; `<<-` strips leading
+    /// tabs from the closing line; `<<<` is a here-string and opens nothing.
+    #[test]
+    fn a_signing_line_inside_a_heredoc_body_is_not_a_command() {
+        for opener in ["<<EOF", "<< EOF", "<<'EOF'", "<< \"EOF\"", "<<-EOF"] {
+            let script = format!(
+                "cat {opener} > notes.txt\n\tcosign sign-blob \"$f\" --bundle \"$f.sigstore.json\" \
+                 --yes\n\tEOF\n"
+            );
+            let cmds = shell_commands(&script);
+            assert_eq!(
+                cmds.len(),
+                1,
+                "{opener}: the body must not tokenise into commands: {cmds:?}"
+            );
+            assert_eq!(cmds[0].words[0], "cat");
+            assert_eq!(
+                cosign_sign_in_run(&script),
+                None,
+                "{opener}: a heredoc body does not sign"
+            );
+        }
+        // A plain `<<EOF` closes only on a line EXACTLY `EOF`; the tab-indented
+        // closer above therefore leaves the body open to the end of input for
+        // `<<EOF`, and that is still not signing — only `<<-` strips tabs.
+        let closed =
+            "cat <<EOF\ncosign sign-blob x --bundle b\nEOF\ncosign sign-blob y --bundle b\n";
+        assert_eq!(
+            cosign_sign_in_run(closed),
+            Some(SigningShortfalls::default()),
+            "the command AFTER the closing delimiter is real"
+        );
+        assert_eq!(shell_commands(closed).len(), 2, "cat, then the real cosign");
+        assert_eq!(
+            cosign_sign_in_run("cosign sign-blob x --bundle b <<< data"),
+            Some(SigningShortfalls::default()),
+            "a here-string is a word of the command, not a heredoc"
+        );
+
+        // The `: <<'COMMENT'` block-comment idiom.
+        let commented = ": <<'COMMENT'\ncosign sign-blob \"$f\" --bundle \"$f.sigstore.json\" \
+                         --yes\nCOMMENT\necho done\n";
+        assert_eq!(cosign_sign_in_run(commented), None);
+
+        // In a workflow: the signing step's body is one heredoc — Absent,
+        // and the control fails as missing, not as defective.
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &format!(
+                    "      - uses: sigstore/cosign-installer@{COSIGN_INSTALLER_SHA}\n\
+                     \x20     - run: |\n\
+                     \x20         cat <<'SIGN' > /dev/null\n\
+                     \x20         for f in dist/*; do\n\
+                     \x20           {COSIGN_SIGN_BUNDLED}\n\
+                     \x20         done\n\
+                     \x20         SIGN"
+                ),
+            ),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(result.evidence.is_empty());
+        assert_message(
+            &result,
+            "release-sign.yml MISSING — run `sscsb init`; no committed (HEAD) workflow",
+        );
+        assert_no_message(&result, "does not meet the bar");
+    }
+
+    /// Gate (c), suppression: a signing command whose failure cannot fail
+    /// the step — negated with `!`, followed by `|| true` / `|| :`, or run
+    /// as the author's own `cosign` function or alias — is named as such.
+    #[test]
+    fn a_signing_command_whose_failure_is_suppressed_is_defective() {
+        for (cmd, needle) in [
+            (
+                format!("! {COSIGN_SIGN_BUNDLED}"),
+                "the signing command is negated with `!` — its exit status is inverted, so a \
+                 failed signing reads as success",
+            ),
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || true"),
+                "the signing command is followed by `|| true` — a failed signing is swallowed \
+                 and the step succeeds with an unsigned artifact",
+            ),
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || :"),
+                "the signing command is followed by `|| :` — a failed signing is swallowed",
+            ),
+            // Any word after `||` that does not fail the step swallows the
+            // failure just as `true` does — the message names the word.
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || echo \"::warning::signing failed for $f\""),
+                "the signing command is followed by `|| echo` — a failed signing is swallowed",
+            ),
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || continue"),
+                "the signing command is followed by `|| continue` — a failed signing is \
+                 swallowed",
+            ),
+            (
+                format!("{COSIGN_SIGN_BUNDLED} || FAILED=1 true"),
+                "the signing command is followed by `|| true`",
+            ),
+            // A pipe hands the step the LAST command's exit status: without
+            // `pipefail` a failed signing whose output `tee` copied is a
+            // success.
+            (
+                format!("{COSIGN_SIGN_BUNDLED} | tee -a sign.log"),
+                "the signing command's output is piped — its exit status is not the step's",
+            ),
+            (
+                format!("{COSIGN_SIGN_BUNDLED} 2>&1 | grep -v noise || exit 1"),
+                "output is piped — its exit status is not the step's",
+            ),
+            // `set -o pipefail` counts only when it PRECEDES the pipe.
+            (
+                format!("{COSIGN_SIGN_BUNDLED} | tee -a sign.log\n            set -o pipefail"),
+                "output is piped — its exit status is not the step's",
+            ),
+            (
+                format!("cosign() {{ echo fake; }}\n            {COSIGN_SIGN_BUNDLED}"),
+                "the `run:` body defines a function or alias named `cosign` — the signing \
+                 command is not the installed cosign",
+            ),
+            (
+                format!("function cosign {{ :; }}\n            {COSIGN_SIGN_BUNDLED}"),
+                "defines a function or alias named `cosign`",
+            ),
+            (
+                format!("alias cosign='true'\n            shopt -s expand_aliases\n            {COSIGN_SIGN_BUNDLED}"),
+                "defines a function or alias named `cosign`",
+            ),
+        ] {
+            let (_d, ctx) = consolidated_repo(
+                "sigstore-signing",
+                &release_workflow(
+                    RELEASE_JOB_PERMISSIONS,
+                    &cosign_sign_steps(COSIGN_INSTALLER_SHA, &cmd),
+                ),
+            );
+            let result = verify_template_control(&ctx, "sigstore-signing");
+            assert_eq!(
+                result.outcome,
+                Outcome::Fail,
+                "{cmd:?} must fail: {:?}",
+                result.messages
+            );
+            assert!(result.evidence.is_empty());
+            assert_message(&result, "release.yml job `release` step #2: ");
+            assert_message(&result, needle);
+        }
+
+        // `|| exit 1` and `|| { …; exit 1; }` — the shipped template's own
+        // shape — fail the step on a signing failure and are NOT suppression;
+        // neither are `return`, `false`, `kill` and a `( … )` group. A pipe
+        // with `set -o pipefail` before it keeps the signing status, and a
+        // signing command that is the LAST in a pipeline owns the status.
+        for cmd in [
+            format!("{COSIGN_SIGN_BUNDLED} || exit 1"),
+            format!("{COSIGN_SIGN_BUNDLED} \\\n              || {{ echo \"::error::failed\"; exit 1; }}"),
+            format!("{COSIGN_SIGN_BUNDLED} || return 1"),
+            format!("{COSIGN_SIGN_BUNDLED} || false"),
+            format!("{COSIGN_SIGN_BUNDLED} || kill -TERM $$"),
+            format!("{COSIGN_SIGN_BUNDLED} || ( echo failed; exit 1 )"),
+            format!("set -o pipefail\n            {COSIGN_SIGN_BUNDLED} | tee -a sign.log"),
+            format!("set -euo pipefail\n            {COSIGN_SIGN_BUNDLED} | tee -a sign.log"),
+            format!("printf '%s\\n' \"$f\" | {COSIGN_SIGN_BUNDLED}"),
+        ] {
+            let (_d, ctx) = consolidated_repo(
+                "sigstore-signing",
+                &release_workflow(
+                    RELEASE_JOB_PERMISSIONS,
+                    &cosign_sign_steps(COSIGN_INSTALLER_SHA, &cmd),
+                ),
+            );
+            let result = verify_template_control(&ctx, "sigstore-signing");
+            assert_eq!(
+                result.outcome,
+                Outcome::Pass,
+                "{cmd:?} must pass: {:?}",
+                result.messages
+            );
+        }
+    }
+
+    /// Gate (c), the pipe under a shell that sets `pipefail` itself: the
+    /// built-in `shell: bash` runs as `bash --noprofile --norc -eo pipefail
+    /// {0}`, so the pipeline's status is the signing command's and the body
+    /// needs no `set -o pipefail` of its own. `shell: sh` (`sh -e {0}`) and
+    /// no `shell:` at all (`bash -e {0}`) set nothing, and the same body
+    /// fails under them.
+    #[test]
+    fn a_piped_signing_command_is_sound_only_when_pipefail_is_on() {
+        let piped_under = |shell: &str| {
+            let shell_line = if shell.is_empty() {
+                String::new()
+            } else {
+                format!("        shell: {shell}\n")
+            };
+            format!(
+                "      - uses: sigstore/cosign-installer@{COSIGN_INSTALLER_SHA}\n\
+                 \x20     - name: Sign\n\
+                 {shell_line}\
+                 \x20       run: {COSIGN_SIGN_BUNDLED} | tee -a sign.log"
+            )
+        };
+        let piped_needle = "the signing command's output is piped — its exit status is not \
+                            the step's (no `set -o pipefail` precedes it in the body, and the \
+                            shell does not set it)";
+        for shell in ["", "sh", "bash -e {0}"] {
+            let (_d, ctx) = consolidated_repo(
+                "sigstore-signing",
+                &release_workflow(RELEASE_JOB_PERMISSIONS, &piped_under(shell)),
+            );
+            let result = verify_template_control(&ctx, "sigstore-signing");
+            assert_eq!(
+                result.outcome,
+                Outcome::Fail,
+                "shell {shell:?} sets no pipefail: {:?}",
+                result.messages
+            );
+            assert_message(&result, "release.yml job `release` step `Sign`: ");
+            assert_message(&result, piped_needle);
+        }
+        for shell in ["bash", "bash --noprofile --norc -eo pipefail {0}"] {
+            let (_d, ctx) = consolidated_repo(
+                "sigstore-signing",
+                &release_workflow(RELEASE_JOB_PERMISSIONS, &piped_under(shell)),
+            );
+            let result = verify_template_control(&ctx, "sigstore-signing");
+            assert_eq!(
+                result.outcome,
+                Outcome::Pass,
+                "shell {shell:?} sets pipefail: {:?}",
+                result.messages
+            );
+            assert_no_message(&result, "output is piped");
+        }
+
+        // The tokeniser's own view: `|` is its own separator, the pipe is a
+        // shortfall only without a preceding `set … pipefail`, and `||` is
+        // swallowing for any word outside the propagating set.
+        let piped = cosign_sign_in_run(&format!("{COSIGN_SIGN_BUNDLED} | tee log")).unwrap();
+        assert!(piped.piped);
+        assert_eq!(piped.failure_ignored, None);
+        let guarded = cosign_sign_in_run(&format!(
+            "set -eo pipefail\n{COSIGN_SIGN_BUNDLED} | tee log"
+        ))
+        .unwrap();
+        assert!(!guarded.piped);
+        assert_eq!(
+            cosign_sign_in_run(&format!("{COSIGN_SIGN_BUNDLED} || echo warn"))
+                .unwrap()
+                .failure_ignored
+                .as_deref(),
+            Some("echo")
+        );
+        for propagating in [
+            "exit 1",
+            "return 1",
+            "false",
+            "kill $$",
+            "{ exit 1; }",
+            "( exit 1 )",
+        ] {
+            assert_eq!(
+                cosign_sign_in_run(&format!("{COSIGN_SIGN_BUNDLED} || {propagating}"))
+                    .unwrap()
+                    .failure_ignored,
+                None,
+                "`|| {propagating}` propagates the failure"
+            );
+        }
+    }
+
+    /// Gate (c), `continue-on-error`: on the proving job, the proving step,
+    /// or the installer step, a failure fails nothing — `true` as YAML or as
+    /// the string `'true'`; any expression is left alone.
+    #[test]
+    fn continue_on_error_on_the_proving_job_or_step_is_defective() {
+        // The signing job.
+        for literal in ["true", "'true'"] {
+            let body = signed_release_workflow().replace(
+                "  release:\n    runs-on: ubuntu-latest\n",
+                &format!(
+                    "  release:\n    continue-on-error: {literal}\n    runs-on: ubuntu-latest\n"
+                ),
+            );
+            assert!(body.contains("continue-on-error"), "fixture premise");
+            let (_d, ctx) = consolidated_repo("sigstore-signing", &body);
+            let result = verify_template_control(&ctx, "sigstore-signing");
+            assert_eq!(
+                result.outcome,
+                Outcome::Fail,
+                "`continue-on-error: {literal}` must fail: {:?}",
+                result.messages
+            );
+            assert!(result.evidence.is_empty());
+            assert_message(
+                &result,
+                "release.yml job `release`: job `continue-on-error: true` — a failed job does \
+                 not fail the run",
+            );
+        }
+
+        // The signing step, and the installer step.
+        let steps = format!(
+            "      - uses: sigstore/cosign-installer@{COSIGN_INSTALLER_SHA}\n\
+             \x20       continue-on-error: true\n\
+             \x20     - name: Sign\n\
+             \x20       continue-on-error: 'true'\n\
+             \x20       run: {COSIGN_SIGN_BUNDLED}"
+        );
+        let (_d, ctx) = consolidated_repo(
+            "sigstore-signing",
+            &release_workflow(RELEASE_JOB_PERMISSIONS, &steps),
+        );
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert_message(
+            &result,
+            "release.yml job `release` step `Sign`: `continue-on-error: true` — a failed \
+             signing does not fail the job",
+        );
+        assert_message(
+            &result,
+            "release.yml job `release` step #1: `continue-on-error: true` on the installer — \
+             a failed install is ignored and signing runs against whatever the runner \
+             happened to have",
+        );
+
+        // The attestation step.
+        let (_d, ctx) = consolidated_repo(
+            "github-attestations",
+            &release_workflow(
+                RELEASE_JOB_PERMISSIONS,
+                &format!(
+                    "      - uses: actions/attest-build-provenance@{ATTEST_BUILD_PROVENANCE_SHA}\n\
+                     \x20       continue-on-error: true\n\
+                     \x20       with:\n\
+                     \x20         subject-path: dist/*.tar.gz"
+                ),
+            ),
+        );
+        let result = verify_template_control(&ctx, "github-attestations");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert_message(
+            &result,
+            "release.yml job `release` step #1: `continue-on-error: true` — a failed \
+             attestation does not fail the job",
+        );
+
+        // An expression is not evaluated: neither `true` nor suppression.
+        let body = signed_release_workflow().replace(
+            "  release:\n    runs-on: ubuntu-latest\n",
+            "  release:\n    continue-on-error: ${{ github.event_name == 'push' }}\n    \
+             runs-on: ubuntu-latest\n",
+        );
+        let (_d, ctx) = consolidated_repo("sigstore-signing", &body);
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+        assert!(!continues_on_error(
+            &YamlLoader::load_from_str("continue-on-error: false").unwrap()[0]
+        ));
+    }
+
+    /// Gate (d), the effective shell: a `run:` body is judged as a POSIX
+    /// signing command only under `bash` / `sh` (bare, or as GitHub's
+    /// `bash … {0}` template) or with no `shell:` at all. Under `pwsh`,
+    /// `python`, `cmd` or a custom template such as `true {0}` the body is
+    /// whatever that program makes of it, and sscsb says it did not judge
+    /// it. The step's `shell:` wins over the job's `defaults.run.shell`,
+    /// which wins over the workflow's.
+    #[test]
+    fn a_signing_step_under_a_non_posix_shell_is_not_judged() {
+        let step_shell = |shell: &str| {
+            format!(
+                "      - uses: sigstore/cosign-installer@{COSIGN_INSTALLER_SHA}\n\
+                 \x20     - name: Sign\n\
+                 \x20       shell: {shell}\n\
+                 \x20       run: {COSIGN_SIGN_BUNDLED}"
+            )
+        };
+        // GitHub's custom-shell shape is `program`, options, one `{0}` — and
+        // nothing else: a template that runs a command of its own before the
+        // script (`bash -c 'exit 0; {0}'`), carries an extra bare word, has
+        // two placeholders, or has options but no placeholder (the runner
+        // starts `bash -e` with no script) is not that shape.
+        for shell in [
+            "pwsh",
+            "true {0}",
+            "python",
+            "cmd",
+            "bash -c 'exit 0; {0}'",
+            "bash {0} extra",
+            "sh {0} {0}",
+            "bash -e",
+        ] {
+            let (_d, ctx) = consolidated_repo(
+                "sigstore-signing",
+                &release_workflow(RELEASE_JOB_PERMISSIONS, &step_shell(shell)),
+            );
+            let result = verify_template_control(&ctx, "sigstore-signing");
+            assert_eq!(
+                result.outcome,
+                Outcome::Fail,
+                "shell `{shell}` must not be judged: {:?}",
+                result.messages
+            );
+            assert!(result.evidence.is_empty());
+            assert_message(
+                &result,
+                &format!(
+                    "release.yml job `release` step `Sign`: step runs under shell `{shell}` — \
+                     not judged as a POSIX signing command"
+                ),
+            );
+        }
+        for shell in [
+            "bash",
+            "sh",
+            "bash -e {0}",
+            "bash --noprofile --norc -eo pipefail {0}",
+            "sh -e {0}",
+        ] {
+            let (_d, ctx) = consolidated_repo(
+                "sigstore-signing",
+                &release_workflow(RELEASE_JOB_PERMISSIONS, &step_shell(shell)),
+            );
+            let result = verify_template_control(&ctx, "sigstore-signing");
+            assert_eq!(
+                result.outcome,
+                Outcome::Pass,
+                "shell `{shell}` is POSIX: {:?}",
+                result.messages
+            );
+        }
+
+        // Job-level and workflow-level `defaults.run.shell` apply when the
+        // step names none; the step's own `shell:` overrides both.
+        let job_default = signed_release_workflow().replace(
+            "  release:\n    runs-on: ubuntu-latest\n",
+            "  release:\n    defaults:\n      run:\n        shell: pwsh\n    runs-on: ubuntu-latest\n",
+        );
+        assert!(job_default.contains("shell: pwsh"), "fixture premise");
+        let (_d, ctx) = consolidated_repo("sigstore-signing", &job_default);
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert_message(&result, "step runs under shell `pwsh`");
+
+        let workflow_default = signed_release_workflow().replace(
+            "permissions:\n  contents: read\n",
+            "permissions:\n  contents: read\ndefaults:\n  run:\n    shell: python\n",
+        );
+        assert!(
+            workflow_default.contains("shell: python"),
+            "fixture premise"
+        );
+        std::fs::write(ctx.root.join(RELEASE), workflow_default).unwrap();
+        commit(&ctx, RELEASE);
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert_message(&result, "step runs under shell `python`");
+
+        let step_overrides = signed_release_workflow()
+            .replace(
+                "permissions:\n  contents: read\n",
+                "permissions:\n  contents: read\ndefaults:\n  run:\n    shell: python\n",
+            )
+            .replace("      - run: |\n", "      - shell: bash\n        run: |\n");
+        assert!(step_overrides.contains("- shell: bash"), "fixture premise");
+        std::fs::write(ctx.root.join(RELEASE), step_overrides).unwrap();
+        commit(&ctx, RELEASE);
+        let result = verify_template_control(&ctx, "sigstore-signing");
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+
+        assert!(is_posix_shell(None));
+        assert!(is_posix_shell(Some("bash -c '{0}'")));
+        assert!(is_posix_shell(Some("sh -e {0}")));
+        assert!(!is_posix_shell(Some("bash -c script.sh")));
+        assert!(!is_posix_shell(Some("zsh {0}")));
+        assert!(!is_posix_shell(Some("bash -c 'exit 0; {0}'")));
+        assert!(!is_posix_shell(Some("bash {0} extra")));
+        assert!(!is_posix_shell(Some("sh {0} {0}")));
+        assert!(!is_posix_shell(Some("bash -e")));
+
+        // Which shells run the body with `pipefail` already on.
+        assert!(shell_sets_pipefail(Some("bash")));
+        assert!(shell_sets_pipefail(Some(
+            "bash --noprofile --norc -eo pipefail {0}"
+        )));
+        assert!(shell_sets_pipefail(Some("sh -o pipefail {0}")));
+        assert!(!shell_sets_pipefail(Some("sh")));
+        assert!(!shell_sets_pipefail(Some("bash -e {0}")));
+        assert!(!shell_sets_pipefail(Some("bash --pipefail {0}")));
+        assert!(!shell_sets_pipefail(None));
     }
 
     // ───────────────── generator subjects ─────────────────
@@ -4132,6 +5611,206 @@ mod tests {
         assert!(result.evidence.is_empty());
         assert_message(&result, "release.yml: job `release` needs `build`");
         assert_message(&result, "but cannot serve as evidence");
+    }
+
+    // ───────────────── Octo STS subject pinning ─────────────────
+
+    const STS: &str = ".github/chainguard/sscsb-automation.sts.yaml";
+
+    fn sts_template() -> &'static str {
+        ARTIFACTS.iter().find(|a| a.dest == STS).unwrap().content
+    }
+
+    /// The `subject_pattern` a rendered policy declares.
+    fn subject_pattern(rendered: &str) -> String {
+        let doc = YamlLoader::load_from_str(rendered).unwrap().remove(0);
+        doc["subject_pattern"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no string subject_pattern in {rendered}"))
+            .to_string()
+    }
+
+    /// GitHub's OIDC `sub` is id-decorated (`repo:p4gs@10093271/
+    /// p4gs.github.io@1354031532:ref:refs/heads/main` — the live refusal
+    /// this was observed in), so the policy pins the ids when they are
+    /// known: each as an optional `(@<id>)?` group, with the repository
+    /// name's `.` escaped, because the pattern is a regular expression. The
+    /// shape checker accepts the rendered file.
+    #[test]
+    fn the_sts_policy_renders_an_id_pinned_subject_when_the_ids_are_known() {
+        let ids = RepoIds {
+            owner_id: "10093271".into(),
+            repo_id: "1354031532".into(),
+        };
+        let rendered = render_with_ids(sts_template(), "p4gs/p4gs.github.io", "main", Some(&ids));
+        assert_eq!(
+            subject_pattern(&rendered),
+            r"repo:p4gs(@10093271)?/p4gs\.github\.io(@1354031532)?:ref:refs/heads/main"
+        );
+        assert!(
+            !rendered.contains("{{"),
+            "every placeholder rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("gh api repos/p4gs/p4gs.github.io --jq .id")
+                && rendered.contains("gh api users/p4gs --jq .id"),
+            "the comment names the two pin commands: {rendered}"
+        );
+
+        let (_d, ctx) = repo();
+        std::fs::write(ctx.root.join(STS), &rendered).unwrap();
+        let result = verify_template_control(&ctx, "octo-sts");
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+    }
+
+    /// Without the ids the policy is TOLERANT, not blind: `[0-9]+` accepts
+    /// whatever id GitHub decorates the subject with, so the exchange works
+    /// — and the operator is told to pin. `render` (no ids) is that form.
+    #[test]
+    fn the_sts_policy_renders_a_tolerant_subject_when_the_ids_are_unknown() {
+        let rendered = render(sts_template(), "p4gs/p4gs.github.io", "release");
+        assert_eq!(
+            subject_pattern(&rendered),
+            r"repo:p4gs(@[0-9]+)?/p4gs\.github\.io(@[0-9]+)?:ref:refs/heads/release"
+        );
+        assert_eq!(
+            render_with_ids(sts_template(), "p4gs/p4gs.github.io", "release", None),
+            rendered
+        );
+        assert!(!rendered.contains("{{"), "{rendered}");
+
+        let (_d, ctx) = repo();
+        std::fs::write(ctx.root.join(STS), &rendered).unwrap();
+        let result = verify_template_control(&ctx, "octo-sts");
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+    }
+
+    /// `init` resolves the ids through `gh api repos/<slug>` and `gh api
+    /// users/<owner>` when `gh` answers; when it refuses or is absent, the
+    /// tolerant form is written and a `note` line names the two commands
+    /// that pin it. The placeholder slug (no remote, no `github_repo`) never
+    /// calls the API at all.
+    #[test]
+    fn install_all_pins_the_sts_subject_ids_from_the_github_api_when_it_can() {
+        let lock = crate::testutil::env_lock();
+        let (_d, ctx) = repo();
+        let sts = ctx.root.join(STS);
+        let cfg = ctx.require_config().unwrap();
+        let note = format!(
+            "note {STS}: owner/repo ids not resolved from the GitHub API — `subject_pattern` \
+             accepts any `@<id>` decoration until you pin them: `gh api \
+             repos/p4gs/sscs-bootstrapper --jq .id` (repo id), `gh api users/p4gs --jq .id` \
+             (owner id)"
+        );
+
+        // Placeholder slug: no remote, so no API call — a `gh` that would
+        // blow up proves it was never run. The note still fires, spelled
+        // with the same placeholders the rest of the file carries.
+        lock.fake_tool(
+            "gh",
+            "#!/bin/sh\necho 'gh must not run for OWNER/REPO' >&2\nexit 99\n",
+        );
+        std::fs::remove_file(&sts).unwrap();
+        let lines = install_all(&ctx, cfg).unwrap();
+        assert!(lines.contains(&format!("write {STS}")), "{lines:?}");
+        assert!(
+            lines.contains(
+                &note
+                    .replace("p4gs/sscs-bootstrapper", "OWNER/REPO")
+                    .replace("users/p4gs", "users/OWNER")
+            ),
+            "{lines:?}"
+        );
+        assert_eq!(
+            subject_pattern(&std::fs::read_to_string(&sts).unwrap()),
+            "repo:OWNER(@[0-9]+)?/REPO(@[0-9]+)?:ref:refs/heads/main"
+        );
+
+        crate::exec::git(
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/p4gs/sscs-bootstrapper.git",
+            ],
+            &ctx.root,
+        )
+        .unwrap();
+
+        // `gh` answers: pinned, no note.
+        lock.fake_tool(
+            "gh",
+            "#!/bin/sh\n\
+             [ \"$1\" = api ] && [ \"$3\" = --jq ] && [ \"$4\" = .id ] || { echo \"unexpected: $*\" >&2; exit 2; }\n\
+             case \"$2\" in\n\
+             \x20 repos/p4gs/sscs-bootstrapper) echo 1156341487 ;;\n\
+             \x20 users/p4gs) echo 10093271 ;;\n\
+             \x20 *) echo \"unexpected path: $2\" >&2; exit 1 ;;\n\
+             esac\n",
+        );
+        std::fs::remove_file(&sts).unwrap();
+        let lines = install_all(&ctx, cfg).unwrap();
+        assert!(lines.contains(&format!("write {STS}")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.starts_with("note ")), "{lines:?}");
+        assert_eq!(
+            subject_pattern(&std::fs::read_to_string(&sts).unwrap()),
+            "repo:p4gs(@10093271)?/sscs-bootstrapper(@1156341487)?:ref:refs/heads/main"
+        );
+
+        // `gh` present but refusing (unauthenticated, offline): tolerant + note.
+        lock.fake_tool(
+            "gh",
+            "#!/bin/sh\necho 'gh: HTTP 401: Bad credentials' >&2\nexit 1\n",
+        );
+        std::fs::remove_file(&sts).unwrap();
+        let lines = install_all(&ctx, cfg).unwrap();
+        assert!(lines.contains(&note), "{lines:?}");
+        assert_eq!(
+            subject_pattern(&std::fs::read_to_string(&sts).unwrap()),
+            "repo:p4gs(@[0-9]+)?/sscs-bootstrapper(@[0-9]+)?:ref:refs/heads/main"
+        );
+
+        // A `gh` that answers with something other than a number is not an id.
+        lock.fake_tool("gh", "#!/bin/sh\necho 'null'\n");
+        std::fs::remove_file(&sts).unwrap();
+        let lines = install_all(&ctx, cfg).unwrap();
+        assert!(lines.contains(&note), "{lines:?}");
+
+        // `gh` absent: tolerant + note.
+        lock.hide_from_path(&["gh"]);
+        assert!(
+            crate::exec::find_in_path("gh").is_none(),
+            "fixture must hide gh"
+        );
+        std::fs::remove_file(&sts).unwrap();
+        let lines = install_all(&ctx, cfg).unwrap();
+        assert!(lines.contains(&note), "{lines:?}");
+        assert_eq!(
+            subject_pattern(&std::fs::read_to_string(&sts).unwrap()),
+            "repo:p4gs(@[0-9]+)?/sscs-bootstrapper(@[0-9]+)?:ref:refs/heads/main"
+        );
+
+        // An existing file is kept, and nothing is asked of the API for it.
+        let lines = install_all(&ctx, cfg).unwrap();
+        assert!(lines.contains(&format!("keep {STS} (exists — delete to regenerate)")));
+        assert!(!lines.iter().any(|l| l.starts_with("note ")), "{lines:?}");
+    }
+
+    /// This repository's own policy is the template rendered with its ids.
+    #[test]
+    fn the_dogfood_sts_policy_is_the_template_rendered_with_this_repositorys_ids() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ids = RepoIds {
+            owner_id: "10093271".into(),
+            repo_id: "1156341487".into(),
+        };
+        let rendered =
+            render_with_ids(sts_template(), "p4gs/sscs-bootstrapper", "main", Some(&ids));
+        let dogfood = std::fs::read_to_string(root.join(STS)).unwrap();
+        assert_eq!(
+            rendered, dogfood,
+            "{STS}: dogfood policy drifted from the rendered template"
+        );
     }
 
     // ───────────────── template ⇄ dogfood parity ─────────────────

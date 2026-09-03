@@ -88,8 +88,56 @@ versions.
   `schema_version: 1` — the field's shape and meaning, "the committed evidence
   for this verdict", are unchanged. Any downstream directory reflects these
   rows once its action scans with this version.
+- **The consolidated-evidence gates close the cheap structural evasions, and
+  `docs/phase-3.md` § "What this does not prove" now states every remaining
+  one.** Heredoc bodies are data; a signing step under a non-POSIX `shell:`
+  (step → job → workflow `defaults.run.shell`) is "not judged"; `continue-on-error:
+  true` on the proving job/step/installer (and on the calling job of a
+  `workflow_call`), a `!`-negated signing command, a `||` after it followed
+  by anything other than `exit` / `return` / `false` / `kill` / `{` / `(`
+  (`|| true`, `|| :`, `|| echo warn`, `|| continue` all swallow), a `|`
+  after it with no `set -o pipefail` before it in the body and a shell that
+  does not set it (the built-in `bash` does; `sh` and no `shell:` do not),
+  and a `cosign` function/alias in the body are each named; a `shell:` is
+  POSIX only as `bash` / `sh`, bare or in GitHub's custom-shell shape —
+  options and exactly one `{0}` — so `bash -c 'exit 0; {0}'` and an extra
+  bare word are "not judged"; a `workflow_call` caller must be shape-sound
+  and its job must already hold the called job's scopes; `types` / `workflows` are named as
+  unevaluated and an empty `types:`/`workflows:`/`schedule:` fails; an empty
+  job-level `permissions:` grants nothing; only `generator_generic_slsa3.yml`
+  at a `vX.Y.Z` tag (a SHA pin is refused) is the generator; a test holds the
+  generator tag identical across `.sscsb/config.toml`, both `release.yml`s,
+  `release-slsa.yml`, both `deploy-gate.yml`s and the docs. Beyond these, no
+  further gates: `with:`/`run:` text as written, `$(…)`, control flow,
+  `/usr/bin/cosign`, a `cosign` shim placed on `$GITHUB_PATH` by an earlier
+  step, filter globs, non-literal `if:`, whether the workflow ever ran, and
+  the runner OS (`runs-on:` is not read — a step with no `shell:` is judged
+  as POSIX) are disclosed, not claimed.
+- **The Octo STS trust policy `sscsb init` installs never matched GitHub's
+  OIDC subject.** GitHub decorates the `sub` claim with ids —
+  `repo:OWNER@<owner_id>/REPO@<repo_id>:ref:refs/heads/main` — and the
+  template's `subject_pattern` was spelled from names alone, so Octo STS
+  refused every exchange (observed live: `subject "repo:p4gs@10093271/
+  p4gs.github.io@1354031532:ref:refs/heads/main" did not match
+  "repo:p4gs/p4gs.github.io:ref:refs/heads/main"`). The template now renders
+  `repo:OWNER(@<owner_id>)?/REPO(@<repo_id>)?:ref:refs/heads/<branch>` with
+  `.` in the repository name escaped; the ids are resolved through `gh api
+  repos/<slug>` / `users/<owner>` when `gh` is available, and otherwise
+  rendered as `[0-9]+` with a `note` line in the `init` log naming the two
+  commands that pin them.
 
 ### Changed (this repository's own release pipeline)
+
+- The `publish` job's already-published re-run guard is decided **once**, in
+  a first step that records `published=true|false` to `GITHUB_OUTPUT`; every
+  later step (collect, refuse-incomplete, create-draft-and-upload, confirm,
+  publish) is gated on `steps.published.outputs.published != 'true'`. Before,
+  the guard lived inside the upload and publish steps only, so a re-run of a
+  published tag still downloaded the set, re-checked it, and re-downloaded
+  the draft's assets before finding nothing to do. Same change in the shipped
+  `templates/workflows/release.yml`; the parity test holds the two together.
+- `.github/chainguard/sscsb-automation.sts.yaml` pins this repository's own
+  ids: `repo:p4gs(@10093271)?/sscs-bootstrapper(@1156341487)?:ref:refs/heads/main`.
 
 - `.github/workflows/release.yml` now generates **SLSA Build L3 provenance**
   via `slsa-framework/slsa-github-generator` (`generator_generic_slsa3.yml@v2.1.0`,

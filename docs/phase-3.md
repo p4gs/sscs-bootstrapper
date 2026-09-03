@@ -179,53 +179,118 @@ step in the repository's workflows. Exactly what it checks, and nothing more:
 3. **Fires unattended.** `on:` includes `push`, `release`, `schedule`,
    `pull_request` or `workflow_run` — or it is `workflow_call` and a
    committed workflow with one of those triggers calls it via `uses: ./<path>`
-   from a job that is not switched off. A `workflow_dispatch`-only workflow,
-   or one with no `on:` at all, is a procedure a human runs, not a control.
-   A trigger's `branches` / `tags` / `paths` (and `-ignore`) filters are
-   **not evaluated** — the message says `on \`push\` (tags filter not
-   evaluated)` rather than claiming the workflow fires — with one exception
-   `sscsb` can judge without a glob engine: an **empty** `branches:` or
-   `tags:` list matches no ref at all, and fails.
+   from a job that is not switched off, where that caller is itself
+   shape-sound (a caller with a ghost `needs:` or two YAML documents calls
+   nothing; it is skipped and the note says why) and the calling job's
+   *effective* `permissions:` already grant every scope the called proving
+   job needs (GitHub refuses a called workflow's job that asks for more than
+   its caller holds; the defect names the caller, its job and the scope). A
+   `workflow_dispatch`-only workflow, or one with no `on:` at all, is a
+   procedure a human runs, not a control. A trigger's `branches` / `tags` /
+   `paths` (and `-ignore`), `types` and `workflows` filters are **not
+   evaluated** — the message says `on \`push\` (tags filter not evaluated)`
+   rather than claiming the workflow fires — with one shape `sscsb` can judge
+   without a glob engine or a cron parser: an **empty** list under
+   `branches:`, `tags:`, `types:` or `workflows:`, or a `schedule:` with no
+   cron entries, matches nothing, and fails.
 4. **Not switched off.** Neither the proving job nor the proving step carries
-   a constant-false `if:` — `false`, `'false'`, `"false"` or `${{ false }}`.
-   Any other expression is left alone; the gate models the switch left off,
-   not the expression language.
+   a constant-false `if:` — `false`, `'false'`, `"false"` or `${{ false }}` —
+   or `continue-on-error: true` (YAML `true` or the string `'true'`; the
+   installer step is held to the same). A signing command is not negated
+   with `!`, not followed by `|| true` / `|| :`, and not preceded in its
+   `run:` body by a function or alias named `cosign` (`cosign()`, `function
+   cosign`, `alias cosign=`). And a `run:` body is judged only under a POSIX
+   shell — no `shell:` at all, `bash`, `sh`, or GitHub's `bash … {0}` /
+   `sh … {0}` template, resolved step → job `defaults.run.shell` → workflow
+   `defaults.run.shell`; under `pwsh`, `python`, `cmd` or a custom template
+   such as `true {0}` the step is reported as "not judged as a POSIX signing
+   command" and fails. Any other expression is left alone; the gate models
+   the switch left off, not the expression language.
 5. **Pinned.** The action is pinned to a 40-hex commit SHA, through the same
-   helpers `actions-audit` uses. The one exception is the slsa-github-generator
-   at a `vX.Y.Z` tag, per its documented trust model.
+   helpers `actions-audit` uses. The one exception is the slsa-github-generator,
+   which must be at a `vX.Y.Z` tag — and **only** a tag: slsa-verifier
+   identifies the trusted builder by its tag ref, so a SHA-pinned generator
+   is refused with the tag requirement named, exactly as the shipped
+   `release.yml` header warns. Only the generic generator,
+   `generator_generic_slsa3.yml` — the one every template calls and the one
+   `provenance-verify`'s `builder_id` names — is judged; a job calling the
+   container generator or a language builder fails with that narrowing
+   stated, because those are different trusted builders with different
+   subjects and are out of scope.
 6. **Bound to an artifact, in the right order.** The step names what it
    binds to, and for Cosign the installer precedes the signer.
 7. **Granted.** The job's *effective* `permissions:` — the job-level block if
    there is one, else the workflow level, exactly as GitHub resolves them —
-   include the scopes the step needs.
+   include the scopes the step needs. An **empty** job-level block
+   (`permissions: {}`, or a bare `permissions:`) is a declaration that grants
+   nothing, never an omission that inherits the workflow level.
 
 | Control | Evidence looked for (steps parsed from YAML, never grepped from text) | Job must be granted |
 |---------|---------------------|---------------------|
-| `sigstore-signing` | a `run:` body tokenised as shell (quotes, `\` escapes and continuations, `#` comments outside quotes, commands split on newline / `;` / `&&` / `\|\|` / `\|` / `&`) in which a command's **command word** — after leading `VAR=…` assignments, `sudo` / `env` / `time` and compound openers such as `do` — is `cosign`, its next word is `sign-blob` or `sign`, and `--bundle` (or `--bundle=…`) is a word of **that** command; preceded in the same job by a SHA-pinned `sigstore/cosign-installer`; every cosign-bearing step is judged and any defective one fails the job | `id-token: write` |
+| `sigstore-signing` | a `run:` body tokenised as shell (quotes, `\` escapes and continuations, `#` comments outside quotes, heredoc bodies — `<<WORD`, `<< 'WORD'`, `<<-WORD` — skipped up to the closing line, commands split on newline / `;` / `&&` / `\|\|` / `\|` / `&`) in which a command's **command word** — after leading `VAR=…` assignments, `sudo` / `env` / `time` and compound openers such as `do` — is `cosign`, its next word is `sign-blob` or `sign`, and `--bundle` (or `--bundle=…`) is a word of **that** command, and that command is not negated, not followed by `\|\|` and any word other than `exit` / `return` / `false` / `kill` / `{` / `(`, not piped (`\|`) into another command unless a `set -o pipefail` precedes it in the body or the shell sets it (the built-in `bash` does; `sh` and no `shell:` do not), and not shadowed by a `cosign` function or alias; run under a POSIX shell (`bash` / `sh`, bare or in GitHub's custom-shell shape — options and exactly one `{0}`); preceded in the same job by a SHA-pinned `sigstore/cosign-installer`; every cosign-bearing step is judged and any defective one fails the job | `id-token: write` |
 | `github-attestations` | SHA-pinned `actions/attest-build-provenance` with `subject-path` / `subject-digest` / `subject-checksums` | `attestations: write` + `id-token: write` |
 | `sbom-attestation` | SHA-pinned `actions/attest` (or `actions/attest-sbom`) with `sbom-path` **and** a `subject-*` input | `attestations: write` + `id-token: write` |
-| `slsa-provenance` | a job `uses:` the `slsa-framework/slsa-github-generator` reusable workflow at a `vX.Y.Z` tag or a SHA, with a non-empty `base64-subjects` or `base64-subjects-as-file` | `actions: read` (read or write) + `id-token: write` + `contents: write` |
+| `slsa-provenance` | a job `uses:` the `slsa-framework/slsa-github-generator` **generic** generator (`generator_generic_slsa3.yml`, no other) at a `vX.Y.Z` tag — a SHA pin is refused — with a non-empty `base64-subjects` or `base64-subjects-as-file` | `actions: read` (read or write) + `id-token: write` + `contents: write` |
 
 A step that falls short of any gate **fails** with the precise defect: the
 mutable ref is named, the missing scope is named, the manual-only trigger is
-quoted, the empty ref filter is named, the constant-false `if:` is quoted,
-the out-of-order installer names both step positions, the generator call
-without subjects is told its provenance is bound to nothing. `cosign
-verify-blob` in a deploy gate is verification, not signing; `echo "cosign
-sign-blob … --bundle"` prints a command and runs none; a `#`-commented
-command — whole-line or trailing — runs nothing; and the consolidated path
-never rescues a modular file that is present but broken — it answers "the
-template is absent", nothing else.
+quoted, the empty filter is named, the constant-false `if:` is quoted, the
+`continue-on-error` (on the proving job, its step, its installer, or the
+calling job of a `workflow_call`), the `!`, the word after `||` that
+swallows the failure, the `|` with no `pipefail` and the shadowing `cosign`
+definition are each named, the non-POSIX shell is quoted, the out-of-order
+installer names both step positions, the generator call without subjects is
+told its provenance is bound to nothing, the SHA-pinned generator is told
+which tag shape it needs, the short caller is told which scope it lacks.
+`cosign verify-blob` in a deploy gate is verification, not signing; `echo
+"cosign sign-blob … --bundle"` prints a command and runs none; a
+`#`-commented command — whole-line or trailing — runs nothing; a heredoc
+body is data to the tokeniser, never a command — a signing line inside one
+is not counted, even when the heredoc is piped into a shell; and the
+consolidated path never rescues a modular file that is present but broken —
+it answers "the template is absent", nothing else.
 
-What this does **not** prove: that the workflow has ever run, that the run
-succeeded, or that a release carries the resulting bundles and attestations.
-Those are properties of releases, which `provenance-verify` (the deploy gate)
-checks per release; `verify` reads committed configuration. Nor does it
-evaluate a trigger's `branches` / `tags` / `paths` filters against any ref
-(only an empty list is judged), or any `if:` expression beyond the literal
-`false` spellings above — a workflow filtered to a branch that never receives
-a tag, or gated on an expression that is always false at runtime, passes
-these gates and is reported with the filter or expression left unevaluated.
+### What this does not prove
+
+Static analysis of committed configuration cannot prove execution. That is
+the class-A stance of the scan methodology, not a gap to be closed by one
+more gate, so after the gates above no further ones are added — what
+remains is written down here, exactly:
+
+- **Whether the workflow has ever run, succeeded, or produced a release** is
+  not proven. Class-A evidence is committed configuration, and the directory
+  methodology says so; whether a release carries the resulting bundles and
+  attestations is a property of releases, which `provenance-verify` (the
+  deploy gate) checks per release.
+- **`with:` inputs and `run:` text are taken as written.** Expressions inside
+  them — `${{ '' }}` as a subject path, `${{ env.X }}` as a flag — are not
+  evaluated; a value that expands to nothing at runtime passes as the text it
+  is in the file.
+- **Command substitution, control flow and path-invoked binaries are not
+  modelled.** `$(…)` is a word; an `exit 0` before the signing line, an
+  `if`/`else` branch the signing line sits in, and `/usr/bin/cosign` (a
+  command word that is not `cosign`) are not followed. A body that
+  tokenises to a sound signing command is judged sound whatever runs around
+  it.
+- **Which `cosign` binary the command word resolves to is not followed
+  across steps** — a shim placed on `$GITHUB_PATH` by an earlier step is not
+  seen. Only a function or alias named `cosign` in the signing step's own
+  body, and an installer that runs after the signing step, are caught.
+- **Branch, tag, path, `types` and `workflows` filters are named, not
+  evaluated.** No glob engine, no ref to match against: a workflow filtered
+  to a branch that never receives a tag passes these gates and is reported
+  with the filter left unevaluated. Only an empty list is judged.
+- **Non-literal `if:` expressions are not evaluated.** Only the literal
+  `false` spellings are recognised; a job gated on an expression that is
+  always false at runtime, or a `continue-on-error: ${{ … }}` that is always
+  true, passes, and the verdict does not mention the expression at all.
+- **The runner's operating system is not consulted.** A step with no
+  `shell:` is judged as POSIX shell; on a Windows runner GitHub's default is
+  `pwsh`, and `runs-on:` is not read.
+
+That list is the boundary. Everything inside it fails with a named defect;
+everything outside it is disclosed here and in the verdict's wording, never
+claimed.
 
 `init` and `verify` agree. `sscsb init` consults the same recognizer before
 writing a modular template: when a control in this set is already proven by
@@ -255,7 +320,7 @@ sscsb provenance verify \
   --provenance dist/multiple.intoto.jsonl \
   --source-uri github.com/OWNER/REPO \
   --source-tag v1.0.0 \
-  --builder-id https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.0.0
+  --builder-id https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.1.0
 ```
 
 `sscsb provenance verify` wraps **slsa-verifier**, which checks that the artifact's
@@ -294,6 +359,17 @@ minutes, governed by a policy file that says which identity may get what.
 `sscsb init` installs a starter `.github/chainguard/*.sts.yaml` policy. The
 credential is issued to *the workflow*, not to *you*, and it cannot outlive the
 job. There is nothing to rotate and nothing to leak.
+
+The policy's `subject_pattern` must match GitHub's OIDC `sub` claim as GitHub
+actually issues it, which is **id-decorated**:
+`repo:OWNER@<owner_id>/REPO@<repo_id>:ref:refs/heads/main`. A pattern spelled
+from names alone is refused. The installed policy therefore reads
+`repo:OWNER(@<owner_id>)?/REPO(@<repo_id>)?:ref:refs/heads/<branch>` (with `.`
+in the repository name escaped — it is a regular expression); `init` fills the
+ids in from `gh api repos/<slug> --jq .id` and `gh api users/<owner> --jq .id`
+when `gh` is available, and otherwise renders `[0-9]+` for each and logs a
+`note` naming those two commands. Pin them: the ids are what survive a rename,
+and what a re-created repository of the same name does not share.
 
 ## Harden-Runner on every job
 
