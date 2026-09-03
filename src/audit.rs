@@ -64,7 +64,7 @@ const TAG_PIN_EXCEPTION_REPO: &str = "slsa-framework/slsa-github-generator";
 /// refs from a rule written for exactly one builder. The exception ends at the
 /// repository boundary — the path is either the repo itself or a `/`-separated
 /// path inside it.
-fn is_tag_pin_exception(action: &str) -> bool {
+pub(crate) fn is_tag_pin_exception(action: &str) -> bool {
     action == TAG_PIN_EXCEPTION_REPO
         || action
             .strip_prefix(TAG_PIN_EXCEPTION_REPO)
@@ -100,11 +100,11 @@ fn is_blank_doc(doc: &Yaml) -> bool {
     matches!(doc, Yaml::Null | Yaml::BadValue)
 }
 
-fn is_full_sha(s: &str) -> bool {
+pub(crate) fn is_full_sha(s: &str) -> bool {
     s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn is_semver_tag(s: &str) -> bool {
+pub(crate) fn is_semver_tag(s: &str) -> bool {
     let Some(rest) = s.strip_prefix('v') else {
         return false;
     };

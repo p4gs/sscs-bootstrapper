@@ -95,36 +95,63 @@ enabled = true
 # ── Phase 3 — Provenance, signing & credential federation ──
 
 # Sigstore keyless signing: Cosign keyless signing + SBOM/provenance attestations bound to digests
-# SUPERSEDED by release-immutability (draft-then-publish): Cosign signing now happens
-# INSIDE release.yml, before publish. Standalone release-sign.yml uploads sigs AFTER
-# publish, which GitHub release immutability forbids.
+# IMPLEMENTED in the consolidated release.yml (draft-then-publish): `cosign sign-blob
+# --bundle` over every shipped tarball, before publish, via a SHA-pinned
+# sigstore/cosign-installer in a job granted `id-token: write`. The modular
+# release-sign.yml is deliberately NOT installed (it uploads signatures AFTER
+# publish, which release immutability forbids); the scanner's consolidated-evidence
+# recognition verifies the step in release.yml and reports that file as the evidence.
 [controls.sigstore-signing]
-enabled = false
-
-# SUPERSEDED by release-immutability: SLSA L3 (slsa-github-generator) attaches provenance
-# to the release AFTER publish — mutually exclusive with immutability (documented trade-off).
-# release.yml attests build-provenance to the attestation store (immutability-safe) instead.
-[controls.slsa-provenance]
-enabled = false
-
-# SUPERSEDED by release-immutability: release.yml attests build-provenance to the store
-# internally, over the same artifact it builds — the standalone workflow would attest a
-# separately-rebuilt archive, producing an attestation for a different digest.
-[controls.github-attestations]
-enabled = false
-
-# SUPERSEDED by release-immutability: release.yml attests the SBOM to the store internally,
-# bound to the artifact it actually ships (see github-attestations note).
-[controls.sbom-attestation]
-enabled = false
-
-# Provenance verification gates: slsa-verifier + cosign verification required before promote/deploy/publish
-[controls.provenance-verify]
 enabled = true
 
+# SLSA Build L3 provenance: IMPLEMENTED in the consolidated release.yml. The earlier
+# note here ("the generator attaches provenance after publish, incompatible with
+# immutability") was wrong: the generic generator can emit the provenance as a RUN
+# ARTIFACT (`upload-assets: false`), and the draft-then-publish flow uploads that
+# *.intoto.jsonl to the DRAFT with the other assets before the single publish. The
+# `provenance` job calls slsa-framework/slsa-github-generator's generic_slsa3 reusable
+# workflow at a vX.Y.Z tag (the one sanctioned pinning exception) over the sha256
+# subjects the release job computed, granted `actions: read` + `id-token: write` +
+# `contents: write`; deploy-gate.yml verifies it with slsa-verifier before publish.
+# The modular release-slsa.yml is NOT installed (it attaches after publish). The
+# scanner's consolidated-evidence recognition verifies the job in release.yml.
+[controls.slsa-provenance]
+enabled = true
+
+# GitHub artifact attestations: IMPLEMENTED in the consolidated release.yml —
+# `actions/attest-build-provenance` (SHA-pinned, `subject-path` = the shipped tarballs)
+# writes build provenance to GitHub's attestation store from a job granted
+# `attestations: write` + `id-token: write`. The modular release-attest.yml is NOT
+# installed on purpose: it would attest a separately-rebuilt archive, i.e. a different
+# digest. Verified in release.yml by the scanner's consolidated-evidence recognition.
+[controls.github-attestations]
+enabled = true
+
+# GitHub SBOM attestation: IMPLEMENTED in the consolidated release.yml — anchore/sbom-action
+# generates the CycloneDX SBOM and `actions/attest` (SHA-pinned, `sbom-path`) binds it to
+# the digest of the artifact actually shipped, in the same attestation-granted job. The
+# modular release-attest-sbom.yml is NOT installed (same different-digest reason as
+# github-attestations). Verified in release.yml by consolidated-evidence recognition.
+[controls.sbom-attestation]
+enabled = true
+
+# Provenance verification gates: slsa-verifier + cosign verification required before promote/deploy/publish.
+# deploy-gate.yml is a `workflow_call` reusable gate that release.yml runs between its
+# provenance and publish jobs (checksums, Cosign bundles against this workflow's identity at
+# the tag, `gh attestation verify` for build provenance + SBOM, slsa-verifier against the
+# pinned builder); `workflow_dispatch` with a tag re-verifies an already-published release.
+[controls.provenance-verify]
+enabled = true
+# The trusted builder `sscsb provenance verify` pins (--builder-id default). It MUST
+# track the slsa-github-generator tag release.yml's `provenance` job calls and the
+# BUILDER_ID deploy-gate.yml verifies against — change one, change all three.
+builder_id = "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.1.0"
+
 # Immutable releases (draft-then-publish): supersedes the modular release-sign/slsa flow.
-# Consolidated release.yml: build → attest build-provenance + SBOM to the store → Cosign
-# sign → upload to a DRAFT → publish once, so nothing changes after the release is immutable.
+# Consolidated release.yml: build → checksum, attest build-provenance + SBOM to the store,
+# Cosign sign → SLSA generator (run artifact) → deploy-gate verifies everything → upload
+# to a DRAFT, confirm the draft's bytes → publish once, so nothing changes after the
+# release is immutable.
 [controls.release-immutability]
 enabled = true
 

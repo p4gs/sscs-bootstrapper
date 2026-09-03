@@ -581,6 +581,17 @@ pub struct VerifyResult {
     pub control: &'static str,
     pub outcome: Outcome,
     pub messages: Vec<String>,
+    /// Repo-relative paths of the files, committed at HEAD, the verdict actually
+    /// rests on, when they are NOT the control's registered `workflows::ARTIFACTS`.
+    ///
+    /// Empty for the common case — the modular artifact sscsb installs is the
+    /// evidence, and `machine.rs` exports the registry paths. Filled only when a
+    /// control was proven by consolidated evidence (its real step living in
+    /// another committed workflow, e.g. `release.yml`), so a reclassifier that
+    /// asks "did this file pre-exist in the repository?" is pointed at the file
+    /// that was examined rather than at a modular template that was never
+    /// installed.
+    pub evidence: Vec<String>,
 }
 
 impl VerifyResult {
@@ -589,7 +600,14 @@ impl VerifyResult {
             control,
             outcome,
             messages,
+            evidence: Vec::new(),
         }
+    }
+
+    /// Attach the committed (HEAD) files a consolidated-evidence verdict rests on.
+    pub fn with_evidence(mut self, evidence: Vec<String>) -> Self {
+        self.evidence = evidence;
+        self
     }
 }
 

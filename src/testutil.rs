@@ -369,6 +369,55 @@ pub fn repo_with_gh_repo(slug: &str, branch: &str) -> (tempfile::TempDir, Ctx) {
     (dir, ctx)
 }
 
+// ───────────────────── consolidated release.yml fixtures ─────────────────────
+//
+// Minimal, shape-Sound `release.yml` bodies carrying the REAL steps the
+// provenance controls look for when their modular template is absent. Shared
+// by `workflows` (the recognizer) and `machine` (the JSON `artifacts` field)
+// so both test the same evidence.
+
+/// The SHA the shipped `release.yml` template pins `sigstore/cosign-installer`
+/// to. A 40-hex value is what the recognizer requires; this one is real.
+pub const COSIGN_INSTALLER_SHA: &str = "6f9f17788090df1f26f669e9d70d6ae9567deba6";
+pub const ATTEST_BUILD_PROVENANCE_SHA: &str = "0f67c3f4856b2e3261c31976d6725780e5e4c373";
+pub const ATTEST_SHA: &str = "a1948c3f048ba23858d222213b7c278aabede763";
+
+/// A single-job release workflow: `permissions` is the job-level block (YAML
+/// scopes, one per line, already indented six spaces) and `steps` the job's
+/// step list (indented six spaces, starting with `- `).
+pub fn release_workflow(job_permissions: &str, steps: &str) -> String {
+    format!(
+        "name: Release\non:\n  push:\n    tags: [\"v*\"]\npermissions:\n  contents: read\n\
+         jobs:\n  release:\n    runs-on: ubuntu-latest\n    permissions:\n{job_permissions}\n\
+         \x20   steps:\n{steps}\n"
+    )
+}
+
+/// Steps that keyless-sign `dist/*` with a bundle, via a pinned installer.
+pub fn cosign_sign_steps(installer_ref: &str, sign_cmd: &str) -> String {
+    format!(
+        "      - uses: sigstore/cosign-installer@{installer_ref}\n\
+         \x20     - run: |\n\
+         \x20         for f in dist/*; do\n\
+         \x20           {sign_cmd}\n\
+         \x20         done"
+    )
+}
+
+pub const COSIGN_SIGN_BUNDLED: &str = "cosign sign-blob \"$f\" --bundle \"$f.sigstore.json\" --yes";
+
+/// The job-level permissions block release.yml grants its release job.
+pub const RELEASE_JOB_PERMISSIONS: &str =
+    "      contents: write\n      id-token: write\n      attestations: write";
+
+/// A release workflow proving `sigstore-signing` in full.
+pub fn signed_release_workflow() -> String {
+    release_workflow(
+        RELEASE_JOB_PERMISSIONS,
+        &cosign_sign_steps(COSIGN_INSTALLER_SHA, COSIGN_SIGN_BUNDLED),
+    )
+}
+
 // ─────────────────────────── invariant enforcement ───────────────────────────
 //
 // The rules above are only worth stating if breaking them fails a build. These

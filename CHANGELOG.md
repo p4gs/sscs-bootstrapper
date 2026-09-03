@@ -8,6 +8,325 @@ versions.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-02
+
+### Fixed
+
+- **Four provenance controls were graded by filename, not by evidence.**
+  `sigstore-signing`, `slsa-provenance`, `github-attestations` and
+  `sbom-attestation` verified by asking whether the modular workflow `sscsb
+  init` installs (`release-sign.yml`, `release-slsa.yml`, `release-attest.yml`,
+  `release-attest-sbom.yml`) existed and parsed. A repository on the
+  draft-then-publish `release-immutability` path performs the Cosign signing,
+  the build-provenance attestation, the SBOM attestation and the
+  slsa-github-generator call **inside `release.yml`**, over the exact artifact
+  it ships — the modular workflows cannot coexist with an immutable release.
+  Such a repository was told to run `sscsb init`, and the only way to silence
+  that was to disable the controls, which every downstream consumer then read
+  as "not implemented".
+
+  When — and only when — the modular artifact is **absent**, `verify` now
+  looks for the control's real step in the repository's workflows. Exactly
+  what it checks (see `docs/phase-3.md` § Consolidated evidence):
+  the candidate files are the ones **committed at HEAD** (`git ls-tree -r
+  --name-only HEAD -- .github/workflows`, each read with `git show
+  HEAD:<path>` — a file that is only on disk, only `git add`ed, or edited in
+  the working tree is never evidence and is named as such, and a working
+  tree that differs from HEAD is reported; only outside a git repository
+  does it read the directory, and the message then says committed-ness was
+  not established); the file is shape-sound (one YAML document, at least one
+  job, no inert job, every `needs:` resolvable); its `on:` carries an
+  automatic trigger (`push`, `release`, `schedule`, `pull_request`,
+  `workflow_run`) or is `workflow_call` reached from a committed workflow
+  that has one — a trigger's `branches`/`tags`/`paths` filters are **not
+  evaluated** and the message says so (`on \`push\` (tags filter not
+  evaluated)`), except that an empty `branches:`/`tags:` list fails; neither
+  the proving job nor the proving step has a constant-false `if:` (`false`,
+  `'false'`, `"false"`, `${{ false }}`; no other expression is evaluated);
+  the action is pinned to a 40-hex commit SHA (the slsa-github-generator's
+  `vX.Y.Z` tag pin excepted); the step is bound to an artifact (`subject-*`
+  for both attestation actions, plus `sbom-path` for the SBOM; a non-empty
+  `base64-subjects` / `base64-subjects-as-file` for the generator; for
+  Cosign the `run:` body is **tokenised as shell** and the command word —
+  after `VAR=…`, `sudo`/`env`/`time`, `do` and the like — must be `cosign`
+  followed by `sign-blob`/`sign` with `--bundle` a word of that same
+  command, so an `echo` that prints the command, a trailing `#` comment, or
+  a `--bundle` on the next command of a chain is not signing; with the
+  `sigstore/cosign-installer` step **preceding** the signing step, every
+  cosign-bearing step judged); and the job's effective `permissions:` (job
+  level replaces workflow level, as GitHub applies them) grant what the step
+  needs — `id-token: write` for signing, `attestations: write` + `id-token:
+  write` for the attestations, `actions: read` + `id-token: write` +
+  `contents: write` for the generator. Every shortfall **fails** with the
+  precise defect named. Nothing here claims the workflow has run; that
+  remains the release's, and `provenance-verify`'s, business.
+- **`init` and `verify` now agree.** `sscsb init` consults the same
+  recognizer before writing a modular template: a control already proven by
+  consolidated evidence committed at HEAD is skipped with a log line naming
+  the proving file (`skip .github/workflows/release-sign.yml
+  (sigstore-signing proven by .github/workflows/release.yml)`). Previously, a
+  pipeline that runs `init` before `verify` had the template written into the
+  clone first, so `verify` graded an init-created file and never reached the
+  committed evidence.
+- **The shipped `release.yml` / `deploy-gate.yml` templates carried the old
+  design** — no generator job, a `workflow_dispatch`-only gate, and a header
+  claiming the slsa-github-generator is incompatible with release
+  immutability. They are now the pipeline this repository runs (below),
+  verbatim outside two marked `sscsb:customize-*` regions (the build job and
+  the tarball count it yields — `git archive` and `1` in the template, a Rust
+  matrix and `3` here), and a test holds the two in byte parity outside
+  those regions; `deploy-gate.yml` has no region and is byte-identical. The
+  `release-slsa.yml` header and the compliance map now say what is actually
+  true: only that workflow's after-publish attachment conflicts with
+  immutability, not the generator.
+- **`verify --format json` rows now report the file the verdict actually rests
+  on.** `artifacts` used to be the registered template paths unconditionally,
+  so a control proven by consolidated evidence pointed reclassifiers at a file
+  the repository never contained. When consolidated evidence proved the
+  control, the row carries that file (e.g. `.github/workflows/release.yml`);
+  otherwise it is the registry parity it always was. Additive within
+  `schema_version: 1` — the field's shape and meaning, "the committed evidence
+  for this verdict", are unchanged. Any downstream directory reflects these
+  rows once its action scans with this version.
+- **The consolidated-evidence gates close the cheap structural evasions, and
+  `docs/phase-3.md` § "What this does not prove" now states every remaining
+  one.** Heredoc bodies are data; a signing step under a non-POSIX `shell:`
+  (step → job → workflow `defaults.run.shell`) is "not judged"; `continue-on-error:
+  true` on the proving job/step/installer (and on the calling job of a
+  `workflow_call`), a `!`-negated signing command **outside a condition**, a
+  signing command in a compound command's CONDITION (`if cosign …; then`,
+  `elif`, `while`/`until cosign …; do`) **whose failure path leaves the step
+  passing** — a conditional that CHECKS the signing is the canonical "check
+  and fail" idiom, not a suppression, so `if cosign …; then echo signed;
+  else exit 1; fi` and `if ! cosign …; then exit 1; fi` both PASS: the gate
+  reads the arm the shell takes when the signing fails FIRST (the `else`
+  arm, or the `then` arm when the test is negated) and stays quiet when it
+  propagates (`exit`/`return` with a literal non-zero status or none,
+  `false`, `kill`); the command after the compound's terminator is consulted
+  only when that arm FALLS THROUGH, because an arm that ends the shell
+  without propagating makes everything after the terminator unreachable, so
+  `if cosign …; then echo signed; exit 0; else echo warn; exit 0; fi`
+  followed by `exit 1` keeps FAILING while
+  `if cosign …; then echo signed; fi` followed by `exit 1` passes. For a
+  loop the failure arm depends on the opener: a plain
+  `while cosign …; do …; done` ENDS on a failing condition, so only the
+  command after `done` speaks; an `until cosign …; do …; done` (and its
+  `while ! cosign …` twin) runs its BODY on a failing condition, so the body
+  is the failure arm and the loop is left on that path only by a `break` or
+  a non-propagating `exit` — which is why the bounded retry
+  `n=0; until cosign …; do n=$((n+1)); if [ "$n" -ge 3 ]; then exit 1; fi;
+  sleep 2; done` PASSES while `until cosign …; do break; done` fails.
+  In condition position the `!` is the conditional's own test, not a status
+  inversion, so the negation message — which would be factually wrong there
+  — is never emitted and the condition defect is reported instead;
+  `if cosign …; then echo signed; fi`, `while cosign …; do break; done` and
+  `if ! cosign …; then echo failed; fi` all still fail, and an `elif` chain,
+  an unclosed compound, an arm whose propagating command is reached
+  only through `&&`/`||`/`|`/`&`, an arm where an `exit 0` comes first, and
+  a compound nested inside an arm all fail closed (a `break` is the one word
+  read deeper, and only inside a loop) —, a `||` branch after it
+  that leaves the step passing — immediately or at the end of the AND-OR
+  list it opens with `&&`, since `&&` short-circuits to that branch, so
+  `cosign … && echo ok || true` swallows exactly as `cosign … || true` does
+  while `… && echo ok || exit 1` does not; only `exit` / `return` with a literal
+  non-zero status (or none at all, which re-raises `$?` — in `||` position
+  the failure that sent the shell down the branch), `false`,
+  `kill`, and a `{ …; }` / `( … )` group whose LAST command is one of those
+  still fail it, so `|| true`, `|| :`, `|| echo warn`, `|| continue`,
+  `|| exit 0`, `|| return 0`, `|| exit $?`, `|| { echo warn; }` and
+  `|| ( echo warn )` all swallow, as does a branch of nothing but
+  `NAME=VALUE` assignments (`|| FAILED=1`, `|| RC=$?`, named as written),
+  and an unreadable or unclosed group fails
+  closed — so a branch that RETRIES the signing (`cosign … || cosign …`) is
+  read as swallowing too, deliberately: a sound retry has to be written as a
+  loop whose exhaustion fails the step (`cosign … && signed=1 && break` per
+  attempt, then `[ -n "${signed:-}" ] || exit 1`), which these gates accept —
+  a single unpaired `&` after it (which detaches it from `-e`
+  exactly as `||` does; `&&` and the `&` of `2>&1` / `>&2` / `&>log` are
+  not backgrounding) unless a bare `wait $!` / `wait "$!"` is the very next
+  command, which collects that job's status (a bare `wait`, a `wait $PID`,
+  and a `wait $!` that is itself negated, piped, backgrounded or `||`-ed
+  still fail), a `set +e` / `set +o errexit` / `shopt -o -u errexit`
+  before it in the body (`shopt -o` addresses the `set -o` namespace, in
+  either flag order and as one cluster; a later `set -e` /
+  `shopt -o -s errexit` turns fail-fast back on, order is honoured as it is
+  for `pipefail`, and `set --` ends the option list so `set -- +e` is an
+  operand, not a toggle) **with no later command that propagates the
+  captured status** — the status-capture idiom (`set +e`, sign, `rc=$?`,
+  `set -e`, `[ "$rc" -eq 0 ] || exit 1`) turns fail-fast off on purpose and
+  re-raises the failure by hand, so it PASSES; the parameter that carries
+  the status must be one assigned from `$?` in the command IMMEDIATELY after
+  the signing, reached unconditionally (`rc=$?`, `RC=$?`, and the `local` /
+  `declare` / `typeset` / `export` / `readonly` spellings), and it is lost
+  the moment anything else is assigned to that name — a parameter that
+  cannot be traced to the signing's own `$?` does not count, so
+  `set +e`, sign, `rc=$?`, `set -e`, `other=$?`, `exit "$other"` and a
+  `RC=0` … `exit "$RC"` wrapped around an unguarded signing loop both keep
+  FAILING; the recognised shapes are then
+  `exit "$rc"` / `return $rc` (that **captured parameter**, never a literal
+  — `exit 1` says nothing about the signing), a test on it whose
+  `||`
+  or `&&` branch fails the step (which way the test reads is not evaluated,
+  so either operator counts, and the branch may equally re-raise the captured
+  parameter itself — `[ "$rc" -eq 0 ] || exit "$rc"` propagates by
+  construction and now PASSES, where before only the literal `|| exit 1`
+  did), and that test in a condition whose arm fails
+  the step (`if [ "$rc" -ne 0 ]; then exit 1; fi`) — the test may be spelled
+  `[ … ]`, `test …`, `[[ … ]]` (its own `]]` required), `(( rc != 0 ))` (its
+  own `))`) or `let`, since an idiomatic guard is the same guard, and a
+  SEPARATED `( ( … ) )` is a nested subshell rather than arithmetic, told
+  apart exactly as bash tells them apart; **and the consultation counts only
+  where the shell reaches it**, at the signing's own depth — one inside a
+  nested compound's arm, one after an unconditional `exit` that already
+  ended the shell, and one behind `&&` / `||` / `|` / `&` are each no
+  consultation at all, on the same reachability model the condition gate
+  grades an arm with (a rebinding of the captured name, by contrast, counts
+  wherever it is written: unknown fails closed on both sides). **That skip is
+  one-directional**: a conditionally reached command never COUNTS, but one
+  that can END the shell stops the walk there anyway, so the one-liner
+  `set +e`, sign, `rc=$?`, `[ -f dist/skip ] && exit 0`, `exit "$rc"` keeps
+  FAILING — with its `||`, `&& return 0`, `&& exit $?` and
+  `[ "${DRY_RUN:-}" = "1" ] && exit 0` spellings, and the same one-liner in
+  an `else` arm or an `until` retry's body — while
+  `[ -f dist/skip ] && exit 1`, which fails the step on the path that takes
+  it, leaves the walk running. **A BARE `exit` / `return` after `&&` abandons
+  the shell too**: an argument-less `exit` re-raises `$?`, which is the
+  FAILURE only where the command is reached because something failed (a `||`
+  branch, or the arm a compound takes on a failing condition), and after `&&`
+  the branch runs only because the test SUCCEEDED, so the status re-raised is
+  0 — `set +e`, sign, `rc=$?`, `[ -f dist/skip ] && exit`, `exit "$rc"` now
+  keeps FAILING (with its `&& return` spelling, and the same one-liner in an
+  `else` arm or an `until` retry's body), while the sound `||` twin
+  `[ "$rc" -eq 0 ] || exit` keeps PASSING, since there the inherited status
+  is the failing one. The rule holds wherever an argument-less `exit` decides
+  a verdict, including the branch of the captured-status test itself:
+  `[ "$rc" -eq 0 ] && exit` and `[ "$rc" -ne 0 ] && exit` both keep the
+  defect. That one is decided rather than disclosed because, unlike the
+  direction a test reads, a bare `exit` after `&&` is unsound in BOTH
+  readings; `&& exit "$rc"` and `&& exit 1` are unaffected. **A nested
+  compound is stepped over only when the shell must come back out of it** —
+  one that can END the shell instead, an abandoning `exit` / `return`
+  anywhere in its span at any depth, ends the walk, so `set +e`, sign,
+  `rc=$?`, `if [ "${SKIP_SIGNING:-}" = "true" ]; then exit 0; fi`,
+  `exit "$rc"` keeps FAILING (with its `while` / `for` / `until` / `case`
+  twins and the same arm nested two deep); and the arm index lists now carry
+  a nested compound at its opener, so the same rule closes an `else` arm that
+  ends the shell from inside one; a status
+  captured and
+  never consulted (`set +e`, sign, `echo done`), a check whose failing path
+  still passes (`|| echo warn`), a `case` on the captured status
+  (`case "$rc" in 0) ;; *) exit 1 ;; esac` — sound, and failed anyway,
+  because an arm's pattern is only skipped so the command behind it can be
+  read, never matched against a value), which now grades identically in
+  **either `case` spelling** — a one-liner
+  `case "$MODE" in skip) echo s ;; esac` carries its keyword and its first
+  arm as one command, and used to open no compound at all, so the walk read
+  it as a simple command and then stopped at the `esac` behind it — and a
+  test of anything but
+  the captured
+  parameter each
+  keep the defect, a `|`
+  after it with no `set -o pipefail` before it in the body and a shell that
+  does not set it (the built-in `bash` does; `sh` and no `shell:` do not),
+  and a `cosign` function/alias in the body are each named; a `shell:` is
+  POSIX only as `bash` / `sh`, bare or in GitHub's custom-shell shape —
+  options and exactly one `{0}` — so `bash -c 'exit 0; {0}'` and an extra
+  bare word are "not judged"; a `workflow_call` caller must be shape-sound
+  and its job must already hold the called job's scopes; `types` / `workflows` are named as
+  unevaluated and an empty `types:`/`workflows:`/`schedule:` fails; an empty
+  job-level `permissions:` grants nothing; only `generator_generic_slsa3.yml`
+  at a `vX.Y.Z` tag (a SHA pin is refused) is the generator; a test holds the
+  generator tag identical across `.sscsb/config.toml`, both `release.yml`s,
+  `release-slsa.yml`, both `deploy-gate.yml`s and the docs. Beyond these, no
+  further gates: `with:`/`run:` text as written, `$(…)`, control flow beyond
+  the failure path of the compound whose CONDITION holds the signing —
+  including an `if`/`else` BODY or a `case` ARM the signing line sits in
+  (the signing there IS seen — the arm's `release)` pattern is skipped so the
+  command word is `cosign` and every gate applies — but whether the arm is
+  ever taken is not asked), a signing command
+  reached later in the same condition list (`if other && cosign …; then`),
+  and the `errexit` exemption for `&&` / `||` lists, which loses a
+  `cosign … && echo ok` failure when further commands follow it —
+  `/usr/bin/cosign`, a `cosign` shim placed on `$GITHUB_PATH` (or a `cosign`
+  function exported through `$BASH_ENV`) by an earlier step, a non-literal
+  option word (`OPTS=+e; set $OPTS` — the value is text, not a toggle), a
+  custom `shell:` template that omits `-e` (`bash {0}`, `sh {0}` — the body
+  is graded as if fail-fast were on) and a `trap` that rewrites the step's
+  status, a suppression applied to a `{ …; }` / `( … )` group from the
+  outside (`( … ) &`, `{ …; } || true` — the recognizer reads the separator
+  that ends the signing command itself, and walks a `&&` list forward to its
+  terminating branch, but never the group's, on one line or across many), a
+  sound body that re-raises a failed signing outside the enumerated
+  condition and captured-status shapes (a `trap`, a flag checked in a later
+  STEP, a helper function that exits, a status relayed through a second
+  variable — `rc=$?; status=$rc; exit "$status"` — since the walk follows a
+  captured status' loss but never its copy: fail-closed, as with the retry),
+  an `until` retry whose body can only loop, which is graded sound because a
+  failed signing never reaches a green step even though the way it never
+  does may be the job's timeout rather than an exit, and whose `break` is
+  counted at any depth so a `break` that leaves only an INNER loop is
+  over-counted, the rest of the class that `break` belongs to — a command
+  that ends or diverts the shell without being an `exit` / `return` this walk
+  can see: a `trap` that rewrites the status, `exec CMD` (which REPLACES the
+  shell process, so `[ -f dist/skip ] && exec true` before the re-raise, and
+  `exec true` as an `else` arm, both PASS while exiting 0 with the signing
+  failed), and `eval STRING` (whose string is never parsed, so
+  `eval "exit 0"` passes and the sound `eval "exit \$rc"` is failed) — an
+  AND-OR list backgrounded or
+  piped as a whole (`cosign … && echo ok &`), a `wait` on anything but a
+  literal `$!` immediately after (`pid=$!; wait "$pid"`),
+  filter globs, non-literal `if:`, whether the workflow ever ran, and
+  the runner OS (`runs-on:` is not read — a step with no `shell:` is judged
+  as POSIX) are disclosed, not claimed.
+- **The Octo STS trust policy `sscsb init` installs never matched GitHub's
+  OIDC subject.** GitHub decorates the `sub` claim with ids —
+  `repo:OWNER@<owner_id>/REPO@<repo_id>:ref:refs/heads/main` — and the
+  template's `subject_pattern` was spelled from names alone, so Octo STS
+  refused every exchange (observed live: `subject "repo:p4gs@10093271/
+  p4gs.github.io@1354031532:ref:refs/heads/main" did not match
+  "repo:p4gs/p4gs.github.io:ref:refs/heads/main"`). The template now renders
+  `repo:OWNER(@<owner_id>)?/REPO(@<repo_id>)?:ref:refs/heads/<branch>` with
+  `.` in the repository name escaped; the ids are resolved through `gh api
+  repos/<slug>` / `users/<owner>` when `gh` is available, and otherwise
+  rendered as `[0-9]+` with a `note` line in the `init` log naming the two
+  commands that pin them.
+
+### Changed (this repository's own release pipeline)
+
+- The `publish` job's already-published re-run guard is decided **once**, in
+  a first step that records `published=true|false` to `GITHUB_OUTPUT`; every
+  later step (collect, refuse-incomplete, create-draft-and-upload, confirm,
+  publish) is gated on `steps.published.outputs.published != 'true'`. Before,
+  the guard lived inside the upload and publish steps only, so a re-run of a
+  published tag still downloaded the set, re-checked it, and re-downloaded
+  the draft's assets before finding nothing to do. Same change in the shipped
+  `templates/workflows/release.yml`; the parity test holds the two together.
+- `.github/chainguard/sscsb-automation.sts.yaml` pins this repository's own
+  ids: `repo:p4gs(@10093271)?/sscs-bootstrapper(@1156341487)?:ref:refs/heads/main`.
+
+- `.github/workflows/release.yml` now generates **SLSA Build L3 provenance**
+  via `slsa-framework/slsa-github-generator` (`generator_generic_slsa3.yml@v2.1.0`,
+  `upload-assets: false`) over the sha256 subjects of the shipped tarballs,
+  and uploads the resulting `*.intoto.jsonl` to the **draft** release with the
+  other assets before the single publish. The earlier premise that the
+  generator is incompatible with release immutability was wrong; the
+  `slsa-provenance` control is re-enabled in `.sscsb/config.toml`.
+- `.github/workflows/deploy-gate.yml` is now a `workflow_call` reusable gate
+  that `release.yml` runs between provenance and publish (`publish` `needs:`
+  it): checksum sidecars, every Cosign bundle against an anchored,
+  regex-escaped identity of `release.yml@refs/tags/<tag>`, `gh attestation
+  verify` for `https://slsa.dev/provenance/v1` and `https://cyclonedx.org/bom`
+  with `--signer-workflow` and `--source-ref`, and `slsa-verifier
+  verify-artifact` with `--source-uri`, `--source-tag` and the pinned
+  `--builder-id`. `workflow_dispatch` with a tag remains as a manual
+  re-verify of a published release. The first tag pushed after this change is
+  the pipeline's first real run; every gate is fail-closed.
+- `.sscsb/config.toml` pins `builder_id` under `[controls.provenance-verify]`
+  to the same `generator_generic_slsa3.yml@refs/tags/v2.1.0` that
+  `release.yml` calls and `deploy-gate.yml` verifies against, so `sscsb
+  provenance verify` needs no `--builder-id` here and the three cannot drift
+  silently.
+
 ## [0.3.0] - 2026-09-01
 
 ### Added
