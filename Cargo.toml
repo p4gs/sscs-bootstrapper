@@ -23,6 +23,23 @@ toml_edit = "0.22"
 ureq = { version = "2.12", features = ["json"] }
 yaml-rust2 = "0.10"
 
+# `sscsb skill check` asks the kernel whether the running binary is writable by
+# the user running it (`faccessat(…, W_OK, AT_EACCESS)`), which is what decides
+# how strong its own result is. rustix is a SAFE wrapper over that call — mode
+# bits alone would miss supplementary groups and ACLs, and would miss them in
+# the direction that OVERSTATES the guarantee. It is already in this tree via
+# `tempfile` with the same `fs` feature, so this edge adds no crate and compiles
+# nothing new.
+#
+# `process` is here for `geteuid()`, and it is not a nicety: `W_OK` answers "may
+# I write this right now", not "may I make myself able to write it", and POSIX
+# lets a file's OWNER chmod it. A binary a user owns at mode 0555 answered every
+# W_OK probe "no" and earned the strong verdict, and was then replaced with
+# `chmod u+w`. Ownership is capability, so the owner comparison needs the
+# EFFECTIVE uid, which std does not expose.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs", "process"] }
+
 [dev-dependencies]
 assert_cmd = "2.1"
 predicates = "3.1"

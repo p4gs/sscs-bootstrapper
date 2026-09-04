@@ -1,14 +1,15 @@
 # sscsb: immutability-compatible release (draft-then-publish). Builds the
-# artifact set, then over the EXACT tarballs it ships:
+# artifact set, then over the EXACT bytes it ships:
 #
 #   build      → the build fan-out (the `sscsb:customize` region below),
 #                handed on as run artifacts
-#   release    → collects them, checksums centrally, attests build provenance
-#                + the CycloneDX SBOM to GitHub's OWN attestation store
-#                (immutability-safe — the store is separate from release
-#                assets), keyless-signs every file (Cosign bundle = cert + sig
-#                + Rekor proof), and emits the sha256 subjects for the SLSA
-#                generator
+#   release    → collects them, checksums centrally, stages any extra asset,
+#                computes ONE subject list from what is staged, attests build
+#                provenance + the CycloneDX SBOM over that list to GitHub's
+#                OWN attestation store (immutability-safe — the store is
+#                separate from release assets), keyless-signs every file
+#                (Cosign bundle = cert + sig + Rekor proof), and hands the same
+#                list to the SLSA generator
 #   provenance → slsa-framework/slsa-github-generator (SLSA Build L3, isolated
 #                trusted builder) over those subjects, emitted as a RUN
 #                ARTIFACT (`upload-assets: false`) — it never touches the
@@ -17,10 +18,20 @@
 #                publish (which immutability forbids)
 #   gate       → .github/workflows/deploy-gate.yml (reusable): re-checks the
 #                checksums, verifies every Cosign bundle against THIS
-#                workflow's identity at THIS tag, verifies both store
-#                attestations, and verifies the SLSA provenance with
-#                slsa-verifier against the pinned builder. Publish is
-#                unreachable unless it passes.
+#                workflow's identity at THIS tag, and verifies both store
+#                attestations and the SLSA provenance — with slsa-verifier
+#                against the pinned builder — for EVERY attested subject, not
+#                only the tarballs. Publish is unreachable unless it passes.
+#
+# SUBJECTS: the attested set is every file staged in dist/, minus four
+# DESCRIPTOR SHAPES — `*.sha256`, `*.sigstore.json`, `*.intoto.jsonl` and
+# `sbom.cdx.json`. Each of those DESCRIBES a subject rather than being one: a
+# sidecar states a digest, a bundle is a signature, an envelope is provenance,
+# an SBOM listed among its own subjects would be a claim about nothing. The
+# exclusion is a NAME rule, not a timing rule, and the publisher and the gate
+# apply the same `case` pattern byte-for-byte — the publisher over what it
+# staged, the gate over what was published. Anything else in dist/ is attested,
+# so do not name a release asset after a descriptor.
 #   publish    → uploads the verified set + provenance to a DRAFT release,
 #                confirms the draft holds exactly the verified bytes, then
 #                publishes ONCE, so nothing is modified after the release
@@ -42,8 +53,9 @@
 # digests users verify are produced by one tool on one platform (macOS has no
 # `sha256sum`; a per-runner split would mean two implementations).
 #
-# The two `sscsb:customize-*` regions are the ONLY repository-specific parts:
-# the build job (what gets built, on what) and the tarball count it yields.
+# The `sscsb:customize-*` regions are the ONLY repository-specific parts: the
+# build job (what gets built, on what), the tarball count it yields, and any
+# extra non-tarball asset this repository ships in its release.
 # Everything else is shared verbatim between the template sscsb ships and
 # sscsb's own release pipeline — a test in the sscsb repository holds the two
 # in byte parity.
@@ -175,20 +187,78 @@ jobs:
           cd dist
           for f in *.tar.gz; do sha256sum "$f" > "$f.sha256"; done
           cat ./*.sha256
-      # The generator's subjects: one `sha256sum` line per shipped tarball,
-      # base64-encoded on one line — the generic generator's documented recipe.
-      # Computed from the SAME bytes that are checksummed, attested and signed
-      # below, so all four trails describe one artifact set.
-      - name: Compute SLSA subject hashes
+      # sscsb:customize-begin extra-assets — sscsb's own agent skill ships as a
+      # release asset so anyone can verify the instructions their agent reads
+      # against THIS workflow's Sigstore identity at this tag (docs/skill.md).
+      # Staged here on purpose: BEFORE the subject set below, so SKILL.md is a
+      # subject of the build provenance, of the SBOM attestation and of the
+      # SLSA L3 provenance, and is signed by the all-files loop like every
+      # other asset. Staged after the subject set it would be signed and
+      # nothing else — a hole the deploy gate now refuses, because the gate
+      # derives the same set from the published assets.
+      #
+      # Deliberately NOT in the shared template: SKILL.md is sscsb's OWN skill,
+      # and mirroring this step would make every sscsb-hardened repository
+      # publish an asset that means nothing in their release.
+      - name: Stage the agent skill as a release asset
+        run: |
+          set -euo pipefail
+          cp templates/skills/sscsb/SKILL.md dist/SKILL.md
+          [ -s dist/SKILL.md ] || { echo "::error::dist/SKILL.md is empty"; exit 1; }
+      # sscsb:customize-end extra-assets
+      # The ONE subject set every provenance trail describes: one `sha256sum`
+      # line per file staged for release, minus the DESCRIPTOR SHAPES — the
+      # files that describe a subject rather than being one. That exclusion is
+      # a NAME rule, written once and applied byte-identically here and in
+      # deploy-gate.yml's "Determine the attested subject set":
+      #
+      #     *.sha256 | *.sigstore.json | *.intoto.jsonl | sbom.cdx.json
+      #
+      # An earlier cut excluded only `*.sha256` here and relied on TIMING for
+      # the rest — the bundles, the SBOM and the SLSA envelope do not exist in
+      # dist/ yet at this point in the job. That yields the same set, but by
+      # coincidence of ordering rather than by rule, while the gate re-derives
+      # its set from the PUBLISHED assets, where all four shapes are present.
+      # Two rules that happen to agree are not one rule: reorder a step, rename
+      # the SBOM, and the publisher and the gate would disagree about what was
+      # supposed to be attested. A test in the sscsb repository now asserts the
+      # two `case` patterns are the same bytes.
+      #
+      # The contract that buys, at its real strength: an extra asset staged in
+      # the region above is attested, SLSA-subjected, signed AND gate-checked —
+      # UNLESS it is named in one of those four shapes, in which case both
+      # sides exclude it identically and it ships signed but unattested. Do not
+      # name a release asset after a descriptor.
+      #
+      # Written OUTSIDE dist/, so it is never itself shipped, signed or
+      # subjected. Both attestations below read this exact file through
+      # `subject-checksums`, and the SLSA generator gets the same bytes
+      # base64-encoded. One list, three consumers: the four trails cannot
+      # describe different sets, and an extra asset cannot be signed without
+      # also being attested.
+      - name: Compute the release subject set
         id: hash
         run: |
           set -euo pipefail
+          shopt -s nullglob
           cd dist
-          echo "hashes=$(sha256sum -- *.tar.gz | base64 -w0)" >> "$GITHUB_OUTPUT"
+          subjects=()
+          for f in *; do
+            case "$f" in *.sha256 | *.sigstore.json | *.intoto.jsonl | sbom.cdx.json) continue ;; esac
+            [ -f "$f" ] || continue
+            subjects+=("$f")
+          done
+          if [ ${#subjects[@]} -eq 0 ]; then
+            echo "::error::no release subjects staged in dist/"
+            exit 1
+          fi
+          sha256sum -- "${subjects[@]}" > ../subjects.sha256
+          cat ../subjects.sha256
+          echo "hashes=$(base64 -w0 < ../subjects.sha256)" >> "$GITHUB_OUTPUT"
       - name: Attest build provenance (attestation store)
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: dist/*.tar.gz
+          subject-checksums: subjects.sha256
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Generate CycloneDX SBOM
@@ -197,10 +267,14 @@ jobs:
           format: cyclonedx-json
           output-file: dist/sbom.cdx.json
           upload-release-assets: false
+      # The SAME subject list the build provenance used — `sbom.cdx.json` is
+      # generated after it and is therefore not among its own subjects, which
+      # is the correct shape: an SBOM describes the artifacts, it is not one of
+      # them.
       - name: Attest the SBOM to the artifact digest (attestation store)
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
-          subject-path: dist/*.tar.gz
+          subject-checksums: subjects.sha256
           sbom-path: dist/sbom.cdx.json
       # Every artifact must sign, or the step fails — a signing failure on ANY
       # file must never let an unsigned asset reach the published (immutable)

@@ -53,6 +53,132 @@ versions.
   over the same digest — so the namespace/shape/path/command mismatches that
   made the first cut of this lane unusable end to end now fail a test instead.
 
+- **`sscsb skill install | print | check` — the bundled agent skill.** The
+  instructions an AI agent needs in order to drive `sscsb` now ship *with*
+  `sscsb`. The canonical copy is `templates/skills/sscsb/SKILL.md`, compiled
+  into the binary with `include_str!`; `install` writes it to
+  `.claude/skills/sscsb/SKILL.md` (refusing — exit `2`, nothing written — to
+  clobber a file that differs, unless `--force`), `print` emits the bundled
+  bytes verbatim for a digest or a diff, and `check` compares the installed copy
+  against the bundled one: exit `0` identical, `1` differs or missing, `2` could
+  not look. `--dry-run` prints the plan and touches nothing in **all four**
+  states — including the one where a real run would refuse, which it now
+  describes rather than performs. This repository installs its own copy and a
+  test holds the two byte-identical — the tool that audits you is the tool that
+  wrote the instructions your agent reads.
+
+  **The two claims are kept apart, deliberately — and the strength of the first
+  is measured, not asserted.** `skill check` detects an edit made to the
+  *installed file* by another agent, a hook, or anything else on the machine.
+  Whether that is worth much depends on something no document can know for you:
+  whether the same unprivileged process could have rewritten `sscsb` itself.
+  Into a root-owned prefix (`/usr/local/bin`, `root:wheel`) it could not. By
+  Homebrew — the install path the README recommends first — it usually could:
+  `/opt/homebrew/bin` is owned by the installing user and the binary there is a
+  symlink you can repoint without `sudo`, so the binary is exactly as writable
+  as the file it checks. `skill check` therefore walks its own executable's
+  **entire resolution chain** — every ancestor directory up to the filesystem
+  root and every symlink hop individually, the link and the directory holding
+  it — and asks the *kernel* about each (not the mode bits, so groups and ACLs
+  count), reporting the answer as `binary trust` —
+  `not-user-writable` / `user-writable` / `unknown`, with `unknown` read as the
+  weak case — in the text output and under `binary` in `--format json`,
+  alongside a boolean `narrow_claim_holds`, a boolean `chain_complete`, and the
+  chain itself as `binary.probes`, one row per path walked, so a reader can see
+  *which* link is writable rather than trusting the verdict over it. Where it is
+  `user-writable`, the tool says outright that a clean result is evidence of no
+  *casual* edit and nothing stronger. It **cannot** detect a tampered `sscsb` in
+  any case: the check, the bytes and the digest all ship in one artifact.
+
+  Walking the whole chain is a **correction**, not a flourish. A probe of four
+  points — the executable, its directory, the canonicalized file, that file's
+  directory — printed `not-user-writable` for two layouts an unprivileged user
+  can take over, and both were taken over to prove it: a **writable
+  grandparent** above a `0555` `bin` (`mv bin bin.orig && mkdir bin`), and a
+  **repointed intermediate symlink**, which is exactly Homebrew's
+  `opt/<formula> -> ../Cellar/<formula>/<version>` shape, where `canonicalize`
+  jumps from one end of the chain to the other and never sees `opt/`. A vague
+  hedge misleads; a green verdict that is checkable and wrong gets trusted.
+  Symlink loops and pathological depth stop the walk and set
+  `chain_complete: false`, which can never earn the strong verdict. The
+  Homebrew sentence in the output is now printed only for chains that actually
+  run through a Homebrew prefix — it used to be appended to every
+  `user-writable` verdict, including for a binary in `/tmp`.
+
+  **Ownership is capability, and the default verdict is now the weak one.**
+  `faccessat(W_OK)` answers "may I write this right now", not "may I make
+  myself able to write it", and POSIX lets a file's owner `chmod` it. A real
+  `sscsb` binary, user-owned at mode `0555` inside a user-owned `0555`
+  directory under a root-owned prefix, probed `writable: false` on every link
+  of its chain, printed `not-user-writable` with `narrow_claim_holds: true`,
+  and was then replaced twice with no elevation — `chmod u+w` on the file, and
+  `chmod u+w` on the directory followed by unlink-and-recreate. Every probe row
+  now carries an `owned` answer beside `writable`, and either one `true` is an
+  open door.
+
+  That was the third consecutive round in which this check produced a
+  checkable-but-wrong "not-user-writable", so the **default is inverted**. The
+  probe is trying to prove a negative about a filesystem and cannot do that
+  portably, so `not-user-writable` is now the narrow, hard-to-earn case:
+  it requires the chain fully walked, every link both unwritable *and*
+  unowned, **and** a platform whose `current_exe()` is known to report the path
+  the executable was invoked by. Anything else — one unreadable link, one
+  unanswered probe, one abandoned walk — is `unknown`, read as the weak case.
+  The platform gate is reported as `binary.chain_start`
+  (`invocation-path` / `pre-resolved`) and `binary.strong_verdict_available`:
+  on Linux `/proc/self/exe` is already resolved, so an intermediate symlink
+  cannot appear on the chain at all, and the strong verdict is simply
+  unavailable there rather than being awarded to a chain that may be missing a
+  door. What no verdict checks even at full strength — POSIX ACLs, BSD file
+  flags, mount options, container image layering, process capabilities — now
+  ships as data in `binary.unchecked_mechanisms` and in the printed statement,
+  not only in prose: `narrow_claim_holds: true` is the floor of what an
+  attacker must beat, never a proof.
+
+  The claim that does not depend on us is the release asset, signed at its tag
+  by `release.yml` and a subject of the release's build-provenance attestation,
+  its CycloneDX SBOM attestation and its SLSA Build L3 provenance, verifiable
+  with `cosign`, `gh` and `slsa-verifier` obtained independently. Two honest
+  qualifications ship with it. First, **`SKILL.md` is not a release asset yet**:
+  `release.yml` stages and signs it, but the first release whose assets include
+  it is the first tag cut after this change lands, so every `SKILL.md` step of
+  the recipe must be run against a platform tarball until then — stated on
+  `docs/skill.md`, `README.md`, the skill and `AGENTS.md`, and pinned by a test
+  that says when it may be deleted. Second, a release's 17 files do **not** all
+  carry one signer: 16 are minted at our tag by `release.yml`, while the
+  `*.intoto.jsonl` envelope is signed by the SLSA generator's own workflow at
+  the generator's own tag, and pinning our `--certificate-identity` against it
+  pins the wrong signer. That is a proof of origin, not a judgement of content.
+  `docs/skill.md` carries the fenced ```contract block pinning all of it, the
+  full verification recipe — including the three-way closure check that is what
+  actually establishes "no asset was altered *or added* afterwards": every asset
+  has a bundle that verifies, every bundle has its asset, and there is exactly
+  one SLSA envelope, which is what closes the two name shapes the verify loop
+  skips. That closure check is now **`nullglob`-guarded**: under `zsh`, macOS's
+  default login shell, an unmatched glob aborts the script, so the
+  removed-envelope case never reached the count it exists for and printed
+  `no matches found: *.intoto.jsonl` instead of a verdict. All five cases now
+  produce identical output under `sh`, `bash`, `dash` and `zsh`, executed by a
+  test rather than claimed. `docs/skill.md` also carries
+  the reasons the tag must come from out of band and the recipe must not be read
+  out of the file it verifies.
+
+- **The release subject set is computed once, and the deploy gate verifies all
+  of it.** `release.yml` previously scoped every subject glob to
+  `dist/*.tar.gz` — `actions/attest-build-provenance`, the SBOM `actions/attest`
+  and the SLSA generator's `base64-subjects` alike — so any non-tarball asset a
+  release staged was signed by the all-files Cosign loop and covered by nothing
+  else, silently. The `release` job now stages extra assets FIRST, computes one
+  `subjects.sha256` over everything in `dist/` except the `.sha256` sidecars,
+  and hands that same list to both attestations (`subject-checksums`) and to the
+  generator. `deploy-gate.yml` derives the same set from the published assets —
+  everything except the sidecars, bundles, SLSA envelope and SBOM — and runs its
+  provenance, SBOM and SLSA gates over it instead of over `*.tar.gz`, so an
+  asset that is attested is an asset that is checked. The shipped
+  `templates/workflows/` copies carry the identical wiring, with the
+  extra-assets slot left empty: the bug is fixed for every repository `sscsb`
+  bootstraps, not only for this one.
+
 ### Changed
 
 - **Generated `allowed_signers` lines now grant two namespaces to `human`-class

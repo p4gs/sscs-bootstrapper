@@ -476,6 +476,137 @@ pub fn status_json(ctx: &Ctx) -> Result<String> {
     Ok(serde_json::to_string_pretty(&doc)?)
 }
 
+#[derive(Serialize)]
+struct SkillCheckDoc<'a> {
+    schema_version: u32,
+    command: &'static str,
+    path: String,
+    /// `identical` | `differs` | `missing`.
+    state: &'static str,
+    /// Digest of the bytes compiled into this binary.
+    bundled_sha256: &'a str,
+    /// Digest of the bytes on disk; absent when there was no file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    on_disk_sha256: Option<&'a str>,
+    messages: &'a [String],
+    /// The exact limit of what this comparison establishes, carried in the
+    /// document itself so a consumer that only ever reads JSON cannot infer a
+    /// stronger claim from a green `state`. A modified binary could report
+    /// `identical` about anything; the release-asset recipe in `docs/skill.md`
+    /// is the check that does not depend on this binary's honesty.
+    scope: &'static str,
+    /// How much this binary's word is worth on the machine that ran it,
+    /// measured at run time. A consumer reading only JSON must be able to tell
+    /// a check whose binary sits in a root-owned prefix from one whose binary
+    /// the same user could have rewritten — the two produce identical `state`
+    /// fields and very different assurances.
+    binary: BinaryDoc<'a>,
+}
+
+#[derive(Serialize)]
+struct BinaryDoc<'a> {
+    /// `user-writable` | `not-user-writable` | `unknown`.
+    trust: &'static str,
+    /// True only for `not-user-writable`: the narrow claim ("nothing that could
+    /// edit the installed file could edit this check") holds as stated — within
+    /// `unchecked_mechanisms`, which is never empty.
+    narrow_claim_holds: bool,
+    /// `invocation-path` | `pre-resolved`. Where this platform's
+    /// `current_exe()` starts the chain. `pre-resolved` (Linux
+    /// `/proc/self/exe`) means a symlink the kernel traversed before the
+    /// process started cannot appear on the chain at all, so the chain may be
+    /// incomplete in a way the walk cannot detect.
+    ///
+    /// A consumer reading only JSON used to get the strong verdict with none of
+    /// that caveat: it was disclosed in prose and nowhere a machine could see
+    /// it.
+    chain_start: &'static str,
+    /// False when this platform's `chain_start` disqualifies
+    /// `not-user-writable` outright, whatever the probes say. When it is false,
+    /// `trust` is never `not-user-writable`.
+    strong_verdict_available: bool,
+    /// What no verdict here checks, strong one included — ACLs, BSD file flags,
+    /// mount options, container layering, process capabilities. Carried as data
+    /// rather than left in prose, because the reader most likely to act on
+    /// `narrow_claim_holds: true` is a machine.
+    unchecked_mechanisms: &'static [&'static str],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    /// Present when `path` is a symlink: the file it resolves to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_path: Option<String>,
+    /// False when the resolution walk stopped early — a symlink cycle, an
+    /// unreadable component, or a chain too deep. An incomplete chain can never
+    /// carry `narrow_claim_holds: true`.
+    chain_complete: bool,
+    /// The binary's whole resolution chain, in walk order: every ancestor
+    /// directory up to the filesystem root and every symlink hop, with the
+    /// kernel's answers for each — `writable` (may I write it now) and `owned`
+    /// (may I make myself able to). `null` = could not be determined. Either
+    /// one `true` is an open door: POSIX lets an owner chmod.
+    ///
+    /// This is the chain, not a summary of it. A consumer that trusts `trust`
+    /// alone is trusting a verdict; a consumer that reads these rows can see
+    /// WHICH link is writable — which is the difference between the four-point
+    /// probe this replaced and an answer that survives a writable grandparent
+    /// or a repointed intermediate symlink.
+    probes: Vec<ProbeDoc>,
+    /// The same statement the text form prints, so the two cannot drift.
+    statement: &'a [String],
+}
+
+#[derive(Serialize)]
+struct ProbeDoc {
+    role: &'static str,
+    path: String,
+    writable: Option<bool>,
+    owned: Option<bool>,
+}
+
+fn binary_doc<'a>(
+    guarantee: &crate::skill::BinaryGuarantee,
+    statement: &'a [String],
+) -> BinaryDoc<'a> {
+    BinaryDoc {
+        trust: guarantee.trust.as_str(),
+        narrow_claim_holds: guarantee.trust.narrow_claim_holds(),
+        chain_start: crate::skill::CHAIN_START,
+        strong_verdict_available: crate::skill::CHAIN_STARTS_AT_INVOCATION_PATH,
+        unchecked_mechanisms: crate::skill::UNCHECKED_MECHANISMS,
+        path: guarantee.exe.as_ref().map(|p| p.display().to_string()),
+        resolved_path: guarantee.resolved.as_ref().map(|p| p.display().to_string()),
+        chain_complete: guarantee.chain_complete,
+        probes: guarantee
+            .probes
+            .iter()
+            .map(|p| ProbeDoc {
+                role: p.role,
+                path: p.path.display().to_string(),
+                writable: p.writable,
+                owned: p.owned,
+            })
+            .collect(),
+        statement,
+    }
+}
+
+/// Render `skill check` as the v1 JSON document.
+pub fn skill_check_json(report: &crate::skill::CheckReport) -> Result<String> {
+    let statement = report.binary.statement();
+    let doc = SkillCheckDoc {
+        schema_version: SCHEMA_VERSION,
+        command: "skill check",
+        path: report.path.display().to_string(),
+        state: report.state.as_str(),
+        bundled_sha256: &report.bundled_sha256,
+        on_disk_sha256: report.on_disk_sha256.as_deref(),
+        messages: &report.messages,
+        scope: crate::skill::EMBEDDED_CHECK_SCOPE,
+        binary: binary_doc(&report.binary, &statement),
+    };
+    Ok(serde_json::to_string_pretty(&doc)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,5 +1095,90 @@ mod tests {
         // non-pass literals and messages explain why.
         assert_ne!(doc["hooks"]["outcome"], "pass");
         assert!(!doc["hooks"]["messages"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn skill_check_json_carries_the_state_the_digests_and_the_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+
+        // Missing: no on-disk digest field at all, rather than a null a
+        // consumer might read as "the empty file".
+        let missing: serde_json::Value =
+            serde_json::from_str(&skill_check_json(&crate::skill::check(&path).unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(missing["schema_version"], SCHEMA_VERSION);
+        assert_eq!(missing["command"], "skill check");
+        assert_eq!(missing["state"], "missing");
+        assert!(missing.get("on_disk_sha256").is_none());
+        assert_eq!(missing["scope"], crate::skill::EMBEDDED_CHECK_SCOPE);
+
+        // A JSON-only consumer must be able to tell a check whose binary sits
+        // in a root-owned prefix from one whose binary the same user could have
+        // rewritten. `state` is identical in both; this block is not.
+        let binary = &missing["binary"];
+        assert!(
+            ["user-writable", "not-user-writable", "unknown"]
+                .contains(&binary["trust"].as_str().unwrap()),
+            "{binary}"
+        );
+        assert_eq!(
+            binary["narrow_claim_holds"],
+            serde_json::Value::Bool(binary["trust"] == "not-user-writable")
+        );
+        assert!(!binary["statement"].as_array().unwrap().is_empty());
+        // The suite's own binary lives under `target/`, owned by whoever ran
+        // it, so this run must report the weaker reading with a probe to prove
+        // it rather than an assertion to assume it.
+        assert_eq!(binary["trust"], "user-writable");
+        assert_eq!(binary["narrow_claim_holds"], false);
+        let probes = binary["probes"].as_array().unwrap();
+        assert!(probes.iter().any(|p| p["writable"] == true), "{binary}");
+        assert!(
+            probes
+                .iter()
+                .any(|p| p["role"] == "executable-directory" && p["path"].is_string()),
+            "{binary}"
+        );
+        // Both kernel answers, per row. `writable` alone said "no" for a
+        // user-owned 0555 binary that was then taken over with `chmod u+w`, so
+        // a consumer that can only read `writable` is reading the field that
+        // shipped the false assurance.
+        assert!(probes.iter().all(|p| p.get("owned").is_some()), "{binary}");
+        assert!(probes.iter().any(|p| p["owned"] == true), "{binary}");
+        // The platform gate and the boundary of the negative travel WITH the
+        // verdict. An agent reading only JSON used to get the strong verdict
+        // with neither.
+        assert_eq!(binary["chain_start"], crate::skill::CHAIN_START);
+        assert_eq!(
+            binary["strong_verdict_available"],
+            crate::skill::CHAIN_STARTS_AT_INVOCATION_PATH
+        );
+        assert!(
+            !binary["unchecked_mechanisms"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{binary}"
+        );
+
+        crate::skill::install(&path, false, false).unwrap();
+        let ok: serde_json::Value =
+            serde_json::from_str(&skill_check_json(&crate::skill::check(&path).unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(ok["state"], "identical");
+        assert_eq!(ok["on_disk_sha256"], ok["bundled_sha256"]);
+        assert_eq!(
+            ok["bundled_sha256"],
+            crate::skill::digest(crate::skill::SKILL_MD.as_bytes())
+        );
+
+        std::fs::write(&path, "tampered\n").unwrap();
+        let bad: serde_json::Value =
+            serde_json::from_str(&skill_check_json(&crate::skill::check(&path).unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(bad["state"], "differs");
+        assert_ne!(bad["on_disk_sha256"], bad["bundled_sha256"]);
+        assert!(!bad["messages"].as_array().unwrap().is_empty());
     }
 }
