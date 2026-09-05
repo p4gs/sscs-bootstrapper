@@ -115,6 +115,47 @@ flowchart LR
 ## Install
 
 ```sh
+brew install p4gs/p4gs/sscsb
+```
+
+Or download a release directly. Every file in an `sscsb` release carries a
+signature — but not all of them from the same signer. A release publishes 17
+files. 16 of the 17 are signed at *our* tag by
+`.github/workflows/release.yml` — 8 keyless-signed into a `*.sigstore.json`
+bundle, plus those 8 bundles, each of which *is* such a signature. The 17th, the
+`*.intoto.jsonl` envelope, is signed by the SLSA generator's own workflow at the
+generator's own tag, not by ours — `slsa-verifier --builder-id` is what checks
+that signature, and pinning our `release.yml` identity against it would be
+pinning the wrong signer. That is the path on which the verification recipe in
+[docs/skill.md](docs/skill.md) is actually reachable:
+
+```sh
+TAG=v0.3.1                                  # the version you MEANT to install
+gh release download "$TAG" --repo p4gs/sscs-bootstrapper --dir sscsb-release
+cd sscsb-release
+cosign verify-blob sscsb-"$TAG"-x86_64-unknown-linux-gnu.tar.gz \
+  --bundle sscsb-"$TAG"-x86_64-unknown-linux-gnu.tar.gz.sigstore.json \
+  --certificate-identity "https://github.com/p4gs/sscs-bootstrapper/.github/workflows/release.yml@refs/tags/${TAG}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+tar -xzf sscsb-"$TAG"-x86_64-unknown-linux-gnu.tar.gz
+install -m 0755 sscsb /usr/local/bin/sscsb
+```
+
+That proves which pipeline produced those bytes. It is not a judgement of their
+content — see [docs/skill.md](docs/skill.md), which states both claims at their
+real strength.
+
+One gap, stated plainly: `SKILL.md` is not a release asset yet. `release.yml`
+stages and signs it, but the first release whose assets include it is the first
+tag cut after this change lands — the worked example above uses a platform
+tarball precisely because that is what every published tag actually carries.
+Steps in `docs/skill.md` that name `SKILL.md` become runnable from the next
+release onward; every other step works today.
+
+Or from source — note that a source build has no release asset, no Cosign bundle
+and no attestation, so none of the verification above applies to it:
+
+```sh
 cargo build --release
 install -m 0755 target/release/sscsb /usr/local/bin/sscsb
 ```
@@ -154,6 +195,10 @@ Two more docs cover the parts people get wrong:
   human/CI/AI key separation, and the WSL2 USB problem (and its fixes).
 - **[docs/ai-provenance.md](docs/ai-provenance.md)** — commit trailers, the AI
   dependency and shell-command gates, and cryptographic receipts.
+- **[docs/skill.md](docs/skill.md)** — the bundled agent skill
+  (`sscsb skill install | print | check`), and how to verify a copy of it: what
+  the in-binary comparison does and does not prove, and the release-asset recipe
+  that does not depend on `sscsb` being honest.
 - **[docs/example-walkthrough.md](docs/example-walkthrough.md)** — a complete
   bootstrap on a fresh repo, with the real terminal output, including the hooks
   actually blocking a planted secret and an unsigned protected-branch commit.

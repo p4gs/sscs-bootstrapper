@@ -8832,14 +8832,18 @@ mod tests {
     /// SHIP: `.github/workflows/release.yml` and `deploy-gate.yml` are the
     /// rendered templates, byte for byte, outside the marked
     /// repository-specific regions — the build fan-out (a Rust matrix here,
-    /// `git archive` in the template) and the artifact-count assertion that
-    /// depends on it. `deploy-gate.yml` has no such region: it is identical.
+    /// `git archive` in the template), the artifact-count assertion that
+    /// depends on it, and the extra-assets slot (this repository stages its
+    /// own agent skill there; the template leaves it empty, because SKILL.md
+    /// is sscsb's skill and a downstream release publishing it would be
+    /// shipping an asset meaningless to that repository).
+    /// `deploy-gate.yml` has no such region: it is identical.
     /// Either file drifting from the other fails here.
     #[test]
     fn dogfood_release_workflows_are_the_rendered_templates() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         for (dest, regions) in [
-            (".github/workflows/release.yml", 2),
+            (".github/workflows/release.yml", 3),
             (".github/workflows/deploy-gate.yml", 0),
         ] {
             let template = ARTIFACTS.iter().find(|a| a.dest == dest).unwrap();

@@ -160,8 +160,42 @@ enum Command {
         #[command(subcommand)]
         action: SigningAction,
     },
+    /// The bundled agent skill: install it, print it, or compare the installed
+    /// copy against the one compiled into this binary
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
     /// Show the pinned external-tool registry and detection status
     Tools,
+}
+
+#[derive(Subcommand)]
+enum SkillAction {
+    /// Write the bundled skill to .claude/skills/sscsb/SKILL.md
+    Install {
+        /// Print what would be written; touch nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace an existing file that differs from the bundled copy
+        #[arg(long)]
+        force: bool,
+        /// Write somewhere other than the repo's .claude/skills/sscsb/SKILL.md
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Write the bundled skill to stdout, verbatim
+    Print,
+    /// Compare the installed skill against the copy compiled into this binary.
+    /// Exit 0 identical, 1 differs or missing, 2 operational error.
+    Check {
+        /// Check a file other than the repo's .claude/skills/sscsb/SKILL.md
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -440,6 +474,7 @@ pub fn run() -> Result<ExitCode> {
         Command::Signers { action } => cmd_signers(&cwd, action),
         Command::AgentKey { action } => cmd_agent_key(action),
         Command::Signing { action } => cmd_signing(&cwd, action),
+        Command::Skill { action } => cmd_skill(&cwd, action),
         Command::Tools => cmd_tools(),
     }
 }
@@ -759,6 +794,99 @@ fn cmd_scan_local(
     }
 
     verify_exit(failed, degraded, strict)
+}
+
+/// Resolve where the skill lives for `install` / `check`.
+///
+/// With `--path`, the argument is used as given (relative to the working
+/// directory) and no repository is required: an operator staging the skill into
+/// an arbitrary agent directory should not need a git repo to do it. Without
+/// it, the default is repo-root-relative, so the answer does not silently
+/// depend on which subdirectory the command was run from.
+fn skill_path(cwd: &std::path::Path, over: Option<PathBuf>) -> Result<PathBuf> {
+    match over {
+        Some(p) => Ok(p),
+        None => Ok(Ctx::discover(cwd)?.root.join(crate::skill::SKILL_PATH)),
+    }
+}
+
+/// `sscsb skill` — the bundled agent skill.
+///
+/// # What `check` is, and what it is not
+///
+/// It compares the file on disk against the bytes compiled into this binary.
+/// That catches an edit made to the installed copy by something that is not
+/// `sscsb` — another agent, a hook, a postinstall script — and a copy left
+/// stale by an older version. It cannot catch a tampered `sscsb`: the check,
+/// the bytes and the digest all ship in the same artifact. The honest proof of
+/// the binary is the release asset's Sigstore identity, verified with tools the
+/// verifier obtained independently of us; `docs/skill.md` carries that recipe,
+/// and every surface here points at it rather than overstating this one.
+fn cmd_skill(cwd: &std::path::Path, action: SkillAction) -> Result<ExitCode> {
+    match action {
+        // Verbatim bytes and nothing else: this output is piped into `sha256sum`
+        // and into files. A banner would corrupt both.
+        SkillAction::Print => {
+            print!("{}", crate::skill::SKILL_MD);
+            ok()
+        }
+        SkillAction::Install {
+            dry_run,
+            force,
+            path,
+        } => {
+            let path = skill_path(cwd, path)?;
+            let outcome = crate::skill::install(&path, dry_run, force)?;
+            for m in &outcome.messages {
+                println!("{m}");
+            }
+            ok()
+        }
+        SkillAction::Check { path, format } => {
+            // An unknown format is a usage error (exit 2) before anything is
+            // read — the same contract `verify` and `status` follow, and never
+            // a silent fallthrough to text.
+            if !matches!(format.as_str(), "text" | "json") {
+                anyhow::bail!("unknown --format `{format}` — expected `text` or `json`");
+            }
+            let path = skill_path(cwd, path)?;
+            let report = crate::skill::check(&path)?;
+            if format == "json" {
+                println!("{}", machine::skill_check_json(&report)?);
+            } else {
+                println!("skill check — {}", report.state.as_str());
+                for m in &report.messages {
+                    println!("  {m}");
+                }
+                println!();
+                println!("  bundled sha256  {}", report.bundled_sha256);
+                if let Some(on_disk) = &report.on_disk_sha256 {
+                    println!("  on-disk sha256  {on_disk}");
+                }
+                println!();
+                println!(
+                    "This compares the file on disk against the copy compiled into this binary.\n\
+                     It {scope}. To check the binary itself, verify the release artifact against\n\
+                     its Sigstore identity — see {doc}.",
+                    scope = crate::skill::EMBEDDED_CHECK_SCOPE,
+                    doc = crate::skill::VERIFY_DOC,
+                );
+                // How much the sentence above is worth HERE, measured on this
+                // machine rather than asserted from a document. A binary the
+                // current user can rewrite is exactly as writable as the file
+                // it just compared.
+                println!();
+                println!("  binary trust    {}", report.binary.trust.as_str());
+                for line in report.binary.statement() {
+                    println!("  {line}");
+                }
+            }
+            match report.state.exit_code() {
+                0 => ok(),
+                code => fail(code),
+            }
+        }
+    }
 }
 
 /// `verify`'s exit contract, shared by both lanes: FAIL is exit 1, and

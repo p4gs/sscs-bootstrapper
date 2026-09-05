@@ -632,3 +632,128 @@ fn agents_md_states_the_ai_cannot_sign_invariant() {
         "AGENTS.md must name --no-gpg-sign as a prohibited route around signing"
     );
 }
+
+/// AGENTS.md's `skill check` row must document the surface the command
+/// actually has.
+///
+/// The skill file calls AGENTS.md the "full machine contract", so an agent that
+/// reads only AGENTS.md is the intended reader. The row documented exit codes
+/// and the tamper caveat and said nothing about `binary trust`,
+/// `narrow_claim_holds` or the `binary` block — a whole verdict the command
+/// prints on every result, and the one that decides what a clean check is
+/// worth. Pinned to the binary the way the rest of the file is: the fields are
+/// read out of a real `--format json` run, not restated.
+#[test]
+fn agents_md_documents_the_binary_trust_surface_skill_check_actually_emits() {
+    let dir = bootstrapped_repo();
+    assert!(sscsb_in(dir.path(), &["skill", "install"]).status.success());
+
+    let run = |exe: &std::path::Path| -> serde_json::Map<String, serde_json::Value> {
+        let out = std::process::Command::new(exe)
+            .args(["skill", "check", "--format", "json"])
+            .current_dir(dir.path())
+            .output()
+            .expect("runs");
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("json from {}: {e}", exe.display()));
+        doc["binary"].as_object().expect("a `binary` block").clone()
+    };
+
+    let real = assert_cmd::cargo::cargo_bin("sscsb");
+    let mut binary = run(&real);
+
+    // …and again THROUGH A SYMLINK, because `resolved_path` is omitted when
+    // there is nothing to resolve. Without this the test only documents the
+    // keys that this host's layout happens to produce, and a field would go
+    // undocumented on every machine where the binary is not behind a link —
+    // which is how `resolved_path` was missed until a coverage run under
+    // `/tmp` (a symlink to `/private/tmp` on macOS) emitted it.
+    let link_dir = tempfile::tempdir().expect("tempdir");
+    let link = link_dir.path().join("sscsb");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    #[cfg(unix)]
+    {
+        let through_link = run(&link);
+        // `std::env::current_exe()` is platform-dependent by the std docs'
+        // own admission, and this is where that stops being an abstract
+        // caveat: on Linux it resolves through `/proc/self/exe`, so the
+        // KERNEL reports the real target directly and the invoking symlink
+        // never reaches this process at all — `chain_start` comes back
+        // "pre-resolved" and there is nothing left to resolve, so
+        // `resolved_path` is correctly absent rather than merely untested.
+        // On a platform whose `current_exe()` instead reports the path it
+        // was invoked by ("invocation-path"), the symlink survives into our
+        // code and `resolved_path` must appear — that is the case this
+        // trick exists to force, and it is still a hard requirement there.
+        let chain_start = through_link.get("chain_start").and_then(|v| v.as_str());
+        if chain_start == Some("pre-resolved") {
+            eprintln!(
+                "resolved_path not forced: this platform's current_exe() pre-resolves \
+                 through the invoking symlink before it reaches this process, which is \
+                 the same disqualification `binary.strong_verdict_available` already \
+                 reports — not a gap in this test's coverage of that platform."
+            );
+        } else {
+            assert!(
+                through_link.contains_key("resolved_path"),
+                "invoking through a symlink must report the path it resolves to \
+                 on a platform whose current_exe() is invocation-path: {through_link:?}"
+            );
+        }
+        for (k, v) in through_link {
+            binary.entry(k).or_insert(v);
+        }
+    }
+
+    // Every key the block emits has to be findable in the doc, and so does the
+    // verdict vocabulary an agent would branch on.
+    let mut expected: Vec<String> = binary.keys().cloned().collect();
+    expected.extend(
+        [
+            "user-writable",
+            "not-user-writable",
+            "unknown",
+            "binary trust",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    // Probe rows are what let an agent name WHICH link is writable.
+    expected.extend(
+        binary["probes"]
+            .as_array()
+            .expect("probes")
+            .first()
+            .expect("at least one probe")
+            .as_object()
+            .expect("a probe object")
+            .keys()
+            .cloned(),
+    );
+    expected.sort();
+    expected.dedup();
+
+    let missing: Vec<&String> = expected
+        .iter()
+        .filter(|k| !AGENTS_MD.contains(k.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "`sscsb skill check --format json` emits {missing:?}, and AGENTS.md — which the skill \
+         calls the full machine contract — never mentions them"
+    );
+
+    // …and the row must state the rule, not merely list the words: `unknown`
+    // is read as the weak case, and only `not-user-writable` earns the strong
+    // one. An agent that branches the other way has been told wrong.
+    for claim in [
+        "Only `not-user-writable`",
+        "read `unknown`, and `binary.chain_complete: false`, as `user-writable`",
+    ] {
+        assert!(
+            AGENTS_MD.contains(claim),
+            "AGENTS.md must state how to read the verdict: `{claim}`"
+        );
+    }
+}

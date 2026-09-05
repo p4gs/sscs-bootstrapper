@@ -19,6 +19,7 @@
 //! - [`sbom`] / [`scan`] / [`sast`] — Syft / Trivy+OSV / OpenGrep+Semgrep
 //! - [`provenance`] — slsa-verifier, DSSE/in-toto, cosign, AI receipts
 //! - [`local_scan`] — the local lane: a signed, workstation-produced scan record
+//! - [`skill`] — the bundled agent skill (`sscsb skill install | print | check`)
 //! - [`observability`] — Dependency-Track, GUAC, OpenVEX, ORAS
 //! - [`compliance`] — control → SLSA/SSDF/CRA/Badge map and `sscsb report`
 
@@ -46,6 +47,7 @@ pub mod scan;
 pub mod scorecard;
 pub mod signers;
 pub mod signing_setup;
+pub mod skill;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod tools;

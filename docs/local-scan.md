@@ -294,7 +294,7 @@ every lane — plus the additive `local` block:
 }
 ```
 
-Three properties are load-bearing:
+### Three properties are load-bearing
 
 - **The score in the record is the tool's own arithmetic over the tool's own
   rows.** The directory recomputes it from the merged evidence and never

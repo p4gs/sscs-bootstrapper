@@ -8,14 +8,22 @@
 #                         THIS repository's release workflow at THIS tag
 #                         (Fulcio cert, GitHub OIDC issuer, Rekor inclusion),
 #                         and every file that should carry a bundle does;
-#   3. provenance gate  — GitHub's attestation store holds a SLSA v1 build
-#                         provenance for each tarball digest, signed by the
+#   3. subject set      — the attested subjects, derived from the assets alone:
+#                         everything shipped EXCEPT the files that describe a
+#                         subject rather than being one (the *.sha256 sidecars,
+#                         the *.sigstore.json bundles, the *.intoto.jsonl
+#                         envelope and sbom.cdx.json). Gates 4-6 run over THIS
+#                         list, so an extra asset a release stages — an agent
+#                         skill, a policy document, a schema — is verified,
+#                         never signed-but-unattested;
+#   4. provenance gate  — GitHub's attestation store holds a SLSA v1 build
+#                         provenance for each subject's digest, signed by the
 #                         same workflow at the same tag, on a GitHub-hosted
 #                         runner (`gh attestation verify`);
-#   4. SBOM gate        — the store also holds a CycloneDX SBOM attestation
-#                         bound to each tarball digest;
-#   5. SLSA L3 gate     — the *.intoto.jsonl the slsa-github-generator emitted
-#                         verifies with slsa-verifier for every tarball,
+#   5. SBOM gate        — the store also holds a CycloneDX SBOM attestation
+#                         bound to each subject's digest;
+#   6. SLSA L3 gate     — the *.intoto.jsonl the slsa-github-generator emitted
+#                         verifies with slsa-verifier for every subject,
 #                         against this source repository, this tag, and the
 #                         pinned trusted builder.
 #
@@ -160,6 +168,31 @@ jobs:
             [ -f "$f.sigstore.json" ] || { echo "::error::${f} is unsigned"; fail=1; }
           done
           exit $fail
+      # The attested subject set, derived from the published assets the same
+      # way release.yml derived it from the staged ones: everything shipped
+      # EXCEPT the files that DESCRIBE a subject rather than being one — the
+      # `.sha256` sidecars, the Cosign bundles, the SLSA envelope, and the
+      # SBOM. Deriving it here rather than globbing `*.tar.gz` is what makes
+      # every extra asset a release stages actually gate-checked; a `*.tar.gz`
+      # glob would verify the tarballs and wave the rest through unattested.
+      # Computed ONCE and read by all three gates below, so they cannot drift
+      # into verifying different sets.
+      - name: Determine the attested subject set
+        run: |
+          set -uo pipefail
+          cd assets
+          shopt -s nullglob
+          : > ../subjects.txt
+          for f in *; do
+            case "$f" in *.sha256 | *.sigstore.json | *.intoto.jsonl | sbom.cdx.json) continue ;; esac
+            [ -f "$f" ] || continue
+            printf '%s\n' "$f" >> ../subjects.txt
+          done
+          if [ ! -s ../subjects.txt ]; then
+            echo "::error::no attestable assets found — nothing would be verified"
+            exit 1
+          fi
+          cat ../subjects.txt
       # Both store lookups pin: this repository, the signer workflow, the tag's
       # ref, GitHub-hosted runners only, and the exact predicate type. A short
       # retry absorbs store propagation right after the release job wrote them —
@@ -170,10 +203,10 @@ jobs:
         run: |
           set -uo pipefail
           cd assets
-          shopt -s nullglob
-          artifacts=(*.tar.gz)
+          artifacts=()
+          while IFS= read -r subject; do artifacts+=("$subject"); done < ../subjects.txt
           if [ ${#artifacts[@]} -eq 0 ]; then
-            echo "::error::no *.tar.gz artifacts found — nothing was verified"
+            echo "::error::no attested subjects found — nothing was verified"
             exit 1
           fi
           fail=0
@@ -202,10 +235,10 @@ jobs:
         run: |
           set -uo pipefail
           cd assets
-          shopt -s nullglob
-          artifacts=(*.tar.gz)
+          artifacts=()
+          while IFS= read -r subject; do artifacts+=("$subject"); done < ../subjects.txt
           if [ ${#artifacts[@]} -eq 0 ]; then
-            echo "::error::no *.tar.gz artifacts found — nothing was verified"
+            echo "::error::no attested subjects found — nothing was verified"
             exit 1
           fi
           [ -s sbom.cdx.json ] || { echo "::error::sbom.cdx.json missing from the set"; exit 1; }
@@ -226,22 +259,26 @@ jobs:
             [ "$ok" -eq 1 ] || { echo "::error::no verifiable SBOM attestation for ${f}"; fail=1; }
           done
           exit $fail
-      # slsa-verifier checks that each tarball's digest is a subject of the
+      # slsa-verifier checks that each subject's digest is a subject of the
       # provenance, that the provenance was produced by the PINNED trusted
       # builder, and that it came from this source repository at this tag.
+      # `verify-artifact` hashes whatever file it is given and looks that
+      # digest up among the provenance's subjects — it is indifferent to the
+      # file's type, so a staged document is covered exactly as a tarball is.
       - name: Verify SLSA provenance with slsa-verifier (SLSA L3 gate)
         run: |
           set -uo pipefail
           cd assets
           shopt -s nullglob
           provenance=(*.intoto.jsonl)
-          artifacts=(*.tar.gz)
+          artifacts=()
+          while IFS= read -r subject; do artifacts+=("$subject"); done < ../subjects.txt
           if [ ${#provenance[@]} -ne 1 ]; then
             echo "::error::expected exactly one *.intoto.jsonl provenance, found ${#provenance[@]} — refusing to publish unprovenanced artifacts"
             exit 1
           fi
           if [ ${#artifacts[@]} -eq 0 ]; then
-            echo "::error::no *.tar.gz artifacts found — nothing was verified"
+            echo "::error::no attested subjects found — nothing was verified"
             exit 1
           fi
           fail=0

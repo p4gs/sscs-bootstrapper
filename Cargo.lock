@@ -941,6 +941,7 @@ dependencies = [
  "clap",
  "hex",
  "predicates",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
