@@ -623,7 +623,24 @@ pub fn guarantee_for(exe: &Path) -> BinaryGuarantee {
         .iter()
         .map(|(path, kind)| {
             let p = path.as_path();
-            let role = if p == exe || p == exe_abs || Some(p) == exe_as_walked.as_deref() {
+            // An unresolvable entry is always labelled as such, checked BEFORE
+            // any positional match. Positional labels (`executable-directory`
+            // and friends) claim the path was actually walked and resolved;
+            // an entry the walk gave up on has no business claiming that, even
+            // when it lexically happens to equal `exe_parent` — which is
+            // exactly the shape of a nonexistent immediate parent directory.
+            // This was previously an `else` arm reached only when every
+            // positional check failed, which is what a lexical/canonical
+            // mismatch (macOS's `/var` -> `/private/var`) accidentally
+            // guaranteed; on a platform with no such symlink in the temp path
+            // (Linux's `/tmp`), the positional check matched first and an
+            // unresolvable parent was mislabelled `executable-directory`. The
+            // security-relevant fields are unaffected either way — `writable`
+            // and `owned` are already gated on `kind`, not on `role` — this is
+            // a diagnostic-accuracy fix for the label a reader sees.
+            let role = if matches!(kind, Kind::Unresolvable) {
+                "unresolved-chain"
+            } else if p == exe || p == exe_abs || Some(p) == exe_as_walked.as_deref() {
                 match kind {
                     Kind::Symlink => "executable-symlink",
                     _ => "executable",
@@ -639,7 +656,7 @@ pub fn guarantee_for(exe: &Path) -> BinaryGuarantee {
                     Kind::Symlink => "symlink",
                     Kind::Directory => "ancestor-directory",
                     Kind::File => "path-component",
-                    Kind::Unresolvable => "unresolved-chain",
+                    Kind::Unresolvable => unreachable!("handled above"),
                 }
             };
             WriteProbe {
@@ -1861,9 +1878,21 @@ mod tests {
         assert!(!verdict.narrow_claim_holds());
 
         // Every path the fixture controls answers the OLD question "no" …
+        //
+        // Scoped to exactly the two paths this fixture chmod'd (`file` and
+        // `parent`, both already resolved via `probe()`), not a `starts_with`
+        // sweep of everything under the tempdir. The tempdir ROOT itself is
+        // never restricted and is legitimately `writable: true` — on macOS
+        // that entry silently never matched `starts_with(dir.path())` because
+        // `/var` resolves to `/private/var` and the probe stores the resolved
+        // form while `dir.path()` is lexical, so the mismatch masked the bug
+        // there; on Linux, where `/tmp` has no such indirection, the sweep
+        // included the tempdir root and failed on its legitimately-writable
+        // entry. The fixture's intent was always "the two paths we chmod'd",
+        // so that is what it now asserts, on every platform.
         let fixture: Vec<&WriteProbe> = probes
             .iter()
-            .filter(|p| p.path.starts_with(dir.path()) || p.path == file.path)
+            .filter(|p| p.path == file.path || p.path == parent.path)
             .collect();
         assert!(!fixture.is_empty(), "{probes:#?}");
         assert!(
