@@ -165,12 +165,12 @@ Read the reason line. It always says which of the four it is.
 
 ## The controls
 
-**45 controls across five phases.** 30 are on by default, 15 are off — and off
+**47 controls across five phases.** 32 are on by default, 15 are off — and off
 means the code does not run, not that it runs and is ignored.
 
 | Phase | Name | Controls | On by default |
 |-------|------|---------:|--------------:|
-| 1 | Commit integrity | 11 | 8 |
+| 1 | Commit integrity | 13 | 10 |
 | 2 | Dependencies | 9 | 6 |
 | 3 | Provenance | 10 | 7 |
 | 4 | Code analysis | 7 | 4 |

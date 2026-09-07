@@ -154,6 +154,24 @@ pub const CONTROLS: &[ControlDef] = &[
             ),
         ],
     },
+    ControlDef {
+        id: "binary-artifacts",
+        phase: 1,
+        name: "Committed binary artifacts",
+        summary: "No compiled programs or code-carrying archives in the tracked tree — bytes, not names",
+        default_enabled: true,
+        tools: &[],
+        default_options: &[],
+    },
+    ControlDef {
+        id: "webhooks",
+        phase: 1,
+        name: "Webhook secrets",
+        summary: "Every active repository webhook carries a shared secret and verifies TLS",
+        default_enabled: true,
+        tools: &["gh"],
+        default_options: &[],
+    },
     // ───────────────────────── Phase 2 — Dependencies & vulnerabilities ─────
     ControlDef {
         id: "sbom",
@@ -624,6 +642,9 @@ pub const DEGRADED_REASONS: &[&str] = &[
     "no-remote",
     // The control's own configuration is missing or invalid.
     "unconfigured",
+    // The credential in hand cannot read the surface (a 404 from an endpoint
+    // that needs a scope this token lacks). Nothing was verified.
+    "no-access",
 ];
 
 impl VerifyResult {
@@ -687,6 +708,8 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
         "ai-trailers" | "ai-dep-gate" => crate::hooks::verify_hook_installed(ctx, def.id),
         "pr-template" => crate::workflows::verify_pr_template(ctx),
         "ai-receipts" => crate::provenance::verify_receipts_control(ctx, cfg),
+        "binary-artifacts" => crate::artifacts::verify_binary_artifacts(ctx),
+        "webhooks" => crate::webhooks::verify_webhooks(ctx, cfg),
         "sbom" => crate::sbom::verify_sbom_control(ctx, cfg),
         "vuln-scan" => crate::scan::verify_scan_control(ctx, cfg),
         "grype" => crate::sbom::verify_grype_control(ctx),
@@ -744,7 +767,7 @@ mod tests {
         assert!(d.evidence.is_empty());
         let n = VerifyResult::new("sbom", Outcome::Degraded, vec![]);
         assert_eq!(n.degraded_reason, None);
-        assert_eq!(DEGRADED_REASONS.len(), 5);
+        assert_eq!(DEGRADED_REASONS.len(), 6);
         assert!(DEGRADED_REASONS
             .iter()
             .all(|r| r.is_ascii() && !r.contains(' ')));

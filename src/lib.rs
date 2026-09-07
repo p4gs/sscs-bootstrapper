@@ -23,6 +23,7 @@
 //! - [`observability`] — Dependency-Track, GUAC, OpenVEX, ORAS
 //! - [`compliance`] — control → SLSA/SSDF/CRA/Badge map and `sscsb report`
 
+pub mod artifacts;
 pub mod audit;
 pub mod bumblebee;
 pub mod cli;
@@ -52,4 +53,5 @@ pub mod skill;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod tools;
+pub mod webhooks;
 pub mod workflows;

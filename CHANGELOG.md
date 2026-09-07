@@ -10,6 +10,26 @@ versions.
 
 ### Added
 
+- **`binary-artifacts` (phase 1, on by default).** Every file git tracks is
+  read by its leading bytes: an ELF, PE or Mach-O executable is a finding
+  whatever it is called — an executable committed as `logo.png` is still an
+  executable — and the archives that carry compiled code (`.jar`, `.whl`,
+  `.wasm`, `.so`, `.deb`, …) are named by extension. Images, fonts and documents
+  are data. Only tracked files count; symlinks are not followed. OpenSSF
+  Scorecard's Binary-Artifacts check is the same idea by file type; this one
+  reads the bytes.
+- **`webhooks` (phase 1, on by default).** Every active repository webhook must
+  carry a shared secret and verify TLS; a hook without one, or with
+  `insecure_ssl` on, fails naming its URL (query string dropped). Scorecard's
+  own Webhooks check is experimental and never runs for a default install.
+  Read through `gh api` with whatever token the lane holds — a maintainer's
+  `repo` scope includes `read:repo_hook`; a workflow's `GITHUB_TOKEN` cannot
+  read hooks at all and GitHub answers 404, which is `DEGRADED` with the new
+  `degraded_reason = no-access`, never a guess.
+- **`no-access` joins `degraded_reason`**: the credential in hand cannot read
+  the surface. A directory treats it like every reason but `tool-missing` —
+  unverified, never lifted.
+
 - **`dependency-pinning` (phase 2, on by default).** The dependency surfaces
   OpenSSF Scorecard's Pinned-Dependencies check reads that `actions-audit` was
   never scoped for — Dockerfile base images without a digest, downloads piped
