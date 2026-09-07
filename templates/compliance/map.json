@@ -138,6 +138,16 @@
       "notes": "Continuous scanning identifies known-vulnerable components so they are fixed before release and remediated promptly afterward.",
       "osps": ["OSPS-VM-05"]
     },
+    "dependency-pinning": {
+      "name": "Dependency pinning",
+      "phase": 2,
+      "slsa": ["Build L2: Hosted build platform (pinned inputs)", "Source L2: Continuous technical controls"],
+      "ssdf": ["PW.4.1", "PW.4.4"],
+      "cra": ["Annex I Part I(2)(f) (integrity of code, commands and configuration)", "Annex I Part II(1) (identify and document components)"],
+      "badge": ["build_repeatable"],
+      "notes": "Digest-pinned base images, verified downloads, version- or hash-pinned installs and committed lockfiles are what make a build reproduce the same inputs; PW.4.1/PW.4.4 expect well-secured, verified third-party components and CRA Annex I asks for integrity of the build's commands and configuration.",
+      "osps": ["OSPS-BR-03", "OSPS-QA-02"]
+    },
     "scorecard": {
       "name": "OpenSSF Scorecard workflow",
       "phase": 2,

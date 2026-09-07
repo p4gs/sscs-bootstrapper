@@ -144,6 +144,39 @@ suppressions. `sscsb verify` prints the same inventory. It does not change the
 verdict — a documented waiver is a decision, not a failure — so if you want a
 gate on it, `verify --strict` plus a review of that inventory is the place.
 
+## Dependency pinning
+
+```sh
+sscsb verify dependency-pinning
+```
+
+OpenSSF Scorecard's Pinned-Dependencies check reads three things `actions-audit`
+was never scoped for: Dockerfile base images, shell downloads, and package
+installs typed into a script. `dependency-pinning` reads all three, in workflow
+`run:` steps, composite-action steps, Dockerfile `RUN` lines and committed shell
+scripts — and one thing neither tool reads: a package manifest with no committed
+lockfile. Every subject is a committed file, so the verdict is a property of the
+repository, never of the scanning machine.
+
+What fails: a `FROM image:tag` with no `@sha256:` digest (a variable, `scratch`
+and a stage alias are fine); a download piped straight into a shell; a downloaded
+file made executable with no `sha256sum --check`, `cosign verify-blob`,
+`gh attestation verify` or `slsa-verifier` step anywhere in the same script; a
+`pip install`, `go install` or `npm install <name>` that names no version at all,
+or a range or tag instead of one; a root `package.json`, `Cargo.toml`,
+`pyproject.toml` or `go.mod` — or a nested `Cargo.toml` declaring a workspace —
+with no committed lockfile. A `pip` or `npm` install pinned to an exact version
+but not a hash, and a `requirements.txt` with versions but no `--hash=` lines,
+are warnings: they name one release, which is a real decision, and hash pinning
+is the stricter form the message asks for.
+
+Two deliberate boundaries. A bare `npm install` of the project's own manifest is
+`actions-audit`'s lockfile-exact finding and is not counted again here, so one
+line never yields two findings. And a crate declaring
+`[package.metadata] cargo-fuzz = true` is reported as information, not a
+finding: cargo-fuzz ignores `Cargo.lock` by design and the crate is never built
+for release.
+
 ## Package trust — the AI-era control
 
 A model will confidently tell you to install a package that does not exist. If an

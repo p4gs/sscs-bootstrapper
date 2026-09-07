@@ -10,6 +10,20 @@ versions.
 
 ### Added
 
+- **`dependency-pinning` (phase 2, on by default).** The dependency surfaces
+  OpenSSF Scorecard's Pinned-Dependencies check reads that `actions-audit` was
+  never scoped for — Dockerfile base images without a digest, downloads piped
+  into a shell or made executable with no verification step, `pip`/`go`/`npm`
+  installs that name no version — across workflow `run:` steps, composite-action
+  steps, Dockerfile `RUN` lines and committed scripts; plus the surface neither
+  tool reads: a root manifest (or a nested Cargo workspace) with no committed
+  lockfile. Version-only `pip`/`npm` pins and hash-less `requirements.txt` files
+  are warnings, not failures. A bare `npm install` stays `actions-audit`'s
+  finding and is never counted twice; a cargo-fuzz crate is information, not a
+  finding. `docker://` action refs are now held to the same bar as every other
+  `uses:` — they used to be skipped as "pinned elsewhere", and nothing checked
+  them anywhere.
+
 - **`degraded_reason` on `verify --format json` rows.** A `degraded` row can
   now say why: `tool-missing` (the environment lacks the tool — committed
   evidence, if any, still stands), `scan-error` (the tool ran and did not

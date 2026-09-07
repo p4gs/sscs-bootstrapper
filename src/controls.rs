@@ -174,6 +174,15 @@ pub const CONTROLS: &[ControlDef] = &[
         default_options: &[("fail_on", "\"high\"")],
     },
     ControlDef {
+        id: "dependency-pinning",
+        phase: 2,
+        name: "Dependency pinning",
+        summary: "Digest-pinned base images, verified downloads, pinned installs, committed lockfiles",
+        default_enabled: true,
+        tools: &[],
+        default_options: &[],
+    },
+    ControlDef {
         id: "scorecard",
         phase: 2,
         name: "OpenSSF Scorecard",
@@ -683,6 +692,7 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
         "grype" => crate::sbom::verify_grype_control(ctx),
         "bumblebee" => crate::bumblebee::verify_bumblebee_control(ctx, cfg),
         "package-trust" => crate::deps::verify_package_trust(ctx, cfg),
+        "dependency-pinning" => crate::pinning::verify_dependency_pinning(ctx),
         "scorecard" => crate::scorecard::verify_scorecard_control(ctx, cfg),
         "renovate"
         | "codeql"

@@ -39,6 +39,7 @@ pub mod local_scan;
 pub mod machine;
 pub mod observability;
 pub mod openssf;
+pub mod pinning;
 pub mod platform;
 pub mod provenance;
 pub mod sast;
