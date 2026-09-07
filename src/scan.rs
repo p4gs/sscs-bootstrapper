@@ -1146,28 +1146,134 @@ pub fn breaches_threshold(report: &ScanReport, fail_on: &str) -> Result<bool> {
         }))
 }
 
-pub fn verify_scan_control(ctx: &Ctx) -> VerifyResult {
+/// `verify vuln-scan`: run every installed scanner and gate on what it finds.
+///
+/// Until 0.4 this checked that Trivy and OSV-Scanner were on PATH and passed —
+/// no deeper than OpenSSF Scorecard's Vulnerabilities check. Now it is
+/// `sscsb scan` under the control's own `fail_on` (default `high`) and
+/// optional `vex` (a repo-relative OpenVEX document): every installed scanner
+/// runs, at least one must; a finding at or above the threshold Fails and is
+/// named; a suppression is named, never silent. The degraded cases say why:
+/// no scanner installed is `tool-missing`; a scanner that is installed but
+/// does not complete is `scan-error` (never a quiet Pass from an empty run);
+/// a tree with nothing to scan is `no-inventory` — Scorecard's silent clean
+/// on "no packages found" is deliberately not copied; a `fail_on` that is not
+/// a severity is `unconfigured`, not the strictest setting.
+pub fn verify_scan_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
+    let id = "vuln-scan";
     let mut messages = Vec::new();
-    let mut outcome = Outcome::Pass;
+    let mut installed = Vec::new();
     for tool in ["trivy", "osv-scanner"] {
         match tools::detect(tools::spec(tool).expect("registry")) {
-            tools::ToolStatus::Found { version, .. } => messages.push(format!(
-                "{tool}: {}",
-                version.unwrap_or_else(|| "version unknown".into())
-            )),
+            tools::ToolStatus::Found { version, .. } => {
+                installed.push(tool);
+                messages.push(format!(
+                    "{tool}: {}",
+                    version.unwrap_or_else(|| "version unknown".into())
+                ));
+            }
             tools::ToolStatus::Missing => {
-                outcome = Outcome::Degraded;
                 messages.push(tools::degrade_message(tool, ctx.platform));
             }
         }
     }
-    // Which tools are installed is only half of what this control depends on;
-    // the other half is what the repository tells them to skip. `verify` is
-    // where a reviewer looks, so the inventory is stated here too. It does not
-    // move the verdict: a documented waiver is a decision, not a failure —
-    // see `scanner_config_notes` for why inherit-and-report is the contract.
-    messages.extend(scanner_config_notes(&ctx.root));
-    VerifyResult::new("vuln-scan", outcome, messages)
+    if installed.is_empty() {
+        // Which tools are installed is only half of what this control depends
+        // on; the other half is what the repository tells them to skip. State
+        // it even when nothing can run — see `scanner_config_notes`.
+        messages.extend(scanner_config_notes(&ctx.root));
+        return VerifyResult::degraded(id, "tool-missing", messages);
+    }
+
+    let fail_on = cfg
+        .control_opt_str(id, "fail_on")
+        .unwrap_or_else(|| "high".to_string());
+    if severity_rank(&fail_on).is_none() {
+        messages.push(format!(
+            "`fail_on` is not a severity: {fail_on:?} — fix `[controls.vuln-scan] fail_on` in \
+             .sscsb/config.toml (a typo'd threshold gates nothing)"
+        ));
+        return VerifyResult::degraded(id, "unconfigured", messages);
+    }
+    // `vex = "path/to/doc.openvex.json"`, repo-relative; an empty string is
+    // "none", not a document at the repository root.
+    let vex_path = cfg
+        .control_opt_str(id, "vex")
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| ctx.root.join(p));
+
+    // `run_scan` states the repository-supplied scanner configuration in its
+    // notes, runs every installed scanner, applies the VEX, and errors only
+    // when a scanner that IS installed did not complete.
+    let report = match run_scan(ctx, cfg, vex_path.as_deref()) {
+        Ok(r) => r,
+        Err(err) => {
+            messages.push(format!("scan did not complete: {err:#}"));
+            return VerifyResult::degraded(id, "scan-error", messages);
+        }
+    };
+    messages.extend(report.notes.iter().cloned());
+    for s in &report.suppressed {
+        messages.push(format!("suppressed: {s}"));
+    }
+
+    // Only OSV-Scanner can say "nothing here to scan" (exit 128). Trivy scans
+    // the filesystem and reports a clean tree and an empty one identically, so
+    // "no inventory" is only knowable when OSV-Scanner was the scanner.
+    let osv_found_nothing = report
+        .notes
+        .iter()
+        .any(|n| n.contains("no packages found to scan"));
+    if report.findings.is_empty() && osv_found_nothing && installed == ["osv-scanner"] {
+        messages.push(
+            "no package inventory found to scan — nothing was verified, which is not a \
+             clean bill of health"
+                .into(),
+        );
+        return VerifyResult::degraded(id, "no-inventory", messages);
+    }
+
+    let breached = match breaches_threshold(&report, &fail_on) {
+        Ok(b) => b,
+        Err(err) => {
+            messages.push(format!("{err:#}"));
+            return VerifyResult::degraded(id, "unconfigured", messages);
+        }
+    };
+    let threshold = severity_rank(&fail_on).unwrap_or(0);
+    let mut blocking: Vec<&VulnFinding> = report
+        .findings
+        .iter()
+        .filter(|f| severity_rank(&f.severity).is_none_or(|r| r >= threshold))
+        .collect();
+    blocking.sort_by_key(|f| std::cmp::Reverse(severity_rank(&f.severity).unwrap_or(usize::MAX)));
+    messages.push(format!(
+        "{} finding(s) from {}; {} at or above `{fail_on}` (undetermined severity counts as \
+         above)",
+        report.findings.len(),
+        installed.join(" + "),
+        blocking.len()
+    ));
+    if breached {
+        const SHOWN: usize = 10;
+        for f in blocking.iter().take(SHOWN) {
+            messages.push(format!(
+                "{}: {} in {} ({})",
+                f.severity.to_ascii_uppercase(),
+                f.id,
+                f.package,
+                f.source
+            ));
+        }
+        if blocking.len() > SHOWN {
+            messages.push(format!(
+                "… and {} more — `sscsb scan` lists them all",
+                blocking.len() - SHOWN
+            ));
+        }
+        return VerifyResult::new(id, Outcome::Fail, messages);
+    }
+    VerifyResult::new(id, Outcome::Pass, messages)
 }
 
 #[cfg(test)]
@@ -1982,6 +2088,7 @@ mod tests {
 
     #[test]
     fn run_scan_orchestrates_both_installed_scanners_against_a_real_repo() {
+        let _lock = env_lock();
         let (_d, ctx) = repo_with_cargo_lock();
         let cfg = ctx.require_config().unwrap();
         if !tools::is_available("trivy") && !tools::is_available("osv-scanner") {
@@ -2011,6 +2118,7 @@ mod tests {
 
     #[test]
     fn run_osv_reports_no_packages_found_note_on_a_dependency_free_repo() {
+        let _lock = env_lock();
         let (_d, ctx) = fresh_bootstrapped_repo();
         if !tools::is_available("osv-scanner") {
             return; // covered by the degrade-message path elsewhere
@@ -2026,6 +2134,7 @@ mod tests {
 
     #[test]
     fn run_trivy_populates_findings_field_against_a_real_repo() {
+        let _lock = env_lock();
         let (_d, ctx) = fresh_bootstrapped_repo();
         if !tools::is_available("trivy") {
             return; // covered by the degrade-message path elsewhere
@@ -2051,6 +2160,7 @@ mod tests {
 
     #[test]
     fn run_scan_applies_a_provided_vex_file_and_notes_it() {
+        let _lock = env_lock();
         let (_d, ctx) = repo_with_cargo_lock();
         let cfg = ctx.require_config().unwrap();
         if !tools::is_available("trivy") && !tools::is_available("osv-scanner") {
@@ -2110,20 +2220,48 @@ mod tests {
         });
     }
 
+    /// The real scanners against a bootstrapped repo with nothing to scan.
+    /// Trivy reports a clean tree and an empty one identically, so whenever
+    /// Trivy ran this is a Pass; OSV-Scanner alone answers "no packages" and
+    /// that is `no-inventory`, not a clean bill; neither installed is
+    /// `tool-missing`. Every branch is spec-required, none is a skip.
     #[test]
-    fn verify_scan_control_names_the_control_and_reports_tool_availability() {
+    fn verify_scan_control_runs_whatever_is_installed_and_names_it() {
+        let _lock = env_lock();
         let (_d, ctx) = fresh_bootstrapped_repo();
-        let result = verify_scan_control(&ctx);
+        let cfg = ctx.require_config().unwrap();
+        let result = verify_scan_control(&ctx, cfg);
         assert_eq!(result.control, "vuln-scan");
-        if tools::is_available("trivy") && tools::is_available("osv-scanner") {
-            assert_eq!(result.outcome, Outcome::Pass);
-            assert!(result.messages.iter().any(|m| m.starts_with("trivy:")));
-            assert!(result
-                .messages
-                .iter()
-                .any(|m| m.starts_with("osv-scanner:")));
-        } else {
-            assert_eq!(result.outcome, Outcome::Degraded);
+        let trivy = tools::is_available("trivy");
+        let osv = tools::is_available("osv-scanner");
+        match (trivy, osv) {
+            (true, _) => {
+                assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+                assert_eq!(result.degraded_reason, None);
+                assert!(result.messages.iter().any(|m| m.starts_with("trivy:")));
+                if osv {
+                    assert!(result
+                        .messages
+                        .iter()
+                        .any(|m| m.starts_with("osv-scanner:")));
+                }
+                assert!(result
+                    .messages
+                    .iter()
+                    .any(|m| m.contains("finding(s) from")));
+            }
+            (false, true) => {
+                assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+                assert_eq!(result.degraded_reason, Some("no-inventory"));
+                assert!(result
+                    .messages
+                    .iter()
+                    .any(|m| m.starts_with("osv-scanner:")));
+            }
+            (false, false) => {
+                assert_eq!(result.outcome, Outcome::Degraded);
+                assert_eq!(result.degraded_reason, Some("tool-missing"));
+            }
         }
     }
 
@@ -2304,12 +2442,14 @@ mod tests {
     /// decision rather than a failure.
     #[test]
     fn verify_scan_control_reports_repository_supplied_scanner_config() {
+        let _lock = env_lock();
         let (_d, ctx) = fresh_bootstrapped_repo();
-        let clean = verify_scan_control(&ctx);
+        let cfg = ctx.require_config().unwrap();
+        let clean = verify_scan_control(&ctx, cfg);
         assert!(!clean.messages.iter().any(|m| m.contains("scanner config")));
 
         std::fs::write(ctx.root.join(".trivyignore"), "CVE-2021-25900\n").unwrap();
-        let with_config = verify_scan_control(&ctx);
+        let with_config = verify_scan_control(&ctx, cfg);
         assert!(
             with_config
                 .messages
@@ -2322,5 +2462,232 @@ mod tests {
             with_config.outcome, clean.outcome,
             "a documented waiver is not a control failure"
         );
+    }
+
+    use crate::testutil::env_lock;
+
+    // ── the promoted gate under stubbed scanners: no network, no database ──
+    //
+    // Each shim answers `--version` (so `tools::detect` sees a real tool) and
+    // otherwise emits a fixed report with a fixed exit code — the gate's
+    // decision logic is what is under test, not the scanners.
+
+    fn shim(version_line: &str, stdout: &str, exit: i32) -> String {
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo '{version_line}'; exit 0 ;;\n\
+             esac\ncat <<'REPORT'\n{stdout}\nREPORT\nexit {exit}\n"
+        )
+    }
+
+    const OSV_CLEAN: &str = r#"{"results":[]}"#;
+
+    /// A bootstrapped repo whose config carries the given `[controls.vuln-scan]`
+    /// extra lines, plus a lockfile pinning a package with a real CRITICAL
+    /// (minimist 1.2.5, CVE-2021-44906) so a live scanner reproduces the
+    /// stubbed verdict — never committed anywhere but this temp dir.
+    fn repo_for_gate(extra_config: &str) -> (tempfile::TempDir, Ctx) {
+        let (dir, ctx) = fresh_bootstrapped_repo();
+        std::fs::write(
+            ctx.root.join("package-lock.json"),
+            r#"{"name":"fixture","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"fixture","version":"1.0.0","dependencies":{"minimist":"1.2.5"}},"node_modules/minimist":{"version":"1.2.5","resolved":"https://registry.npmjs.org/minimist/-/minimist-1.2.5.tgz","integrity":"sha512-FM9nNUYrRBAELZQT3xeZQ7fmMOBg6nWNmJKTcgsJeaLstP/UODVpGsr5OhXhhXg6f+qtJ8uiZ+PUxkDWcgIXLw=="}}}"#,
+        )
+        .unwrap();
+        if !extra_config.is_empty() {
+            // The generated config already carries `[controls.vuln-scan]` with
+            // `fail_on = "high"`; splice the extra keys into that table rather
+            // than appending a second header, which TOML rejects.
+            let path = ctx.config_path();
+            let header = "[controls.vuln-scan]\n";
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains(header), "generated config lacks {header}");
+            let text = text.replace("fail_on = \"high\"\n", "");
+            let default_fail = if extra_config.contains("fail_on") {
+                ""
+            } else {
+                "fail_on = \"high\"\n"
+            };
+            let text = text.replace(header, &format!("{header}{default_fail}{extra_config}\n"));
+            std::fs::write(&path, text).unwrap();
+        }
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        (dir, ctx)
+    }
+
+    /// ISC-29: a HIGH finding at the default `fail_on = high` Fails, names
+    /// the finding, and counts a finding whose package is `stdlib` like any
+    /// other — findings are never filtered by package origin.
+    #[test]
+    fn verify_scan_control_fails_on_a_high_finding_and_names_it() {
+        let lock = env_lock();
+        let trivy = r#"{"Results":[{"Target":"package-lock.json","Vulnerabilities":[
+            {"VulnerabilityID":"CVE-2021-44906","PkgName":"minimist","Severity":"CRITICAL"},
+            {"VulnerabilityID":"GO-2024-0001","PkgName":"stdlib","Severity":"HIGH"},
+            {"VulnerabilityID":"CVE-2024-0002","PkgName":"bar","Severity":"LOW"}]}]}"#;
+        lock.fake_tool("trivy", &shim("Version: 0.72.0", trivy, 0));
+        lock.fake_tool(
+            "osv-scanner",
+            &shim("osv-scanner version: 2.4.0", OSV_CLEAN, 0),
+        );
+        let (_d, ctx) = repo_for_gate("");
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_scan_control(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert_eq!(result.degraded_reason, None);
+        let joined = result.messages.join("\n");
+        assert!(
+            joined.contains("CRITICAL: CVE-2021-44906 in minimist"),
+            "{joined}"
+        );
+        assert!(joined.contains("HIGH: GO-2024-0001 in stdlib"), "{joined}");
+        assert!(
+            !joined.contains("CVE-2024-0002"),
+            "a LOW below the line is not named as blocking: {joined}"
+        );
+        assert!(
+            joined.contains("3 finding(s) from trivy + osv-scanner; 2 at or above `high`"),
+            "{joined}"
+        );
+    }
+
+    /// The same findings under `fail_on = critical`: the HIGH no longer
+    /// breaches, and the gate says how many sit above the line.
+    #[test]
+    fn verify_scan_control_passes_when_nothing_reaches_the_threshold() {
+        let lock = env_lock();
+        lock.fake_tool("trivy", &shim("Version: 0.72.0", TRIVY_SAMPLE, 0));
+        lock.fake_tool(
+            "osv-scanner",
+            &shim("osv-scanner version: 2.4.0", OSV_CLEAN, 0),
+        );
+        let (_d, ctx) = repo_for_gate("fail_on = \"critical\"");
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_scan_control(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m
+                    .contains("2 finding(s) from trivy + osv-scanner; 0 at or above `critical`"))
+        );
+    }
+
+    /// ISC-30: an OpenVEX `not_affected` statement for the HIGH turns Fail
+    /// into Pass, and the suppression is named in the verdict — never silent.
+    #[test]
+    fn verify_scan_control_honours_an_openvex_not_affected_and_names_it() {
+        let lock = env_lock();
+        lock.fake_tool("trivy", &shim("Version: 0.72.0", TRIVY_SAMPLE, 0));
+        lock.fake_tool(
+            "osv-scanner",
+            &shim("osv-scanner version: 2.4.0", OSV_CLEAN, 0),
+        );
+        let (_d, ctx) = repo_for_gate("vex = \"vex.openvex.json\"");
+        std::fs::write(
+            ctx.root.join("vex.openvex.json"),
+            r#"{"@context":"https://openvex.dev/ns/v0.2.0","statements":[
+              {"vulnerability":{"name":"CVE-2024-0001"},"products":[{"@id":"pkg:cargo/foo"}],
+               "status":"not_affected","justification":"vulnerable_code_not_in_execute_path"}]}"#,
+        )
+        .unwrap();
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_scan_control(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.starts_with("suppressed:") && m.contains("CVE-2024-0001")),
+            "{:?}",
+            result.messages
+        );
+    }
+
+    /// ISC-32 (a): a scanner that is installed but does not complete — a
+    /// database that could not be reached, say — is `scan-error`, and the
+    /// verdict is never a Pass from the empty half of the run.
+    #[test]
+    fn verify_scan_control_degrades_scan_error_when_a_scanner_does_not_complete() {
+        let lock = env_lock();
+        lock.fake_tool(
+            "trivy",
+            "#!/bin/sh\ncase \"$1\" in --version) echo 'Version: 0.72.0'; exit 0 ;; esac\n\
+             echo 'FATAL: DB error: failed to download vulnerability DB' 1>&2\nexit 1\n",
+        );
+        lock.fake_tool(
+            "osv-scanner",
+            &shim("osv-scanner version: 2.4.0", OSV_CLEAN, 0),
+        );
+        let (_d, ctx) = repo_for_gate("");
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_scan_control(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+        assert_eq!(result.degraded_reason, Some("scan-error"));
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("scan did not complete") && m.contains("trivy failed")));
+    }
+
+    /// ISC-32 (b): OSV-Scanner alone, answering "no packages found" (exit
+    /// 128), is `no-inventory` — Scorecard's silent clean on that exit is
+    /// exactly what this gate refuses to copy.
+    #[test]
+    fn verify_scan_control_degrades_no_inventory_when_only_osv_ran_and_found_nothing() {
+        let lock = env_lock();
+        lock.hide_from_path(&["trivy"]);
+        lock.fake_tool("osv-scanner", &shim("osv-scanner version: 2.4.0", "", 128));
+        let (_d, ctx) = fresh_bootstrapped_repo();
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_scan_control(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+        assert_eq!(result.degraded_reason, Some("no-inventory"));
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("nothing was verified")));
+    }
+
+    /// A `fail_on` that is not a severity gates nothing; it is `unconfigured`,
+    /// not silently the strictest setting and not a Pass.
+    #[test]
+    fn verify_scan_control_degrades_unconfigured_on_a_fail_on_typo() {
+        let lock = env_lock();
+        lock.fake_tool("trivy", &shim("Version: 0.72.0", TRIVY_SAMPLE, 0));
+        lock.fake_tool(
+            "osv-scanner",
+            &shim("osv-scanner version: 2.4.0", OSV_CLEAN, 0),
+        );
+        let (_d, ctx) = repo_for_gate("fail_on = \"hgih\"");
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_scan_control(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+        assert_eq!(result.degraded_reason, Some("unconfigured"));
+        assert!(result.messages.iter().any(|m| m.contains("hgih")));
+    }
+
+    /// No scanner installed is `tool-missing` — and the repository-supplied
+    /// scanner configuration is still stated, because a reviewer reads it here.
+    #[test]
+    fn verify_scan_control_degrades_tool_missing_when_no_scanner_is_installed() {
+        let lock = env_lock();
+        lock.hide_from_path(&["trivy", "osv-scanner"]);
+        let (_d, ctx) = fresh_bootstrapped_repo();
+        std::fs::write(ctx.root.join(".trivyignore"), "CVE-2021-25900\n").unwrap();
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_scan_control(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+        assert_eq!(result.degraded_reason, Some("tool-missing"));
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("scanner config") && m.contains(".trivyignore")));
     }
 }

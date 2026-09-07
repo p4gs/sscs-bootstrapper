@@ -52,6 +52,13 @@ struct VerifyEntry<'a> {
     artifacts: Vec<&'a str>,
     /// External tools this control detects (registry order).
     tools: &'static [&'static str],
+    /// Why a `degraded` row degraded (`controls::DEGRADED_REASONS`), when the
+    /// control says. Additive within schema v1: absent on every other outcome
+    /// and on controls that have not adopted it. A reclassifier may key on it
+    /// — `tool-missing` leaves committed evidence standing, `scan-error` and
+    /// `no-inventory` do not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degraded_reason: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -111,6 +118,7 @@ fn entries_and_summary(results: &[VerifyResult]) -> Result<(Vec<VerifyEntry<'_>>
                 r.evidence.iter().map(String::as_str).collect()
             },
             tools: def.tools,
+            degraded_reason: r.degraded_reason,
         });
     }
     Ok((entries, summary))
@@ -1032,6 +1040,44 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("disabled in .sscsb/config.toml"));
+    }
+
+    /// ISC-50: `degraded_reason` rides on a degraded row and on nothing else —
+    /// additive within schema v1, so `schema_version` stays 1 and a Pass row
+    /// has no such key at all (a consumer must not read `null` as a reason).
+    #[test]
+    fn verify_json_carries_degraded_reason_only_on_degraded_rows() {
+        let results = vec![
+            VerifyResult::degraded("sbom", "tool-missing", vec!["syft not found".into()]),
+            VerifyResult::new("vuln-scan", Outcome::Pass, vec!["clean".into()]),
+            VerifyResult::new("grype", Outcome::Degraded, vec!["legacy degrade".into()]),
+        ];
+        let doc: serde_json::Value =
+            serde_json::from_str(&verify_json(&results, false).unwrap()).unwrap();
+        assert_eq!(doc["schema_version"], 1);
+        let rows = doc["results"].as_array().unwrap();
+        let row = |id: &str| {
+            rows.iter()
+                .find(|r| r["control"] == id)
+                .unwrap_or_else(|| panic!("no row for {id}"))
+        };
+        assert_eq!(row("sbom")["outcome"], "degraded");
+        assert_eq!(row("sbom")["degraded_reason"], "tool-missing");
+        assert_eq!(row("vuln-scan")["outcome"], "pass");
+        assert!(
+            row("vuln-scan").get("degraded_reason").is_none(),
+            "a pass row must not carry the key: {}",
+            row("vuln-scan")
+        );
+        assert_eq!(row("grype")["outcome"], "degraded");
+        assert!(
+            row("grype").get("degraded_reason").is_none(),
+            "a control that has not adopted the field emits no key, not null"
+        );
+        for reason in crate::controls::DEGRADED_REASONS {
+            let r = VerifyResult::degraded("sbom", reason, vec![]);
+            assert_eq!(r.degraded_reason, Some(*reason));
+        }
     }
 
     #[test]

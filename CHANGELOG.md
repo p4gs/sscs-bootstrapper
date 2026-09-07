@@ -10,6 +10,17 @@ versions.
 
 ### Added
 
+- **`degraded_reason` on `verify --format json` rows.** A `degraded` row can
+  now say why: `tool-missing` (the environment lacks the tool — committed
+  evidence, if any, still stands), `scan-error` (the tool ran and did not
+  complete — nothing was verified), `no-inventory` (it ran and found nothing to
+  examine), `no-remote`, or `unconfigured`. The field is additive within
+  verify schema v1 — absent on every other outcome and on controls that have
+  not adopted it, never `null` — so a consumer that does not know it reads the
+  rows it always read, and one that does can stop treating "the scanner was
+  never installed" and "the scanner failed" as the same verdict. `sbom` and
+  `vuln-scan` adopt it in this release.
+
 - **`sscsb scan --local` — the local lane.** About a third of the controls
   are checks on a *development environment* — `commit-signing`,
   `agent-signing`, `signing-model`, `ai-trailers`, `ai-dep-gate`, `ai-receipts`,
@@ -181,6 +192,24 @@ versions.
 
 ### Changed
 
+- **`verify sbom` and `verify vuln-scan` run their tools and gate on what
+  they find.** Both checked that Syft, Trivy and OSV-Scanner were on PATH and
+  passed — the same presence test OpenSSF Scorecard's SBOM and Vulnerabilities
+  checks make, and no deeper, so `sscsb verify` in CI enforced nothing the
+  scanners could have told it. `verify sbom` now generates the document under
+  the control's `format`, validates its shape and reports the component count;
+  a valid document with no components is `DEGRADED` (`no-inventory`), because an
+  empty SBOM proves nothing. `verify vuln-scan` runs every installed scanner (at
+  least one must), applies the optional `vex` document named in
+  `[controls.vuln-scan]`, and a finding at or above `fail_on` is a `FAIL` that
+  names it; a scanner that is installed but does not complete is `DEGRADED`
+  (`scan-error`), never a quiet pass from the empty half of a run; OSV-Scanner
+  alone answering "no packages found" is `no-inventory` — Scorecard's silent
+  clean on that exit is deliberately not copied; a `fail_on` that is not a
+  severity is `unconfigured`. Syft is told to skip `target/` at any depth and
+  `.git/`: neither is the repository's inventory, and cataloguing a built
+  `target/` tree turns a seconds-long scan into minutes.
+
 - **Generated `allowed_signers` lines now grant two namespaces to `human`-class
   signers**, `namespaces="git,sscsb-scan-record"` rather than
   `namespaces="git"`. SSHSIG namespaces stop a signature minted for one protocol
@@ -204,6 +233,13 @@ versions.
   refuse independently.
 
 ### Fixed
+
+- **Thirteen real-tool tests in `sbom` and `scan` resolved Syft, Trivy,
+  OSV-Scanner and Grype off `PATH` without the environment lock.** Nothing ever
+  put a fake of those tools on `PATH` before, so the omission was invisible; the
+  first stub-driven gate test did, and the real-tool tests failed with the
+  stub's exit code and documents. They hold the lock now. The lock is a
+  contract on every reader of `PATH`, not only on the tests that write it.
 
 - **A test read `PATH` without the environment lock and failed as if the code
   had regressed.** `scan::tests::run_scan_surfaces_a_clear_error_when_the_vex_path_does_not_exist`

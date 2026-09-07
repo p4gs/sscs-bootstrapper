@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 
 pub const SBOM_FORMATS: &[&str] = &["cyclonedx-json", "spdx-json"];
 
+/// Paths Syft is told to skip: build output at any depth and the object
+/// store. Syft globs are relative to the scan root.
+pub const SYFT_EXCLUDES: &[&str] = &["./target/**", "./**/target/**", "./.git/**"];
+
 pub fn sbom_output_path(ctx: &Ctx, format: &str) -> PathBuf {
     let ext = match format {
         "spdx-json" => "spdx.json",
@@ -38,7 +42,15 @@ pub fn generate(ctx: &Ctx, cfg: &Config, format_override: Option<&str>) -> Resul
     std::fs::create_dir_all(out_path.parent().unwrap())?;
     let target = format!("dir:{}", ctx.root.display());
     let output_arg = format!("{format}={}", out_path.display());
-    let out = exec::run("syft", &[&target, "-o", &output_arg], Some(&ctx.root))?;
+    // Build output and the object store are not the repository's dependency
+    // inventory, and cataloguing a `target/` tree turns a seconds-long scan
+    // into minutes on any Rust repository that has been built.
+    let mut args = vec![target.as_str(), "-o", output_arg.as_str()];
+    for exclude in SYFT_EXCLUDES {
+        args.push("--exclude");
+        args.push(exclude);
+    }
+    let out = exec::run("syft", &args, Some(&ctx.root))?;
     if !out.success() {
         anyhow::bail!("syft failed (exit {}): {}", out.status, out.stderr.trim());
     }
@@ -70,20 +82,77 @@ pub fn validate_sbom(path: &Path, format: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn verify_sbom_control(ctx: &Ctx) -> VerifyResult {
-    match tools::detect(tools::spec("syft").expect("registry")) {
-        tools::ToolStatus::Found { version, .. } => VerifyResult::new(
-            "sbom",
-            Outcome::Pass,
+/// Count the inventory an SBOM carries: CycloneDX `components`, SPDX `packages`.
+pub fn sbom_component_count(path: &Path) -> Result<usize> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading SBOM {}", path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&text).context("SBOM is not valid JSON")?;
+    let count = ["components", "packages"]
+        .iter()
+        .filter_map(|k| v.get(k).and_then(|c| c.as_array()).map(Vec::len))
+        .max()
+        .unwrap_or(0);
+    Ok(count)
+}
+
+/// `verify sbom`: generate the SBOM and check it is real.
+///
+/// Until 0.4 this checked that Syft was on PATH and passed — the same
+/// presence test OpenSSF Scorecard's SBOM check makes, and no deeper. Now it
+/// runs `sscsb sbom` under the control's own `format` (default CycloneDX
+/// JSON), validates the document's shape, and reports the component count.
+/// Syft absent is `Degraded(tool-missing)`; Syft failing is
+/// `Degraded(scan-error)`; a document with no components is
+/// `Degraded(no-inventory)` — an empty SBOM proves nothing about the tree.
+pub fn verify_sbom_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
+    let id = "sbom";
+    let version = match tools::detect(tools::spec("syft").expect("registry")) {
+        tools::ToolStatus::Found { version, .. } => version.unwrap_or_else(|| "?".into()),
+        tools::ToolStatus::Missing => {
+            return VerifyResult::degraded(
+                id,
+                "tool-missing",
+                vec![tools::degrade_message("syft", ctx.platform)],
+            );
+        }
+    };
+    let path = match generate(ctx, cfg, None) {
+        Ok(p) => p,
+        Err(err) => {
+            return VerifyResult::degraded(
+                id,
+                "scan-error",
+                vec![format!("syft {version}: SBOM generation failed: {err:#}")],
+            );
+        }
+    };
+    let rel = path
+        .strip_prefix(&ctx.root)
+        .unwrap_or(&path)
+        .display()
+        .to_string();
+    match sbom_component_count(&path) {
+        Ok(0) => VerifyResult::degraded(
+            id,
+            "no-inventory",
             vec![format!(
-                "syft {} available — `sscsb sbom` emits CycloneDX (default) or SPDX JSON",
-                version.unwrap_or_else(|| "?".into())
+                "syft {version}: {rel} is valid but lists no components — an empty SBOM \
+                 proves nothing about this tree"
             )],
         ),
-        tools::ToolStatus::Missing => VerifyResult::new(
-            "sbom",
-            Outcome::Degraded,
-            vec![tools::degrade_message("syft", ctx.platform)],
+        Ok(n) => VerifyResult::new(
+            id,
+            Outcome::Pass,
+            vec![format!(
+                "syft {version}: {rel} validated, {n} component(s) catalogued"
+            )],
+        ),
+        Err(err) => VerifyResult::degraded(
+            id,
+            "scan-error",
+            vec![format!(
+                "syft {version}: {rel} could not be read back: {err:#}"
+            )],
         ),
     }
 }
@@ -261,6 +330,7 @@ mod tests {
 
     #[test]
     fn generate_writes_a_valid_cyclonedx_sbom_by_default_and_validates_it() {
+        let _lock = env_lock();
         let (_d, ctx) = repo_with_vulnerable_npm_package();
         let cfg = ctx.require_config().unwrap();
         if !tools::is_available("syft") {
@@ -280,6 +350,7 @@ mod tests {
 
     #[test]
     fn generate_honors_an_explicit_spdx_format_override() {
+        let _lock = env_lock();
         let (_d, ctx) = repo_with_vulnerable_npm_package();
         let cfg = ctx.require_config().unwrap();
         if !tools::is_available("syft") {
@@ -293,6 +364,7 @@ mod tests {
 
     #[test]
     fn generate_defaults_to_cyclonedx_when_config_has_no_format_key() {
+        let _lock = env_lock();
         let (_d, ctx) = repo_with_vulnerable_npm_package();
         if !tools::is_available("syft") {
             return; // covered by the syft-missing branch above
@@ -318,6 +390,7 @@ mod tests {
 
     #[test]
     fn generate_rejects_an_unsupported_format_before_invoking_syft() {
+        let _lock = env_lock();
         let (_d, ctx) = repo_with_vulnerable_npm_package();
         let cfg = ctx.require_config().unwrap();
         if !tools::is_available("syft") {
@@ -327,17 +400,135 @@ mod tests {
         assert!(format!("{err:#}").contains("unsupported SBOM format"));
     }
 
+    /// With the real Syft installed the gate generates and validates the
+    /// document and counts what it catalogued; the planted npm dependency
+    /// guarantees at least one component. Without Syft it says `tool-missing`.
     #[test]
-    fn verify_sbom_control_names_the_control_and_reports_tool_availability() {
-        let (_d, ctx) = fresh_bootstrapped_repo();
-        let result = verify_sbom_control(&ctx);
+    fn verify_sbom_control_generates_and_validates_a_real_sbom_or_says_why_not() {
+        let _lock = env_lock();
+        let (_d, ctx) = repo_with_vulnerable_npm_package();
+        let cfg = ctx.require_config().unwrap();
+        let result = verify_sbom_control(&ctx, cfg);
         assert_eq!(result.control, "sbom");
         if tools::is_available("syft") {
-            assert_eq!(result.outcome, Outcome::Pass);
+            assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+            assert_eq!(result.degraded_reason, None);
             assert!(result.messages[0].contains("syft"));
+            assert!(result.messages[0].contains("component(s) catalogued"));
+            assert!(ctx.root.join(".sscsb/out/sbom.cdx.json").is_file());
         } else {
             assert_eq!(result.outcome, Outcome::Degraded);
+            assert_eq!(result.degraded_reason, Some("tool-missing"));
         }
+    }
+
+    use crate::testutil::env_lock;
+
+    // ── the promoted gate under a stubbed Syft: deterministic documents ─────
+    //
+    // The shim answers `--version`, then writes `doc` to the `-o` path
+    // (`cyclonedx-json=<path>`, argv[3]) and records its argv beside it.
+
+    fn syft_shim(doc: &str, exit: i32) -> String {
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'syft 1.46.0'; exit 0 ;;\nesac\n\
+             out=\"${{3#*=}}\"\nmkdir -p \"$(dirname \"$out\")\"\n\
+             printf '%s\\n' \"$@\" > \"$out.argv\"\n\
+             cat > \"$out\" <<'DOC'\n{doc}\nDOC\nexit {exit}\n"
+        )
+    }
+
+    const CDX_TWO: &str = r#"{"bomFormat":"CycloneDX","specVersion":"1.6","components":[{"name":"a","version":"1"},{"name":"b","version":"2"}]}"#;
+    const CDX_EMPTY: &str = r#"{"bomFormat":"CycloneDX","specVersion":"1.6","components":[]}"#;
+
+    /// ISC-28: the gate writes `.sscsb/out/sbom.cdx.json`, validates it, and
+    /// reports the component count; Syft is told to skip build output and the
+    /// object store.
+    #[test]
+    fn verify_sbom_control_passes_on_a_validated_sbom_with_components() {
+        let lock = env_lock();
+        lock.fake_tool("syft", &syft_shim(CDX_TWO, 0));
+        let (_d, ctx) = fresh_bootstrapped_repo();
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_sbom_control(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+        assert_eq!(result.degraded_reason, None);
+        assert!(result.messages[0].contains("syft 1.46.0"));
+        assert!(result.messages[0].contains(".sscsb/out/sbom.cdx.json validated, 2 component(s)"));
+        let out = ctx.root.join(".sscsb/out/sbom.cdx.json");
+        assert_eq!(sbom_component_count(&out).unwrap(), 2);
+        let argv = std::fs::read_to_string(out.with_extension("json.argv")).unwrap();
+        for exclude in SYFT_EXCLUDES {
+            assert!(argv.contains(exclude), "syft argv lacks {exclude}: {argv}");
+        }
+    }
+
+    /// An SBOM with no components is valid and proves nothing: `no-inventory`.
+    #[test]
+    fn verify_sbom_control_degrades_no_inventory_on_an_empty_sbom() {
+        let lock = env_lock();
+        lock.fake_tool("syft", &syft_shim(CDX_EMPTY, 0));
+        let (_d, ctx) = fresh_bootstrapped_repo();
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_sbom_control(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+        assert_eq!(result.degraded_reason, Some("no-inventory"));
+        assert!(result.messages[0].contains("lists no components"));
+    }
+
+    /// Syft exiting non-zero, or writing a document that is not what was asked
+    /// for, is `scan-error` — the gate never passes on a file it could not trust.
+    #[test]
+    fn verify_sbom_control_degrades_scan_error_when_syft_fails_or_lies() {
+        let lock = env_lock();
+        lock.fake_tool("syft", &syft_shim(CDX_TWO, 1));
+        let (_d, ctx) = fresh_bootstrapped_repo();
+        let cfg = ctx.require_config().unwrap();
+        let result = verify_sbom_control(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+        assert_eq!(result.degraded_reason, Some("scan-error"));
+        assert!(result.messages[0].contains("syft failed (exit 1)"));
+
+        lock.fake_tool(
+            "syft",
+            &syft_shim(r#"{"bomFormat":"SPDX","components":[]}"#, 0),
+        );
+        let result = verify_sbom_control(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+        assert_eq!(result.degraded_reason, Some("scan-error"));
+        assert!(result.messages[0].contains("expected bomFormat=CycloneDX"));
+    }
+
+    #[test]
+    fn verify_sbom_control_degrades_tool_missing_without_syft() {
+        let lock = env_lock();
+        lock.hide_from_path(&["syft"]);
+        let (_d, ctx) = fresh_bootstrapped_repo();
+        let cfg = ctx.require_config().unwrap();
+        let result = verify_sbom_control(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Degraded);
+        assert_eq!(result.degraded_reason, Some("tool-missing"));
+    }
+
+    #[test]
+    fn sbom_component_count_reads_cyclonedx_components_and_spdx_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let cdx = dir.path().join("a.cdx.json");
+        std::fs::write(&cdx, CDX_TWO).unwrap();
+        assert_eq!(sbom_component_count(&cdx).unwrap(), 2);
+        let spdx = dir.path().join("a.spdx.json");
+        std::fs::write(
+            &spdx,
+            r#"{"spdxVersion":"SPDX-2.3","packages":[{"name":"x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(sbom_component_count(&spdx).unwrap(), 1);
+        let neither = dir.path().join("n.json");
+        std::fs::write(&neither, "{}").unwrap();
+        assert_eq!(sbom_component_count(&neither).unwrap(), 0);
+        assert!(sbom_component_count(&dir.path().join("missing.json")).is_err());
     }
 
     #[test]
@@ -355,6 +546,7 @@ mod tests {
 
     #[test]
     fn grype_scan_summarizes_real_findings_from_a_generated_sbom() {
+        let _lock = env_lock();
         let (_d, ctx) = repo_with_vulnerable_npm_package();
         let cfg = ctx.require_config().unwrap();
         if !tools::is_available("syft") || !tools::is_available("grype") {
@@ -378,6 +570,7 @@ mod tests {
 
     #[test]
     fn grype_scan_errors_loudly_instead_of_a_false_clean_when_the_sbom_is_missing() {
+        let _lock = env_lock();
         let (_d, ctx) = fresh_bootstrapped_repo();
         if !tools::is_available("grype") {
             return; // covered by the grype-missing branch above

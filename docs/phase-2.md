@@ -29,6 +29,17 @@ attestation step in [phase 3](phase-3.md), Dependency-Track and GUAC in
 [phase 5](phase-5.md).
 
 An unsupported `--format` is an error, not a silent fallback to the default.
+Build output (`target/` at any depth) and the `.git` object store are excluded:
+neither is the repository's dependency inventory, and cataloguing a built
+`target/` tree turns a seconds-long scan into minutes.
+
+**`sscsb verify sbom` generates the document.** It used to check that Syft was
+on PATH and pass — the same presence test OpenSSF Scorecard's SBOM check makes.
+Now it runs `sscsb sbom` under the control's `format`, validates the shape, and
+reports how many components it catalogued. Syft absent is `DEGRADED` with
+`degraded_reason = tool-missing`; Syft failing, or writing something that is not
+the requested BOM, is `scan-error`; a valid document with no components is
+`no-inventory` — an empty SBOM proves nothing about the tree.
 
 ## Vulnerability scanning
 
@@ -57,7 +68,23 @@ Findings are gated against a configurable threshold:
 [controls.vuln-scan]
 enabled = true
 fail_on = "high"      # critical | high | medium | low
+# vex = "vex.openvex.json"   # optional, repo-relative: applied by `verify` too
 ```
+
+**`sscsb verify vuln-scan` runs this scan.** It used to check that Trivy and
+OSV-Scanner were on PATH and pass — the same presence test OpenSSF Scorecard's
+Vulnerabilities check makes, and no deeper, so CI enforced nothing. Now every
+installed scanner runs (at least one must), the VEX named above is applied, and a
+finding at or above `fail_on` is a `FAIL` that names it. When the gate cannot
+verify, it says which way: no scanner installed is `DEGRADED` with
+`degraded_reason = tool-missing`; a scanner that is installed but did not
+complete — a vulnerability database it could not reach — is `scan-error`, never a
+quiet pass from the empty half of a run; OSV-Scanner alone answering "no packages
+found" is `no-inventory` (Scorecard's silent clean on that exit is deliberately
+not copied); a `fail_on` that is not a severity is `unconfigured`. The reason
+rides on the `verify --format json` row so a consumer can tell "the tool was
+absent" from "the tool ran and failed", which is the difference between committed
+evidence that still stands and evidence that does not.
 
 A `fail_on` that is not one of those four is a configuration error, not a
 default. It used to rank below `low` — which meant `fail_on = "error"` gated on
