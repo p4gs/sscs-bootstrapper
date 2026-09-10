@@ -135,20 +135,32 @@ fn parse_workflow_yaml(content: &str) -> Result<Vec<Yaml>> {
 /// concern, so there is nothing to parameterize about it.
 fn parse_workflow_yaml_with_budget(content: &str, budget: Duration) -> Result<Vec<Yaml>> {
     refuse_yaml_amplification_shape(content)?;
-    let (tx, rx) = std::sync::mpsc::channel();
     let owned = content.to_string();
+    run_with_timeout(budget, move || YamlLoader::load_from_str(&owned))?.context("YAML parse error")
+}
+
+/// Run `f` on a background thread and wait up to `budget` for it to finish.
+///
+/// Split out from `parse_workflow_yaml_with_budget` so the timeout mechanism
+/// itself can be tested with a workload whose duration the test controls
+/// completely (a sleep), rather than racing a real YAML parse of trivial
+/// content against a zero-duration budget — that construction looked like a
+/// deterministic proof but wasn't: a CI runner fast enough to complete the
+/// spawn-parse-send round trip before the main thread's very next
+/// instruction turns `recv_timeout(Duration::ZERO)` into a coin flip. See
+/// the corresponding test for the real failure this replaced.
+fn run_with_timeout<T: Send + 'static>(
+    budget: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         // The receiver may already be gone (budget expired) — a send error
         // here only means nobody is listening any more.
-        let _ = tx.send(YamlLoader::load_from_str(&owned));
+        let _ = tx.send(f());
     });
-    match rx.recv_timeout(budget) {
-        Ok(Ok(docs)) => Ok(docs),
-        Ok(Err(e)) => Err(e).context("YAML parse error"),
-        Err(_) => {
-            anyhow::bail!("parsing did not finish within {budget:?} — refused rather than hung")
-        }
-    }
+    rx.recv_timeout(budget)
+        .map_err(|_| anyhow::anyhow!("did not finish within {budget:?} — refused rather than hung"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1243,16 +1255,25 @@ jobs:
     #[test]
     fn the_cpu_backstop_mechanism_genuinely_fires_when_a_budget_is_exceeded() {
         // Proves the SECOND, separate layer — the timeout wrapper — actually
-        // triggers, using ordinary content (so it passes the anchor check
-        // and reaches this code) against a budget of zero. A zero-duration
-        // `recv_timeout` cannot succeed: the spawned thread's create-parse-
-        // send round trip always takes non-zero wall time, so this is a
-        // deterministic proof of the mechanism, not a race. Documents the
-        // honest limit stated in YAML_PARSE_BUDGET's doc comment: this layer
-        // does not currently have a live attack it alone defends against —
-        // it is defense-in-depth for a shape not yet measured.
-        let doc = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps: []\n";
-        let err = parse_workflow_yaml_with_budget(doc, Duration::ZERO).unwrap_err();
+        // triggers. Exercises `run_with_timeout` directly with a workload
+        // whose duration the test fully controls (a 500ms sleep against a
+        // 5ms budget — a 100x margin), rather than racing a real YAML parse
+        // of trivial content against a zero-duration budget: a real CI run
+        // proved that construction was a genuine race, not a deterministic
+        // proof — a machine fast enough to complete the spawn-parse-send
+        // round trip before the main thread's very next instruction makes
+        // `recv_timeout(Duration::ZERO)` a coin flip, and one such runner
+        // called it heads. Controlling the workload's duration directly
+        // removes the dependency on how fast any given machine happens to
+        // parse a few dozen bytes of YAML. Documents the honest limit stated
+        // in YAML_PARSE_BUDGET's doc comment: this layer does not currently
+        // have a live attack it alone defends against — it is
+        // defense-in-depth for a shape not yet measured.
+        let err = run_with_timeout(Duration::from_millis(5), || {
+            std::thread::sleep(Duration::from_millis(500));
+            42
+        })
+        .unwrap_err();
         assert!(format!("{err:#}").contains("did not finish within"));
     }
 
