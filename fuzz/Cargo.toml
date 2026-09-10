@@ -38,3 +38,10 @@ path = "fuzz_targets/parse_deps.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "workflow_audit"
+path = "fuzz_targets/workflow_audit.rs"
+test = false
+doc = false
+bench = false
