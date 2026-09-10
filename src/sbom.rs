@@ -89,15 +89,29 @@ pub fn verify_sbom_control(ctx: &Ctx) -> VerifyResult {
 }
 
 /// Optional Grype scan over a Syft SBOM (SBOM-first workflow).
+/// The top-level keys that identify a document as a grype vulnerability
+/// report. Measured on grype 0.118.0: a clean scan of an empty SBOM emits
+/// `{"matches":[],"source":…,"distro":…,"descriptor":…}` — `matches` is
+/// present, and an empty array, even when there is nothing to report. Unlike
+/// trivy (`TRIVY_REPORT_MARKERS` in `scan.rs` — its clean-scan shape omits
+/// `Results` entirely), there is no grype clean-scan shape that omits
+/// `matches`, so requiring it costs a real clean scan nothing while still
+/// refusing `{}`, `[]`, or an unrelated JSON document.
+const GRYPE_REPORT_MARKERS: &[&str] = &["matches", "source", "distro", "descriptor"];
+
 pub fn grype_scan(ctx: &Ctx, sbom_path: &Path) -> Result<(usize, Vec<String>)> {
     if !tools::is_available("grype") {
         anyhow::bail!("{}", tools::degrade_message("grype", ctx.platform));
     }
     let target = format!("sbom:{}", sbom_path.display());
     let out = exec::run("grype", &[&target, "-o", "json"], Some(&ctx.root))?;
-    // grype exits non-zero when findings exceed --fail-on severity; parse output regardless.
-    let v: serde_json::Value = serde_json::from_str(&out.stdout)
-        .with_context(|| format!("grype output not JSON (exit {})", out.status))?;
+    // grype exits non-zero when findings exceed --fail-on severity; parse output
+    // regardless — but a document this cannot recognise as a grype report is
+    // not a clean scan, so the same shape guard scan.rs applies to trivy/osv
+    // applies here: `{}`, `[]`, or an unrelated JSON document must not silently
+    // read as "0 matches" (issue #40).
+    let v = crate::scan::scanner_report(&out.stdout, "grype", GRYPE_REPORT_MARKERS, "matches")
+        .with_context(|| format!("grype exited {}", out.status))?;
     let matches = v
         .get("matches")
         .and_then(|m| m.as_array())
@@ -374,6 +388,49 @@ mod tests {
         assert!(summaries
             .iter()
             .all(|s| s.contains(" (") && s.ends_with(')')));
+    }
+
+    #[test]
+    fn a_wrong_shaped_document_is_not_read_as_zero_matches() {
+        // Issue #40: `matches` was read with `.unwrap_or_default()`, so `{}`,
+        // `[]`, or any unrelated JSON document silently reported "0 matches"
+        // — the same failure `scanner_report` was already built to close for
+        // trivy and osv-scanner (`scan.rs`), just never applied here. Drives
+        // the shared guard directly with grype's own markers, so this proves
+        // the fix without needing a live grype invocation.
+        for wrong_shape in [
+            "{}",
+            "[]",
+            "null",
+            "42",
+            r#""a string""#,
+            r#"{"results":[]}"#,             // osv's envelope, wrong parser
+            r#"{"error":"grype exploded"}"#, // a real failure mode, still valid JSON
+            r#"[{"matches":[]}]"#,           // the right key, wrong nesting
+            r#"{"matches":"not-a-list","source":{}}"#, // envelope present, body unreadable
+        ] {
+            let Err(err) =
+                crate::scan::scanner_report(wrong_shape, "grype", GRYPE_REPORT_MARKERS, "matches")
+            else {
+                panic!("{wrong_shape} must not read as a clean grype scan");
+            };
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not in grype's report shape"),
+                "{wrong_shape} must be named unreadable, not counted as zero matches: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_clean_grype_report_still_passes_the_shape_guard() {
+        // The negative control for the fix above: the guard must not reject
+        // grype's OWN documented clean-scan shape (measured live on grype
+        // 0.118.0 against an empty CycloneDX SBOM).
+        let clean = r#"{"matches":[],"source":{},"distro":{},"descriptor":{}}"#;
+        let v = crate::scan::scanner_report(clean, "grype", GRYPE_REPORT_MARKERS, "matches")
+            .expect("grype's real clean-scan shape must pass");
+        assert_eq!(v["matches"].as_array().unwrap().len(), 0);
     }
 
     #[test]

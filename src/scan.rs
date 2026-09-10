@@ -418,7 +418,12 @@ const OSV_REPORT_MARKERS: &[&str] = &["results"];
 /// or a marker present whose findings container is not a list. The marker set
 /// is deliberately liberal — any one key is enough — so a future field rename
 /// costs an error message rather than every clean scan.
-fn scanner_report(
+///
+/// `pub(crate)` rather than private: `sbom.rs`'s grype path applies the same
+/// guard (grype's own clean-scan shape is `{"matches":[],"source":…,
+/// "distro":…,"descriptor":…}` — measured on grype 0.118.0 — so `matches`
+/// alone is a sufficient, always-present marker there, unlike trivy's).
+pub(crate) fn scanner_report(
     stdout: &str,
     tool: &str,
     markers: &[&str],
