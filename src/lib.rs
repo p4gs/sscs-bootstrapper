@@ -18,6 +18,7 @@
 //! - [`deps`] — package trust (existence, approval, typosquat heuristics)
 //! - [`sbom`] / [`scan`] / [`sast`] — Syft / Trivy+OSV / OpenGrep+Semgrep
 //! - [`provenance`] — slsa-verifier, DSSE/in-toto, cosign, AI receipts
+//! - [`socket_firewall`] — `socket-firewall-ci`: are committed workflow installs behind `sfw`?
 //! - [`local_scan`] — the local lane: a signed, workstation-produced scan record
 //! - [`skill`] — the bundled agent skill (`sscsb skill install | print | check`)
 //! - [`observability`] — Dependency-Track, GUAC, OpenVEX, ORAS
@@ -52,6 +53,7 @@ pub mod scorecard;
 pub mod signers;
 pub mod signing_setup;
 pub mod skill;
+pub mod socket_firewall;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod tools;

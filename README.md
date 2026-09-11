@@ -209,7 +209,7 @@ Two more docs cover the parts people get wrong:
 
 ## Controls
 
-53 controls, each with an id you can `enable`, `disable`, and `verify`:
+54 controls, each with an id you can `enable`, `disable`, and `verify`:
 
 ```sh
 sscsb status                      # what's on, what's installed
@@ -221,8 +221,11 @@ sscsb verify --strict             # DEGRADED also exits non-zero — the check c
 
 Secure defaults are on. Off by default are the ones that need infrastructure you
 may not have (Dependency-Track, GUAC, ORAS), a paid or unreleased tool
-(Sighthound, Socket), or that overlap something already on (Grype duplicates
-Trivy for most people; Witness overlaps the SLSA generator).
+(Sighthound), that overlap something already on (Grype duplicates Trivy for most
+people; Witness overlaps the SLSA generator), or that ask you to change how the
+team works rather than what is installed — the two Socket Firewall controls put
+a filtering proxy in front of every package install, which Socket Firewall Free
+does without an account or a key but not without that decision.
 
 ## CI templates
 

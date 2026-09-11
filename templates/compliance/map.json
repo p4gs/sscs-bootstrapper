@@ -228,6 +228,16 @@
       "notes": "Install-time firewall blocks known-malicious packages before they enter the environment (Shai-Hulud/lottie-player class).",
       "osps": []
     },
+    "socket-firewall-ci": {
+      "name": "Malicious-package install firewall in CI (Socket, optional)",
+      "phase": 2,
+      "slsa": [],
+      "ssdf": ["PW.4.1", "PO.3.2"],
+      "cra": ["Article 13(5) (due diligence on third-party components)"],
+      "badge": [],
+      "notes": "The repository-observable half of socket-firewall: every committed workflow job must route its FIRST package-manager acquisition per ecosystem through `sfw`, so the build environment acquires components through a filtering proxy rather than straight from a registry. PO.3.2 because the evidence is the build toolchain's own configuration. Only Socket Firewall Free's ecosystems (npm, yarn, pnpm, pip, uv, cargo) can fail it; Enterprise-only and unsupported ecosystems are reported as information. Proves what the workflow SAYS, not that it ran.",
+      "osps": []
+    },
     "sigstore-signing": {
       "name": "Cosign keyless artifact signing + SBOM attestation",
       "phase": 3,

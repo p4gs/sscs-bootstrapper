@@ -4,7 +4,7 @@ description: >-
   Bootstrap and verify software supply chain security in a git repository using
   the `sscsb` CLI — secret scanning, commit signing policy, SBOMs, vulnerability
   scanning, SAST, dependency trust, SLSA provenance, and continuous posture, as
-  53 individually toggleable controls across six phases. USE WHEN harden this
+  54 individually toggleable controls across six phases. USE WHEN harden this
   repo, supply chain security, SSCS, secret scanning, commit signing, SBOM,
   vulnerability scan, dependency trust, typosquat, SLSA provenance, sigstore,
   cosign, OpenSSF Scorecard, OpenVEX, SAST, branch protection, pin GitHub
@@ -164,13 +164,13 @@ Read the reason line. It always says which of the four it is.
 
 ## The controls
 
-**53 controls across six phases.** 38 are on by default, 15 are off — and off
+**54 controls across six phases.** 38 are on by default, 16 are off — and off
 means the code does not run, not that it runs and is ignored.
 
 | Phase | Name | Controls | On by default |
 |-------|------|---------:|--------------:|
 | 1 | Commit integrity | 13 | 10 |
-| 2 | Dependencies | 9 | 6 |
+| 2 | Dependencies | 10 | 6 |
 | 3 | Provenance | 10 | 7 |
 | 4 | Code analysis | 7 | 4 |
 | 5 | Continuous posture | 8 | 5 |
@@ -180,15 +180,19 @@ Common reasons a control ships off. This is not a partition — some controls fi
 more than one, and `sscsb status` is the authority on your repo:
 
 - **Infrastructure you may not have** — `dependency-track`, `guac`, `oras`.
-- **A paid or unreleased tool** — `sighthound`, `socket-firewall`.
+- **A paid or unreleased tool** — `sighthound`.
 - **It overlaps something already on** — `grype` duplicates Trivy for most
   people; `witness` overlaps the SLSA generator.
 - **It is a decision, not an installation.** `agent-signing` is a policy choice
   about whether an agent key may exist at all — and turning it on still buys an
-  agent nothing on a protected branch. `model-signing` applies only to a repo
-  that ships models, `fuzzing` needs a harness someone has to write, and
-  `gittuf`, `ai-receipts`, `bumblebee`, `release-immutability` and
-  `wait-for-secrets` each change how the team works, not just what is installed.
+  agent nothing on a protected branch. `socket-firewall` and
+  `socket-firewall-ci` put a filtering proxy in front of every package install —
+  Socket Firewall Free needs neither an account nor a key, but routing every
+  build's installs through a proxy is a change to how the team fetches, not a
+  binary you drop in. `model-signing` applies only to a repo that ships models,
+  `fuzzing` needs a harness someone has to write, and `gittuf`, `ai-receipts`,
+  `bumblebee`, `release-immutability` and `wait-for-secrets` each change how the
+  team works, not just what is installed.
   Turning one on without that decision produces a `FAIL` nobody asked for.
 
 Phase 6 adds no off-by-default control. Every publishing check is on, because

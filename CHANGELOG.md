@@ -10,7 +10,7 @@ versions.
 
 ### Added
 
-- **Phase 6 — Distribution & publishing. Six controls, 47 → 53.** Phases 1 to 5
+- **Phase 6 — Distribution & publishing. Six controls, 48 → 54.** Phases 1 to 5
   stopped at the registry door: they harden the repository, its dependencies,
   its CI and the artifacts a GitHub Release carries, and none of them covers the
   moment the artifact leaves for crates.io, npm, PyPI, Homebrew, Chocolatey or
@@ -107,6 +107,65 @@ versions.
   as a version note under **Before you start: which tags the recipe runs
   against** rather than as a gap in the pipeline. Verified against the live
   release API before the change, not inferred from the workflow.
+
+### Added
+
+- **`socket-firewall-ci` (phase 2, off by default).** The existing
+  `socket-firewall` asks whether `sfw` is on the developer's PATH — a fact about
+  a machine nobody else can observe. This additive control asks the
+  repository-observable question with different evidence: do this repository's
+  **committed** workflows put their package-manager installs behind Socket
+  Firewall? Every subject is read from HEAD, so an uncommitted edit is never
+  evidence; no tool runs and no network call is made. `socket-firewall` is
+  untouched.
+
+  The unit of judgement is (job, ecosystem), with a local composite action
+  (`uses: ./…`) spliced into the calling job at the position of the step that
+  uses it, and the **first** acquisition of each pair must carry the `sfw`
+  prefix — so `sfw cargo fetch --locked` followed by a bare `cargo build` is a
+  PASS and the remedy is one step per job, not a prefix on every matrix
+  `cargo test`.
+
+  **Only Socket Firewall Free's ecosystems can fail it** — npm, yarn, pnpm, pip
+  (including `python -m pip`), uv and cargo. Go, Maven, Gradle, Bundler, gem,
+  dotnet and NuGet are Enterprise-only; bun, composer, apt, brew and rustup are
+  not proxied at any tier. Both are reported as information, because failing a
+  maintainer for an ecosystem the free tool cannot protect is a false positive by
+  construction. Acquiring subcommands are an **allowlist**: `cargo fmt`,
+  `npm run` and `npm test` are silent, and an unrecognised subcommand is not an
+  acquisition — detection fails open. Recognition runs on the same shell
+  tokeniser the signing recogniser uses, so an install inside a heredoc, comment
+  or quoted string is text, while `sudo`, `env`, `time` and `FOO=1` hide neither
+  the manager nor the firewall. The operator gates that apply to cosign signing
+  deliberately do **not** apply here: `sfw npm ci || true` still ran the install
+  through the firewall.
+
+  `DEGRADED` carries `no-inventory` when workflows parsed but nothing of any
+  tier was acquired (nothing verified — not a pass) and `scan-error` when HEAD
+  cannot be read. A `workflow_dispatch`-only workflow, one GitHub would refuse to
+  run, a constant-false job or step, and a non-POSIX `run:` body are each named
+  as *not examined* rather than counted as clean.
+
+  Four disclosed misses: (1) `SocketDev/action`'s `shims: true` PATH-shimming is
+  unreleased upstream, and when it ships an unprefixed install under it will be
+  protected while this control still reads it as unprotected; (2) indirect
+  acquisition (`npm run build` whose script installs, a Makefile target) is not
+  followed; (3) composites are spliced one level deep; (4) it proves the workflow
+  *says* installs go through the firewall — not that it ran, nor that `sfw`
+  resolved on PATH.
+
+  It ships **off**, and `sscsb`'s own repository currently **fails** it with six
+  findings across `ci.yml` and `release.yml`, so the gap is visible rather than
+  silently absorbed.
+
+### Fixed
+
+- **Two now-false statements about Socket Firewall.** `docs/phase-2.md` said
+  `socket-firewall` "needs a Socket account" and the bundled skill filed it under
+  "a paid or unreleased tool". Socket Firewall Free needs neither an account nor
+  an API key. Both controls are off for the real reason instead: putting a
+  filtering proxy in front of every install is a decision about how builds fetch,
+  not a binary you drop in.
 
 ## [0.4.0] - 2026-09-11
 

@@ -259,6 +259,20 @@ pub const CONTROLS: &[ControlDef] = &[
         tools: &[],
         default_options: &[],
     },
+    ControlDef {
+        id: "socket-firewall-ci",
+        phase: 2,
+        name: "Socket Firewall in CI (optional)",
+        summary: "Committed workflows put each job's first package-manager install behind `sfw`",
+        // Off by default, and that is load-bearing beyond taste: the public
+        // directory's `in_scope` excludes default-off controls, so adding this
+        // control cannot move any other repository's grade.
+        default_enabled: false,
+        // It runs no tool and makes no network call — the evidence is the
+        // repository's own committed YAML.
+        tools: &[],
+        default_options: &[],
+    },
     // ───────────────────────── Phase 3 — Provenance, signing, federation ────
     ControlDef {
         id: "sigstore-signing",
@@ -786,6 +800,7 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
         "sast" => crate::sast::verify_sast_control(ctx, cfg),
         "sighthound" => crate::sast::verify_sighthound_control(ctx),
         "socket-firewall" => crate::deps::verify_socket_control(ctx),
+        "socket-firewall-ci" => crate::socket_firewall::verify_socket_firewall_ci(ctx),
         "witness" => crate::provenance::verify_witness_control(ctx),
         "secure-repo" => VerifyResult::new(
             def.id,
@@ -1105,6 +1120,7 @@ mod tests {
         for id in [
             "grype",
             "socket-firewall",
+            "socket-firewall-ci",
             "witness",
             "sighthound",
             "wait-for-secrets",
