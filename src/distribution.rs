@@ -949,6 +949,74 @@ fn detect_or_degrade(
     })
 }
 
+// ───────────────── what may be copied out of a tool's answer ────────────────
+//
+// `maintainer-mfa` and `trusted-publishing` are the only controls in sscsb that
+// ask a CREDENTIAL-HOLDING tool about an ACCOUNT: `gh api user` and
+// `npm profile get --json` both answer as the logged-in maintainer, and both
+// can put things in stdout or stderr that nobody should republish — a registry
+// URL with embedded basic-auth, a token fragment in an error, an email.
+//
+// That matters more here than in most tools, because a `VerifyResult`'s
+// `messages` are not just printed. `machine.rs` serializes them into
+// `--format json` AND into the signed local-scan record that gets committed and
+// published to the public directory. Anything interpolated into a message is
+// therefore an artifact with a signature on it.
+//
+// So the invariant for this module is narrow and absolute, and
+// `no_tool_output_is_ever_echoed_into_a_published_message` enforces it:
+//
+//   NO byte of a tool's stdout or stderr is ever copied into a message.
+//
+// Only the specific field a control needs is read (`two_factor_authentication`,
+// `tfa.mode`), and any of it that is a free-form string is passed through
+// [`safe_label`] first. Failures are reported as a status, never as output —
+// see [`tool_failure`]. Spawn errors are exempt and deliberately so: they carry
+// our own argv and an OS message, never anything the registry said.
+
+/// Longest external token this module will copy into a published message.
+const MAX_ECHOED: usize = 64;
+
+/// Reduce an externally-supplied identifier to something safe to publish.
+///
+/// A GitHub login or npm username is public and genuinely useful in the
+/// message — "GitHub `p4gs` has 2FA enabled" is worth more than "the account
+/// does" — but it arrives inside a payload from a credential-holding command,
+/// so it is treated as untrusted: a bounded charset, a bounded length, and a
+/// visible refusal rather than a silent truncation when it is neither.
+fn safe_label(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let ok = !trimmed.is_empty()
+        && trimmed.len() <= MAX_ECHOED
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-@/".contains(c));
+    if ok {
+        trimmed.to_string()
+    } else {
+        "(unprintable)".to_string()
+    }
+}
+
+/// Summarise a failed tool invocation WITHOUT echoing a byte of its output.
+///
+/// The HTTP status is the only thing worth extracting and the only thing that
+/// cannot carry a credential: it tells an operator whether to authenticate,
+/// grant a scope, or look elsewhere, which is the whole diagnostic value the
+/// raw stderr line used to carry. Everything else in that line — a URL with
+/// inline basic-auth, a token echoed back by a registry, an email — is exactly
+/// what must not reach a signed, published record.
+fn tool_failure(stderr: &str) -> String {
+    for code in [
+        "400", "401", "403", "404", "422", "429", "500", "502", "503",
+    ] {
+        if stderr.contains(code) {
+            return format!("HTTP {code}");
+        }
+    }
+    "a non-zero exit (output withheld — it can carry credentials)".to_string()
+}
+
 /// The line every verifier prints when the repository publishes nothing.
 fn no_targets(id: &'static str) -> VerifyResult {
     VerifyResult::new(
@@ -1204,17 +1272,17 @@ fn read_environment(ctx: &Ctx, cfg: &Config, environment: &str) -> EnvironmentRe
         }
     };
     if !out.success() {
-        let first = out.stderr.lines().next().unwrap_or("error");
+        let status = tool_failure(&out.stderr);
         // GitHub answers 404 both for "no such environment" and for "your
         // token cannot see environments". Those are opposite verdicts, so the
         // ambiguous case must degrade rather than assert the environment is
         // missing — a false Fail here would tell a maintainer to create an
         // environment that already exists.
-        if first.contains("404") {
+        if status == "HTTP 404" {
             return EnvironmentRead::Unavailable(
                 "no-access",
                 format!(
-                    "not read — GitHub answered `{first}` for `{api}`, which means EITHER no \
+                    "not read — GitHub answered {status} for `{api}`, which means EITHER no \
                      such environment OR a token that cannot read environments (needs repo \
                      admin). Unverified, not confirmed absent"
                 ),
@@ -1222,15 +1290,15 @@ fn read_environment(ctx: &Ctx, cfg: &Config, environment: &str) -> EnvironmentRe
         }
         return EnvironmentRead::Unavailable(
             "scan-error",
-            format!("not read — GitHub answered `{first}`"),
+            format!("not read — GitHub answered {status} for `{api}`"),
         );
     }
     let env: serde_json::Value = match serde_json::from_str(&out.stdout) {
         Ok(v) => v,
-        Err(err) => {
+        Err(_) => {
             return EnvironmentRead::Unavailable(
                 "scan-error",
-                format!("not read — `{api}` did not parse: {err}"),
+                format!("not read — `{api}` did not return JSON"),
             )
         }
     };
@@ -1264,7 +1332,11 @@ fn classify_environment(env: &serde_json::Value) -> EnvironmentRead {
                 described.push(format!("{m}-minute wait timer"));
             }
             Some("branch_policy") => described.push("deployment-branch policy".to_string()),
-            Some(other) => described.push(other.to_string()),
+            // A rule type GitHub adds after this code was written is still
+            // worth naming, but it arrives in a payload and ends up in a
+            // published record, so it goes through the same bound as any
+            // other external string.
+            Some(other) => described.push(safe_label(other)),
             None => {}
         }
     }
@@ -1509,23 +1581,23 @@ fn github_two_factor(
         }
     };
     if !out.success() {
-        let first = out.stderr.lines().next().unwrap_or("error");
+        let status = tool_failure(&out.stderr);
         return (
             Outcome::Degraded,
             Some("no-access"),
             vec![format!(
-                "GitHub answered `{first}` for `user` — run `gh auth login`. The GitHub account \
+                "GitHub answered {status} for `user` — run `gh auth login`. The GitHub account \
                  gates publishing for {for_targets}; unverified, not confirmed"
             )],
         );
     }
     let user: serde_json::Value = match serde_json::from_str(&out.stdout) {
         Ok(v) => v,
-        Err(err) => {
+        Err(_) => {
             return (
                 Outcome::Degraded,
                 Some("scan-error"),
-                vec![format!("`gh api user` did not parse: {err}")],
+                vec!["`gh api user` did not return JSON".to_string()],
             )
         }
     };
@@ -1536,7 +1608,10 @@ fn classify_github_two_factor(
     user: &serde_json::Value,
     for_targets: &str,
 ) -> (Outcome, Option<&'static str>, Vec<String>) {
-    let login = user.get("login").and_then(|l| l.as_str()).unwrap_or("?");
+    // Only the boolean is the evidence. The login is carried for legibility
+    // and is bounded first — it arrives in a payload from a credential-holding
+    // command, and these messages are published.
+    let login = safe_label(user.get("login").and_then(|l| l.as_str()).unwrap_or("?"));
     match user
         .get("two_factor_authentication")
         .and_then(|v| v.as_bool())
@@ -1592,12 +1667,15 @@ fn npm_tfa(ctx: &Ctx) -> (Outcome, Option<&'static str>, Vec<String>) {
         }
     };
     if !out.success() {
-        let first = out.stderr.lines().next().unwrap_or("error");
+        // npm's failure output is the single most dangerous string in this
+        // module to republish: a misconfigured `.npmrc` puts the registry URL
+        // in the error, and a registry URL can carry inline basic-auth.
+        let status = tool_failure(&out.stderr);
         return (
             Outcome::Degraded,
             Some("no-access"),
             vec![format!(
-                "npm answered `{first}` for `npm profile get` — run `npm login`. Unverified, \
+                "npm exited with {status} for `npm profile get` — run `npm login`. Unverified, \
                  not confirmed"
             )],
         );
@@ -1608,18 +1686,25 @@ fn npm_tfa(ctx: &Ctx) -> (Outcome, Option<&'static str>, Vec<String>) {
 fn classify_npm_tfa(stdout: &str) -> (Outcome, Option<&'static str>, Vec<String>) {
     let profile: serde_json::Value = match serde_json::from_str(stdout) {
         Ok(v) => v,
-        Err(err) => {
+        Err(_) => {
             return (
                 Outcome::Degraded,
                 Some("scan-error"),
-                vec![format!("`npm profile get --json` did not parse: {err}")],
-            )
+                // The parse error is withheld along with the payload. `npm
+                // profile get` prints the profile, and a profile that will not
+                // parse is still a profile.
+                vec!["`npm profile get --json` did not return JSON".to_string()],
+            );
         }
     };
+    // The npm profile payload also carries `email`, `fullname`, `created` and
+    // more. Only the username is read, and only after bounding — nothing else
+    // in that document is this control's business.
     let who = profile
         .get("name")
         .and_then(|n| n.as_str())
-        .unwrap_or("the npm account");
+        .map(safe_label)
+        .unwrap_or_else(|| "the npm account".to_string());
     // npm reports `tfa` as an object `{mode: ...}`, as a bare string, or as
     // `null`/`false` when no second factor is enrolled at all. All three
     // spellings have been seen from the same CLI across versions.
@@ -1649,12 +1734,20 @@ fn classify_npm_tfa(stdout: &str) -> (Outcome, Option<&'static str>, Vec<String>
                  moving to Trusted Publishing"
             )],
         ),
-        Some(other) => (
+        // A mode outside npm's vocabulary is NOT echoed, and `safe_label` is
+        // deliberately not used here. `tfa.mode` is a closed enum, not a name:
+        // a value that is not one of the known modes is not a mode at all, and
+        // a secret can be perfectly well-formed as an identifier — which is
+        // exactly how `no_tool_output_is_ever_echoed_into_a_published_message`
+        // caught this line echoing a planted credential that passed every
+        // charset and length bound. Report the fact, withhold the value.
+        Some(_) => (
             Outcome::Fail,
             None,
             vec![format!(
-                "npm `{who}`: tfa.mode = {other}, which is weaker than `auth-and-writes` — the \
-                 publish itself is not behind a second factor"
+                "npm `{who}`: tfa.mode is a value npm does not document (withheld — an \
+                 unrecognised value is not a mode, and could be anything), which is not \
+                 `auth-and-writes` — treat the publish as not behind a second factor"
             )],
         ),
         None => (
@@ -3243,7 +3336,10 @@ mod tests {
         let (o, reason, m) = classify_npm_tfa("not json");
         assert_eq!(o, Outcome::Degraded);
         assert_eq!(reason, Some("scan-error"));
-        assert!(m[0].contains("did not parse"), "{m:?}");
+        assert!(m[0].contains("did not return JSON"), "{m:?}");
+        // The unparseable payload is withheld along with the parse error: a
+        // profile that will not parse is still a profile.
+        assert!(!m[0].contains("not json"), "{m:?}");
     }
 
     #[test]
@@ -4275,11 +4371,19 @@ mod tests {
         let (o, reason, m) = classify_npm_tfa(r#"{"name":"me","tfa":{"mode":"some-new-mode"}}"#);
         assert_eq!(o, Outcome::Fail);
         assert_eq!(reason, None);
-        assert!(m[0].contains("weaker than `auth-and-writes`"), "{m:?}");
+        assert!(m[0].contains("not `auth-and-writes`"), "{m:?}");
+        // The value is deliberately NOT named. `tfa.mode` is a closed enum, so
+        // a value outside it is not a mode — and this message is signed and
+        // published, where "it looked like a plain identifier" is not a good
+        // enough reason to copy a credential-holding tool's output. A planted
+        // secret passing every charset and length bound is exactly how
+        // `no_tool_output_is_ever_echoed_into_a_published_message` caught this
+        // line leaking.
         assert!(
-            m[0].contains("some-new-mode"),
-            "the mode must be named: {m:?}"
+            !m[0].contains("some-new-mode"),
+            "an undocumented mode must be withheld, not echoed: {m:?}"
         );
+        assert!(m[0].contains("withheld"), "{m:?}");
     }
 
     /// A credential for a registry with NO OIDC alternative is unavoidable, so
@@ -4336,6 +4440,127 @@ mod tests {
             2,
             "{joined}"
         );
+    }
+
+    // ──────────────── nothing a tool says is ever republished ───────────────
+
+    /// The load-bearing security property of this module, asserted end to end.
+    ///
+    /// `maintainer-mfa` and `trusted-publishing` ask CREDENTIAL-HOLDING
+    /// commands about an ACCOUNT, and a `VerifyResult`'s `messages` are not
+    /// merely printed: `machine.rs` serializes them into `--format json` and
+    /// into the local-scan record that is SIGNED, COMMITTED and PUBLISHED to
+    /// the public directory. So a byte of `npm`'s stderr reaching a message is
+    /// not a log-hygiene nit — it is a credential in a signed artifact, from
+    /// the tool whose entire purpose is stopping that.
+    ///
+    /// Every case below hands the verifier a plausible hostile answer with a
+    /// distinctive secret in it, and asserts the secret appears in NO message.
+    /// Each string is fake and none is a live credential.
+    #[test]
+    fn no_tool_output_is_ever_echoed_into_a_published_message() {
+        const SECRET: &str = "SUPERSECRETVALUE";
+        let (dir, _) = crate::testutil::repo_with_gh_repo("o/r", "main");
+        let root = dir.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+        );
+        write(root, "package.json", r#"{"name":"x","version":"1.0.0"}"#);
+        crate::init::bootstrap(root).unwrap();
+
+        // A real shape: npm puts the registry URL in its error, and a
+        // misconfigured .npmrc makes that URL carry inline basic-auth.
+        let npm_stderr = format!(
+            "echo 'npm ERR! 401 Unauthorized - GET https://user:{SECRET}@registry.npmjs.org/-/whoami' >&2; exit 1"
+        );
+        // A profile whose free-form fields carry things nobody should publish.
+        let npm_profile = format!(
+            "cat <<'EOF'\n{{\"name\":\"me {SECRET}\",\"email\":\"me@example.com\",\"tfa\":{{\"mode\":\"{SECRET}\"}}}}\nEOF"
+        );
+        let gh_stderr = format!("echo 'gh: 403 Forbidden (token ghp_{SECRET})' >&2; exit 1");
+        let gh_user = format!(
+            "cat <<'EOF'\n{{\"login\":\"me {SECRET}\",\"email\":\"me@example.com\",\"two_factor_authentication\":false}}\nEOF"
+        );
+
+        for (label, gh, npm) in [
+            ("npm stderr", "echo '{}'", npm_stderr.as_str()),
+            ("npm payload", "echo '{}'", npm_profile.as_str()),
+            ("gh stderr", gh_stderr.as_str(), "echo '{}'"),
+            ("gh payload", gh_user.as_str(), "echo '{}'"),
+        ] {
+            let results = crate::testutil::with_env(|lock| {
+                lock.fake_tool("gh", gh);
+                lock.fake_tool("npm", npm);
+                let ctx = Ctx::discover(root).unwrap();
+                let cfg = ctx.require_config().unwrap();
+                vec![
+                    verify_maintainer_mfa(&ctx, cfg),
+                    verify_trusted_publishing(&ctx, cfg),
+                ]
+            });
+            for r in &results {
+                let joined = r.messages.join("\n");
+                assert!(
+                    !joined.contains(SECRET),
+                    "{label}: `{}` republished tool output into a message that gets SIGNED and \
+                     PUBLISHED:\n{joined}",
+                    r.control
+                );
+            }
+        }
+    }
+
+    /// The bound itself, at its edges. A label that is not a plain identifier
+    /// is REFUSED rather than truncated: a truncated secret is still a secret
+    /// prefix, and half a token in a signed record is not half a problem.
+    #[test]
+    fn safe_label_passes_plain_identifiers_and_refuses_everything_else() {
+        for ok in [
+            "p4gs",
+            "some-user",
+            "user.name",
+            "a_b",
+            "me@example.com",
+            "o/r",
+        ] {
+            assert_eq!(safe_label(ok), ok, "{ok} is a plain identifier");
+        }
+        for bad in [
+            "",
+            "   ",
+            "user name",              // whitespace splices a message
+            "https://u:pw@registry/", // inline basic-auth
+            "tok\nen",                // a newline forges a second line
+            "café",                   // non-ascii
+        ] {
+            assert_eq!(
+                safe_label(bad),
+                "(unprintable)",
+                "{bad:?} must be refused, not published"
+            );
+        }
+        // Over-length is refused whole, never truncated to a secret prefix.
+        let long = "a".repeat(MAX_ECHOED + 1);
+        assert_eq!(safe_label(&long), "(unprintable)");
+        assert_eq!(safe_label(&"a".repeat(MAX_ECHOED)), "a".repeat(MAX_ECHOED));
+    }
+
+    /// A failed tool is reported by STATUS, never by output. The status is the
+    /// whole diagnostic value of the line it replaces — authenticate, grant a
+    /// scope, or look elsewhere — and it is the one part that cannot carry a
+    /// credential.
+    #[test]
+    fn tool_failure_reports_a_status_and_never_the_output() {
+        assert_eq!(
+            tool_failure("npm ERR! 401 Unauthorized - GET https://u:pw@registry/"),
+            "HTTP 401"
+        );
+        assert_eq!(tool_failure("gh: Not Found (HTTP 404)"), "HTTP 404");
+        let opaque = tool_failure("something went wrong with token ghp_abcdef");
+        assert!(!opaque.contains("ghp_abcdef"), "{opaque}");
+        assert!(opaque.contains("output withheld"), "{opaque}");
     }
 
     // ─────────────────────── reporting surfaces ────────────────────────────
