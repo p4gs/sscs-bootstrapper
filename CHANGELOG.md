@@ -8,6 +8,34 @@ versions.
 
 ## [Unreleased]
 
+### Changed
+
+- **The `SKILL.md`-is-not-a-release-asset-yet disclosure is gone, because it
+  stopped being true.** `release.yml` had staged and signed `SKILL.md` for
+  several releases, but no *published* tag carried it, so `docs/skill.md`,
+  `README.md`, the skill and `AGENTS.md` each said so and a test —
+  `every_surface_showing_the_recipe_discloses_that_the_asset_is_not_published_yet`
+  — held the sentence on all four surfaces, with its own deletion instructions
+  in a `WHEN_TO_DELETE` constant. `v0.4.0`, published 2026-09-11, attaches 17
+  assets including `SKILL.md` and `SKILL.md.sigstore.json`, which is exactly the
+  precondition that constant named. The hedge, the test and the
+  `ASSET_PENDING_NOTICE` / `ASSET_PENDING_FIRST_TAG` constants it read are
+  removed together, as that constant required.
+
+  The prose around them was rewritten rather than merely cut. Steps 3, 5 and 6
+  of the recipe were documented as "not runnable against a published tag,
+  substitute a platform tarball"; they now run against `SKILL.md` itself, and
+  the worked examples in `docs/skill.md` and `README.md` say `TAG=v0.4.0`
+  instead of `v0.3.1` so the recipe is copy-pasteable end to end. The "a release
+  publishes 17 assets" claim no longer carries an aspirational qualifier, and
+  §2 of `docs/skill.md` is no longer prefaced "read this whole section in the
+  future tense". What survives is the part that is still a fact and not a
+  hedge: `v0.3.1` and earlier were cut from a tree that did not stage the asset,
+  attach 15 files rather than 17, and need a tarball substituted — now stated
+  as a version note under **Before you start: which tags the recipe runs
+  against** rather than as a gap in the pipeline. Verified against the live
+  release API before the change, not inferred from the workflow.
+
 ## [0.4.0] - 2026-09-11
 
 ### Added

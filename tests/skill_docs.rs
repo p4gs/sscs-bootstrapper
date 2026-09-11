@@ -33,7 +33,6 @@ const TEMPLATE_SKILL_MD: &str = include_str!("../templates/skills/sscsb/SKILL.md
 const INSTALLED_SKILL_MD: &str = include_str!("../.claude/skills/sscsb/SKILL.md");
 const README_MD: &str = include_str!("../README.md");
 const CHANGELOG_MD: &str = include_str!("../CHANGELOG.md");
-const AGENTS_MD: &str = include_str!("../AGENTS.md");
 const SKILL_RS: &str = include_str!("../src/skill.rs");
 
 /// The digest pinned over the normalized contract block.
@@ -448,85 +447,15 @@ fn every_surface_names_both_signers_not_one() {
     }
 }
 
-/// `SKILL.md` is staged and signed by `release.yml`, but no PUBLISHED tag
-/// carries it: the recipe's own worked example (`TAG=v0.3.1`) returns "no such
-/// file or directory" from step 3 while every step around it works, which reads
-/// as the reader's mistake rather than as a gap.
-///
-/// This test exists to keep the disclosure in place until the asset is real. It
-/// is deliberately a presence check, not a network call — a doc test that
-/// queried GitHub would be flaky and would not run offline.
-#[test]
-fn every_surface_showing_the_recipe_discloses_that_the_asset_is_not_published_yet() {
-    const WHEN_TO_DELETE: &str =
-        "delete this hedge only once a release contains SKILL.md — check with \
-         `gh release view <tag> --json assets`, and remove it from EVERY surface at once \
-         (docs/skill.md, README.md, templates/skills/sscsb/SKILL.md, AGENTS.md) together with \
-         this test and the sscsb::skill constants it reads";
-
-    for (name, doc) in [
-        ("docs/skill.md", SKILL_DOC_MD),
-        ("README.md", README_MD),
-        ("the skill", TEMPLATE_SKILL_MD),
-        ("AGENTS.md", AGENTS_MD),
-    ] {
-        assert!(
-            unwrapped(doc).contains(sscsb::skill::ASSET_PENDING_NOTICE),
-            "{name} must state `{}` — {WHEN_TO_DELETE}",
-            sscsb::skill::ASSET_PENDING_NOTICE
-        );
-        assert!(
-            unwrapped(doc).contains(sscsb::skill::ASSET_PENDING_FIRST_TAG),
-            "{name} states the gap without stating when it ends; it must also say `{}` — \
-             {WHEN_TO_DELETE}",
-            sscsb::skill::ASSET_PENDING_FIRST_TAG
-        );
-    }
-
-    // The document must also tell the reader what they CAN run today, or the
-    // disclosure is a dead end.
-    for claim in [
-        "3 — `cosign verify-blob` | yes, with a platform tarball substituted for `SKILL.md`",
-        "4 — the closure loop | yes, over the whole published set",
-    ] {
-        assert!(
-            SKILL_DOC_MD.contains(claim),
-            "docs/skill.md must say which steps are runnable against a published tag: `{claim}`"
-        );
-    }
-
-    // A hedge that arrives after the claim it qualifies has already been read
-    // is not a hedge. `docs/skill.md` asserted twice that a release publishes
-    // 17 assets — flatly, in reading order, hundreds of lines BEFORE the
-    // section explaining that `SKILL.md` is not among them yet — so a reader
-    // going front-to-back learned the count as fact and only later learned it
-    // was aspirational. Every count claim must be qualified at or before its
-    // FIRST use.
-    let flat = unwrapped(SKILL_DOC_MD);
-    let first_notice = flat
-        .find(sscsb::skill::ASSET_PENDING_NOTICE)
-        .expect("the notice is asserted above");
-    let first_count = ["publishes 17 ", "publishes **17** "]
-        .iter()
-        .filter_map(|n| flat.find(n))
-        .min()
-        .expect("docs/skill.md states the asset count");
-    assert!(
-        first_notice < first_count,
-        "docs/skill.md states the release asset count at byte {first_count} but does not \
-         disclose that `SKILL.md` is not a release asset yet until byte {first_notice} — \
-         qualify the count at first use, or move the disclosure above it. {WHEN_TO_DELETE}"
-    );
-
-    // …and the release.yml staging that makes the promise true is still there,
-    // so the hedge cannot outlive a pipeline that stopped shipping the asset.
-    let yml = workflow(".github/workflows/release.yml");
-    assert!(
-        literal_dist_files(&yml).contains(&sscsb::skill::ASSET_NAME.to_string()),
-        "release.yml no longer stages {} — the hedge promises a release that will never come",
-        sscsb::skill::ASSET_NAME
-    );
-}
+// Removed in the release after v0.4.0: for as long as `release.yml` staged and
+// signed `SKILL.md` but no PUBLISHED tag carried it, every surface showing the
+// recipe had to disclose that, and
+// `every_surface_showing_the_recipe_discloses_that_the_asset_is_not_published_yet`
+// held the disclosure in place. `v0.4.0` published 17 assets including
+// `SKILL.md` and `SKILL.md.sigstore.json`, so the disclosure became false and
+// went, along with the `ASSET_PENDING_*` constants it read. What it also
+// guarded is not lost: that `release.yml` still stages the asset is asserted by
+// `replay()` itself, which every counting test above runs through.
 
 // ─────────────────────────────── the contract ───────────────────────────────
 

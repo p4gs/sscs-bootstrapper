@@ -130,7 +130,7 @@ pinning the wrong signer. That is the path on which the verification recipe in
 [docs/skill.md](docs/skill.md) is actually reachable:
 
 ```sh
-TAG=v0.3.1                                  # the version you MEANT to install
+TAG=v0.4.0                                  # the version you MEANT to install
 gh release download "$TAG" --repo p4gs/sscs-bootstrapper --dir sscsb-release
 cd sscsb-release
 cosign verify-blob sscsb-"$TAG"-x86_64-unknown-linux-gnu.tar.gz \
@@ -145,12 +145,12 @@ That proves which pipeline produced those bytes. It is not a judgement of their
 content — see [docs/skill.md](docs/skill.md), which states both claims at their
 real strength.
 
-One gap, stated plainly: `SKILL.md` is not a release asset yet. `release.yml`
-stages and signs it, but the first release whose assets include it is the first
-tag cut after this change lands — the worked example above uses a platform
-tarball precisely because that is what every published tag actually carries.
-Steps in `docs/skill.md` that name `SKILL.md` become runnable from the next
-release onward; every other step works today.
+The example above verifies a platform tarball, but `SKILL.md` is a release asset
+in its own right and verifies exactly the same way: `v0.4.0` is the first tag
+that carries it, so every step of `docs/skill.md` — the ones naming `SKILL.md`
+included — runs verbatim against that tag and later. On `v0.3.1` and earlier a
+release attaches 15 assets rather than 17, and the `SKILL.md` steps need a
+tarball substituted.
 
 Or from source — note that a source build has no release asset, no Cosign bundle
 and no attestation, so none of the verification above applies to it:

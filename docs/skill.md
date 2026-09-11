@@ -247,14 +247,6 @@ only check left that means anything.
 
 ### 2. The release asset — the claim that does not depend on us
 
-> **Read this whole section in the future tense.** `SKILL.md` is not a release
-> asset yet — `release.yml` stages and signs it, but no tag published so far was
-> cut from a tree that did, so every count below describes what a release *of
-> this repository's current shape* publishes, not what you will find attached to
-> the newest tag today. The gap, and when it closes, is
-> [spelled out before the recipe](#before-you-start-skillmd-is-not-a-release-asset-yet);
-> nothing here is worth reading as a promise about an existing download.
->
 > Every file in an `sscsb` release carries a signature, `SKILL.md` included —
 > but not all of them are signed by the same identity, and the difference is
 > the whole point of `--certificate-identity`. A release of this repository's
@@ -286,11 +278,9 @@ does not answer *should I run this*, and nothing in this document claims it does
 Three of the statements in this document are statements about *counts*, and a
 reader running the closure check in step 4 sees every one of these files. For
 this repository's current build fan-out — three platform targets — a release
-publishes **17** assets. Future tense again, for the same reason as above:
-`SKILL.md` is one of the 17, and
-[`SKILL.md` is not a release asset yet](#before-you-start-skillmd-is-not-a-release-asset-yet).
-A tag cut before that change lands attaches 15 — the same table without the
-`SKILL.md` row and without its bundle.
+publishes **17** assets, `SKILL.md` among them. `v0.4.0` is the first tag that
+carries it; anything older attaches 15 — the same table without the `SKILL.md`
+row and without its bundle.
 
 | What | How many | Cosign bundle | Attested |
 |------|---------:|---------------|----------|
@@ -349,35 +339,17 @@ Every step below uses a tool you obtain from somewhere that is not us. That is
 the point: a verification performed entirely with software the publisher shipped
 you is a publisher telling you about itself.
 
-### Before you start: `SKILL.md` is not a release asset yet
+### Before you start: which tags the recipe runs against
 
-`release.yml` stages `SKILL.md` into `dist/` and the signing loop covers it, so
-the pipeline described above is real — but it is newer than every tag published
-so far. **The first release whose assets include `SKILL.md` and
-`SKILL.md.sigstore.json` is the first tag cut after this change lands.** Any tag
-published before that carries those two files fewer than the counts above, and
-`gh release download` will simply not produce a `SKILL.md` for it.
+Every step below runs verbatim against **`v0.4.0` and later**, `SKILL.md` steps
+included: `release.yml` stages `SKILL.md` into `dist/`, the signing loop covers
+it, and the published release carries both it and `SKILL.md.sigstore.json`.
 
-This matters because everything *around* the gap works. Real Cosign verifies the
-real published tarballs, and the closure loop in step 4 prints `closed` over a
-real release. A reader who runs step 3 verbatim against a published tag gets
-`no such file or directory` from an otherwise-working recipe and reasonably
-concludes the mistake is theirs. It is not.
-
-What you can run **today**, against any published tag:
-
-| Step | Against a published tag |
-|------|-------------------------|
-| 0, 1, 2 | yes |
-| 3 — `cosign verify-blob` | yes, with a platform tarball substituted for `SKILL.md` |
-| 4 — the closure loop | yes, over the whole published set |
-| 5 — `gh attestation verify` | yes, with a platform tarball substituted |
-| 6 — `slsa-verifier verify-artifact` | yes, with a platform tarball substituted |
-| any step naming `SKILL.md` | from the next release onward |
-
-The steps are written against `SKILL.md` because that is what this document is
-about. Substituting a tarball changes nothing about what each step proves — the
-signature, the attestations and the provenance cover both the same way.
+Older tags — `v0.3.1` and before — were cut from a tree that did not stage it,
+so they attach 15 assets rather than 17 and `gh release download` produces no
+`SKILL.md` for them. On such a tag, run the `SKILL.md` steps against a platform
+tarball instead: substituting one changes nothing about what each step proves —
+the signature, the attestations and the provenance cover both the same way.
 
 ### 0. Get the tools from an independent source
 
@@ -394,7 +366,7 @@ Pick the version from a changelog, a release announcement, or the pin in your ow
 dependency manifest. Write it down before you download anything.
 
 ```sh
-TAG=v0.3.1                      # ← the version you MEANT to install
+TAG=v0.4.0                      # ← the version you MEANT to install
 REPO=p4gs/sscs-bootstrapper
 ```
 
@@ -411,9 +383,9 @@ one `*.intoto.jsonl` provenance envelope, `SKILL.md`, and a `*.sigstore.json`
 bundle beside every one of those except the provenance envelope itself — 17
 files for a release of this repository's current shape, broken down in
 [what a release actually contains](#what-a-release-actually-contains). On a tag
-published before this change, `SKILL.md` and its bundle are the two that are not
-there; see
-[`SKILL.md` is not a release asset yet](#before-you-start-skillmd-is-not-a-release-asset-yet).
+older than `v0.4.0`, `SKILL.md` and its bundle are the two that are not there;
+see
+[which tags the recipe runs against](#before-you-start-which-tags-the-recipe-runs-against).
 
 ### 3. Verify the signature on `SKILL.md`
 
