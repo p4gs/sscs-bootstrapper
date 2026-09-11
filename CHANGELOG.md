@@ -8,6 +8,8 @@ versions.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-11
+
 ### Added
 
 - **`binary-artifacts` (phase 1, on by default).** Every file git tracks is
