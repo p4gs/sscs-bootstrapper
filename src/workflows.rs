@@ -396,7 +396,7 @@ fn shape_of(dest: &str) -> Shape {
 }
 
 /// The verdict on one installed artifact's contents.
-enum ShapeVerdict {
+pub(crate) enum ShapeVerdict {
     /// Structurally sound as far as this artifact kind can be checked.
     Sound(String),
     /// Present and non-empty, but sscsb's parser cannot confirm it — reported
@@ -425,7 +425,7 @@ fn strip_lines_starting_with(content: &str, marker: &str) -> String {
         .join("\n")
 }
 
-fn check_workflow(dest: &str, content: &str) -> ShapeVerdict {
+pub(crate) fn check_workflow(dest: &str, content: &str) -> ShapeVerdict {
     let docs = match YamlLoader::load_from_str(content) {
         Ok(d) => d,
         Err(err) => {
@@ -867,7 +867,7 @@ fn subject_input_set(step: &Yaml) -> bool {
 /// inside the braces. Anything else — including an expression sscsb cannot
 /// evaluate — is NOT treated as false: this gate exists to catch the switch
 /// left off, not to model the expression language.
-fn constant_false(cond: &Yaml) -> Option<String> {
+pub(crate) fn constant_false(cond: &Yaml) -> Option<String> {
     match cond {
         Yaml::Boolean(false) => Some("false".to_string()),
         Yaml::String(s) => {
@@ -891,7 +891,7 @@ fn constant_false(cond: &Yaml) -> Option<String> {
 /// What followed a simple command — the two operators that change what the
 /// command's exit status means for the verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Sep {
+pub(crate) enum Sep {
     /// Newline, `;` or end of input — a real command terminator.
     Other,
     /// `&&` — the next command runs only when this one succeeds, and the
@@ -912,9 +912,9 @@ enum Sep {
 
 /// One simple command of a `run:` body: its shell words and what ended it.
 #[derive(Debug, PartialEq, Eq)]
-struct ShellCommand {
-    words: Vec<String>,
-    sep: Sep,
+pub(crate) struct ShellCommand {
+    pub(crate) words: Vec<String>,
+    pub(crate) sep: Sep,
 }
 
 /// The state of [`shell_commands`] while it walks a script.
@@ -1007,7 +1007,7 @@ impl Tokeniser {
 /// `<<<` is a here-string, not a heredoc. Nothing is expanded — `$f` stays
 /// `$f` — because the question is what the author wrote, not what it would
 /// evaluate to.
-fn shell_commands(script: &str) -> Vec<ShellCommand> {
+pub(crate) fn shell_commands(script: &str) -> Vec<ShellCommand> {
     let mut t = Tokeniser::default();
     let mut chars = script.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1138,7 +1138,7 @@ fn is_shell_assignment(word: &str) -> bool {
 /// compound-command openers (`do`, `then`, `{`, …) are skipped, so
 /// `for f in dist/*; do cosign sign-blob …` and `env COSIGN_YES=1 cosign …`
 /// both name `cosign`.
-fn command_word(words: &[String]) -> Option<(&str, &[String])> {
+pub(crate) fn command_word(words: &[String]) -> Option<(&str, &[String])> {
     command_index(words).map(|i| (words[i].as_str(), &words[i + 1..]))
 }
 
@@ -1162,7 +1162,7 @@ fn case_arm_pattern_end(words: &[String]) -> usize {
 }
 
 /// The index of the command word in `words` — see [`command_word`].
-fn command_index(words: &[String]) -> Option<usize> {
+pub(crate) fn command_index(words: &[String]) -> Option<usize> {
     let mut i = case_arm_pattern_end(words);
     while i < words.len() {
         let w = words[i].as_str();
@@ -2338,7 +2338,7 @@ fn cosign_sign_in_run(run: &str) -> Option<SigningShortfalls> {
 /// The shell a `run:` step executes under, as GitHub resolves it: the step's
 /// `shell:`, else the job's `defaults.run.shell`, else the workflow's. `None`
 /// is the runner default.
-fn effective_shell<'a>(doc: &'a Yaml, job: &'a Yaml, step: &'a Yaml) -> Option<&'a str> {
+pub(crate) fn effective_shell<'a>(doc: &'a Yaml, job: &'a Yaml, step: &'a Yaml) -> Option<&'a str> {
     [
         &step["shell"],
         &job["defaults"]["run"]["shell"],
@@ -2360,7 +2360,7 @@ fn effective_shell<'a>(doc: &'a Yaml, job: &'a Yaml, step: &'a Yaml) -> Option<&
 /// of the script (`bash -c 'exit 0; {0}'`), an extra bare word beside the
 /// placeholder, or options with no `{0}` at all (the runner then starts
 /// `bash -e` with no script and the body never runs).
-fn is_posix_shell(shell: Option<&str>) -> bool {
+pub(crate) fn is_posix_shell(shell: Option<&str>) -> bool {
     let Some(shell) = shell else {
         return true;
     };
@@ -2417,7 +2417,7 @@ fn shell_sets_pipefail(shell: Option<&str>) -> bool {
 
 /// `continue-on-error: true` on a job or a step, as YAML `true` or the
 /// string `'true'`. Any expression is left alone.
-fn continues_on_error(node: &Yaml) -> bool {
+pub(crate) fn continues_on_error(node: &Yaml) -> bool {
     match &node["continue-on-error"] {
         Yaml::Boolean(b) => *b,
         Yaml::String(s) => s.trim() == "true",
@@ -2451,7 +2451,7 @@ fn step_uses(step: &Yaml) -> Option<&str> {
 
 /// How a step is named in a message: its `name:` if it has one, else its
 /// 1-based position in the job.
-fn step_label(index: usize, step: &Yaml) -> String {
+pub(crate) fn step_label(index: usize, step: &Yaml) -> String {
     match step["name"].as_str() {
         Some(n) if !n.trim().is_empty() => format!("step `{}`", n.trim()),
         _ => format!("step #{}", index + 1),
@@ -2848,7 +2848,7 @@ fn dead_trigger(doc: &Yaml, trigger: &str) -> Option<String> {
 
 /// `push`, or `push (tags filter not evaluated)` — the trigger named
 /// together with what sscsb did NOT check about it.
-fn describe_trigger(doc: &Yaml, trigger: &str) -> String {
+pub(crate) fn describe_trigger(doc: &Yaml, trigger: &str) -> String {
     let filters = trigger_filters(doc, trigger);
     if filters.is_empty() {
         return format!("`{trigger}`");
@@ -2861,7 +2861,7 @@ fn describe_trigger(doc: &Yaml, trigger: &str) -> String {
 }
 
 /// The first automatic trigger that is not filtered down to nothing.
-fn automatic_trigger(doc: &Yaml) -> Option<String> {
+pub(crate) fn automatic_trigger(doc: &Yaml) -> Option<String> {
     trigger_names(doc)
         .into_iter()
         .filter(|t| AUTOMATIC_TRIGGERS.contains(&t.as_str()))
@@ -2869,17 +2869,17 @@ fn automatic_trigger(doc: &Yaml) -> Option<String> {
 }
 
 /// One workflow file as the recognizer sees it: committed, readable, parsed.
-struct WorkflowFile {
-    rel: String,
-    content: String,
-    docs: Vec<Yaml>,
+pub(crate) struct WorkflowFile {
+    pub(crate) rel: String,
+    pub(crate) content: String,
+    pub(crate) docs: Vec<Yaml>,
 }
 
 /// The candidate set plus every reason a file under `.github/workflows/`
 /// was NOT a candidate, so "absent" is never quietly "unexamined".
-struct WorkflowSet {
-    files: Vec<WorkflowFile>,
-    notes: Vec<String>,
+pub(crate) struct WorkflowSet {
+    pub(crate) files: Vec<WorkflowFile>,
+    pub(crate) notes: Vec<String>,
 }
 
 /// Where a candidate's bytes come from.
@@ -2999,7 +2999,7 @@ fn on_disk_workflows(ctx: &Ctx) -> Vec<String> {
 /// working-tree edit can be evidence — what is examined is what a fresh clone
 /// would carry. Only when there is no git repository to ask does this fall
 /// back to the directory listing, and it says so.
-fn committed_workflows(ctx: &Ctx) -> WorkflowSet {
+pub(crate) fn committed_workflows(ctx: &Ctx) -> WorkflowSet {
     let on_disk = on_disk_workflows(ctx);
     let (mut candidates, mut notes) = committed_workflow_names(ctx, &on_disk);
     candidates.sort_by(|a, b| a.0.cmp(&b.0));

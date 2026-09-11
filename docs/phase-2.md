@@ -14,6 +14,7 @@ the question the AI era added — *is this package even real?*
 | `bumblebee` | Known-compromised packages, MCP servers, extensions and agent skills present on the endpoint | Bumblebee | off |
 | `grype` | SBOM-first vulnerability scanning | Grype | off |
 | `socket-firewall` | Malicious-package blocking at install time | Socket | off |
+| `socket-firewall-ci` | Committed workflows route each job's first install through `sfw` | (native) | off |
 
 ## SBOM
 
@@ -387,7 +388,7 @@ Off by default: it needs a catalog you may not have, which is the same reason
 Dependency-Track and GUAC are off. Note also that bumblebee has **no Cargo/Rust
 ecosystem** — for a Rust repository the value is the endpoint surface, not the lockfile.
 
-## The optional two
+## The optional ones
 
 **Grype** (`sscsb enable grype`) scans the SBOM rather than the source tree. If
 your workflow is SBOM-first — you build a BOM, then reason about it — Grype fits
@@ -397,5 +398,109 @@ provides, which is why it is off by default rather than absent.
 **Socket** (`sscsb enable socket-firewall`) blocks malicious packages at install
 time, catching install-scripts, obfuscated payloads, and telemetry exfiltration
 that a CVE database will never list because they were never disclosed — they were
-just published. It needs a Socket account, so it is off by default; when enabled
-and unconfigured, the control reports `DEGRADED` and tells you what is missing.
+just published. `sscsb verify socket-firewall` asks one question: is the `sfw`
+CLI on **this machine's** PATH? Absent is `DEGRADED`, present is `PASS`.
+
+Socket Firewall **Free** needs neither an account nor an API key — an earlier
+version of this page said it needed an account, and that was wrong. It is off by
+default for a different reason: putting a proxy in front of every install is a
+decision about how your builds fetch, not a binary you drop in.
+
+## Socket Firewall in CI — the half a clone can check
+
+`socket-firewall` describes a machine. `socket-firewall-ci`
+(`sscsb enable socket-firewall-ci`) asks the repository-observable question
+instead: **do this repository's committed workflows put their package-manager
+installs behind Socket Firewall?** The two are additive and independent —
+enabling one does nothing to the other.
+
+Every subject is a file committed at HEAD under `.github/workflows/`, read
+through `git show HEAD:<path>`, so an uncommitted edit is never evidence and
+anyone cloning the repository reaches the same verdict. No tool is run and no
+network call is made.
+
+### Only Socket Firewall Free's ecosystems can fail
+
+Socket Firewall Free proxies exactly **npm, yarn, pnpm, pip (including
+`python -m pip`), uv and cargo**. Go, Maven, Gradle, Bundler, gem, dotnet and
+NuGet are Enterprise-only; bun, composer, apt, brew and rustup are not proxied at
+any tier. Only a free-tier acquisition can produce a `FAIL` — failing a
+maintainer for an ecosystem the free tool *cannot* protect would be a false
+positive by construction. Enterprise and unsupported acquisitions are reported as
+information, and a repository whose only installs are Enterprise-tier verifies
+`INFO`, never `PASS` and never `FAIL`.
+
+### The first-acquisition rule
+
+The unit of judgement is **(job, ecosystem)**, and a local composite action
+(`uses: ./…`) is spliced into the calling job at the position of the step that
+uses it. For each pair, the **first** acquisition in step order must carry the
+`sfw` prefix:
+
+```yaml
+- run: sfw cargo fetch --locked        # ← the one step that has to change
+- run: cargo build --release --locked  # reads the filtered cache; silent
+```
+
+That is a one-step remedy per job, and it is why the control does not demand a
+prefix on every matrix `cargo test`.
+
+### Acquiring subcommands are an allowlist
+
+`npm ci|install|i|add`, `yarn install|add` (a bare `yarn` is `yarn install`),
+`pnpm install|i|add|fetch`, `pip install|download`, `uv pip install|sync|add|
+tool install`, and `cargo fetch|add|install|update|build|test|check|clippy|bench|
+doc|run|publish|llvm-cov|nextest`. **An unrecognised subcommand is not an
+acquisition** — `cargo fmt`, `npm run build` and `npm test` are silent, and
+detection fails open on purpose: a missed install is a gap disclosed below, while
+an invented one sends a maintainer to fix something that is not broken.
+
+Recognition runs on the same shell tokeniser `sscsb` uses for signing steps, not
+on string matching, so an install inside a heredoc, a comment or a quoted string
+is text rather than a command, and `sudo`, `env`, `time` and `FOO=1` prefixes
+hide neither the manager (`sudo npm ci` fails) nor the firewall (`sudo sfw npm
+ci` passes).
+
+### What it does not fail on, deliberately
+
+`sscsb`'s cosign recogniser treats `!`, condition position, `set +e`, `||`, `|`
+and `&` as shortfalls, because a signature whose failure was swallowed proves
+nothing. None of those apply here and importing them would be a bug:
+`sfw npm ci || true` still ran the install **through the firewall**, which is the
+whole question.
+
+### Verdicts
+
+| Verdict | When |
+|---------|------|
+| `PASS` | every first free-tier acquisition per (job, ecosystem) carries `sfw` |
+| `FAIL` | at least one does not |
+| `INFO` | an inventory exists, but no free-tier acquisition is in it |
+| `DEGRADED` `no-inventory` | workflows parsed, no acquisition of any tier found — nothing was verified, which is not a pass |
+| `DEGRADED` `scan-error` | HEAD could not be read, so no committed content is available |
+
+A workflow reachable only by hand (`workflow_dispatch`, `workflow_call` with no
+caller), one GitHub would refuse to run, a job or step switched off with a
+constant-false `if:`, and a `run:` body handed to something other than a POSIX
+shell are each named in the output as **not examined** rather than silently
+counted as clean.
+
+### Four disclosed misses
+
+1. **PATH shimming is not read.** `SocketDev/action`'s `shims: true` — which
+   puts firewall shims on PATH so an *unprefixed* install is proxied anyway — is
+   unreleased upstream. When it ships, an unprefixed install under it will be
+   protected and this control will still read it as unprotected.
+2. **Indirect acquisition is not followed.** `npm run build` whose package
+   script installs, or a `make deps` target that does, is invisible here. Only
+   the command written in the `run:` body is judged.
+3. **Composites are spliced one level deep.** A composite action that itself
+   uses another local action is named in the output and not followed.
+4. **It proves what the workflow says, not what happened.** A `PASS` means the
+   committed YAML routes the install through `sfw`. It is not evidence that the
+   workflow ran, that `sfw` resolved on PATH when it did, or that the proxy
+   blocked anything.
+
+Its own repository is the worked example: `sscsb` itself **fails** this control
+today, with six findings across `ci.yml` and `release.yml`, and it ships off so
+that gap is visible rather than silently absorbed.
