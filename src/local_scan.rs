@@ -119,7 +119,14 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// The directory scoring methodology this record was built against — contract
 /// line `methodology-version`. Matches `METHODOLOGY_VERSION` in the site's
 /// `config.ts`. A record missing it fails the site's `validateScanRecord`.
-pub const METHODOLOGY_VERSION: u32 = 1;
+///
+/// 2: `branch-protection` reads classic protection and the public
+/// `protected` flag (a classic-only branch no longer scores as unprotected;
+/// an unreadable one is Degraded, not Fail); `workflow-audit-extended`
+/// detects script injection; `sbom`/`vuln-scan` gate on findings, not tool
+/// presence, and rows carry `degraded_reason`; three new controls
+/// (`dependency-pinning`, `binary-artifacts`, `webhooks`).
+pub const METHODOLOGY_VERSION: u32 = 2;
 
 /// The **committed** repo-relative path the record lives at — contract line
 /// `record-path`. `sscsb init` ignores `.sscsb/out/` and nothing else, so this

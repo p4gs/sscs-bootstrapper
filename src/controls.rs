@@ -381,7 +381,7 @@ pub const CONTROLS: &[ControlDef] = &[
         id: "workflow-audit-extended",
         phase: 4,
         name: "Extended workflow audit",
-        summary: "pull_request_target misuse, credential persistence, secret echo, risky actions",
+        summary: "pull_request_target misuse, script injection, credential persistence, secret echo, risky actions",
         default_enabled: true,
         tools: &[],
         default_options: &[],

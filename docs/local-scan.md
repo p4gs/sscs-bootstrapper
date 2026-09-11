@@ -43,7 +43,7 @@ anchor-namespaces    git,sscsb-scan-record
 signed-bytes         the bytes of .sscsb/scan-record.local.json, verbatim
 record-shape         ScanRecord
 schema-version       1
-methodology-version  1
+methodology-version  2
 record-fields        schema_version methodology_version repo scanned_at scanner request_issue controls score
 repo-fields          owner name url default_branch commit description
 control-fields       id phase in_scope raw_outcome scan_outcome reclassified reason messages
@@ -237,7 +237,7 @@ every lane — plus the additive `local` block:
 ```jsonc
 {
   "schema_version": 1,
-  "methodology_version": 1,
+  "methodology_version": 2,
   "repo": {
     "owner": "p4gs",
     "name": "sscs-bootstrapper",
