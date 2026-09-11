@@ -304,7 +304,26 @@ fn git_dir() -> PathBuf {
 }
 
 /// Write `script` to `path` and make it executable.
+/// Write an executable shim, supplying the interpreter line when the caller
+/// did not.
+///
+/// The shebang is not cosmetic and its absence does not fail the same way on
+/// every platform, which is the worst combination. macOS falls back to
+/// `/bin/sh` when it execs a shebang-less text file, so a script written
+/// without one runs fine on a developer's machine; Linux returns ENOEXEC, and
+/// the test fails in CI with `Exec format error (os error 8)` — a message that
+/// names nothing the author did wrong. Six tests shipped that way and were
+/// green locally.
+///
+/// Every pre-existing caller already spells `#!/bin/sh` itself, so prepending
+/// only when it is missing leaves them byte-identical and makes the next
+/// caller's omission harmless.
 fn write_shim(path: &Path, script: &str) {
+    let script = if script.starts_with("#!") {
+        script.to_string()
+    } else {
+        format!("#!/bin/sh\n{script}")
+    };
     std::fs::write(path, script).unwrap();
     #[cfg(unix)]
     {
@@ -427,6 +446,37 @@ pub fn signed_release_workflow() -> String {
 #[cfg(test)]
 mod invariants {
     use super::*;
+
+    /// A shim written WITHOUT an interpreter line must still execute.
+    ///
+    /// This is a regression test for a platform split, so it only proves
+    /// anything on the platform that has the bug: macOS execs a shebang-less
+    /// text file by falling back to `/bin/sh`, while Linux returns ENOEXEC.
+    /// Six `fake_tool` callers shipped without a shebang, were green on a
+    /// developer's Mac, and failed the CI runner with `Exec format error
+    /// (os error 8)` — a message that names nothing the author did wrong.
+    /// Running the shim (rather than inspecting its bytes) is what makes this
+    /// test fail on the runner it is meant to protect.
+    #[test]
+    #[cfg(unix)]
+    fn a_shim_written_without_a_shebang_is_still_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shimless");
+        write_shim(&path, "echo ran-without-a-shebang\n");
+        let out = crate::exec::run(path.to_str().unwrap(), &[], None)
+            .expect("a shim must be executable on every unix, not just macOS");
+        assert!(out.success(), "shim exited {}: {}", out.status, out.stderr);
+        assert!(out.stdout.contains("ran-without-a-shebang"), "{out:?}");
+
+        // A caller that supplies its own interpreter line keeps it verbatim —
+        // every pre-existing caller does, and none of them may change shape.
+        let explicit = dir.path().join("explicit");
+        write_shim(&explicit, "#!/bin/sh\necho kept\n");
+        assert_eq!(
+            std::fs::read_to_string(&explicit).unwrap(),
+            "#!/bin/sh\necho kept\n"
+        );
+    }
 
     /// Every `.rs` file in `src/`, as (name, contents).
     fn crate_sources() -> Vec<(String, String)> {
