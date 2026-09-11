@@ -179,7 +179,7 @@ pub struct Finding {
 }
 
 impl Finding {
-    fn new(severity: Severity, file: &str, message: String) -> Self {
+    pub(crate) fn new(severity: Severity, file: &str, message: String) -> Self {
         Finding {
             severity,
             file: file.to_string(),
@@ -328,7 +328,7 @@ pub fn audit_workflow(file: &str, content: &str, extended: bool) -> Result<Vec<F
     Ok(findings)
 }
 
-fn jobs(doc: &Yaml) -> Vec<(&str, &Yaml)> {
+pub(crate) fn jobs(doc: &Yaml) -> Vec<(&str, &Yaml)> {
     let mut out = Vec::new();
     if let Some(jobs) = doc["jobs"].as_hash() {
         for (k, v) in jobs {
@@ -340,7 +340,7 @@ fn jobs(doc: &Yaml) -> Vec<(&str, &Yaml)> {
     out
 }
 
-fn steps(job: &Yaml) -> Vec<&Yaml> {
+pub(crate) fn steps(job: &Yaml) -> Vec<&Yaml> {
     job["steps"]
         .as_vec()
         .map(|v| v.iter().collect())
@@ -371,10 +371,25 @@ fn audit_uses_refs(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
 }
 
 /// Pin-check a single `uses:` reference. Local (`./`) actions are resolved and
-/// audited separately (see [`audit_repo`]); `docker://` images are expected to
-/// be digest-pinned elsewhere.
+/// audited separately (see [`audit_repo`]). A `docker://` image is a `uses:`
+/// ref like any other and is held to the same bar: a tag can move, a digest
+/// cannot. (Until 0.4 these were skipped as "pinned elsewhere" — nothing
+/// checked them anywhere.)
 fn check_uses_ref(file: &str, uses: &str, findings: &mut Vec<Finding>) {
-    if uses.starts_with("./") || uses.starts_with("docker://") {
+    if uses.starts_with("./") {
+        return;
+    }
+    if let Some(image) = uses.strip_prefix("docker://") {
+        if !image.contains("@sha256:") {
+            findings.push(Finding::new(
+                Severity::Error,
+                file,
+                format!(
+                    "`{uses}` runs a container image by tag — pin \
+                     `docker://{image}@sha256:<digest>`"
+                ),
+            ));
+        }
         return;
     }
     let Some((action, r)) = uses.rsplit_once('@') else {
@@ -1713,14 +1728,18 @@ jobs:
         assert!(f.is_empty(), "empty jobs map yields no findings: {f:?}");
     }
 
+    /// ISC-23: a `docker://` ref by tag is flagged like any other floating
+    /// `uses:`; a local composite action is still resolved separately; a
+    /// digest-pinned image is clean. One finding for the three, not two and
+    /// not zero.
     #[test]
-    fn local_and_docker_uses_refs_are_skipped_not_flagged() {
-        let wf = "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ./.github/actions/local\n      - uses: docker://alpine:3.19\n      - run: echo hi\n";
+    fn docker_uses_refs_are_pinned_like_any_other_and_local_refs_stay_skipped() {
+        let wf = "on: push\npermissions:\n  contents: read\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ./.github/actions/local\n      - uses: docker://alpine:3.19\n      - uses: docker://ghcr.io/acme/tool@sha256:1111111111111111111111111111111111111111111111111111111111111111\n      - run: echo hi\n";
         let f = audit_workflow("w.yml", wf, false).unwrap();
-        assert!(
-            f.is_empty(),
-            "local composite actions and docker refs are out of scope: {f:?}"
-        );
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].severity, Severity::Error);
+        assert!(f[0].message.contains("docker://alpine:3.19"));
+        assert!(f[0].message.contains("@sha256:<digest>"));
     }
 
     #[test]

@@ -213,6 +213,43 @@ and inherits nothing from it.
 `sscsb`'s own shipped templates are held to this: a test asserts that every
 workflow template it installs passes this very audit.
 
+## Committed binary artifacts
+
+```sh
+sscsb verify binary-artifacts
+```
+
+A compiled program checked in beside the source is code nobody reviewed, and a
+build ships it as if it had been built from that source — the xz backdoor
+travelled as a "test file". `binary-artifacts` reads the leading bytes of every
+file git tracks, so an ELF, PE or Mach-O executable is found whatever it is
+called (an executable committed as `logo.png` is still an executable), and it
+names the archives that carry compiled code by extension — `.jar`, `.war`,
+`.pyc`, `.whl`, `.wasm`, `.dex`, `.rpm`, `.deb`, `.msi`, `.so`, `.dylib`,
+`.dll`, `.o`, `.a`, `.iso`. Images, fonts and documents are data and are never
+flagged. Only what git tracks is examined: a binary under an ignored `target/`
+is the working tree's business, not the repository's. Any finding fails the
+control and names the path; the fix is to build it in CI from source, or fetch
+it pinned by digest at build time.
+
+## Webhook secrets
+
+```sh
+sscsb verify webhooks
+```
+
+A repository webhook without a shared secret lets anyone who learns its URL
+forge the event that drives a deploy or CI receiver — a supply-chain path with
+no commit in it. OpenSSF Scorecard registers a Webhooks check for exactly this,
+gated behind an experimental flag that no default install sets, so it has never
+run for anyone. `webhooks` reads every hook through `gh api` and fails on an
+active hook with no secret or with `insecure_ssl` on, naming the hook's URL
+without its query string. It reads with whatever token the lane holds: a
+maintainer's `gh auth login` grants `repo`, which includes `read:repo_hook`, so
+the local lane sees hooks by default. A workflow's `GITHUB_TOKEN` cannot read
+them at all — GitHub answers 404, not 403 — and the control reports `DEGRADED`
+with `degraded_reason = no-access` naming the scope. Unverified is never a pass.
+
 ## Turning things off
 
 ```sh

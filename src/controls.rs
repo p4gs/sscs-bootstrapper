@@ -154,6 +154,24 @@ pub const CONTROLS: &[ControlDef] = &[
             ),
         ],
     },
+    ControlDef {
+        id: "binary-artifacts",
+        phase: 1,
+        name: "Committed binary artifacts",
+        summary: "No compiled programs or code-carrying archives in the tracked tree — bytes, not names",
+        default_enabled: true,
+        tools: &[],
+        default_options: &[],
+    },
+    ControlDef {
+        id: "webhooks",
+        phase: 1,
+        name: "Webhook secrets",
+        summary: "Every active repository webhook carries a shared secret and verifies TLS",
+        default_enabled: true,
+        tools: &["gh"],
+        default_options: &[],
+    },
     // ───────────────────────── Phase 2 — Dependencies & vulnerabilities ─────
     ControlDef {
         id: "sbom",
@@ -172,6 +190,15 @@ pub const CONTROLS: &[ControlDef] = &[
         default_enabled: true,
         tools: &["trivy", "osv-scanner"],
         default_options: &[("fail_on", "\"high\"")],
+    },
+    ControlDef {
+        id: "dependency-pinning",
+        phase: 2,
+        name: "Dependency pinning",
+        summary: "Digest-pinned base images, verified downloads, pinned installs, committed lockfiles",
+        default_enabled: true,
+        tools: &[],
+        default_options: &[],
     },
     ControlDef {
         id: "scorecard",
@@ -592,7 +619,33 @@ pub struct VerifyResult {
     /// that was examined rather than at a modular template that was never
     /// installed.
     pub evidence: Vec<String>,
+    /// Why a `Degraded` verdict degraded, when the control can say — one of
+    /// [`DEGRADED_REASONS`]. `None` on every other outcome, and on controls
+    /// that have not adopted it. Additive within verify schema v1: a consumer
+    /// that does not know the field reads the rows it always read; one that
+    /// does can tell "the tool was absent" (committed evidence may still
+    /// stand) from "the tool ran and failed" (nothing was verified), which
+    /// is the difference a directory must not lift away.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<&'static str>,
 }
+
+/// The closed vocabulary of [`VerifyResult::degraded_reason`].
+pub const DEGRADED_REASONS: &[&str] = &[
+    // The lane lacks the tool. Committed evidence, if any, still stands.
+    "tool-missing",
+    // The tool ran and failed. Nothing was verified.
+    "scan-error",
+    // The tool ran and found nothing to examine. Nothing was verified.
+    "no-inventory",
+    // No remote or repository to ask.
+    "no-remote",
+    // The control's own configuration is missing or invalid.
+    "unconfigured",
+    // The credential in hand cannot read the surface (a 404 from an endpoint
+    // that needs a scope this token lacks). Nothing was verified.
+    "no-access",
+];
 
 impl VerifyResult {
     pub fn new(control: &'static str, outcome: Outcome, messages: Vec<String>) -> Self {
@@ -601,6 +654,23 @@ impl VerifyResult {
             outcome,
             messages,
             evidence: Vec::new(),
+            degraded_reason: None,
+        }
+    }
+
+    /// A `Degraded` verdict that says why. `reason` is one of
+    /// [`DEGRADED_REASONS`]; anything else is a programming error.
+    pub fn degraded(control: &'static str, reason: &'static str, messages: Vec<String>) -> Self {
+        debug_assert!(
+            DEGRADED_REASONS.contains(&reason),
+            "unknown degraded_reason {reason:?}"
+        );
+        VerifyResult {
+            control,
+            outcome: Outcome::Degraded,
+            messages,
+            evidence: Vec::new(),
+            degraded_reason: Some(reason),
         }
     }
 
@@ -638,11 +708,14 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
         "ai-trailers" | "ai-dep-gate" => crate::hooks::verify_hook_installed(ctx, def.id),
         "pr-template" => crate::workflows::verify_pr_template(ctx),
         "ai-receipts" => crate::provenance::verify_receipts_control(ctx, cfg),
-        "sbom" => crate::sbom::verify_sbom_control(ctx),
-        "vuln-scan" => crate::scan::verify_scan_control(ctx),
+        "binary-artifacts" => crate::artifacts::verify_binary_artifacts(ctx),
+        "webhooks" => crate::webhooks::verify_webhooks(ctx, cfg),
+        "sbom" => crate::sbom::verify_sbom_control(ctx, cfg),
+        "vuln-scan" => crate::scan::verify_scan_control(ctx, cfg),
         "grype" => crate::sbom::verify_grype_control(ctx),
         "bumblebee" => crate::bumblebee::verify_bumblebee_control(ctx, cfg),
         "package-trust" => crate::deps::verify_package_trust(ctx, cfg),
+        "dependency-pinning" => crate::pinning::verify_dependency_pinning(ctx),
         "scorecard" => crate::scorecard::verify_scorecard_control(ctx, cfg),
         "renovate"
         | "codeql"
@@ -685,6 +758,20 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn degraded_constructor_sets_the_outcome_and_the_reason_and_new_leaves_it_unset() {
+        let d = VerifyResult::degraded("sbom", "scan-error", vec!["x".into()]);
+        assert_eq!(d.outcome, Outcome::Degraded);
+        assert_eq!(d.degraded_reason, Some("scan-error"));
+        assert!(d.evidence.is_empty());
+        let n = VerifyResult::new("sbom", Outcome::Degraded, vec![]);
+        assert_eq!(n.degraded_reason, None);
+        assert_eq!(DEGRADED_REASONS.len(), 6);
+        assert!(DEGRADED_REASONS
+            .iter()
+            .all(|r| r.is_ascii() && !r.contains(' ')));
+    }
 
     /// Every `.rs` file under `src/`, whitespace-collapsed so a rustfmt line
     /// break cannot hide a call from a source scan.

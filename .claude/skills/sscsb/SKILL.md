@@ -4,7 +4,7 @@ description: >-
   Bootstrap and verify software supply chain security in a git repository using
   the `sscsb` CLI — secret scanning, commit signing policy, SBOMs, vulnerability
   scanning, SAST, dependency trust, SLSA provenance, and continuous posture, as
-  44 individually toggleable controls across five phases. USE WHEN harden this
+  47 individually toggleable controls across five phases. USE WHEN harden this
   repo, supply chain security, SSCS, secret scanning, commit signing, SBOM,
   vulnerability scan, dependency trust, typosquat, SLSA provenance, sigstore,
   cosign, OpenSSF Scorecard, OpenVEX, SAST, branch protection, pin GitHub
@@ -165,13 +165,13 @@ Read the reason line. It always says which of the four it is.
 
 ## The controls
 
-**44 controls across five phases.** 29 are on by default, 15 are off — and off
+**47 controls across five phases.** 32 are on by default, 15 are off — and off
 means the code does not run, not that it runs and is ignored.
 
 | Phase | Name | Controls | On by default |
 |-------|------|---------:|--------------:|
-| 1 | Commit integrity | 11 | 8 |
-| 2 | Dependencies | 8 | 5 |
+| 1 | Commit integrity | 13 | 10 |
+| 2 | Dependencies | 9 | 6 |
 | 3 | Provenance | 10 | 7 |
 | 4 | Code analysis | 7 | 4 |
 | 5 | Continuous posture | 8 | 5 |

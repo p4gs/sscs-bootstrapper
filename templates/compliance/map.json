@@ -118,6 +118,26 @@
       "notes": "Signed receipts upgrade AI-involvement claims from honor-system trailers to cryptographically verifiable attestations.",
       "osps": []
     },
+    "binary-artifacts": {
+      "name": "No committed binary artifacts",
+      "phase": 1,
+      "slsa": ["Source L2: Continuous technical controls", "Build L1: Provenance exists (built from source, not checked in)"],
+      "ssdf": ["PS.1.1", "PW.4.1"],
+      "cra": ["Annex I Part I(2)(f) (integrity of code, commands and configuration)"],
+      "badge": ["build_reproducible"],
+      "notes": "A compiled program checked in beside the source is code nobody reviewed and a build ships it as if built from that source; PS.1.1 protects code from unauthorised change and SLSA expects artifacts to be built from source with provenance.",
+      "osps": ["OSPS-QA-02"]
+    },
+    "webhooks": {
+      "name": "Webhook secrets and TLS",
+      "phase": 1,
+      "slsa": ["Build L2: Hosted build platform (trusted triggers)"],
+      "ssdf": ["PO.5.1", "PO.5.2"],
+      "cra": ["Annex I Part I(2)(d) (protection from unauthorised access)"],
+      "badge": [],
+      "notes": "An unsecreted webhook lets anyone who learns the URL forge the event that drives a deploy or CI receiver; PO.5.1/PO.5.2 expect the environments that build and deliver software to be protected from unauthorised access.",
+      "osps": ["OSPS-AC-01"]
+    },
     "sbom": {
       "name": "Syft CycloneDX SBOM generation",
       "phase": 2,
@@ -137,6 +157,16 @@
       "badge": ["dependency_monitoring"],
       "notes": "Continuous scanning identifies known-vulnerable components so they are fixed before release and remediated promptly afterward.",
       "osps": ["OSPS-VM-05"]
+    },
+    "dependency-pinning": {
+      "name": "Dependency pinning",
+      "phase": 2,
+      "slsa": ["Build L2: Hosted build platform (pinned inputs)", "Source L2: Continuous technical controls"],
+      "ssdf": ["PW.4.1", "PW.4.4"],
+      "cra": ["Annex I Part I(2)(f) (integrity of code, commands and configuration)", "Annex I Part II(1) (identify and document components)"],
+      "badge": ["build_repeatable"],
+      "notes": "Digest-pinned base images, verified downloads, version- or hash-pinned installs and committed lockfiles are what make a build reproduce the same inputs; PW.4.1/PW.4.4 expect well-secured, verified third-party components and CRA Annex I asks for integrity of the build's commands and configuration.",
+      "osps": ["OSPS-BR-03", "OSPS-QA-02"]
     },
     "scorecard": {
       "name": "OpenSSF Scorecard workflow",

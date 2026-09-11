@@ -10,6 +10,51 @@ versions.
 
 ### Added
 
+- **`binary-artifacts` (phase 1, on by default).** Every file git tracks is
+  read by its leading bytes: an ELF, PE or Mach-O executable is a finding
+  whatever it is called — an executable committed as `logo.png` is still an
+  executable — and the archives that carry compiled code (`.jar`, `.whl`,
+  `.wasm`, `.so`, `.deb`, …) are named by extension. Images, fonts and documents
+  are data. Only tracked files count; symlinks are not followed. OpenSSF
+  Scorecard's Binary-Artifacts check is the same idea by file type; this one
+  reads the bytes.
+- **`webhooks` (phase 1, on by default).** Every active repository webhook must
+  carry a shared secret and verify TLS; a hook without one, or with
+  `insecure_ssl` on, fails naming its URL (query string dropped). Scorecard's
+  own Webhooks check is experimental and never runs for a default install.
+  Read through `gh api` with whatever token the lane holds — a maintainer's
+  `repo` scope includes `read:repo_hook`; a workflow's `GITHUB_TOKEN` cannot
+  read hooks at all and GitHub answers 404, which is `DEGRADED` with the new
+  `degraded_reason = no-access`, never a guess.
+- **`no-access` joins `degraded_reason`**: the credential in hand cannot read
+  the surface. A directory treats it like every reason but `tool-missing` —
+  unverified, never lifted.
+
+- **`dependency-pinning` (phase 2, on by default).** The dependency surfaces
+  OpenSSF Scorecard's Pinned-Dependencies check reads that `actions-audit` was
+  never scoped for — Dockerfile base images without a digest, downloads piped
+  into a shell or made executable with no verification step, `pip`/`go`/`npm`
+  installs that name no version — across workflow `run:` steps, composite-action
+  steps, Dockerfile `RUN` lines and committed scripts; plus the surface neither
+  tool reads: a root manifest (or a nested Cargo workspace) with no committed
+  lockfile. Version-only `pip`/`npm` pins and hash-less `requirements.txt` files
+  are warnings, not failures. A bare `npm install` stays `actions-audit`'s
+  finding and is never counted twice; a cargo-fuzz crate is information, not a
+  finding. `docker://` action refs are now held to the same bar as every other
+  `uses:` — they used to be skipped as "pinned elsewhere", and nothing checked
+  them anywhere.
+
+- **`degraded_reason` on `verify --format json` rows.** A `degraded` row can
+  now say why: `tool-missing` (the environment lacks the tool — committed
+  evidence, if any, still stands), `scan-error` (the tool ran and did not
+  complete — nothing was verified), `no-inventory` (it ran and found nothing to
+  examine), `no-remote`, or `unconfigured`. The field is additive within
+  verify schema v1 — absent on every other outcome and on controls that have
+  not adopted it, never `null` — so a consumer that does not know it reads the
+  rows it always read, and one that does can stop treating "the scanner was
+  never installed" and "the scanner failed" as the same verdict. `sbom` and
+  `vuln-scan` adopt it in this release.
+
 - **`sscsb scan --local` — the local lane.** About a third of the controls
   are checks on a *development environment* — `commit-signing`,
   `agent-signing`, `signing-model`, `ai-trailers`, `ai-dep-gate`, `ai-receipts`,
@@ -181,6 +226,24 @@ versions.
 
 ### Changed
 
+- **`verify sbom` and `verify vuln-scan` run their tools and gate on what
+  they find.** Both checked that Syft, Trivy and OSV-Scanner were on PATH and
+  passed — the same presence test OpenSSF Scorecard's SBOM and Vulnerabilities
+  checks make, and no deeper, so `sscsb verify` in CI enforced nothing the
+  scanners could have told it. `verify sbom` now generates the document under
+  the control's `format`, validates its shape and reports the component count;
+  a valid document with no components is `DEGRADED` (`no-inventory`), because an
+  empty SBOM proves nothing. `verify vuln-scan` runs every installed scanner (at
+  least one must), applies the optional `vex` document named in
+  `[controls.vuln-scan]`, and a finding at or above `fail_on` is a `FAIL` that
+  names it; a scanner that is installed but does not complete is `DEGRADED`
+  (`scan-error`), never a quiet pass from the empty half of a run; OSV-Scanner
+  alone answering "no packages found" is `no-inventory` — Scorecard's silent
+  clean on that exit is deliberately not copied; a `fail_on` that is not a
+  severity is `unconfigured`. Syft is told to skip `target/` at any depth and
+  `.git/`: neither is the repository's inventory, and cataloguing a built
+  `target/` tree turns a seconds-long scan into minutes.
+
 - **`branch-protection` reads classic branch protection, and the public
   `protected` flag when it cannot.** It read only the rulesets API, which
   answers `[]` for a branch protected the classic way — proven live on a
@@ -227,6 +290,13 @@ versions.
   refuse independently.
 
 ### Fixed
+
+- **Thirteen real-tool tests in `sbom` and `scan` resolved Syft, Trivy,
+  OSV-Scanner and Grype off `PATH` without the environment lock.** Nothing ever
+  put a fake of those tools on `PATH` before, so the omission was invisible; the
+  first stub-driven gate test did, and the real-tool tests failed with the
+  stub's exit code and documents. They hold the lock now. The lock is a
+  contract on every reader of `PATH`, not only on the tests that write it.
 
 - **`workflow-audit-extended` detects script injection.** The namesake of
   OpenSSF Scorecard's Dangerous-Workflow check had no detection at all: an

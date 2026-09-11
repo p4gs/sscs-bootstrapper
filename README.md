@@ -208,7 +208,7 @@ Two more docs cover the parts people get wrong:
 
 ## Controls
 
-44 controls, each with an id you can `enable`, `disable`, and `verify`:
+47 controls, each with an id you can `enable`, `disable`, and `verify`:
 
 ```sh
 sscsb status                      # what's on, what's installed
