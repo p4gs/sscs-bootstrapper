@@ -240,6 +240,16 @@ versions.
   does not fire, and the documented safe pattern — bind it in `env:`, read it
   as `"$VAR"` — is asserted clean.
 
+- **The shipped SAST ruleset is pure ASCII, so the engine parses it under
+  any locale.** opengrep and semgrep open `--config` files with Python's
+  locale encoding; in a `LANG=C` environment — a slim CI image, a bare Docker
+  base — that is ASCII, and three em-dashes in `sscsb-default.yaml` made the
+  engine exit 2 with no output under `--quiet`. The pre-commit hook rendered
+  that as "opengrep failed (exit 2): no diagnostic output" and fail-closed on
+  every commit, telling nobody why. CI's Ubuntu runner and macOS are UTF-8, so
+  neither ever saw it; a Linux run of this suite in a locale-less container
+  did. A test now pins the file as ASCII and names any offender by line.
+
 - **A test read `PATH` without the environment lock and failed as if the code
   had regressed.** `scan::tests::run_scan_surfaces_a_clear_error_when_the_vex_path_does_not_exist`
   resolved `trivy`/`osv-scanner` by bare name in its skip guard and again inside
