@@ -37,7 +37,7 @@ const PHASE_2_MD: &str = include_str!("../docs/phase-2.md");
 /// header excluded. The site computes the same digest over its verbatim mirror
 /// and asserts the same hex, so an edit on one side that is not mirrored on
 /// the other fails a test in whichever tree was edited.
-const CONTRACT_DIGEST: &str = "6f7f55db83c16865499db2230ef7aed46982cc84e16bdd550e44b6754d991227";
+const CONTRACT_DIGEST: &str = "15c9e9a204bd57c321e94120cf76689705ec4f9fcf031e73cea9e2a0cf6b9070";
 
 const CONTRACT_HEADER: &str = "sscsb local-lane contract v1";
 
