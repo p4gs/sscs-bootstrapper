@@ -367,7 +367,19 @@ pub fn default_config_toml(repo_slug: Option<&str>) -> String {
                 2 => "Phase 2 — Dependency & vulnerability visibility",
                 3 => "Phase 3 — Provenance, signing & credential federation",
                 4 => "Phase 4 — Deeper code security & CI hardening",
-                _ => "Phase 5 — Observability & governance",
+                5 => "Phase 5 — Observability & governance",
+                6 => "Phase 6 — Distribution & publishing",
+                // Every phase gets its own arm on purpose. This used to be
+                // `_ => "Phase 5 …"`, so the day a phase 6 was added, its
+                // banner in every generated config.toml would have read
+                // "Phase 5 — Observability & governance" — a wrong label on a
+                // file every user reads, with nothing to catch it. The
+                // fallback now says it is a bug, and a test asserts no control
+                // renders it.
+                other => {
+                    let _ = other;
+                    "Phase ? — uncategorized (a control has a phase this file does not name)"
+                }
             };
             let _ = writeln!(out, "# ── {title} ──\n");
         }
@@ -388,6 +400,40 @@ mod tests {
 
     fn parsed_default() -> toml::Table {
         default_config_toml(Some("owner/repo")).parse().unwrap()
+    }
+
+    /// Every phase in the registry gets its own named banner, and NO control
+    /// renders the uncategorized fallback.
+    ///
+    /// This arm used to be `_ => "Phase 5 — Observability & governance"`, which
+    /// is correct exactly until a sixth phase exists — and then it is a wrong
+    /// heading, silently, in the one file every user of sscsb opens and edits.
+    /// Nothing failed; the config simply lied. The fallback is now a visible
+    /// bug marker, and this test is what keeps it unreachable.
+    #[test]
+    fn every_phase_has_its_own_banner_and_no_control_renders_the_fallback() {
+        let text = default_config_toml(Some("owner/repo"));
+        assert!(
+            !text.contains("Phase ? — uncategorized"),
+            "a control has a phase `default_config_toml` does not name, so its section in \
+             every generated config carries the bug-marker banner:\n{text}"
+        );
+        let mut phases: Vec<u8> = CONTROLS.iter().map(|c| c.phase).collect();
+        phases.sort_unstable();
+        phases.dedup();
+        for phase in phases {
+            let banner = format!("# ── Phase {phase} — ");
+            assert_eq!(
+                text.matches(&banner).count(),
+                1,
+                "phase {phase} must render exactly one banner in the generated config"
+            );
+        }
+        // And the sixth is genuinely its own heading, not phase 5's reused.
+        assert!(
+            text.contains("Phase 6 — Distribution & publishing"),
+            "{text}"
+        );
     }
 
     /// Write `body` as a repo's config and load it.

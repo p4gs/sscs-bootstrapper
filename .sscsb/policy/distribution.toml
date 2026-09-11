@@ -1,0 +1,74 @@
+# sscsb distribution & publishing policy (phase 6).
+#
+# Everything here is OPTIONAL and everything here is a SELF-DECLARED CLAIM.
+# sscsb reports claims as claims and evaluates their expiry; a claim never
+# upgrades a verdict, and an EXPIRED claim FAILS — a stale assertion about a
+# publishing account is exactly as actionable as an expired signing key.
+#
+# Publish targets are detected from the filesystem (Cargo.toml with [package],
+# a non-private package.json, pyproject.toml with [project], Formula/*.rb, a
+# *.nuspec, a winget *.installer.yaml). You only need [targets] to correct it.
+
+# sscsb's own declaration, and a worked example of why the override exists.
+#
+# Detection is right about crates.io and wrong about Homebrew, in both
+# directions, which is the case the override is for:
+#
+#   - crates.io: this crate's Cargo.toml carries `publish = false`. sscsb is
+#     not on crates.io and is not meant to be, so detection correctly reports
+#     no target and nothing here needs to say so.
+#   - Homebrew: the README's first install line is
+#     `brew install p4gs/p4gs/sscsb`, and the formula lives in the separate
+#     `p4gs/homebrew-p4gs` tap. Nothing in THIS tree can prove that, so
+#     without the line below sscsb would report that its own project publishes
+#     nowhere — while thousands of installs come through a channel it never
+#     looked at.
+#
+# The manifest checks for this target therefore run in the tap's repository,
+# not here; `sscsb verify dist-manifests` says exactly that rather than
+# degrading over a file that was never supposed to be in this tree.
+[targets]
+homebrew = "on"
+# crates-io  = "auto"   # auto (believe the filesystem) | on | off
+# npm        = "auto"
+# pypi       = "auto"
+# chocolatey = "auto"
+# winget     = "auto"
+
+# ── Publishing accounts ─────────────────────────────────────────────────────
+# The far-left link: whoever can log in to the registry can publish under your
+# name. No registry API reports whether a second factor is phishing-resistant,
+# so `mfa` is a human claim with a date on it. `sscsb verify maintainer-mfa`
+# reads what the APIs DO expose (GitHub's two_factor_authentication, npm's
+# tfa.mode) and uses this block only for the part they cannot answer.
+#
+# [[account]]
+# target   = "npm"
+# identity = "your-npm-username"
+# mfa      = "webauthn-only"     # webauthn-only | webauthn | totp | none
+# attested = "2026-01-15"        # the day a human last confirmed the above
+# # attestation_file = ".sscsb/policy/attestations/npm-mfa.png"
+
+# ── Publishing credentials you have deliberately kept ───────────────────────
+# Trusted Publishing (OIDC) removes the credential entirely and is the right
+# answer for crates.io, npm and PyPI. Declare a token here only where no OIDC
+# path exists (Chocolatey's push key) or where you have decided to keep one
+# anyway — and then say what makes it defensible.
+#
+# [[token]]
+# target         = "chocolatey"
+# purpose        = "push key — Chocolatey has no OIDC path"
+# scoped         = true          # scoped to specific packages, not the account
+# cidr_allowlist = false         # restricted to known source addresses
+# issued         = "2026-01-01"
+# expires        = "2026-04-01"  # npm caps granular WRITE tokens at 90 days
+# stored_in      = "1Password / GitHub environment `release`"
+
+# ── Windows code signing ────────────────────────────────────────────────────
+# Authenticode is WinGet's and Chocolatey's real trust anchor, and it cannot be
+# verified from macOS or Linux. Recorded, with its expiry evaluated.
+#
+# [signing]
+# authenticode = true
+# subject      = "CN=Your Org, O=Your Org, C=US"
+# expires      = "2027-06-30"

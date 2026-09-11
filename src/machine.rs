@@ -165,6 +165,29 @@ struct DirectoryControl<'a> {
     messages: &'a [String],
 }
 
+/// How many phases `score.phases[]` carries.
+///
+/// Derived from the registry rather than typed, because this number is a
+/// SHARED WIRE CONTRACT with the directory site: the site recomputes a
+/// listing's grade from the same blocks, and a phase the tool scores but the
+/// site does not know about (or the reverse) is a silent disagreement about a
+/// published letter grade. It was a literal `5` in three places until phase 6
+/// landed, and the failure mode was not a crash — every phase-6 row would have
+/// fallen out of BOTH the numerator and the denominator here while still
+/// counting toward `scoped`, so adding six passing controls would have LOWERED
+/// every repository's evidence coverage.
+const PHASE_COUNT: u8 = {
+    let mut max = 0u8;
+    let mut i = 0;
+    while i < controls::CONTROLS.len() {
+        if controls::CONTROLS[i].phase > max {
+            max = controls::CONTROLS[i].phase;
+        }
+        i += 1;
+    }
+    max
+};
+
 /// One `score.phases[]` row.
 #[derive(Serialize)]
 struct DirectoryPhase {
@@ -298,8 +321,8 @@ fn scan_outcome_for(scoped: bool, raw: &Outcome) -> (&'static str, Option<&'stat
 /// not be validated by anyone offline.
 fn score_of(rows: &[DirectoryControl<'_>]) -> DirectoryScore {
     let scoped: Vec<&DirectoryControl<'_>> = rows.iter().filter(|r| r.in_scope).collect();
-    let mut phases = Vec::with_capacity(5);
-    for phase in 1u8..=5 {
+    let mut phases = Vec::with_capacity(PHASE_COUNT as usize);
+    for phase in 1u8..=PHASE_COUNT {
         let inp = |o: &str| {
             scoped
                 .iter()
@@ -750,7 +773,10 @@ mod tests {
         ] {
             assert!(doc["score"].get(field).is_some(), "score missing `{field}`");
         }
-        assert_eq!(doc["score"]["phases"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            doc["score"]["phases"].as_array().unwrap().len(),
+            usize::from(PHASE_COUNT)
+        );
         // contract line `control-fields`
         let rows = doc["controls"].as_array().unwrap();
         assert_eq!(rows.len(), controls::CONTROLS.len());

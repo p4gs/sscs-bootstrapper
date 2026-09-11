@@ -95,6 +95,7 @@ fn init_creates_config_hooks_policies_and_templates() {
         ".sscsb/policy/packages.toml",
         ".sscsb/policy/allowed_signers",
         ".sscsb/policy/signing-model.toml",
+        ".sscsb/policy/distribution.toml",
         ".sscsb/rules/sscsb-default.yaml",
         ".github/PULL_REQUEST_TEMPLATE.md",
         ".github/workflows/secrets-scan.yml",
@@ -128,6 +129,23 @@ fn init_creates_config_hooks_policies_and_templates() {
             .exists(),
         "wait-for-secrets is default-off"
     );
+    // The phase-6 publish workflows are gated on DETECTION, not on their
+    // control being enabled — and `trusted-publishing` IS enabled here. This
+    // throwaway repo has no Cargo.toml, package.json or pyproject.toml, so it
+    // publishes nothing and must receive none of them. A publish workflow in a
+    // repository that publishes nothing is a workflow_dispatch button wired to
+    // somebody else's namespace, which is why they live in their own table
+    // rather than in the control-gated one.
+    for publish in [
+        ".github/workflows/publish-crates.yml",
+        ".github/workflows/publish-npm.yml",
+        ".github/workflows/publish-pypi.yml",
+    ] {
+        assert!(
+            !repo.join(publish).exists(),
+            "{publish} installed into a repository with no publish target"
+        );
+    }
     assert!(
         !repo
             .join(".sscsb/templates/dependency-track-compose.yml")
@@ -277,7 +295,9 @@ fn status_and_report_render_all_phases() {
 
     let out = sscsb(repo).arg("status").assert().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
-    for phase in ["Phase 1", "Phase 2", "Phase 3", "Phase 4", "Phase 5"] {
+    for phase in [
+        "Phase 1", "Phase 2", "Phase 3", "Phase 4", "Phase 5", "Phase 6",
+    ] {
         assert!(stdout.contains(phase), "status missing {phase}");
     }
 

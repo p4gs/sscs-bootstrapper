@@ -27,7 +27,7 @@ pub fn render_report(ctx: &Ctx) -> Result<String> {
     out.push_str(
         "frameworks: SLSA v1.2 (Build L3 + Source L3) · NIST SSDF v1.2 · EU CRA · OSPS Baseline · OpenSSF Badge\n\n",
     );
-    for phase in 1..=5u8 {
+    for phase in 1..=6u8 {
         out.push_str(&format!("Phase {phase}\n"));
         for def in controls::phase_controls(phase) {
             let entry = &map["controls"][def.id];
@@ -182,6 +182,7 @@ mod tests {
         for marker in [
             "Phase 1",
             "Phase 5",
+            "Phase 6",
             "SLSA",
             "SSDF",
             "CRA ",

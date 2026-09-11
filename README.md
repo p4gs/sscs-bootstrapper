@@ -68,7 +68,7 @@ with a tool that isn't there.
 ## Threat & Control Model
 
 Kept deliberately high level — SDLC-stage threats, not individual MITRE ATT&CK
-techniques. Every arrow below maps to one of the five phases above; every
+techniques. Every arrow below maps to one of the six phases above; every
 control listed is a real, `verify`-able check, not an aspiration.
 
 ```mermaid
@@ -175,7 +175,7 @@ External tools are **pinned** — `sscsb tools` prints the exact version `sscsb`
 expects and where each one was found. Nothing installs `latest`, and nothing is
 installed behind your back.
 
-## The five phases
+## The six phases
 
 Each phase is a coherent layer, and each is independently useful. Full detail —
 what each control does, which tool backs it, how it fails, how to turn it off — is
@@ -188,6 +188,7 @@ in the per-phase docs.
 | **3 — Provenance** | Keyless signing (Cosign/Fulcio/Rekor). SBOM and provenance attestations bound to artifact digests. SLSA Build L3 provenance via the official generator, verified with slsa-verifier before anything is promoted. GitHub-native build-provenance and SBOM attestations, verifiable with nothing but `gh`. Short-lived credentials (Octo STS). Harden-Runner on every job. | [docs/phase-3.md](docs/phase-3.md) |
 | **4 — Code analysis** | OpenGrep SAST by default (Semgrep selectable), in pre-commit and CI. CodeQL on PRs and the default branch. Extended workflow auditing: `pull_request_target` misuse, credential persistence, secret echo, known-risky actions. | [docs/phase-4.md](docs/phase-4.md) |
 | **5 — Continuous posture** | Dependency-Track for continuous SBOM management. GUAC for the supply-chain graph. OpenVEX so "not exploitable" is a first-class, auditable answer instead of a muted alert. A machine-readable control → SLSA/SSDF/CRA map behind `sscsb report`. | [docs/phase-5.md](docs/phase-5.md) |
+| **6 — Distribution & publishing** | The registry door, and the account behind it. Trusted Publishing (OIDC) on crates.io, npm and PyPI so there is no publish token in the repository to steal. The maintainer account's second factor, read from the APIs that expose it. Committed-credential and long-lived-token detection. A probe of the live registry for provenance on what was actually published. Checksum pinning in Homebrew, Chocolatey and WinGet manifests. | [docs/phase-6.md](docs/phase-6.md) |
 
 Two more docs cover the parts people get wrong:
 
@@ -208,7 +209,7 @@ Two more docs cover the parts people get wrong:
 
 ## Controls
 
-48 controls, each with an id you can `enable`, `disable`, and `verify`:
+54 controls, each with an id you can `enable`, `disable`, and `verify`:
 
 ```sh
 sscsb status                      # what's on, what's installed

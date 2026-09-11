@@ -228,6 +228,8 @@ the local typosquat heuristic running.
 | `sscsb dtrack upload` | Upload the SBOM to Dependency-Track. |
 | `sscsb guac ingest` | Ingest into the GUAC supply-chain graph. |
 | `sscsb oras push <ref> <file>` | Push SBOM/attestation files to an OCI registry. |
+| `sscsb dist status` | Which registries this repo publishes to, whether each publish workflow is installed, and the declared account/token claims. |
+| `sscsb dist check [--strict]` | Run the six phase-6 verifiers including the live registry probes. A preflight before a manual publish — **not** a publish wrapper. There is deliberately no publish subcommand at all; docs/phase-6.md records why, so do not go looking for one. |
 
 ### Hooks (invoked by git, not by you)
 
@@ -344,7 +346,7 @@ parsing and printing over library functions that are themselves covered.
 ## Where to read more
 
 - [README.md](README.md) — the human introduction
-- [docs/phase-1.md](docs/phase-1.md) … [docs/phase-5.md](docs/phase-5.md) — what each control does and how it fails
+- [docs/phase-1.md](docs/phase-1.md) … [docs/phase-6.md](docs/phase-6.md) — what each control does and how it fails
 - [docs/signing.md](docs/signing.md) — the human/CI/AI key separation
 - [docs/ai-provenance.md](docs/ai-provenance.md) — commit trailers and AI gates
 - [docs/example-walkthrough.md](docs/example-walkthrough.md) — a real bootstrap with real output

@@ -497,6 +497,66 @@
       "badge": [],
       "osps": [],
       "notes": "Maps enabled sscsb controls to OpenSSF Project Security Baseline requirement families (OSPS-AC/BR/QA/SA/VM) and adds an OSPS column to `sscsb report`."
+    },
+    "publish-targets": {
+      "name": "Publish-target inventory (which registries this repository ships to)",
+      "phase": 6,
+      "slsa": [],
+      "ssdf": ["PO.3.1", "PS.3.1"],
+      "cra": ["Annex I Part II \u00a71 (identify and document components)"],
+      "badge": [],
+      "notes": "You cannot defend a distribution channel you have not enumerated. Detects crates.io, npm, PyPI, Homebrew, Chocolatey and WinGet targets from the manifests in the tree, which is what scopes every other phase-6 control. Reports; never grades.",
+      "osps": ["OSPS-BR-01"]
+    },
+    "trusted-publishing": {
+      "name": "Trusted Publishing (OIDC) with a gated release environment",
+      "phase": 6,
+      "slsa": ["Build L2: Hosted, authenticated build platform produces the published artifact"],
+      "ssdf": ["PO.3.2", "PS.2.1", "PW.6.1"],
+      "cra": ["Annex I Part I(2)(d) (protection against unauthorised access)", "Annex I Part I(2)(f) (integrity of code, commands and configuration)"],
+      "badge": [],
+      "notes": "Replaces the long-lived registry token with a short-lived OIDC identity bound to this repository and this workflow, so there is no publish credential in the repository to phish or exfiltrate \u2014 the Shai-Hulud and chalk/debug attack path. Also checks that the release environment carries protection rules, since an OIDC identity with no reviewer in front of it is a workflow_dispatch button wired to your namespace. CISA/OpenSSF Principles for Package Repository Security places trusted publishing and short-lived credentials at its upper maturity levels.",
+      "osps": ["OSPS-BR-07"]
+    },
+    "maintainer-mfa": {
+      "name": "Maintainer publishing-account MFA (GitHub 2FA, npm tfa.mode, phishing-resistance claim)",
+      "phase": 6,
+      "slsa": ["Source L1: Identity Management"],
+      "ssdf": ["PO.3.2", "PS.1.1"],
+      "cra": ["Annex I Part I(2)(d) (protection against unauthorised access)"],
+      "badge": [],
+      "notes": "The farthest-left link in the chain: whoever can log in to the registry publishes under your name, with no commit involved. Reads what the APIs expose \u2014 GitHub two_factor_authentication and npm tfa.mode, where only auth-and-writes gates the publish itself \u2014 and records the part no registry API exposes (whether the second factor is phishing-resistant) as a dated claim that goes stale. CISA/OpenSSF Principles for Package Repository Security places phishing-resistant MFA at its upper maturity levels. Chocolatey's absent account 2FA is reported as an ecosystem gap, not a repository failure.",
+      "osps": ["OSPS-AC-01"]
+    },
+    "publish-tokens": {
+      "name": "Publishing credential hygiene (no committed credentials, no avoidable long-lived tokens)",
+      "phase": 6,
+      "slsa": [],
+      "ssdf": ["PO.3.2", "PS.1.1", "PW.9.1"],
+      "cra": ["Annex I Part I(2)(d) (protection against unauthorised access)", "Annex I Part I(2)(e) (protection of the confidentiality of stored data)"],
+      "badge": ["no_leaked_credentials"],
+      "notes": "A committed .npmrc _authToken or .pypirc password is a live publish credential in history; a secrets.NPM_TOKEN on a registry that supports Trusted Publishing is an avoidable one. Tokens a maintainer deliberately keeps (Chocolatey's push key, which has no OIDC alternative) are declared with scope, CIDR allowlist and expiry, and the expiry is evaluated by the same code that evaluates an agent signing key's \u2014 an expired declaration fails, because a stale claim is as actionable as a stale key. npm caps granular write tokens at 90 days, which is the default window.",
+      "osps": ["OSPS-BR-07"]
+    },
+    "publish-provenance": {
+      "name": "Published-artifact provenance (npm attestations, PyPI PEP 740, Homebrew digest pinning)",
+      "phase": 6,
+      "slsa": ["Build L2: Provenance on the published artifact", "Build L3: when the provenance names an isolated builder"],
+      "ssdf": ["PS.3.1", "PS.3.2", "PO.3.2"],
+      "cra": ["Annex I Part II \u00a71 (identify and document components)", "Annex I Part I(2)(f) (integrity of code, commands and configuration)"],
+      "badge": [],
+      "notes": "Whether a trusted publisher is CONFIGURED is not anonymously queryable on any registry; whether the artifact people actually downloaded carries provenance is. The probe reads the live registry for the published package \u2014 npm's attestations endpoint, PyPI's PEP 740 attestations on the simple index \u2014 so the control measures the outcome rather than the intent. crates.io has no artifact-level provenance in the ecosystem yet and is reported as such rather than graded. probe_registry = false declines the network deliberately, and says the claim was narrowed rather than passed.",
+      "osps": ["OSPS-BR-06"]
+    },
+    "dist-manifests": {
+      "name": "Distribution manifest checksums (Homebrew sha256, Chocolatey checksum, WinGet InstallerSha256)",
+      "phase": 6,
+      "slsa": [],
+      "ssdf": ["PS.2.1", "PW.4.4"],
+      "cra": ["Annex I Part I(2)(f) (integrity of code, commands and configuration)"],
+      "badge": [],
+      "notes": "For the three PR-published ecosystems the manifest digest IS the trust boundary on the consumer's machine, and it is checkable offline. A formula with a url and no sha256, or a chocolateyinstall.ps1 that downloads with no checksum, installs whatever that URL serves at install time \u2014 the shape of the Polyfill.io hijack. The Authenticode certificate, which Windows actually checks and which sscsb cannot verify off Windows, is recorded as a claim with an evaluated expiry rather than asserted.",
+      "osps": ["OSPS-BR-06"]
     }
   }
 }

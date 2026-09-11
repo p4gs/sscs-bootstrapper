@@ -270,7 +270,7 @@ every lane — plus the additive `local` block:
     "provisional": false,
     "overall_percent": 92.3,
     "evidence_coverage_percent": 88.9,
-    "phases": [ /* one entry per phase 1-5 */ ]
+    "phases": [ /* one entry per registry phase, currently 1-6 */ ]
   },
   "local": {
     "record_version": 1,

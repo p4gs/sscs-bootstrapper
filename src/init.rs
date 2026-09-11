@@ -166,6 +166,13 @@ pub fn bootstrap(cwd: &Path) -> Result<Vec<String>> {
     )? {
         log.push("write .sscsb/policy/signing-model.toml".to_string());
     }
+    if workflows::write_if_absent(
+        &ctx.root,
+        ".sscsb/policy/distribution.toml",
+        crate::distribution::DISTRIBUTION_TEMPLATE,
+    )? {
+        log.push("write .sscsb/policy/distribution.toml".to_string());
+    }
     hooks::regenerate_allowed_signers(&ctx, hooks::agent_signing_enabled(cfg))?;
     log.push("write .sscsb/policy/allowed_signers (generated from signers.toml)".to_string());
 
@@ -174,6 +181,11 @@ pub fn bootstrap(cwd: &Path) -> Result<Vec<String>> {
     }
 
     log.extend(workflows::install_all(&ctx, cfg)?);
+    // Publish workflows come last and are gated on DETECTION, not just on the
+    // control being enabled: `publish-npm.yml` in a repository with no
+    // package.json is a workflow_dispatch button wired to someone else's
+    // namespace, so it lives in its own table with its own installer.
+    log.extend(crate::distribution::install_templates(&ctx, cfg)?);
     Ok(log)
 }
 
