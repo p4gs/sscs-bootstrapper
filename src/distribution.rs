@@ -1965,7 +1965,25 @@ fn probe_provenance(
     let Some(url) = provenance_probe_url(target, package) else {
         return (Outcome::Info, None, Vec::new());
     };
-    match fetch(&url) {
+    let fetched = fetch(&url);
+    classify_probe(target, package, &url, fetched)
+}
+
+/// The verdict half of the probe, with the network response passed IN.
+///
+/// Split from [`probe_provenance`] for the same reason `deps.rs` threads
+/// `registry_exists` into `deps_check_with`: every branch here is a verdict a
+/// maintainer acts on — "never published" is a skip, an unreachable registry is
+/// UNVERIFIED rather than absent, and only a real attestation is a Pass — and
+/// none of them is reachable from a test while the socket call is inlined. The
+/// one remaining untestable line is the socket itself.
+fn classify_probe(
+    target: PublishTarget,
+    package: &str,
+    url: &str,
+    fetched: FetchResult,
+) -> (Outcome, Option<&'static str>, Vec<String>) {
+    match fetched {
         FetchResult::NotFound => (
             Outcome::Info,
             None,
@@ -3394,11 +3412,12 @@ mod tests {
         let dir = repo();
         let root = dir.path();
         write(root, "package.json", r#"{"name":"x","version":"1.0.0"}"#);
-        write(
-            root,
-            ".npmrc",
-            "//registry.npmjs.org/:_authToken=npm_notarealtokenvaluehere\n",
-        );
+        // The VALUE is deliberately not token-shaped. The detector keys on the
+        // `_authToken` marker, never on the value, so a realistic-looking
+        // literal would buy the test nothing and would put a string that
+        // pattern-matches a real npm granular token into this repository's own
+        // history — which is the thing this control exists to prevent.
+        write(root, ".npmrc", "//registry.npmjs.org/:_authToken=EXAMPLE\n");
         bootstrapped(root);
         crate::exec::git(&["add", "-A"], root).unwrap();
         crate::exec::git(&["commit", "--no-verify", "-m", "fixture"], root).unwrap();
@@ -3549,6 +3568,79 @@ mod tests {
         let (has, detail) = classify_provenance(PublishTarget::PyPi, bare);
         assert!(!has);
         assert!(detail.contains("none of 1"), "{detail}");
+    }
+
+    /// Every verdict the registry probe can reach, with the response injected.
+    ///
+    /// The distinctions here are the whole control: an unpublished package is
+    /// a SKIP (you cannot fail to attest something you never shipped), an
+    /// unreachable registry is UNVERIFIED and must never read as "no
+    /// provenance", and only a real attestation earns a Pass.
+    #[test]
+    fn every_registry_probe_verdict_is_reachable_and_says_the_right_thing() {
+        let url = "https://registry.npmjs.org/-/npm/v1/attestations/p";
+
+        let (o, reason, m) = classify_probe(PublishTarget::Npm, "p", url, FetchResult::NotFound);
+        assert_eq!(o, Outcome::Info, "never-published is a skip, not a failure");
+        assert_eq!(reason, None);
+        assert!(m[0].contains("never published"), "{m:?}");
+
+        let (o, reason, m) = classify_probe(
+            PublishTarget::Npm,
+            "p",
+            url,
+            FetchResult::Error("dns failure".into()),
+        );
+        assert_eq!(o, Outcome::Degraded);
+        assert_eq!(reason, Some("scan-error"));
+        assert!(
+            m[0].contains("UNVERIFIED, not absent"),
+            "an unreachable registry is not evidence of missing provenance: {m:?}"
+        );
+        assert!(m[0].contains("probe_registry = false"), "{m:?}");
+
+        let (o, _, m) = classify_probe(
+            PublishTarget::Npm,
+            "p",
+            url,
+            FetchResult::Body(
+                r#"{"attestations":[{"predicateType":"https://slsa.dev/provenance/v1"}]}"#.into(),
+            ),
+        );
+        assert_eq!(o, Outcome::Pass);
+        assert!(m[0].contains("carries provenance"), "{m:?}");
+
+        let (o, _, m) = classify_probe(
+            PublishTarget::Npm,
+            "p",
+            url,
+            FetchResult::Body(r#"{"attestations":[]}"#.into()),
+        );
+        assert_eq!(o, Outcome::Fail);
+        assert!(m[0].contains("NO provenance"), "{m:?}");
+        assert!(
+            m[0].contains("npm publish --provenance"),
+            "the remediation must be the npm one: {m:?}"
+        );
+
+        // PyPI's remediation differs — attestations are automatic there, so
+        // telling someone to pass `--provenance` would be wrong advice.
+        let (o, _, m) = classify_probe(
+            PublishTarget::PyPi,
+            "p",
+            "https://pypi.org/simple/p/",
+            FetchResult::Body(r#"{"files":[{"filename":"p-1.0.tar.gz"}]}"#.into()),
+        );
+        assert_eq!(o, Outcome::Fail);
+        assert!(
+            m[0].contains("PEP 740 attestations are generated automatically"),
+            "{m:?}"
+        );
+
+        // A registry with no provenance model reaches no verdict at all.
+        let (o, _, m) = probe_provenance(PublishTarget::CratesIo, "p");
+        assert_eq!(o, Outcome::Info);
+        assert!(m.is_empty(), "no endpoint means nothing to say here: {m:?}");
     }
 
     #[test]
@@ -3885,6 +3977,482 @@ mod tests {
         let text = render_status(&ctx).unwrap();
         assert!(text.contains("No publish target detected"), "{text}");
         assert!(text.contains("pyproject.toml with [project]"), "{text}");
+    }
+
+    // ───────────────── gh / npm paths, with fake tools on PATH ─────────────
+    //
+    // These verifiers shell out, so their real branches are unreachable from a
+    // fixture unless the tool is made to answer. `testutil`'s decoy-PATH
+    // helpers give each case a `gh` or `npm` that returns exactly the payload
+    // under test, which is the only way to exercise a Pass, a Fail and a
+    // degrade through the SAME code an operator runs.
+
+    /// The three environment verdicts, end to end through `verify`, not just
+    /// through the pure classifier. The environment gate is half of
+    /// `trusted-publishing`: an OIDC identity nobody reviews is a
+    /// workflow_dispatch button, so "no rules" must FAIL and not merely note.
+    #[test]
+    fn the_environment_gate_fails_unprotected_and_passes_reviewed_through_the_real_verifier() {
+        let (dir, _) = crate::testutil::repo_with_gh_repo("o/r", "main");
+        let root = dir.path();
+        write(root, "package.json", r#"{"name":"x","version":"1.0.0"}"#);
+        crate::init::bootstrap(root).unwrap();
+
+        let cases = [
+            (
+                r#"{"name":"release","protection_rules":[{"type":"required_reviewers","reviewers":[{"type":"User"}]}]}"#,
+                Outcome::Pass,
+                "environment protected",
+            ),
+            (
+                r#"{"name":"release","protection_rules":[]}"#,
+                Outcome::Fail,
+                "a label rather than a gate",
+            ),
+            (
+                r#"{"message":"Not Found"}"#,
+                Outcome::Fail,
+                "create it and add required reviewers",
+            ),
+        ];
+        for (payload, want, needle) in cases {
+            let r = crate::testutil::with_env(|lock| {
+                lock.fake_tool("gh", &format!("cat <<'EOF'\n{payload}\nEOF"));
+                let ctx = Ctx::discover(root).unwrap();
+                verify_trusted_publishing(&ctx, ctx.require_config().unwrap())
+            });
+            let joined = r.messages.join("\n");
+            assert_eq!(r.outcome, want, "payload {payload} → {joined}");
+            assert!(joined.contains(needle), "payload {payload} → {joined}");
+        }
+    }
+
+    /// `gh` present but refusing is NOT `gh` absent, and neither is a verdict
+    /// about the repository. Both degrade, with different reasons, so a
+    /// consumer can tell "install a tool" from "grant a scope".
+    #[test]
+    fn an_unreadable_environment_degrades_with_the_reason_that_actually_applies() {
+        let (dir, _) = crate::testutil::repo_with_gh_repo("o/r", "main");
+        let root = dir.path();
+        write(root, "package.json", r#"{"name":"x","version":"1.0.0"}"#);
+        crate::init::bootstrap(root).unwrap();
+
+        // A 404 is ambiguous — no such environment, OR a token that cannot see
+        // environments. Asserting the first would tell a maintainer to create
+        // something that already exists.
+        let r = crate::testutil::with_env(|lock| {
+            lock.fake_tool("gh", "echo 'gh: Not Found (HTTP 404)' >&2; exit 1");
+            let ctx = Ctx::discover(root).unwrap();
+            verify_trusted_publishing(&ctx, ctx.require_config().unwrap())
+        });
+        assert_eq!(r.outcome, Outcome::Degraded);
+        assert_eq!(r.degraded_reason, Some("no-access"));
+        assert!(
+            r.messages.join("\n").contains("not confirmed absent"),
+            "{:?}",
+            r.messages
+        );
+
+        // No gh at all is a different reason entirely.
+        let r = crate::testutil::with_env(|lock| {
+            lock.only_git_on_path();
+            let ctx = Ctx::discover(root).unwrap();
+            verify_trusted_publishing(&ctx, ctx.require_config().unwrap())
+        });
+        assert_eq!(r.outcome, Outcome::Degraded);
+        assert_eq!(r.degraded_reason, Some("tool-missing"));
+    }
+
+    /// The far-left control, through the real verifier: 2FA on passes, 2FA off
+    /// FAILS, and a response missing the field degrades rather than convicting
+    /// a maintainer who holds a passkey.
+    #[test]
+    fn maintainer_mfa_reads_the_github_account_through_the_real_verifier() {
+        let (dir, _) = crate::testutil::repo_with_gh_repo("o/r", "main");
+        let root = dir.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+        );
+        crate::init::bootstrap(root).unwrap();
+
+        for (payload, want, needle) in [
+            (
+                r#"{"login":"maintainer","two_factor_authentication":true}"#,
+                Outcome::Pass,
+                "2FA enabled",
+            ),
+            (
+                r#"{"login":"maintainer","two_factor_authentication":false}"#,
+                Outcome::Fail,
+                "2FA DISABLED",
+            ),
+            (
+                r#"{"login":"maintainer"}"#,
+                Outcome::Degraded,
+                "gh auth refresh -s read:user",
+            ),
+        ] {
+            let r = crate::testutil::with_env(|lock| {
+                lock.fake_tool("gh", &format!("cat <<'EOF'\n{payload}\nEOF"));
+                let ctx = Ctx::discover(root).unwrap();
+                verify_maintainer_mfa(&ctx, ctx.require_config().unwrap())
+            });
+            let joined = r.messages.join("\n");
+            assert_eq!(r.outcome, want, "payload {payload} → {joined}");
+            assert!(joined.contains(needle), "payload {payload} → {joined}");
+        }
+    }
+
+    /// Without a GitHub remote, the account `gh` is logged in as is whoever
+    /// owns the laptop — not whoever owns the package. Grading on that is the
+    /// false positive this project refuses to ship, so it degrades instead.
+    #[test]
+    fn maintainer_mfa_will_not_grade_a_repo_with_no_remote_on_the_ambient_login() {
+        let dir = repo();
+        let root = dir.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+        );
+        bootstrapped(root);
+        let r = crate::testutil::with_env(|lock| {
+            // A `gh` that WOULD answer, to prove the gate is the remote and
+            // not merely the tool's absence.
+            lock.fake_tool(
+                "gh",
+                "cat <<'EOF'\n{\"login\":\"somebody\",\"two_factor_authentication\":false}\nEOF",
+            );
+            let ctx = Ctx::discover(root).unwrap();
+            verify_maintainer_mfa(&ctx, ctx.require_config().unwrap())
+        });
+        assert_eq!(r.outcome, Outcome::Degraded);
+        assert_eq!(r.degraded_reason, Some("no-remote"));
+        assert!(
+            r.messages.join("\n").contains("would only be a guess"),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// An undated claim is the quiet failure mode of any attestation scheme:
+    /// it can never go stale, which is exactly why it can never be trusted.
+    /// Reported, never counted as evidence.
+    #[test]
+    fn an_undated_account_claim_is_reported_as_uncheckable_rather_than_accepted() {
+        let dir = repo();
+        let root = dir.path();
+        write(root, "pyproject.toml", "[project]\nname = \"p\"\n");
+        bootstrapped(root);
+        write(
+            root,
+            ".sscsb/policy/distribution.toml",
+            "[[account]]\ntarget = \"pypi\"\nidentity = \"me\"\nmfa = \"webauthn-only\"\n",
+        );
+        let ctx = Ctx::discover(root).unwrap();
+        let r = verify_maintainer_mfa(&ctx, ctx.require_config().unwrap());
+        assert_eq!(r.outcome, Outcome::Info, "{:?}", r.messages);
+        let joined = r.messages.join("\n");
+        assert!(joined.contains("no `attested` date"), "{joined}");
+        assert!(joined.contains("cannot go stale"), "{joined}");
+    }
+
+    /// A repo that DOES name a GitHub remote, with no `gh` to ask: the account
+    /// is knowable in principle and unreadable in practice, which is a degrade
+    /// naming the tool — distinct from the no-remote case above, where the
+    /// account is not knowable at all.
+    #[test]
+    fn a_missing_gh_degrades_on_the_tool_when_the_remote_is_known() {
+        let (dir, _) = crate::testutil::repo_with_gh_repo("o/r", "main");
+        let root = dir.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+        );
+        crate::init::bootstrap(root).unwrap();
+        let r = crate::testutil::with_env(|lock| {
+            lock.only_git_on_path();
+            let ctx = Ctx::discover(root).unwrap();
+            verify_maintainer_mfa(&ctx, ctx.require_config().unwrap())
+        });
+        assert_eq!(r.outcome, Outcome::Degraded);
+        assert_eq!(r.degraded_reason, Some("tool-missing"));
+        assert!(
+            r.messages
+                .join("\n")
+                .contains("publish under a GitHub identity, and its 2FA state was not read"),
+            "{:?}",
+            r.messages
+        );
+    }
+
+    /// npm's `tfa.mode`, through the real verifier rather than the classifier.
+    #[test]
+    fn maintainer_mfa_reads_npm_tfa_mode_through_the_real_verifier() {
+        let dir = repo();
+        let root = dir.path();
+        write(root, "package.json", r#"{"name":"x","version":"1.0.0"}"#);
+        bootstrapped(root);
+
+        for (payload, want, needle) in [
+            (
+                r#"{"name":"me","tfa":{"mode":"auth-and-writes"}}"#,
+                Outcome::Pass,
+                "auth-and-writes",
+            ),
+            (
+                r#"{"name":"me","tfa":{"mode":"auth-only"}}"#,
+                Outcome::Fail,
+                "not PUBLISH",
+            ),
+        ] {
+            let r = crate::testutil::with_env(|lock| {
+                lock.fake_tool("npm", &format!("cat <<'EOF'\n{payload}\nEOF"));
+                let ctx = Ctx::discover(root).unwrap();
+                verify_maintainer_mfa(&ctx, ctx.require_config().unwrap())
+            });
+            let joined = r.messages.join("\n");
+            assert_eq!(r.outcome, want, "payload {payload} → {joined}");
+            assert!(joined.contains(needle), "payload {payload} → {joined}");
+        }
+
+        // Unauthenticated npm is Degraded, never a verdict about the account.
+        let r = crate::testutil::with_env(|lock| {
+            lock.fake_tool("npm", "echo 'npm ERR! code ENEEDAUTH' >&2; exit 1");
+            let ctx = Ctx::discover(root).unwrap();
+            verify_maintainer_mfa(&ctx, ctx.require_config().unwrap())
+        });
+        assert_eq!(r.outcome, Outcome::Degraded);
+        assert!(
+            r.messages.join("\n").contains("npm login"),
+            "{:?}",
+            r.messages
+        );
+
+        // And npm absent degrades for a DIFFERENT reason than npm refusing.
+        let r = crate::testutil::with_env(|lock| {
+            lock.only_git_on_path();
+            let ctx = Ctx::discover(root).unwrap();
+            verify_maintainer_mfa(&ctx, ctx.require_config().unwrap())
+        });
+        assert_eq!(r.outcome, Outcome::Degraded);
+        assert_eq!(r.degraded_reason, Some("tool-missing"));
+    }
+
+    /// An unauthenticated `gh` is not a verdict about the account. This is the
+    /// difference between "we looked and 2FA is off" (a finding someone must
+    /// act on) and "we could not look" (a finding about the lane).
+    #[test]
+    fn a_refusing_gh_degrades_on_access_rather_than_convicting_the_account() {
+        let (dir, _) = crate::testutil::repo_with_gh_repo("o/r", "main");
+        let root = dir.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+        );
+        crate::init::bootstrap(root).unwrap();
+        let r = crate::testutil::with_env(|lock| {
+            lock.fake_tool("gh", "echo 'gh: authentication required' >&2; exit 1");
+            let ctx = Ctx::discover(root).unwrap();
+            verify_maintainer_mfa(&ctx, ctx.require_config().unwrap())
+        });
+        assert_eq!(r.outcome, Outcome::Degraded);
+        assert_eq!(r.degraded_reason, Some("no-access"));
+        let joined = r.messages.join("\n");
+        assert!(joined.contains("gh auth login"), "{joined}");
+        assert!(joined.contains("unverified, not confirmed"), "{joined}");
+    }
+
+    /// An npm `tfa.mode` nobody has seen before is still weaker than
+    /// `auth-and-writes` until proven otherwise, so it fails rather than being
+    /// waved through as "probably fine".
+    #[test]
+    fn an_unrecognised_npm_tfa_mode_fails_rather_than_being_assumed_adequate() {
+        let (o, reason, m) = classify_npm_tfa(r#"{"name":"me","tfa":{"mode":"some-new-mode"}}"#);
+        assert_eq!(o, Outcome::Fail);
+        assert_eq!(reason, None);
+        assert!(m[0].contains("weaker than `auth-and-writes`"), "{m:?}");
+        assert!(
+            m[0].contains("some-new-mode"),
+            "the mode must be named: {m:?}"
+        );
+    }
+
+    /// A credential for a registry with NO OIDC alternative is unavoidable, so
+    /// it is reported and scoped rather than failed. Failing it would demand a
+    /// migration that does not exist — the fastest way to teach someone to
+    /// ignore a tool.
+    #[test]
+    fn a_token_secret_for_a_registry_without_oidc_is_reported_not_failed() {
+        let dir = repo();
+        let root = dir.path();
+        write(root, "thing.nuspec", "<package/>\n");
+        write(
+            root,
+            "tools/chocolateyinstall.ps1",
+            "Install-ChocolateyPackage -Url 'https://e.com/t.exe' -checksum 'a' -checksumType 'sha256'\n",
+        );
+        let ctx = bootstrapped(root);
+        write(
+            root,
+            ".github/workflows/push-choco.yml",
+            "name: p\non: [workflow_dispatch]\npermissions:\n  contents: read\njobs:\n  p:\n    runs-on: ubuntu-latest\n    steps:\n      - run: choco push\n        env:\n          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}\n",
+        );
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        let r = verify_publish_tokens(&ctx, ctx.require_config().unwrap());
+        let joined = r.messages.join("\n");
+        assert_ne!(
+            r.outcome,
+            Outcome::Fail,
+            "Chocolatey has no OIDC path, so the credential is not avoidable: {joined}"
+        );
+        assert!(joined.contains("CHOCO_API_KEY"), "{joined}");
+        assert!(joined.contains("no OIDC path exists there"), "{joined}");
+        assert!(joined.contains("declare it in `[[token]]`"), "{joined}");
+    }
+
+    /// For the Windows ecosystems the provenance story is Authenticode plus the
+    /// manifest digest, and `publish-provenance` says so rather than inventing
+    /// a verdict it has no evidence for.
+    #[test]
+    fn windows_targets_defer_provenance_to_signing_and_the_manifest_checksum() {
+        let dir = repo();
+        let root = dir.path();
+        write(root, "thing.nuspec", "<package/>\n");
+        write(root, "manifests/T.installer.yaml", "InstallerSha256: ABC\n");
+        let ctx = bootstrapped(root);
+        let r = verify_publish_provenance(&ctx, ctx.require_config().unwrap());
+        assert_eq!(r.outcome, Outcome::Info, "{:?}", r.messages);
+        let joined = r.messages.join("\n");
+        assert!(joined.contains("Authenticode signature"), "{joined}");
+        assert!(joined.contains("dist-manifests"), "{joined}");
+        // Once each, not once per manifest.
+        assert_eq!(
+            joined.matches("Authenticode signature").count(),
+            2,
+            "{joined}"
+        );
+    }
+
+    // ─────────────────────── reporting surfaces ────────────────────────────
+
+    /// `dist status` renders declared claims, not just the empty case — the
+    /// branch an operator who HAS done the policy work actually sees.
+    #[test]
+    fn dist_status_renders_declared_accounts_and_tokens() {
+        let dir = repo();
+        let root = dir.path();
+        write(root, "thing.nuspec", "<package/>\n");
+        bootstrapped(root);
+        write(
+            root,
+            ".sscsb/policy/distribution.toml",
+            "[[account]]\ntarget = \"chocolatey\"\nidentity = \"pkg-owner\"\nmfa = \"totp\"\nattested = \"2026-01-15\"\n\n\
+             [[token]]\ntarget = \"chocolatey\"\npurpose = \"push key\"\nscoped = true\nexpires = \"2026-12-31\"\n",
+        );
+        let ctx = Ctx::discover(root).unwrap();
+        let text = render_status(&ctx).unwrap();
+        assert!(text.contains("Declared claims"), "{text}");
+        assert!(text.contains("account  chocolatey"), "{text}");
+        assert!(text.contains("pkg-owner"), "{text}");
+        assert!(text.contains("mfa totp (attested 2026-01-15)"), "{text}");
+        assert!(text.contains("token    chocolatey"), "{text}");
+        assert!(text.contains("expires 2026-12-31"), "{text}");
+        assert!(
+            text.contains("no OIDC path in the ecosystem"),
+            "Chocolatey's gap belongs in the summary too: {text}"
+        );
+    }
+
+    /// A declared token with none of the compensating controls is reported as
+    /// weak on every axis. Keeping a credential is defensible; keeping an
+    /// unscoped, unrestricted, unlocated, undated one is the thing that gets
+    /// people owned, and the report must say so rather than tick a box.
+    #[test]
+    fn a_declared_token_with_no_compensating_controls_is_called_out_on_every_axis() {
+        let dir = repo();
+        let root = dir.path();
+        write(root, "thing.nuspec", "<package/>\n");
+        bootstrapped(root);
+        write(
+            root,
+            ".sscsb/policy/distribution.toml",
+            "[[token]]\ntarget = \"chocolatey\"\npurpose = \"push key\"\n",
+        );
+        let ctx = Ctx::discover(root).unwrap();
+        let r = verify_publish_tokens(&ctx, ctx.require_config().unwrap());
+        let joined = r.messages.join("\n");
+        assert_ne!(
+            r.outcome,
+            Outcome::Fail,
+            "an undated token is weak, not broken"
+        );
+        assert!(joined.contains("no expiry declared"), "{joined}");
+        assert!(joined.contains("no `expires`"), "{joined}");
+        assert!(
+            joined.contains("not scoped to specific packages"),
+            "{joined}"
+        );
+        assert!(joined.contains("no CIDR allowlist"), "{joined}");
+        assert!(joined.contains("no `stored_in`"), "{joined}");
+    }
+
+    /// `dist-manifests`' own Homebrew arm — distinct code from
+    /// `publish-provenance`'s formula check, and it must reach the same verdict.
+    #[test]
+    fn dist_manifests_checks_a_homebrew_formula_and_agrees_with_the_provenance_control() {
+        let dir = repo();
+        let root = dir.path();
+        write(
+            root,
+            "Formula/t.rb",
+            "class T < Formula\n  url \"https://example.com/t.tar.gz\"\nend\n",
+        );
+        let ctx = bootstrapped(root);
+        let cfg = ctx.require_config().unwrap();
+        let manifests = verify_dist_manifests(&ctx, cfg);
+        let provenance = verify_publish_provenance(&ctx, cfg);
+        assert_eq!(manifests.outcome, Outcome::Fail);
+        assert_eq!(
+            manifests.outcome, provenance.outcome,
+            "two controls reading the same formula must not disagree about it"
+        );
+        assert!(
+            manifests
+                .messages
+                .join("\n")
+                .contains("only 0 sha256 pin(s)"),
+            "{:?}",
+            manifests.messages
+        );
+
+        write(
+            root,
+            "Formula/t.rb",
+            "class T < Formula\n  url \"https://example.com/t.tar.gz\"\n  sha256 \"abc\"\nend\n",
+        );
+        let ctx = Ctx::discover(root).unwrap();
+        let r = verify_dist_manifests(&ctx, ctx.require_config().unwrap());
+        assert_eq!(r.outcome, Outcome::Pass, "{:?}", r.messages);
+
+        // A formula that downloads nothing has nothing to pin, and that is not
+        // a failure — it is a cask pointing at an existing artifact.
+        write(
+            root,
+            "Formula/t.rb",
+            "class T < Formula\n  desc \"x\"\nend\n",
+        );
+        let ctx = Ctx::discover(root).unwrap();
+        let r = verify_dist_manifests(&ctx, ctx.require_config().unwrap());
+        assert!(
+            r.messages.join("\n").contains("nothing to pin"),
+            "{:?}",
+            r.messages
+        );
     }
 
     #[test]
