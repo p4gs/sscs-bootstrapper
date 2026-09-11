@@ -7,8 +7,8 @@ use crate::context::Ctx;
 use crate::controls::{self, Outcome};
 use crate::exec;
 use crate::{
-    compliance, deps, hooks, init, local_scan, machine, observability, provenance, sast, sbom,
-    scan, signers, tools,
+    compliance, deps, distribution, hooks, init, local_scan, machine, observability, provenance,
+    sast, sbom, scan, signers, tools,
 };
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
@@ -166,8 +166,27 @@ enum Command {
         #[command(subcommand)]
         action: SkillAction,
     },
+    /// Distribution & publishing posture (phase 6). NOT a publish wrapper —
+    /// see docs/phase-6.md for why `sscsb publish` was rejected.
+    Dist {
+        #[command(subcommand)]
+        action: DistAction,
+    },
     /// Show the pinned external-tool registry and detection status
     Tools,
+}
+
+#[derive(Subcommand)]
+enum DistAction {
+    /// Detected publish targets, installed publish workflows, declared claims
+    Status,
+    /// Run every phase-6 verifier, including the registry probes. A
+    /// break-glass preflight before an emergency manual publish.
+    Check {
+        /// Exit non-zero on a degraded control too, not only on a failure
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -475,6 +494,7 @@ pub fn run() -> Result<ExitCode> {
         Command::AgentKey { action } => cmd_agent_key(action),
         Command::Signing { action } => cmd_signing(&cwd, action),
         Command::Skill { action } => cmd_skill(&cwd, action),
+        Command::Dist { action } => cmd_dist(&cwd, action),
         Command::Tools => cmd_tools(),
     }
 }
@@ -560,7 +580,7 @@ fn cmd_status(cwd: &std::path::Path, format: &str) -> Result<ExitCode> {
         println!("  {m}");
     }
     println!();
-    for phase in 1..=5u8 {
+    for phase in 1..=6u8 {
         println!("Phase {phase}");
         for def in controls::phase_controls(phase) {
             let enabled = cfg
@@ -1263,6 +1283,39 @@ fn cmd_oras(cwd: &std::path::Path, action: OrasAction) -> Result<ExitCode> {
         OrasAction::Push { reference, file } => {
             println!("{}", observability::oras_push(&ctx, &reference, &file)?);
             ok()
+        }
+    }
+}
+
+fn cmd_dist(cwd: &std::path::Path, action: DistAction) -> Result<ExitCode> {
+    let ctx = Ctx::discover(cwd)?;
+    match action {
+        DistAction::Status => {
+            print!("{}", distribution::render_status(&ctx)?);
+            ok()
+        }
+        DistAction::Check { strict } => {
+            let results = distribution::run_check(&ctx)?;
+            let mut failed = 0u32;
+            let mut degraded = 0u32;
+            for result in &results {
+                println!("[{:8}] {}", result.outcome.symbol(), result.control);
+                for m in &result.messages {
+                    println!("           {m}");
+                }
+                match result.outcome {
+                    Outcome::Fail => failed += 1,
+                    Outcome::Degraded => degraded += 1,
+                    _ => {}
+                }
+            }
+            println!();
+            println!("dist check: {failed} failed, {degraded} degraded");
+            if failed > 0 || (strict && degraded > 0) {
+                fail(1)
+            } else {
+                ok()
+            }
         }
     }
 }

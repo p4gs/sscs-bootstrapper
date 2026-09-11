@@ -8,6 +8,78 @@ versions.
 
 ## [Unreleased]
 
+### Added
+
+- **Phase 6 — Distribution & publishing. Six controls, 47 → 53.** Phases 1 to 5
+  stopped at the registry door: they harden the repository, its dependencies,
+  its CI and the artifacts a GitHub Release carries, and none of them covers the
+  moment the artifact leaves for crates.io, npm, PyPI, Homebrew, Chocolatey or
+  WinGet — or the credential that lets it. That is the Shai-Hulud and
+  chalk/debug attack class, in which no commit is involved and every existing
+  control is looking the other way.
+
+  New module `src/distribution.rs` owns file-based, offline detection of what a
+  repository *publishes* (distinct from `deps::Ecosystem`, which is what it
+  *consumes*), the `.sscsb/policy/distribution.toml` policy, and six verifiers:
+  `publish-targets` (inventory, never grades), `trusted-publishing` (OIDC plus a
+  gated `release` environment), `maintainer-mfa` (the far-left link — the
+  account that can log in and publish), `publish-tokens` (committed credential
+  files, avoidable long-lived secrets, declared-token expiry),
+  `publish-provenance` (probes the live registry for provenance on what was
+  actually published) and `dist-manifests` (Homebrew `sha256`, Chocolatey
+  `checksum` + `checksumType`, WinGet `InstallerSha256`).
+
+  All six ship on, and phase 6 adds no off-by-default control, because the gate
+  is *detection* rather than configuration: each verifier goes quiet on its own
+  when its target is not in the tree. A repository with no `package.json` is not
+  a repository failing its npm posture.
+
+- **Three publish workflow templates, in their own detection-gated table.**
+  `publish-crates.yml` (30-minute OIDC token via `rust-lang/crates-io-auth-action`),
+  `publish-npm.yml` (`npm publish --provenance`, no `NODE_AUTH_TOKEN`) and
+  `publish-pypi.yml` (`pypa/gh-action-pypi-publish` with `attestations: true`,
+  and a build job that deliberately does not hold `id-token: write`). They live
+  in `DIST_ARTIFACTS` rather than `workflows::ARTIFACTS` because that table
+  installs on control-enabled alone, and `trusted-publishing` is on by default —
+  so registering them there would have dropped `publish-npm.yml` into every
+  repository sscsb ever touched. A publish workflow you do not publish with is
+  not a harmless extra file; it is a `workflow_dispatch` button wired to
+  somebody else's namespace. A test asserts the separation rather than only
+  commenting it.
+
+- **`sscsb dist status` and `sscsb dist check`.** Status lists detected targets,
+  their manifests, whether each publish template is installed, and the declared
+  `[[account]]`/`[[token]]` claims. Check runs the six phase-6 verifiers,
+  probes included, as a break-glass preflight before a manual publish. There is
+  deliberately **no** `sscsb publish`: git hooks fire on git events and nothing
+  intercepts `npm publish`, so a wrapper would be advisory theater; the doctrine
+  of this phase is to move publishing *into* CI behind an OIDC identity, which a
+  convenient local publish command works against; and reimplementing six
+  registries' publish clients adds no security property. `docs/phase-6.md`
+  records all three reasons so nobody re-proposes it.
+
+### Fixed
+
+- **Six phase bounds were hard-coded to 5, and one of them would have silently
+  mis-scored every repository.** `controls.rs` (twice), `cli.rs`,
+  `compliance.rs` and `tests/skill_docs.rs` each iterated `1..=5`, so a phase-6
+  control would simply not have appeared in `sscsb status`, `sscsb report`, or
+  the registry's own sparseness guard. The one that mattered most was
+  `machine.rs`'s `score_of`, which built `score.phases[]` from `1u8..=5`: a
+  phase-6 row would have fallen out of both the numerator and the denominator
+  while still counting toward `scoped`, so adding six *passing* controls would
+  have **lowered** every repository's evidence-coverage percentage in the
+  directory record. That literal is now derived from the registry as
+  `PHASE_COUNT`, with the reason written down, because the number is a shared
+  wire contract with the directory site.
+
+- **`default_config_toml`'s phase banner had a latent mislabel.** The match arm
+  was `_ => "Phase 5 — Observability & governance"`, which is correct exactly
+  until a sixth phase exists and then silently prints the wrong heading in the
+  one file every user opens and edits. Phases 5 and 6 now have explicit arms,
+  the fallback is a visible bug marker, and a test asserts that no control in
+  the registry renders it.
+
 ### Changed
 
 - **The `SKILL.md`-is-not-a-release-asset-yet disclosure is gone, because it

@@ -145,6 +145,16 @@ pub const TOOLS: &[ToolSpec] = &[
         install_note: "Required for branch-protection verification (GitHub API).",
     },
     ToolSpec {
+        id: "npm",
+        bin: "npm",
+        pinned_version: "11.6.2",
+        version_args: &["--version"],
+        homepage: "https://docs.npmjs.com/cli",
+        brew: Some("node"),
+        install_note: "Ships with Node.js. sscsb uses it read-only, for `npm profile get --json` \
+                       (the maintainer's tfa.mode) — it never publishes on your behalf.",
+    },
+    ToolSpec {
         id: "guacone",
         bin: "guacone",
         pinned_version: "1.1.0",

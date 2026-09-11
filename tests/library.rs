@@ -1085,6 +1085,7 @@ fn report_renders_text_and_json_with_live_enabled_state() {
     for marker in [
         "Phase 1",
         "Phase 5",
+        "Phase 6",
         "SLSA",
         "SSDF",
         "CRA",

@@ -1,0 +1,70 @@
+# sscsb: publish to crates.io through Trusted Publishing (OIDC), never a
+# long-lived token.
+#
+# crates.io Trusted Publishing went GA in July 2025. The exchange below trades
+# this workflow's GitHub OIDC identity for a crates.io token that lives THIRTY
+# MINUTES and is scoped to this crate — so there is no `CARGO_REGISTRY_TOKEN`
+# secret sitting in the repository for a phished maintainer, a malicious
+# dependency, or a compromised action to steal. That is the point: Shai-Hulud
+# and the chalk/debug thefts both turned on a long-lived publish token, not on
+# a compromised commit.
+#
+# ONE-TIME SETUP on crates.io, which this workflow cannot do for you:
+#   crates.io → your crate → Settings → Trusted Publishing → Add
+#   Repository owner: {{owner}}   Repository name: {{project}}
+#   Workflow filename: publish-crates.yml   Environment: release
+# Until that exists the exchange step fails closed. It does not fall back to a
+# token, and you should not add one.
+#
+# The `release` environment is where required reviewers, a wait timer, and a
+# branch restriction live. An OIDC identity is only as strong as the gate in
+# front of it: without the environment, any `workflow_dispatch` publishes.
+name: Publish — crates.io (Trusted Publishing)
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # exchanged for a 30-minute crates.io token
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      # Refuse to publish nothing. A pure `[workspace]` manifest, or a
+      # `Cargo.toml` that lost its `[package]` section, must fail loudly —
+      # "there was nothing to publish" must never read as a successful publish.
+      - name: Refuse to publish nothing
+        run: |
+          set -uo pipefail
+          if ! grep -q '^\[package\]' Cargo.toml; then
+            echo "::error::Cargo.toml has no [package] section — nothing to publish"
+            exit 1
+          fi
+      # Everything that can fail is made to fail BEFORE a token exists, so the
+      # 30-minute window is spent publishing rather than compiling.
+      - name: Package and verify before any credential exists
+        run: cargo package --locked
+      - name: Exchange OIDC for a short-lived crates.io token
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      # The token reaches cargo through the ENVIRONMENT, never `${{ }}`
+      # interpolated into a shell body — the same rule sscsb enforces on your
+      # workflows, and the reason a token cannot be spliced out of a log line.
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked --no-verify

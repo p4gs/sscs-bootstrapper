@@ -1620,7 +1620,7 @@ fn the_skills_control_arithmetic_matches_the_registry() {
         .count();
     let doc = sscsb::skill::SKILL_MD;
     assert!(
-        doc.contains(&format!("**{total} controls across five phases.**")),
+        doc.contains(&format!("**{total} controls across six phases.**")),
         "the skill must state the registry's real control count ({total})"
     );
     assert!(
@@ -1628,7 +1628,7 @@ fn the_skills_control_arithmetic_matches_the_registry() {
         "the skill must state the real default split ({on} on, {} off)",
         total - on
     );
-    for phase in 1..=5u8 {
+    for phase in 1..=6u8 {
         let in_phase = sscsb::controls::CONTROLS
             .iter()
             .filter(|c| c.phase == phase)

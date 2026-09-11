@@ -1550,7 +1550,19 @@ mod tests {
             assert_eq!(doc["controls"][0]["id"], "secrets");
             assert_eq!(doc["controls"][0]["scan_outcome"], "pass");
             assert_eq!(doc["repo"]["owner"], "o");
-            assert_eq!(doc["score"]["phases"].as_array().unwrap().len(), 5);
+            // One block per registry phase. Derived, not typed: this count is
+            // a wire contract with the directory, which recomputes the grade
+            // from these blocks, so a phase the tool scores and the site does
+            // not know about is a silent disagreement about a published grade.
+            let phases = crate::controls::CONTROLS
+                .iter()
+                .map(|c| c.phase)
+                .max()
+                .expect("the registry is never empty");
+            assert_eq!(
+                doc["score"]["phases"].as_array().unwrap().len(),
+                usize::from(phases)
+            );
             // The record and its signature are COMMITTED paths, not gitignored
             // output — contract lines `record-path` / `signature-path`.
             assert_eq!(signed.record_path, f.ctx.root.join(RECORD_PATH));

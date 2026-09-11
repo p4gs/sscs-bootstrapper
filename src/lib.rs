@@ -21,6 +21,7 @@
 //! - [`local_scan`] — the local lane: a signed, workstation-produced scan record
 //! - [`skill`] — the bundled agent skill (`sscsb skill install | print | check`)
 //! - [`observability`] — Dependency-Track, GUAC, OpenVEX, ORAS
+//! - [`distribution`] — phase 6: publish targets, trusted publishing, maintainer MFA
 //! - [`compliance`] — control → SLSA/SSDF/CRA/Badge map and `sscsb report`
 
 pub mod artifacts;
@@ -32,6 +33,7 @@ pub mod config;
 pub mod context;
 pub mod controls;
 pub mod deps;
+pub mod distribution;
 pub mod exec;
 pub mod harden;
 pub mod hooks;

@@ -1,0 +1,79 @@
+# sscsb: publish to npm through Trusted Publishing (OIDC) with provenance,
+# never an `NPM_TOKEN` secret.
+#
+# npm revoked classic tokens permanently on 2025-11-19 and granular write
+# tokens now expire in 90 days at most, which is an improvement on forever and
+# still a credential someone can phish. Trusted Publishing removes the
+# credential entirely: npm trusts this workflow's GitHub OIDC identity, so
+# there is no `NPM_TOKEN` in the repository to steal. The Shai-Hulud worm and
+# the chalk/debug compromise both spread on stolen publish tokens.
+#
+# `--provenance` additionally binds the published tarball to this workflow run
+# and this commit, and the attestation is queryable afterwards by anyone —
+# which is what `sscsb verify publish-provenance` probes for.
+#
+# ONE-TIME SETUP on npmjs.com, which this workflow cannot do for you:
+#   npmjs.com → your package → Settings → Trusted Publisher → GitHub Actions
+#   Organization or user: {{owner}}   Repository: {{project}}
+#   Workflow filename: publish-npm.yml   Environment: release
+# Until that exists `npm publish` fails closed. Do not add a token to "fix" it.
+#
+# The `release` environment is where required reviewers, a wait timer, and a
+# branch restriction live. An OIDC identity is only as strong as the gate in
+# front of it: without the environment, any `workflow_dispatch` publishes.
+name: Publish — npm (Trusted Publishing + provenance)
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # npm Trusted Publishing + provenance attestation
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      # Refuse to publish nothing, and refuse to publish something marked
+      # private: `npm publish` on a `"private": true` package is an error, and
+      # a workflow that swallows it reports a publish that never happened.
+      - name: Refuse to publish nothing
+        run: |
+          set -uo pipefail
+          if [ ! -f package.json ]; then
+            echo "::error::no package.json — nothing to publish"
+            exit 1
+          fi
+          if node -e 'process.exit(require("./package.json").private === true ? 0 : 1)'; then
+            echo "::error::package.json is marked \"private\": true — refusing to publish"
+            exit 1
+          fi
+      # npm's own integrity check runs before the OIDC exchange, so a broken
+      # tree fails without ever touching the registry.
+      - name: Install dependencies from the lockfile
+        run: npm ci
+      - name: Build a tarball and prove it is not empty
+        run: |
+          set -uo pipefail
+          npm pack --dry-run
+      # No NODE_AUTH_TOKEN, no `secrets.NPM_TOKEN`: the OIDC identity IS the
+      # credential. `--provenance` needs `id-token: write`, granted above.
+      - name: Publish with provenance
+        run: npm publish --provenance --access public

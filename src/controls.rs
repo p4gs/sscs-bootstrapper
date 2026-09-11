@@ -504,6 +504,61 @@ pub const CONTROLS: &[ControlDef] = &[
         tools: &[],
         default_options: &[],
     },
+    // ───────────────────── Phase 6 — Distribution & publishing ──────────────
+    ControlDef {
+        id: "publish-targets",
+        phase: 6,
+        name: "Publish-target inventory",
+        summary: "Detects which registries this repo publishes to (crates.io/npm/PyPI/Homebrew/Chocolatey/WinGet)",
+        default_enabled: true,
+        tools: &[],
+        default_options: &[],
+    },
+    ControlDef {
+        id: "trusted-publishing",
+        phase: 6,
+        name: "Trusted Publishing (OIDC)",
+        summary: "Publish workflows authenticate by OIDC with a gated environment, never a long-lived registry token",
+        default_enabled: true,
+        tools: &["gh"],
+        default_options: &[("environment", "\"release\"")],
+    },
+    ControlDef {
+        id: "maintainer-mfa",
+        phase: 6,
+        name: "Maintainer account MFA",
+        summary: "The publishing account's second factor — GitHub 2FA, npm tfa.mode, and a dated phishing-resistance claim",
+        default_enabled: true,
+        tools: &["gh", "npm"],
+        default_options: &[("max_attestation_age_days", "180")],
+    },
+    ControlDef {
+        id: "publish-tokens",
+        phase: 6,
+        name: "Publishing credential hygiene",
+        summary: "No committed credential files, no long-lived registry secrets where OIDC exists, declared tokens scoped and unexpired",
+        default_enabled: true,
+        tools: &[],
+        default_options: &[("max_token_age_days", "90")],
+    },
+    ControlDef {
+        id: "publish-provenance",
+        phase: 6,
+        name: "Published-artifact provenance",
+        summary: "Probes the live registry for provenance on what was actually published (npm attestations, PyPI PEP 740)",
+        default_enabled: true,
+        tools: &[],
+        default_options: &[("probe_registry", "true")],
+    },
+    ControlDef {
+        id: "dist-manifests",
+        phase: 6,
+        name: "Distribution manifest checksums",
+        summary: "Formula sha256, Chocolatey $checksum + checksumType, WinGet InstallerSha256, and the Authenticode claim",
+        default_enabled: true,
+        tools: &[],
+        default_options: &[],
+    },
 ];
 
 pub fn control(id: &str) -> Option<&'static ControlDef> {
@@ -747,6 +802,12 @@ pub fn verify_control(ctx: &Ctx, cfg: &Config, def: &'static ControlDef) -> Veri
         "openvex" => crate::observability::verify_openvex_control(ctx),
         "oras" => crate::observability::verify_oras_control(ctx),
         "compliance-map" => crate::compliance::verify_compliance_control(ctx),
+        "publish-targets" => crate::distribution::verify_publish_targets(ctx, cfg),
+        "trusted-publishing" => crate::distribution::verify_trusted_publishing(ctx, cfg),
+        "maintainer-mfa" => crate::distribution::verify_maintainer_mfa(ctx, cfg),
+        "publish-tokens" => crate::distribution::verify_publish_tokens(ctx, cfg),
+        "publish-provenance" => crate::distribution::verify_publish_provenance(ctx, cfg),
+        "dist-manifests" => crate::distribution::verify_dist_manifests(ctx, cfg),
         other => VerifyResult::new(
             def.id,
             Outcome::Fail,
@@ -971,7 +1032,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for c in CONTROLS {
             assert!(seen.insert(c.id), "duplicate control id {}", c.id);
-            assert!((1..=5).contains(&c.phase), "{} has invalid phase", c.id);
+            assert!((1..=6).contains(&c.phase), "{} has invalid phase", c.id);
             assert!(!c.summary.is_empty());
         }
     }
@@ -1007,7 +1068,7 @@ mod tests {
 
     #[test]
     fn every_phase_has_controls() {
-        for phase in 1..=5u8 {
+        for phase in 1..=6u8 {
             assert!(
                 phase_controls(phase).count() >= 3,
                 "phase {phase} suspiciously sparse"

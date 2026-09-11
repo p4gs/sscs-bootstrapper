@@ -1,0 +1,108 @@
+# sscsb: publish to PyPI through a Trusted Publisher (OIDC), never a
+# `PYPI_API_TOKEN` / `TWINE_PASSWORD` secret.
+#
+# PyPI's Trusted Publishers are mature, and 2FA is mandatory for every
+# uploader, so the account itself is already the hardest of the six ecosystems
+# to phish. What Trusted Publishing adds is the removal of the long-lived
+# upload token: PyPI trusts this workflow's GitHub OIDC identity instead, and
+# there is no secret in the repository to steal.
+#
+# Publishing this way also gets PEP 740 attestations generated automatically —
+# PyPI signs the distributions against this workflow's identity and serves the
+# result from its integrity API, which is exactly what
+# `sscsb verify publish-provenance` probes for. A token upload gets none.
+#
+# ONE-TIME SETUP on pypi.org, which this workflow cannot do for you:
+#   pypi.org → your project → Publishing → Add a new publisher → GitHub
+#   Owner: {{owner}}   Repository: {{project}}
+#   Workflow name: publish-pypi.yml   Environment: release
+# Until that exists the upload fails closed. Do not add a token to "fix" it.
+#
+# The `release` environment is where required reviewers, a wait timer, and a
+# branch restriction live. An OIDC identity is only as strong as the gate in
+# front of it: without the environment, any `workflow_dispatch` publishes.
+name: Publish — PyPI (Trusted Publisher)
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Refuse to build nothing
+        run: |
+          set -uo pipefail
+          if [ ! -f pyproject.toml ]; then
+            echo "::error::no pyproject.toml — nothing to publish"
+            exit 1
+          fi
+      # CUSTOMIZE: pin `build` (and any backend it needs) in a hash-pinned
+      # requirements file if your threat model covers the build frontend too.
+      - name: Build sdist and wheel
+        run: |
+          set -uo pipefail
+          python -m pip install build
+          python -m build
+      # An empty dist/ must fail loudly. "Nothing was uploaded" must never be
+      # indistinguishable from "everything was uploaded".
+      - name: Refuse to publish nothing
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          artifacts=(dist/*)
+          if [ ${#artifacts[@]} -eq 0 ]; then
+            echo "::error::dist/ is empty — nothing to publish (did the build step run?)"
+            exit 1
+          fi
+      - name: Upload the distributions for the publish job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-distributions
+          path: dist/
+
+  # The build runs without `id-token: write`; only this job — which does
+  # nothing but upload a reviewed artifact set — holds the identity that can
+  # publish. A compromised build step therefore cannot mint an upload token.
+  publish:
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # PyPI Trusted Publisher + PEP 740 attestations
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Download the distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-distributions
+          path: dist/
+      # No password, no `secrets.PYPI_API_TOKEN`: the OIDC identity IS the
+      # credential, and `attestations: true` is what produces the PEP 740
+      # signatures PyPI then serves from its integrity API.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          attestations: true

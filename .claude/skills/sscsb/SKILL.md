@@ -4,7 +4,7 @@ description: >-
   Bootstrap and verify software supply chain security in a git repository using
   the `sscsb` CLI — secret scanning, commit signing policy, SBOMs, vulnerability
   scanning, SAST, dependency trust, SLSA provenance, and continuous posture, as
-  47 individually toggleable controls across five phases. USE WHEN harden this
+  53 individually toggleable controls across six phases. USE WHEN harden this
   repo, supply chain security, SSCS, secret scanning, commit signing, SBOM,
   vulnerability scan, dependency trust, typosquat, SLSA provenance, sigstore,
   cosign, OpenSSF Scorecard, OpenVEX, SAST, branch protection, pin GitHub
@@ -164,7 +164,7 @@ Read the reason line. It always says which of the four it is.
 
 ## The controls
 
-**47 controls across five phases.** 32 are on by default, 15 are off — and off
+**53 controls across six phases.** 38 are on by default, 15 are off — and off
 means the code does not run, not that it runs and is ignored.
 
 | Phase | Name | Controls | On by default |
@@ -174,6 +174,7 @@ means the code does not run, not that it runs and is ignored.
 | 3 | Provenance | 10 | 7 |
 | 4 | Code analysis | 7 | 4 |
 | 5 | Continuous posture | 8 | 5 |
+| 6 | Distribution & publishing | 6 | 6 |
 
 Common reasons a control ships off. This is not a partition — some controls fit
 more than one, and `sscsb status` is the authority on your repo:
@@ -189,6 +190,11 @@ more than one, and `sscsb status` is the authority on your repo:
   `gittuf`, `ai-receipts`, `bumblebee`, `release-immutability` and
   `wait-for-secrets` each change how the team works, not just what is installed.
   Turning one on without that decision produces a `FAIL` nobody asked for.
+
+Phase 6 adds no off-by-default control. Every publishing check is on, because
+each one goes quiet on its own when the target is not there: a repository with
+no `package.json` is not a repository failing its npm posture, and saying so
+would be the false positive this tool exists to avoid.
 
 ```sh
 sscsb status                      # what's on, what's installed
@@ -208,6 +214,8 @@ Run `sscsb <command> --help` for flags.
 | `sscsb verify [controls...] [--strict] [--format text\|json]` | Verify all enabled controls, or only the named ones. An id that is not a real control exits `2` and runs nothing. |
 | `sscsb report [--format text\|json]` | Control → framework coverage map. |
 | `sscsb enable <control>` / `sscsb disable <control>` | Toggle a control in `.sscsb/config.toml`. |
+| `sscsb dist status` | Detected publish targets, installed publish workflows, declared account/token claims. |
+| `sscsb dist check [--strict]` | Run every phase-6 verifier including the registry probes — a break-glass preflight before a manual publish. Not a publish wrapper. |
 | `sscsb tools` | The pinned external-tool registry and where each was detected. |
 | `sscsb sbom [--format cyclonedx-json\|spdx-json]` | Generate an SBOM with Syft. |
 | `sscsb scan [--vex <file>] [--grype]` | Vulnerability scan (Trivy + OSV-Scanner), optional OpenVEX suppression. |

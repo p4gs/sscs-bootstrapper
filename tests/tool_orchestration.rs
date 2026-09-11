@@ -958,6 +958,12 @@ fn every_control_can_be_enabled_and_verified() {
         "best-practices-badge",
         "osps-baseline",
         "compliance-map",
+        "publish-targets",
+        "trusted-publishing",
+        "maintainer-mfa",
+        "publish-tokens",
+        "publish-provenance",
+        "dist-manifests",
     ];
 
     for control in ALL {
@@ -1110,6 +1116,12 @@ fn verify_reports_every_control_and_strict_mode_gates_on_degraded() {
         "best-practices-badge",
         "osps-baseline",
         "compliance-map",
+        "publish-targets",
+        "trusted-publishing",
+        "maintainer-mfa",
+        "publish-tokens",
+        "publish-provenance",
+        "dist-manifests",
     ] {
         assert!(
             stdout.contains(control),
