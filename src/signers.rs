@@ -1032,6 +1032,9 @@ mod tests {
 
     #[test]
     fn add_signer_warns_when_agent_signing_is_disabled() {
+        // Spawns git, which reads the process-global GIT_CONFIG_* this lock
+        // governs — see its doc comment above. A reader must take it too.
+        let _lock = env_lock();
         // A default (agent-signing OFF) bootstrapped repo.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1065,6 +1068,9 @@ mod tests {
 
     #[test]
     fn classify_range_labels_recent_commits() {
+        // Spawns git, which reads the process-global GIT_CONFIG_* this lock
+        // governs — see its doc comment above. A reader must take it too.
+        let _lock = env_lock();
         let (_d, _k, ctx) = repo();
         std::fs::write(ctx.root.join("a.txt"), "a\n").unwrap();
         git(&ctx, &["add", "-A"]);
@@ -1085,6 +1091,12 @@ mod tests {
 
     #[test]
     fn verify_policy_changes_accepts_human_and_rejects_ci_and_untrusted() {
+        // Spawns git, which reads the process-global GIT_CONFIG_* this lock
+        // governs — see its doc comment above. A reader must take it too.
+        // Without it this test fails as `git rev-parse HEAD failed (exit 128):
+        // bad config line 1`, borrowing the deliberately-corrupt gitconfig a
+        // concurrent signing_setup test points GIT_CONFIG_GLOBAL at.
+        let _lock = env_lock();
         let (_d, keydir, ctx) = repo();
         let kd = keydir.path();
         let human_pub = keygen(kd, "human", "human@example.com");
@@ -1336,6 +1348,9 @@ mod tests {
 
     #[test]
     fn verify_github_app_commits_degrades_without_a_configured_repo() {
+        // Spawns git, which reads the process-global GIT_CONFIG_* this lock
+        // governs — see its doc comment above. A reader must take it too.
+        let _lock = env_lock();
         // A bootstrapped repo with no origin remote and no github_repo set:
         // the function must error (degrade), never silently pass.
         let dir = tempfile::tempdir().unwrap();
