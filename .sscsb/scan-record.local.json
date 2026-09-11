@@ -1,17 +1,17 @@
 {
   "schema_version": 1,
-  "methodology_version": 1,
+  "methodology_version": 2,
   "repo": {
     "owner": "p4gs",
     "name": "sscs-bootstrapper",
     "url": "https://github.com/p4gs/sscs-bootstrapper",
     "default_branch": "main",
-    "commit": "2fada7b79aa37a9b3b958206ab7f4d71de8c5081",
+    "commit": "3cb129084db2d0b499823b8535be433f889852d8",
     "description": ""
   },
-  "scanned_at": "2026-09-04T16:21:00Z",
+  "scanned_at": "2026-09-11T15:44:32Z",
   "scanner": {
-    "sscsb_version": "0.3.1",
+    "sscsb_version": "0.4.0",
     "workflow_run_id": 0,
     "workflow_run_url": ""
   },
@@ -71,7 +71,6 @@
       "messages": [
         "human-local: configured",
         "agent-claude-code: incomplete — run `sscsb signing setup agent-claude-code`",
-        "cloud-claude: repo-side attribution is probeable and is not in place — an attestation cannot stand in for it",
         "cloud-claude: github_app_installed: not attested — `sscsb signing setup cloud-claude --confirm`",
         "github-web: vigilant_mode: not attested — `sscsb signing setup github-web --confirm`",
         "github-web: phishing_resistant_mfa: not attested — `sscsb signing setup github-web --confirm`",
@@ -185,6 +184,30 @@
       ]
     },
     {
+      "id": "binary-artifacts",
+      "phase": 1,
+      "in_scope": true,
+      "raw_outcome": "pass",
+      "scan_outcome": "pass",
+      "reclassified": false,
+      "reason": null,
+      "messages": [
+        "215 tracked file(s), none a compiled program or a code-carrying archive"
+      ]
+    },
+    {
+      "id": "webhooks",
+      "phase": 1,
+      "in_scope": true,
+      "raw_outcome": "pass",
+      "scan_outcome": "pass",
+      "reclassified": false,
+      "reason": null,
+      "messages": [
+        "p4gs/sscs-bootstrapper: no webhooks configured"
+      ]
+    },
+    {
       "id": "sbom",
       "phase": 2,
       "in_scope": true,
@@ -193,7 +216,7 @@
       "reclassified": false,
       "reason": null,
       "messages": [
-        "syft 1.51.0 available — `sscsb sbom` emits CycloneDX (default) or SPDX JSON"
+        "syft 1.51.1: .sscsb/out/sbom.cdx.json validated, 618 component(s) catalogued"
       ]
     },
     {
@@ -207,7 +230,30 @@
       "messages": [
         "trivy: 0.74.0",
         "osv-scanner: 2.5.1",
-        "scanner config: .trivyignore is present with 2 entr(ies): DS-0002, DS-0026 — suppressions it causes are listed individually as `suppressed:` rows"
+        "scanner config: .trivyignore is present with 2 entr(ies): DS-0002, DS-0026 — suppressions it causes are listed individually as `suppressed:` rows",
+        "trivy: 8 finding(s) suppressed by configuration trivy loaded from the repository — each is listed as a `suppressed:` row",
+        "suppressed: DS-0002 (.claude/worktrees/agent-ad4d771051016ecbd/.clusterfuzzlite/Dockerfile) — trivy ignored via .trivyignore",
+        "suppressed: DS-0026 (.claude/worktrees/agent-ad4d771051016ecbd/.clusterfuzzlite/Dockerfile) — trivy ignored via .trivyignore",
+        "suppressed: DS-0002 (.claude/worktrees/agent-ad4d771051016ecbd/templates/clusterfuzzlite/Dockerfile) — trivy ignored via .trivyignore",
+        "suppressed: DS-0026 (.claude/worktrees/agent-ad4d771051016ecbd/templates/clusterfuzzlite/Dockerfile) — trivy ignored via .trivyignore",
+        "suppressed: DS-0002 (.clusterfuzzlite/Dockerfile) — trivy ignored via .trivyignore",
+        "suppressed: DS-0026 (.clusterfuzzlite/Dockerfile) — trivy ignored via .trivyignore",
+        "suppressed: DS-0002 (templates/clusterfuzzlite/Dockerfile) — trivy ignored via .trivyignore",
+        "suppressed: DS-0026 (templates/clusterfuzzlite/Dockerfile) — trivy ignored via .trivyignore",
+        "0 finding(s) from trivy + osv-scanner; 0 at or above `high` (undetermined severity counts as above)"
+      ]
+    },
+    {
+      "id": "dependency-pinning",
+      "phase": 2,
+      "in_scope": true,
+      "raw_outcome": "pass",
+      "scan_outcome": "pass",
+      "reclassified": false,
+      "reason": null,
+      "messages": [
+        "[warn] .github/actions/setup-sscsb-tools/action.yml: step `Install pinned tools (checksum-verified)`: `pip install semgrep==${SEMGREP_VERSION}` pins a version, not a hash — `--require-hashes` with `--hash=sha256:…` pins the bytes",
+        "[info] fuzz/Cargo.toml: cargo-fuzz crate — no lockfile by the fuzzer's own convention"
       ]
     },
     {
@@ -248,7 +294,7 @@
       "messages": [
         "new-package approval gate enforced in commit-msg hook",
         "pre-commit + commit-msg + pre-push shims installed, executable, and unmodified (core.hooksPath=.sscsb/hooks)",
-        "approved baseline present (17 package(s))",
+        "approved baseline present (18 package(s))",
         "registry existence validation ON for `sscsb deps check` and approvals (anti-slopsquat)",
         "typosquat proximity heuristic ON for `sscsb deps check`, approvals, and the commit gate"
       ]
@@ -262,7 +308,7 @@
       "reclassified": false,
       "reason": null,
       "messages": [
-        "bumblebee 0.1.2: 16247 artifact(s) inventoried, no known-compromised packages found (profile baseline, catalog /opt/homebrew/opt/bumblebee/share/bumblebee/threat_intel)",
+        "bumblebee 0.1.2: 17048 artifact(s) inventoried, no known-compromised packages found (profile baseline, catalog /opt/homebrew/opt/bumblebee/share/bumblebee/threat_intel)",
         "endpoint classes covered: MCP server configs, editor extensions, browser extensions, agent skills",
         "note: 4 informational diagnostic(s) from the scan"
       ]
@@ -276,7 +322,7 @@
       "reclassified": false,
       "reason": null,
       "messages": [
-        "grype 0.117.0 available — `sscsb scan --grype` runs SBOM-first scanning"
+        "grype 0.118.0 available — `sscsb scan --grype` runs SBOM-first scanning"
       ]
     },
     {
@@ -449,7 +495,7 @@
       "reclassified": false,
       "reason": null,
       "messages": [
-        "engine: opengrep (rules: /Users/p4gs/.claude/jobs/206a2ff9/tmp/sscsb-main/.sscsb/rules)",
+        "engine: opengrep (rules: /Users/p4gs/Code/p4gs/sscs-bootstrapper/.sscsb/rules)",
         "local ruleset present (1 file(s))",
         "opengrep: 1.25.0"
       ]
@@ -624,7 +670,7 @@
       "reclassified": false,
       "reason": null,
       "messages": [
-        "map covers all 44 controls across SLSA/SSDF/CRA/Badge"
+        "map covers all 47 controls across SLSA/SSDF/CRA/Badge"
       ]
     }
   ],
@@ -632,11 +678,11 @@
     "grade": "A+",
     "provisional": false,
     "overall_percent": 100.0,
-    "evidence_coverage_percent": 88.6,
+    "evidence_coverage_percent": 89.5,
     "phases": [
       {
         "phase": 1,
-        "pass": 8,
+        "pass": 10,
         "fail": 0,
         "gap": 0,
         "unverified": 1,
@@ -645,7 +691,7 @@
       },
       {
         "phase": 2,
-        "pass": 7,
+        "pass": 8,
         "fail": 0,
         "gap": 0,
         "unverified": 0,
@@ -685,15 +731,15 @@
     "record_version": 1,
     "lane": "local",
     "namespace": "sscsb-scan-record",
-    "generated_at": "2026-09-04T16:21:00Z",
-    "sscsb_version": "0.3.1",
+    "generated_at": "2026-09-11T15:44:32Z",
+    "sscsb_version": "0.4.0",
     "repo": {
       "owner": "p4gs",
       "name": "sscs-bootstrapper",
       "url": "https://github.com/p4gs/sscs-bootstrapper",
       "default_branch": "main",
-      "branch": "main",
-      "commit": "2fada7b79aa37a9b3b958206ab7f4d71de8c5081"
+      "branch": "chore/rescan-0.4.0",
+      "commit": "3cb129084db2d0b499823b8535be433f889852d8"
     },
     "worktree": {
       "clean": true,
