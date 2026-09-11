@@ -138,26 +138,11 @@ pub const TEMPLATE_PATH: &str = "templates/skills/sscsb/SKILL.md";
 
 /// The release asset's name. `release.yml` stages [`TEMPLATE_PATH`] into
 /// `dist/` under this name, where the all-files Cosign loop signs it.
+///
+/// `v0.4.0` is the first published tag whose assets actually include it, so the
+/// recipe in `docs/skill.md` runs verbatim from there on. Every earlier tag was
+/// cut from a tree that did not stage it and attaches 15 assets rather than 17.
 pub const ASSET_NAME: &str = "SKILL.md";
-
-/// The disclosure every surface showing the release-asset recipe must carry
-/// until a published release actually contains [`ASSET_NAME`].
-///
-/// `release.yml` stages the skill and the signing loop covers it — the pipeline
-/// is real — but no tag published so far was cut from a tree that did that.
-/// A reader who runs the recipe's worked example verbatim today gets "no such
-/// file or directory" from step 3, with every step around it working, and reads
-/// that as their own mistake. Naming the gap is the fix; deleting the step
-/// would remove the one trust root in the document that does not depend on this
-/// binary.
-///
-/// `tests/skill_docs.rs` asserts this sentence onto every such surface, and its
-/// failure message says when it may be removed.
-pub const ASSET_PENDING_NOTICE: &str = "`SKILL.md` is not a release asset yet";
-
-/// When it becomes one. Pinned beside [`ASSET_PENDING_NOTICE`] so a surface
-/// cannot state the gap without stating its end.
-pub const ASSET_PENDING_FIRST_TAG: &str = "the first tag cut after this change lands";
 
 /// What `cosign sign-blob --bundle` appends to each signed file's name. The
 /// deploy gate requires one of these per asset, and refuses an orphan.

@@ -71,13 +71,12 @@ provenance.
 [`docs/skill.md`](https://github.com/p4gs/sscs-bootstrapper/blob/main/docs/skill.md)
 carries the verification recipe.
 
-**`SKILL.md` is not a release asset yet.** `release.yml` stages and signs it,
-but the first release whose assets include it is the first tag cut after this
-change lands. Against a tag published before that, `gh release download`
-produces no `SKILL.md` and the recipe's `SKILL.md` steps have no file to run
-against — run them on a platform tarball instead, which every published release
-carries and which they prove exactly the same things about. Every other step of
-the recipe works today.
+`v0.4.0` is the first tag whose assets include `SKILL.md` and
+`SKILL.md.sigstore.json`, so every step of that recipe — the ones naming
+`SKILL.md` included — runs verbatim against `v0.4.0` and later. Against an older
+tag, `gh release download` produces no `SKILL.md`; run those steps on a platform
+tarball instead, which every published release carries and which they prove
+exactly the same things about.
 
 Or build `sscsb` itself from source. This clones **`sscsb`'s** repository — it is
 not a command to run in the repository you are hardening, and it needs a Rust
