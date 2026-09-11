@@ -1118,4 +1118,26 @@ pub(crate) mod tests {
             "the ruleset must never appear in its own findings: {findings:?}"
         );
     }
+    /// The shipped ruleset must be pure ASCII. opengrep and semgrep open
+    /// `--config` files with Python's locale encoding; in a `LANG=C` container
+    /// (a slim CI image, a bare Docker base) that is ASCII, and a single
+    /// em-dash in a rule message made the engine exit 2 with NO output under
+    /// `--quiet` -- which the pre-commit hook rendered as "opengrep failed
+    /// (exit 2): no diagnostic output" and fail-closed on every commit.
+    /// Found on a Linux run of this suite (2026-09-07); CI's Ubuntu runner
+    /// and macOS are UTF-8, so neither ever saw it.
+    #[test]
+    fn the_shipped_ruleset_is_ascii_so_engines_parse_it_under_any_locale() {
+        let ruleset = include_str!("../templates/rules/sscsb-default.yaml");
+        let offenders: Vec<(usize, char)> = ruleset
+            .lines()
+            .enumerate()
+            .flat_map(|(i, l)| l.chars().filter(|c| !c.is_ascii()).map(move |c| (i + 1, c)))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "sscsb-default.yaml has non-ASCII characters (line, char): {offenders:?} -- \
+             an engine running under LANG=C cannot read the file"
+        );
+    }
 }

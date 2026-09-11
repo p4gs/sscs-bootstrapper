@@ -408,7 +408,7 @@ pub const CONTROLS: &[ControlDef] = &[
         id: "workflow-audit-extended",
         phase: 4,
         name: "Extended workflow audit",
-        summary: "pull_request_target misuse, credential persistence, secret echo, risky actions",
+        summary: "pull_request_target misuse, script injection, credential persistence, secret echo, risky actions",
         default_enabled: true,
         tools: &[],
         default_options: &[],
@@ -973,6 +973,35 @@ mod tests {
             assert!(seen.insert(c.id), "duplicate control id {}", c.id);
             assert!((1..=5).contains(&c.phase), "{} has invalid phase", c.id);
             assert!(!c.summary.is_empty());
+        }
+    }
+
+    #[test]
+    fn controls_are_grouped_by_phase_in_array_order() {
+        // Issue #42: `default_config_toml` (config.rs) emits a phase banner
+        // whenever a control's phase DIFFERS from the previous control's —
+        // not when a phase is first seen — so the array order is load-bearing
+        // even though nothing previously said so. A phase-2 control sitting
+        // between two phase-3 controls would silently duplicate both banners
+        // in a file every user reads. `is_sorted_by` alone is not quite the
+        // right check — it would also accept 1,1,3,3,1 as "sorted" in the
+        // sense of never decreasing pairwise is false there — so assert the
+        // real invariant the banner logic depends on: each phase's entries
+        // are one contiguous run.
+        let mut seen = std::collections::HashSet::new();
+        let mut phase = 0u8;
+        for c in CONTROLS {
+            if c.phase != phase {
+                assert!(
+                    seen.insert(c.phase),
+                    "control {} re-opens phase {} after the registry had already moved past \
+                     it — CONTROLS must group every phase's entries into one contiguous run, \
+                     or default_config_toml duplicates that phase's banner",
+                    c.id,
+                    c.phase
+                );
+                phase = c.phase;
+            }
         }
     }
 

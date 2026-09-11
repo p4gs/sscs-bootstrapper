@@ -296,6 +296,26 @@ namespace verifies against no principal in the committed anchor. The full contra
 statement of the namespace, the paths, the record shape and the command —
 is in [docs/local-scan.md](docs/local-scan.md).
 
+## Network and credentials
+
+The `secrets` control runs TruffleHog with verification **on**
+(`--results=verified,unknown`, never `--no-verification`). A candidate secret
+found in staged content is sent to the credential's **own issuing platform**
+to check whether it is live — the only path on which repository content
+leaves your machine during ordinary use, and it happens on every `git commit`.
+
+This is a deliberate choice, not an oversight: the platform verifying a secret
+is checking data that *originated with it*, not being handed anything to a
+third party its issuer doesn't already control, and verification is what
+separates a real leaked credential from a false-positive high-entropy string.
+If your repository's threat model requires zero egress on commit, set
+`[controls.secrets] trufflehog = false` and rely on Gitleaks alone, which
+never verifies.
+
+Full outbound inventory — every call `sscsb` makes, what credential each
+uses — is in
+[`openwiki/operations/network-and-credentials.md`](openwiki/operations/network-and-credentials.md).
+
 ## Platforms
 
 macOS, Linux, and WSL. The hooks are POSIX shell shims that delegate to the Rust

