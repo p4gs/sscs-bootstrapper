@@ -4151,7 +4151,17 @@ mod tests {
 
         // No gh at all is a different reason entirely.
         let r = crate::testutil::with_env(|lock| {
-            lock.only_git_on_path();
+            // `hide_from_path`, NOT `only_git_on_path`: on a GitHub runner `gh`
+            // lives in /usr/bin beside `git`, so masking PATH down to git's own
+            // directory leaves gh perfectly resolvable and the test then
+            // asserts the opposite of what it set up. Green on a Mac, red on
+            // the runner. Hide the one binary instead.
+            lock.hide_from_path(&["gh"]);
+            assert!(
+                exec::find_in_path("gh").is_none(),
+                "precondition: this case is about gh being ABSENT, and a fixture that \
+                 quietly failed to hide it would assert a degrade it never set up"
+            );
             let ctx = Ctx::discover(root).unwrap();
             verify_trusted_publishing(&ctx, ctx.require_config().unwrap())
         });
@@ -4270,7 +4280,13 @@ mod tests {
         );
         crate::init::bootstrap(root).unwrap();
         let r = crate::testutil::with_env(|lock| {
-            lock.only_git_on_path();
+            // git and gh share /usr/bin on a GitHub runner, so only hiding the
+            // one binary actually hides it.
+            lock.hide_from_path(&["gh"]);
+            assert!(
+                exec::find_in_path("gh").is_none(),
+                "precondition: gh is hidden"
+            );
             let ctx = Ctx::discover(root).unwrap();
             verify_maintainer_mfa(&ctx, ctx.require_config().unwrap())
         });
@@ -4330,7 +4346,11 @@ mod tests {
 
         // And npm absent degrades for a DIFFERENT reason than npm refusing.
         let r = crate::testutil::with_env(|lock| {
-            lock.only_git_on_path();
+            lock.hide_from_path(&["npm"]);
+            assert!(
+                exec::find_in_path("npm").is_none(),
+                "precondition: npm is hidden"
+            );
             let ctx = Ctx::discover(root).unwrap();
             verify_maintainer_mfa(&ctx, ctx.require_config().unwrap())
         });
