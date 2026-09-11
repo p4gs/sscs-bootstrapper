@@ -590,6 +590,19 @@ pub fn hook_pre_commit(ctx: &Ctx) -> Result<i32> {
 
 /// Run TruffleHog + Gitleaks over staged content. Returns findings.
 /// Errors when NO enabled scanner could run (caller applies fail-open policy).
+///
+/// **`--results=verified,unknown` (never `--no-verification`) is a deliberate
+/// ruling, not an oversight (issue #41, owner decision 2026-09-10).** A
+/// candidate secret found in staged content is sent to the credential's OWN
+/// issuing platform to check whether it is live — the only path on which
+/// repository content leaves the machine during ordinary use. That is judged
+/// acceptable: the platform verifying a secret is verifying data that
+/// *originated with it in the first place*, not disclosing anything to a
+/// third party the credential's issuer does not already control. Turning
+/// verification off would raise the false-positive rate on the one gate a
+/// maintainer cannot afford to start ignoring. Documented at
+/// `openwiki/operations/network-and-credentials.md` (regenerated from this
+/// comment, not hand-edited) and `README.md`.
 fn run_secret_scan_staged(ctx: &Ctx, cfg: &Config) -> Result<Vec<String>> {
     let want_th = cfg
         .control_opt_bool("secrets", "trufflehog")

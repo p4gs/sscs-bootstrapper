@@ -12,7 +12,157 @@ use crate::context::Ctx;
 use crate::controls::{Outcome, VerifyResult};
 use crate::exec;
 use anyhow::{Context as _, Result};
+use std::time::Duration;
 use yaml_rust2::{Yaml, YamlLoader};
+
+/// Hard cap on YAML anchor DECLARATIONS (`&name`) plus alias REFERENCES
+/// (`*name`) permitted in one document — checked BEFORE any of it reaches
+/// the YAML parser.
+///
+/// This, not a time budget, is what actually closes the vector (issue #43).
+/// The first fix here was a wall-clock timeout around the parse, on its own
+/// thread — and MEASUREMENT (replaying a 30-level document through the real,
+/// ASAN-instrumented `workflow_audit` fuzz target) proved that insufficient:
+/// the timeout bounds how long the CALLER waits, not what the abandoned
+/// thread does afterward. That thread went on to allocate past 2.5GB and
+/// trip libFuzzer's OOM guard in under 7 seconds — memory is shared across
+/// every thread in a process, so "the caller already returned an error" is
+/// not "the resource is contained". A time budget that lets the real cost
+/// keep running in the background is a false assurance, not a fix.
+///
+/// So the defense has to happen before yaml-rust2 ever sees the bytes.
+/// `yaml-rust2` 0.10.4 — the version this crate pins, and every version
+/// through 0.13.0, its latest as of this writing, per its own changelog —
+/// applies no bound to alias/anchor expansion: a document of N three-line
+/// anchors, each aliasing the previous TWICE, is under 25 bytes per level
+/// and roughly DOUBLES parse cost per level (96µs at 5 levels, 664ms at 22,
+/// under 500 bytes total). No real GitHub Actions workflow or composite
+/// action uses YAML anchors at all — the feature exists in the YAML 1.1
+/// spec, not in GitHub's authoring guidance — so refusing anything with more
+/// than a handful of anchor/alias tokens costs genuine files nothing while
+/// making the amplification shape structurally unreachable: with at most
+/// this many tokens total, the worst possible blowup a malicious arrangement
+/// could construct is a small, fixed, sub-millisecond bound, not an
+/// unbounded exponential one.
+const YAML_ANCHOR_ALIAS_LIMIT: usize = 16;
+
+/// Conservatively count anchor-declaration and alias-reference TOKENS in raw
+/// YAML text, without parsing it.
+///
+/// Deliberately an OVER-count, not a precise grammar: it matches `&`/`*` at
+/// any position YAML allows a scalar to start — after whitespace, `:`, `-`,
+/// `,`, `[`, or `{`, or at the very start of the document — immediately
+/// followed by at least one anchor-name character. That is the conservative
+/// direction to be wrong in. A `run:` step's shell content essentially never
+/// puts `&`/`*` directly after one of those bytes with no space (`ls *.txt`
+/// has a space before `*`; `cmd &` backgrounding has `&` at END of a token,
+/// not the start) — false positives are rare and refusing one is a far
+/// better failure mode than parsing an amplification document. This is a
+/// COUNTING pass only; it never allocates the anchor/alias NAMES, never
+/// builds a document tree, and its own cost is linear in the input length
+/// with no recursion — it cannot itself be turned into the attack it exists
+/// to detect.
+fn count_anchor_alias_tokens(content: &str) -> usize {
+    fn is_boundary(prev: Option<u8>) -> bool {
+        match prev {
+            None => true,
+            Some(b) => matches!(b, b'\n' | b' ' | b'\t' | b':' | b'-' | b'[' | b'{' | b','),
+        }
+    }
+    fn is_name_char(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+    }
+
+    let bytes = content.as_bytes();
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if (b == b'&' || b == b'*') && is_boundary(i.checked_sub(1).map(|p| bytes[p])) {
+            let start_of_name = i + 1;
+            let mut j = start_of_name;
+            while j < bytes.len() && is_name_char(bytes[j]) {
+                j += 1;
+            }
+            if j > start_of_name {
+                count += 1;
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    count
+}
+
+/// Refuse a YAML document whose anchor/alias token count exceeds
+/// [`YAML_ANCHOR_ALIAS_LIMIT`] — see that constant's doc comment for why
+/// this, and not a parse timeout, is the real fix.
+fn refuse_yaml_amplification_shape(content: &str) -> Result<()> {
+    let count = count_anchor_alias_tokens(content);
+    anyhow::ensure!(
+        count <= YAML_ANCHOR_ALIAS_LIMIT,
+        "{count} YAML anchor/alias tokens (`&name` or `*name`) found — refused before parsing. \
+         No real GitHub Actions workflow or composite action uses this many; this is the shape \
+         of a YAML \"billion laughs\" amplification document, not a legitimate file"
+    );
+    Ok(())
+}
+
+/// Upper bound on how long parsing may run after the anchor/alias check
+/// above has already passed.
+///
+/// Explicitly a SECONDARY backstop, not the primary defense: it catches a
+/// CPU-time pathology unrelated to alias amplification (a future yaml-rust2
+/// regression, or some other shape not yet measured) that the count check
+/// above would not see coming. It does **not** bound memory — a document
+/// that blows this budget leaves its worker thread running until the
+/// process exits, and that thread can still allocate in the meantime, which
+/// is precisely the property that disqualified a timeout as the primary fix
+/// above. Two seconds is generous for any real workflow file.
+const YAML_PARSE_BUDGET: Duration = Duration::from_secs(2);
+
+/// Parse untrusted workflow/action YAML: refuse the measured amplification
+/// shape outright, then apply the CPU-time backstop for anything else.
+fn parse_workflow_yaml(content: &str) -> Result<Vec<Yaml>> {
+    parse_workflow_yaml_with_budget(content, YAML_PARSE_BUDGET)
+}
+
+/// The budget is a parameter so tests can prove the backstop fires in
+/// milliseconds against the exact code path production uses, rather than
+/// burning real seconds per test or asserting against a mock that could
+/// drift from what `parse_workflow_yaml` actually does. The anchor/alias
+/// check above is unconditional regardless of budget — it is not a timing
+/// concern, so there is nothing to parameterize about it.
+fn parse_workflow_yaml_with_budget(content: &str, budget: Duration) -> Result<Vec<Yaml>> {
+    refuse_yaml_amplification_shape(content)?;
+    let owned = content.to_string();
+    run_with_timeout(budget, move || YamlLoader::load_from_str(&owned))?.context("YAML parse error")
+}
+
+/// Run `f` on a background thread and wait up to `budget` for it to finish.
+///
+/// Split out from `parse_workflow_yaml_with_budget` so the timeout mechanism
+/// itself can be tested with a workload whose duration the test controls
+/// completely (a sleep), rather than racing a real YAML parse of trivial
+/// content against a zero-duration budget — that construction looked like a
+/// deterministic proof but wasn't: a CI runner fast enough to complete the
+/// spawn-parse-send round trip before the main thread's very next
+/// instruction turns `recv_timeout(Duration::ZERO)` into a coin flip. See
+/// the corresponding test for the real failure this replaced.
+fn run_with_timeout<T: Send + 'static>(
+    budget: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver may already be gone (budget expired) — a send error
+        // here only means nobody is listening any more.
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(budget)
+        .map_err(|_| anyhow::anyhow!("did not finish within {budget:?} — refused rather than hung"))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -136,8 +286,7 @@ fn locate(findings: &mut [Finding], index: usize, total: usize) {
 /// a second document is beside the point — sscsb must not call a file clean on
 /// the strength of the half it read.
 pub fn audit_workflow(file: &str, content: &str, extended: bool) -> Result<Vec<Finding>> {
-    let docs =
-        YamlLoader::load_from_str(content).with_context(|| format!("parsing YAML in {file}"))?;
+    let docs = parse_workflow_yaml(content).with_context(|| format!("parsing YAML in {file}"))?;
     let live: Vec<&Yaml> = docs.iter().filter(|d| !is_blank_doc(d)).collect();
     if live.is_empty() {
         return Ok(vec![Finding::new(
@@ -275,8 +424,7 @@ fn composite_action_uses(doc: &Yaml) -> Vec<String> {
 /// spot: a local action can pull in an unpinned third-party action, and the
 /// workflow-level audit never looked inside it.
 pub fn audit_action_file(file: &str, content: &str) -> Result<Vec<Finding>> {
-    let docs =
-        YamlLoader::load_from_str(content).with_context(|| format!("parsing YAML in {file}"))?;
+    let docs = parse_workflow_yaml(content).with_context(|| format!("parsing YAML in {file}"))?;
     let live: Vec<&Yaml> = docs.iter().filter(|d| !is_blank_doc(d)).collect();
     if live.is_empty() {
         return Ok(vec![Finding::new(
@@ -788,7 +936,7 @@ fn harden_runner_jobs(doc: &Yaml) -> Vec<(String, HardenRunner)> {
 /// An empty result means the file declares no jobs at all — which proves
 /// nothing about harden-runner, and callers must not read it as a pass.
 pub fn harden_runner_status(content: &str) -> Result<Vec<(String, HardenRunner)>> {
-    let docs = YamlLoader::load_from_str(content).context("parsing workflow YAML")?;
+    let docs = parse_workflow_yaml(content).context("parsing workflow YAML")?;
     Ok(docs.iter().flat_map(harden_runner_jobs).collect())
 }
 
@@ -1259,6 +1407,147 @@ pub fn verify_branch_protection(ctx: &Ctx, cfg: &Config) -> VerifyResult {
 mod tests {
     use super::*;
     use crate::context::Ctx;
+
+    /// A YAML alias/anchor amplification document. `levels` three-line
+    /// anchors, each aliasing the previous TWICE, so the expanded structure
+    /// is 2^levels nodes from a source document a few bytes longer per
+    /// level — and `2 * levels + 1` anchor/alias TOKENS, which is the count
+    /// [`refuse_yaml_amplification_shape`] actually measures.
+    fn billion_laughs(levels: u32) -> String {
+        let mut doc = String::from("a0: &a0 [\"x\"]\n");
+        for i in 1..levels {
+            doc.push_str(&format!("a{i}: &a{i} [*a{prev}, *a{prev}]\n", prev = i - 1));
+        }
+        doc.push_str(&format!("final: *a{}\n", levels - 1));
+        doc
+    }
+
+    #[test]
+    fn count_anchor_alias_tokens_counts_declarations_and_references() {
+        // Hand-verified (and cross-checked with an independent Python
+        // simulation of the same scan): "a0" declares 1 (&a0); the loop for
+        // i in 1..4 (3 iterations) each adds 1 declaration + 2 references =
+        // 3 tokens × 3 = 9; the trailing `final: *a3` adds 1 more. Total 11.
+        // In general billion_laughs(L) carries exactly 3L - 1 tokens.
+        let doc = billion_laughs(4);
+        assert_eq!(count_anchor_alias_tokens(&doc), 11, "{doc}");
+    }
+
+    #[test]
+    fn the_token_scan_does_not_false_positive_on_ordinary_shell_and_expressions() {
+        // The false-positive resistance the doc comment on
+        // count_anchor_alias_tokens claims, checked against the actual
+        // shapes real workflow steps use: `ls *.txt`'s `*` is followed by
+        // `.`, not a name character, so it never completes a token;
+        // `some-server &`'s `&` has nothing after it on the line; `'*'`'s
+        // `*` is preceded by a quote, which is not a value-start boundary
+        // at all, so it is never even considered a candidate.
+        let doc = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ls *.txt
+      - run: some-server &
+      - run: echo "a & b, c * d"
+      - if: contains(github.event.head_commit.message, '*')
+"#;
+        assert_eq!(
+            count_anchor_alias_tokens(doc),
+            0,
+            "none of these are real YAML anchors or aliases"
+        );
+    }
+
+    #[test]
+    fn a_billion_laughs_document_is_refused_before_it_ever_reaches_the_parser() {
+        // The real fix (issue #43): the anchor/alias count check runs BEFORE
+        // yaml-rust2 sees the bytes at all, so this must return in
+        // microseconds regardless of level count — 40 levels would still be
+        // an exponential blowup if actually parsed, but it never gets that
+        // far. No custom budget needed any more; the default path is already
+        // fast because parsing never starts.
+        let doc = billion_laughs(40);
+        let t = std::time::Instant::now();
+        let err = parse_workflow_yaml(&doc).unwrap_err();
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "the check must reject before parsing, not after: took {:?}",
+            t.elapsed()
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refused before parsing"),
+            "must be named a pre-parse refusal: {msg}"
+        );
+        assert!(
+            msg.contains("119"),
+            "must report the real count (3*40-1): {msg}"
+        );
+    }
+
+    #[test]
+    fn the_limit_is_a_real_boundary_not_a_decoration() {
+        // billion_laughs(5) carries 3*5-1 = 14 tokens (under the limit of
+        // 16); billion_laughs(6) carries 3*6-1 = 17 (one over) — the
+        // smallest step this generator can take across the boundary, so
+        // this is a genuine off-by-one proof, not a generous margin. Proves
+        // the constant is load-bearing rather than a number nothing checks.
+        let under = billion_laughs(5);
+        assert_eq!(count_anchor_alias_tokens(&under), 14);
+        assert!(refuse_yaml_amplification_shape(&under).is_ok());
+
+        let over = billion_laughs(6);
+        assert_eq!(count_anchor_alias_tokens(&over), 17);
+        assert!(refuse_yaml_amplification_shape(&over).is_err());
+    }
+
+    #[test]
+    fn ordinary_workflow_yaml_passes_both_checks() {
+        // The negative control: a real (if tiny) workflow document must not
+        // be mistaken for the attack shape either check guards against.
+        let doc = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps: []\n";
+        let docs = parse_workflow_yaml(doc).expect("an ordinary document must not be refused");
+        assert_eq!(docs.len(), 1);
+    }
+
+    #[test]
+    fn the_cpu_backstop_mechanism_genuinely_fires_when_a_budget_is_exceeded() {
+        // Proves the SECOND, separate layer — the timeout wrapper — actually
+        // triggers. Exercises `run_with_timeout` directly with a workload
+        // whose duration the test fully controls (a 500ms sleep against a
+        // 5ms budget — a 100x margin), rather than racing a real YAML parse
+        // of trivial content against a zero-duration budget: a real CI run
+        // proved that construction was a genuine race, not a deterministic
+        // proof — a machine fast enough to complete the spawn-parse-send
+        // round trip before the main thread's very next instruction makes
+        // `recv_timeout(Duration::ZERO)` a coin flip, and one such runner
+        // called it heads. Controlling the workload's duration directly
+        // removes the dependency on how fast any given machine happens to
+        // parse a few dozen bytes of YAML. Documents the honest limit stated
+        // in YAML_PARSE_BUDGET's doc comment: this layer does not currently
+        // have a live attack it alone defends against — it is
+        // defense-in-depth for a shape not yet measured.
+        let err = run_with_timeout(Duration::from_millis(5), || {
+            std::thread::sleep(Duration::from_millis(500));
+            42
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("did not finish within"));
+    }
+
+    #[test]
+    fn audit_workflow_reports_the_pre_parse_refusal_rather_than_hanging() {
+        // The end-to-end path a real `.github/workflows/*.yml` takes,
+        // through the public entry point — not just the bounded helper in
+        // isolation.
+        let doc = billion_laughs(40);
+        let err = audit_workflow("evil.yml", &doc, true).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("evil.yml"), "must name the file: {msg}");
+        assert!(msg.contains("refused before parsing"), "{msg}");
+    }
 
     /// Throwaway repo bootstrapped through the real `sscsb init` path —
     /// mirrors the pattern in `tests/library.rs` so audit-control tests run

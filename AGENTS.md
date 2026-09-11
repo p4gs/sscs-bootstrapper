@@ -274,6 +274,15 @@ trufflehog = true
 gitleaks = true
 ```
 
+**`trufflehog = true` here means verification-on, not just detection-on.**
+`run_secret_scan_staged` (`src/hooks.rs`) invokes TruffleHog with
+`--results=verified,unknown`, never `--no-verification` — a candidate secret
+staged in a commit is sent to its own issuing platform to check whether it is
+live. This is the one path on which repository content leaves the machine
+during ordinary use, and it is a deliberate ruling (issue #41, owner decision
+2026-09-10), not an oversight: full reasoning at
+[`README.md#network-and-credentials`](README.md#network-and-credentials).
+
 Policy lives beside it:
 
 - `.sscsb/policy/signers.toml` — signing identities and their class

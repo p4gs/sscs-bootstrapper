@@ -890,6 +890,35 @@ mod tests {
     }
 
     #[test]
+    fn controls_are_grouped_by_phase_in_array_order() {
+        // Issue #42: `default_config_toml` (config.rs) emits a phase banner
+        // whenever a control's phase DIFFERS from the previous control's —
+        // not when a phase is first seen — so the array order is load-bearing
+        // even though nothing previously said so. A phase-2 control sitting
+        // between two phase-3 controls would silently duplicate both banners
+        // in a file every user reads. `is_sorted_by` alone is not quite the
+        // right check — it would also accept 1,1,3,3,1 as "sorted" in the
+        // sense of never decreasing pairwise is false there — so assert the
+        // real invariant the banner logic depends on: each phase's entries
+        // are one contiguous run.
+        let mut seen = std::collections::HashSet::new();
+        let mut phase = 0u8;
+        for c in CONTROLS {
+            if c.phase != phase {
+                assert!(
+                    seen.insert(c.phase),
+                    "control {} re-opens phase {} after the registry had already moved past \
+                     it — CONTROLS must group every phase's entries into one contiguous run, \
+                     or default_config_toml duplicates that phase's banner",
+                    c.id,
+                    c.phase
+                );
+                phase = c.phase;
+            }
+        }
+    }
+
+    #[test]
     fn every_phase_has_controls() {
         for phase in 1..=5u8 {
             assert!(
