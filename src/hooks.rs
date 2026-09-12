@@ -972,7 +972,7 @@ pub fn hook_pre_push(ctx: &Ctx, _remote: &str, stdin: &str) -> Result<i32> {
                 .control_opt_bool("secrets", "pre_push_range_scan")
                 .unwrap_or(true)
         {
-            match range_secret_scan(ctx, u) {
+            match range_secret_scan(ctx, cfg, u) {
                 Ok(findings) => problems.extend(findings),
                 Err(err) => {
                     if cfg.fail_open() {
@@ -1292,88 +1292,180 @@ fn trailer_identity_email(value: &str) -> Option<String> {
         .then(|| candidate.to_string())
 }
 
+/// `git log` revision arguments naming exactly the commits this push would
+/// publish — and nothing else.
+///
+/// A branch with no remote counterpart yet arrives on pre-push stdin carrying
+/// the ZERO sha as `remote_sha`. Read literally that says "no lower bound",
+/// and the outgoing range silently becomes the branch's ENTIRE reachable
+/// history: every commit ever made on the base branch, re-scanned as though
+/// this push had introduced it. Reproduced 2026-09-12 on a genuinely new
+/// branch whose real range (`f565d53..b50b020`) both scanners called clean,
+/// while the `git push` on that same branch raised ~20 gitleaks findings from
+/// years-old strings in vendored source and lockfile digests that appear
+/// nowhere in the outgoing diff. A gate that blocks a legitimate push over
+/// content the push does not contain is a gate maintainers learn to
+/// `--no-verify` past, which costs more than the findings were ever worth.
+///
+/// `<tip> --not --remotes` is the bound: everything reachable from the tip
+/// that is not already on a remote-tracking ref. [`commits_in_range`] already
+/// uses exactly that definition for the signing gate, so both pre-push gates
+/// now answer for the same range instead of two different ones.
+fn outgoing_rev_args(u: &RefUpdate) -> Result<Vec<String>> {
+    // Same fail-closed argument as `commits_in_range`: these shas arrive on
+    // pre-push stdin, `git log` and `git rev-list` inherit git's diff options
+    // (`--output=<file>` included), and an option-shaped "sha" would make the
+    // scan write a file and then see an EMPTY range — waving the push through.
+    // `--end-of-options` is not usable here either: `--not --remotes` must
+    // follow the revision, and `--end-of-options` would swallow them.
+    for sha in [&u.local_sha, &u.remote_sha] {
+        anyhow::ensure!(
+            sha.starts_with(ZERO_SHA_PREFIX) || exec::is_object_name(sha),
+            "refusing to run git with {sha:?}, which is not a git object name"
+        );
+    }
+    Ok(if u.remote_sha.starts_with(ZERO_SHA_PREFIX) {
+        vec![u.local_sha.clone(), "--not".into(), "--remotes".into()]
+    } else {
+        vec![format!("{}..{}", u.remote_sha, u.local_sha)]
+    })
+}
+
+/// The single commit bounding the outgoing range from below, for TruffleHog's
+/// `--since-commit` — which takes one commit, not a revision set, so it cannot
+/// be handed [`outgoing_rev_args`] directly.
+///
+/// For a branch the remote already has, that is `remote_sha`. For a new branch
+/// it is the first parent of the OLDEST unpublished commit: the point the
+/// branch was cut from. `Ok(None)` when no such commit exists — the outgoing
+/// range reaches a root commit, so the branch genuinely is its own whole
+/// history and there is nothing to exclude.
+fn range_since_commit(ctx: &Ctx, u: &RefUpdate) -> Result<Option<String>> {
+    if !u.remote_sha.starts_with(ZERO_SHA_PREFIX) {
+        return Ok(Some(u.remote_sha.clone()));
+    }
+    let rev_args = outgoing_rev_args(u)?;
+    let mut args = vec!["rev-list"];
+    args.extend(rev_args.iter().map(String::as_str));
+    let outgoing = exec::git(&args, &ctx.root)?;
+    let Some(oldest) = outgoing
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+    else {
+        return Ok(None); // nothing outgoing at all
+    };
+    anyhow::ensure!(
+        exec::is_object_name(oldest),
+        "git rev-list returned {oldest:?}, which is not a git object name"
+    );
+    let parents = exec::git(&["log", "-1", "--format=%P", oldest], &ctx.root)?;
+    Ok(parents.split_whitespace().next().map(str::to_string))
+}
+
 /// Secret scan over the outgoing commit range (TruffleHog git mode +
 /// Gitleaks log-opts).
-fn range_secret_scan(ctx: &Ctx, u: &RefUpdate) -> Result<Vec<String>> {
+///
+/// Honours `[controls.secrets] trufflehog` / `gitleaks` exactly as the
+/// pre-commit path ([`run_secret_scan_staged`]) already does. It did not, and
+/// ran whichever of the two happened to be on PATH: a repository that had
+/// turned gitleaks OFF in its own `.sscsb/config.toml` was still
+/// gitleaks-scanned on push, and blocked by the tool it had explicitly
+/// disabled. Found in four separate repositories on the same day.
+fn range_secret_scan(ctx: &Ctx, cfg: &Config, u: &RefUpdate) -> Result<Vec<String>> {
+    let want_th = cfg
+        .control_opt_bool("secrets", "trufflehog")
+        .unwrap_or(true);
+    let want_gl = cfg.control_opt_bool("secrets", "gitleaks").unwrap_or(true);
     let mut findings = Vec::new();
     let mut ran = 0u32;
+    let mut degrade = Vec::new();
     let repo_url = format!("file://{}", ctx.root.display());
     let branch = branch_of_ref(&u.local_ref).unwrap_or("HEAD").to_string();
 
-    if tools::is_available("trufflehog") {
-        ran += 1;
-        let mut args: Vec<String> = vec![
-            "git".into(),
-            repo_url.clone(),
-            "--no-update".into(),
-            "--fail".into(),
-            "--json".into(),
-            "--results=verified,unknown".into(),
-            format!("--branch={branch}"),
-        ];
-        if !u.remote_sha.starts_with(ZERO_SHA_PREFIX) {
-            args.push(format!("--since-commit={}", u.remote_sha));
-        }
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = exec::run("trufflehog", &arg_refs, Some(&ctx.root))?;
-        match out.status {
-            0 => {}
-            TRUFFLEHOG_FINDINGS_EXIT => findings.extend(parse_trufflehog_findings(&out.stdout)),
-            code => anyhow::bail!(
-                "trufflehog range scan failed (exit {code}): {}",
-                out.stderr.trim()
-            ),
+    if want_th {
+        if tools::is_available("trufflehog") {
+            ran += 1;
+            let mut args: Vec<String> = vec![
+                "git".into(),
+                repo_url.clone(),
+                "--no-update".into(),
+                "--fail".into(),
+                "--json".into(),
+                "--results=verified,unknown".into(),
+                format!("--branch={branch}"),
+            ];
+            if let Some(since) = range_since_commit(ctx, u)? {
+                args.push(format!("--since-commit={since}"));
+            }
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = exec::run("trufflehog", &arg_refs, Some(&ctx.root))?;
+            match out.status {
+                0 => {}
+                TRUFFLEHOG_FINDINGS_EXIT => findings.extend(parse_trufflehog_findings(&out.stdout)),
+                code => anyhow::bail!(
+                    "trufflehog range scan failed (exit {code}): {}",
+                    out.stderr.trim()
+                ),
+            }
+        } else {
+            degrade.push(tools::degrade_message("trufflehog", ctx.platform));
         }
     }
 
-    if tools::is_available("gitleaks") {
-        ran += 1;
-        let report = tempfile::NamedTempFile::new()?;
-        let report_arg = report.path().display().to_string();
-        let exit_arg = GITLEAKS_FINDINGS_EXIT.to_string();
-        let log_opts = if u.remote_sha.starts_with(ZERO_SHA_PREFIX) {
-            u.local_sha.clone()
-        } else {
-            format!("{}..{}", u.remote_sha, u.local_sha)
-        };
-        let log_opts_arg = format!("--log-opts={log_opts}");
-        let root_arg = ctx.root.display().to_string();
-        let out = exec::run(
-            "gitleaks",
-            &[
-                "git",
-                &root_arg,
-                "--no-banner",
-                "--redact",
-                "--exit-code",
-                &exit_arg,
-                &log_opts_arg,
-                "--report-format",
-                "json",
-                "--report-path",
-                &report_arg,
-            ],
-            None,
-        )?;
-        match out.status {
-            0 => {}
-            code if code == GITLEAKS_FINDINGS_EXIT => {
-                let json = std::fs::read_to_string(report.path()).unwrap_or_default();
-                findings.extend(parse_gitleaks_findings(&json));
+    if want_gl {
+        if tools::is_available("gitleaks") {
+            ran += 1;
+            let report = tempfile::NamedTempFile::new()?;
+            let report_arg = report.path().display().to_string();
+            let exit_arg = GITLEAKS_FINDINGS_EXIT.to_string();
+            let log_opts_arg = format!("--log-opts={}", outgoing_rev_args(u)?.join(" "));
+            let root_arg = ctx.root.display().to_string();
+            let out = exec::run(
+                "gitleaks",
+                &[
+                    "git",
+                    &root_arg,
+                    "--no-banner",
+                    "--redact",
+                    "--exit-code",
+                    &exit_arg,
+                    &log_opts_arg,
+                    "--report-format",
+                    "json",
+                    "--report-path",
+                    &report_arg,
+                ],
+                None,
+            )?;
+            match out.status {
+                0 => {}
+                code if code == GITLEAKS_FINDINGS_EXIT => {
+                    let json = std::fs::read_to_string(report.path()).unwrap_or_default();
+                    findings.extend(parse_gitleaks_findings(&json));
+                }
+                code => anyhow::bail!(
+                    "gitleaks range scan failed (exit {code}): {}",
+                    out.stderr.trim()
+                ),
             }
-            code => anyhow::bail!(
-                "gitleaks range scan failed (exit {code}): {}",
-                out.stderr.trim()
-            ),
+        } else {
+            degrade.push(tools::degrade_message("gitleaks", ctx.platform));
         }
     }
 
     if ran == 0 {
         anyhow::bail!(
-            "no secret scanner available for pre-push range scan ({} / {})",
-            tools::degrade_message("trufflehog", ctx.platform),
-            tools::degrade_message("gitleaks", ctx.platform)
+            "no secret scanner ran for the pre-push range scan: {}",
+            if degrade.is_empty() {
+                "both scanners disabled in config".to_string()
+            } else {
+                degrade.join(" | ")
+            }
         );
+    }
+    for d in degrade {
+        eprintln!("sscsb: degraded — {d}");
     }
     Ok(findings)
 }
@@ -3756,6 +3848,228 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
             pre_push(&ctx, &stdin),
             0,
             "clean incremental push must pass"
+        );
+    }
+
+    // ───────────── pre-push range scan: config + range boundedness ──────────
+    //
+    // Both tests below drive `range_secret_scan` directly rather than through
+    // the `pre_push` wrapper, because they install fake scanners on PATH and
+    // must own the environment lock for the whole invocation. `with_env` and
+    // `serialized` both acquire that lock and it is NOT reentrant, so calling
+    // `pre_push(..)` from inside `with_env(..)` would panic by design — see
+    // the composition rules in src/testutil.rs.
+
+    /// A shim that records one argument per line into `log` and exits 0.
+    ///
+    /// `tools::detect` probes every tool with its version arguments before the
+    /// scanner is used, and treats empty output as "unusable", so the shim has
+    /// to answer that probe too — hence the unconditional version line.
+    fn recording_shim(log: &Path, version_line: &str) -> String {
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\necho '{version_line}'\nexit 0\n",
+            log.display()
+        )
+    }
+
+    /// Every argument the shim at `log` was ever handed, across all
+    /// invocations. An absent file means it was never invoked at all.
+    fn recorded_args(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A scan invocation, as opposed to the version probe: the flag each tool
+    /// only ever receives when it is actually being asked to scan.
+    fn scanned(args: &[String], scan_flag: &str) -> bool {
+        args.iter().any(|a| a == scan_flag)
+    }
+
+    const TH_SCAN_FLAG: &str = "--results=verified,unknown";
+    const GL_SCAN_FLAG: &str = "--report-path";
+
+    /// Run the range scan with both scanners faked, returning what each was
+    /// handed. `logs` is a directory the shims write into.
+    fn range_scan_with_fake_tools(
+        ctx: &Ctx,
+        u: &RefUpdate,
+        logs: &Path,
+    ) -> (Result<Vec<String>>, Vec<String>, Vec<String>) {
+        let th_log = logs.join("trufflehog.argv");
+        let gl_log = logs.join("gitleaks.argv");
+        let cfg = ctx.config.as_ref().expect("config");
+        let out = crate::testutil::with_env(|lock| {
+            lock.fake_tool("trufflehog", &recording_shim(&th_log, "trufflehog 3.95.9"));
+            lock.fake_tool(
+                "gitleaks",
+                &recording_shim(&gl_log, "gitleaks version 8.30.1"),
+            );
+            range_secret_scan(ctx, cfg, u)
+        });
+        (out, recorded_args(&th_log), recorded_args(&gl_log))
+    }
+
+    /// A repo with one commit and the ref update a push of it would produce.
+    fn repo_with_one_commit() -> (tempfile::TempDir, Ctx, RefUpdate) {
+        let (dir, ctx) = test_repo();
+        write_file(&ctx, "README.md", "# x\n");
+        stage(&ctx, "README.md");
+        git_ok(&ctx, &["commit", "-m", "chore: base", "--no-verify"]);
+        let tip = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+        let u = RefUpdate {
+            local_ref: "refs/heads/feature/x".into(),
+            local_sha: tip,
+            remote_ref: "refs/heads/feature/x".into(),
+            remote_sha: ZERO.into(),
+        };
+        (dir, ctx, u)
+    }
+
+    /// Defect 1. The pre-commit path reads `[controls.secrets] trufflehog` /
+    /// `gitleaks` before deciding what to run; the pre-push RANGE path read
+    /// neither, and ran whichever tool was on PATH. A repository that had
+    /// turned gitleaks off in its own config was still gitleaks-scanned on
+    /// push — and blocked by the tool it had explicitly disabled. Four
+    /// repositories hit exactly that on 2026-09-12.
+    ///
+    /// Asserted in BOTH directions on purpose: the "did not run" half alone
+    /// would pass just as happily if the shim were never reachable on PATH,
+    /// which is a vacuous green. The first half proves the shim is wired.
+    #[test]
+    fn the_pre_push_range_scan_obeys_the_secrets_control_switches() {
+        let logs = tempfile::tempdir().unwrap();
+
+        // Both switches at their default `true`: both scanners run.
+        let (_d, ctx, u) = repo_with_one_commit();
+        let (out, th, gl) = range_scan_with_fake_tools(&ctx, &u, logs.path());
+        out.expect("range scan must succeed when both scanners are available");
+        assert!(
+            scanned(&th, TH_SCAN_FLAG),
+            "control on: trufflehog must be invoked for the range scan, got {th:?}"
+        );
+        assert!(
+            scanned(&gl, GL_SCAN_FLAG),
+            "control on: gitleaks must be invoked for the range scan, got {gl:?}"
+        );
+
+        // Same repo shape, `gitleaks = false`: gitleaks must not be invoked,
+        // and the scan must still run on the scanner that IS enabled.
+        let logs_off = tempfile::tempdir().unwrap();
+        let (_d2, ctx2, u2) = repo_with_one_commit();
+        let cfg_text = std::fs::read_to_string(ctx2.config_path())
+            .unwrap()
+            .replace("gitleaks = true", "gitleaks = false");
+        assert!(
+            cfg_text.contains("gitleaks = false"),
+            "fixture must actually flip the switch it is testing"
+        );
+        std::fs::write(ctx2.config_path(), cfg_text).unwrap();
+        let ctx2 = Ctx::discover(&ctx2.root).unwrap();
+
+        let (out, th, gl) = range_scan_with_fake_tools(&ctx2, &u2, logs_off.path());
+        out.expect("trufflehog is still enabled, so the range scan must succeed");
+        assert!(
+            scanned(&th, TH_SCAN_FLAG),
+            "trufflehog is still enabled and must still run, got {th:?}"
+        );
+        assert!(
+            !scanned(&gl, GL_SCAN_FLAG),
+            "[controls.secrets] gitleaks = false must keep gitleaks out of the pre-push \
+             range scan, but it was invoked with {gl:?}"
+        );
+    }
+
+    /// Defect 2. A branch with no remote counterpart arrives with the ZERO sha
+    /// as `remote_sha`, and the range collapsed to the branch tip alone —
+    /// i.e. every commit reachable from it, the whole history, scanned as if
+    /// this push had introduced it. That is how a narrow, clean three-commit
+    /// push produced ~20 findings from years-old strings that are nowhere in
+    /// its diff.
+    #[test]
+    fn a_brand_new_branch_scans_only_its_own_commits_not_the_whole_history() {
+        let (_d, ctx) = test_repo();
+        for n in 0..4 {
+            write_file(&ctx, &format!("base{n}.txt"), "base\n");
+            stage(&ctx, &format!("base{n}.txt"));
+            git_ok(
+                &ctx,
+                &["commit", "-m", &format!("chore: base {n}"), "--no-verify"],
+            );
+        }
+        let published = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+        // The remote already has main at `published` — the only thing that
+        // makes the new branch's commits distinguishable from its history.
+        git_ok(
+            &ctx,
+            &["update-ref", "refs/remotes/origin/main", &published],
+        );
+
+        git_ok(&ctx, &["checkout", "-b", "feature/new"]);
+        for n in 0..2 {
+            write_file(&ctx, &format!("new{n}.txt"), "new\n");
+            stage(&ctx, &format!("new{n}.txt"));
+            git_ok(
+                &ctx,
+                &["commit", "-m", &format!("feat: new {n}"), "--no-verify"],
+            );
+        }
+        let tip = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+
+        let outgoing: Vec<String> =
+            exec::git(&["rev-list", &format!("{published}..{tip}")], &ctx.root)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+        let everything: Vec<String> = exec::git(&["rev-list", &tip], &ctx.root)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(outgoing.len(), 2, "fixture: two commits are outgoing");
+        assert_eq!(everything.len(), 6, "fixture: six commits exist in total");
+
+        let u = RefUpdate {
+            local_ref: "refs/heads/feature/new".into(),
+            local_sha: tip,
+            remote_ref: "refs/heads/feature/new".into(),
+            remote_sha: ZERO.into(),
+        };
+        let logs = tempfile::tempdir().unwrap();
+        let (out, th, gl) = range_scan_with_fake_tools(&ctx, &u, logs.path());
+        out.expect("range scan must succeed");
+
+        // What gitleaks was actually pointed at, resolved by git itself —
+        // asserting on the revision SET, not on the spelling of the argument.
+        let log_opts = gl
+            .iter()
+            .find_map(|a| a.strip_prefix("--log-opts="))
+            .expect("gitleaks must receive --log-opts");
+        let mut rev = vec!["rev-list"];
+        rev.extend(log_opts.split_whitespace());
+        let gl_scanned: Vec<String> = exec::git(&rev, &ctx.root)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            gl_scanned,
+            outgoing,
+            "a new branch must be scanned over its OWN commits only; `--log-opts={log_opts}` \
+             resolved to {} commit(s) of the {} in this repository",
+            gl_scanned.len(),
+            everything.len()
+        );
+
+        // TruffleHog takes a single commit rather than a revision set, so it
+        // is bounded by the point the branch was cut from.
+        assert!(
+            th.iter()
+                .any(|a| a == &format!("--since-commit={published}")),
+            "trufflehog must be bounded to the branch point, got {th:?}"
         );
     }
 }
