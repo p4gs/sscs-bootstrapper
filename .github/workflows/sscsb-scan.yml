@@ -1,7 +1,7 @@
 # Authenticated sscsb scan via the published action (p4gs/sscsb-action@v1).
 # Runs in THIS repo's own CI, so GitHub-side checks see full permissions —
 # the record uploads as the `sscsb-scan-record` artifact; submission to the
-# directory (tools.sensiblesecurity.xyz/sscsb/) goes via an
+# directory (sscsb.dev) goes via an
 # `action-scan-result` issue referencing the run (submit is off: cross-repo
 # issue creation needs a token this workflow deliberately does not hold).
 name: SSCSB Scan
