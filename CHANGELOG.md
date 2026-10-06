@@ -60,6 +60,33 @@ versions.
 
 ### Fixed
 
+- **The pre-push range secret scan ignored `[controls.secrets]` entirely, and
+  ran both scanners on a repository that had turned one of them off.** The
+  pre-commit path (`run_secret_scan_staged`) reads
+  `control_opt_bool("secrets", "trufflehog")` / `"gitleaks"` before deciding
+  what to run; the pre-push range path read neither and ran whichever tool was
+  on `PATH`. A repository with `gitleaks = false` in its own
+  `.sscsb/config.toml` was therefore still gitleaks-scanned on every push, and
+  blocked by the tool it had explicitly disabled — hit independently by four
+  repositories being onboarded on 2026-09-12. `range_secret_scan` now takes the
+  `Config` and honours both switches, with the same degrade messages and the
+  same "nothing could run" fail-closed bail the pre-commit path already had.
+
+- **A branch with no remote counterpart had its whole history scanned as if it
+  were outgoing.** A new branch arrives on pre-push stdin with the ZERO sha as
+  `remote_sha`, and both scanners read that as "no lower bound": gitleaks was
+  handed `--log-opts=<tip>` (every commit reachable from the tip) and
+  trufflehog was given no `--since-commit` at all. Reproduced on a genuinely
+  new branch whose real range both scanners called clean, while the push raised
+  ~20 gitleaks findings from years-old strings in vendored source and lockfile
+  digests that appear nowhere in the outgoing diff. The range is now bounded by
+  `<tip> --not --remotes` — the same definition `commits_in_range` already used
+  for the signing gate, so both pre-push gates answer for one range — and
+  trufflehog, which takes a single commit rather than a revision set, is
+  bounded by the first parent of the oldest unpublished commit (the branch
+  point), or left unbounded only when the range genuinely reaches a root
+  commit.
+
 - **Six phase bounds were hard-coded to 5, and one of them would have silently
   mis-scored every repository.** `controls.rs` (twice), `cli.rs`,
   `compliance.rs` and `tests/skill_docs.rs` each iterated `1..=5`, so a phase-6
