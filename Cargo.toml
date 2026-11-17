@@ -38,7 +38,7 @@ yaml-rust2 = "0.10"
 # `chmod u+w`. Ownership is capability, so the owner comparison needs the
 # EFFECTIVE uid, which std does not expose.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1", features = ["fs", "process"] }
+rustix = { version = "1.1.6", features = ["fs", "process"] }
 
 [dev-dependencies]
 assert_cmd = "2.1"
