@@ -10,6 +10,11 @@ versions.
 
 ### Added
 
+- `sscsb init` installs the official OpenGrep Agent Skill and its MIT license
+  for Claude Code and Agent Skills-compatible clients. The bundled source is
+  pinned to upstream revision `bfbc2419225e8884a343c312b2d3b05c2106fa45`;
+  bootstrap preserves existing skills and needs no package manager (SEC-5).
+
 - **Phase 6 — Distribution & publishing. Six controls, 48 → 54.** Phases 1 to 5
   stopped at the registry door: they harden the repository, its dependencies,
   its CI and the artifacts a GitHub Release carries, and none of them covers the
@@ -59,6 +64,15 @@ versions.
   records all three reasons so nobody re-proposes it.
 
 ### Fixed
+
+- Update Rustls to 0.23.46, rustls-webpki to 0.103.17, webpki-roots to
+  1.0.12, and rustix to 1.1.6 to address current security advisories (SEC-1).
+- Withhold free-form account identities and token purposes from distribution
+  status output, retaining target, MFA posture, and validated dates (SEC-2).
+- Pin OpenGrep 2.0.0 and use its renamed Linux release asset in both generated
+  workflows and the checksum-verified CI installer (SEC-5).
+- Make Trivy fail CI on findings while preserving SARIF upload on failed
+  scans that produced a report (SEC-3, SEC-4).
 
 - **Six phase bounds were hard-coded to 5, and one of them would have silently
   mis-scored every repository.** `controls.rs` (twice), `cli.rs`,

@@ -181,6 +181,31 @@ pub fn bootstrap(cwd: &Path) -> Result<Vec<String>> {
     }
 
     log.extend(workflows::install_all(&ctx, cfg)?);
+    // Official Agent Skill, verbatim from opengrep/skills at
+    // bfbc2419225e8884a343c312b2d3b05c2106fa45, with its MIT license.
+    // These are agent documentation, not evidence that SAST enforces anything:
+    // putting them in ARTIFACTS would turn older repos with valid SAST into gaps.
+    if cfg.control_enabled_or_default("sast") {
+        for prefix in [".agents", ".claude"] {
+            for (name, content) in [
+                (
+                    "SKILL.md",
+                    include_str!("../templates/skills/opengrep/SKILL.md"),
+                ),
+                (
+                    "LICENSE",
+                    include_str!("../templates/skills/opengrep/LICENSE"),
+                ),
+            ] {
+                let dest = format!("{prefix}/skills/opengrep/{name}");
+                if workflows::write_if_absent(&ctx.root, &dest, content)? {
+                    log.push(format!("write {dest}"));
+                } else {
+                    log.push(format!("keep {dest} (exists — delete to regenerate)"));
+                }
+            }
+        }
+    }
     // Publish workflows come last and are gated on DETECTION, not just on the
     // control being enabled: `publish-npm.yml` in a repository with no
     // package.json is a workflow_dispatch button wired to someone else's
@@ -228,6 +253,84 @@ mod tests {
             second.iter().filter(|l| l.starts_with("write")).count()
                 < first.iter().filter(|l| l.starts_with("write")).count(),
             "the second run writes strictly less than the first"
+        );
+    }
+
+    #[test]
+    fn bootstrap_installs_the_official_opengrep_skill_without_clobbering_edits() {
+        // Installing documentation must not make it required SAST evidence.
+        assert!(!workflows::artifacts_for("sast")
+            .iter()
+            .any(|a| a.dest.contains("/skills/")));
+        let dir = fresh_repo();
+        let root = dir.path();
+        bootstrap(root).unwrap();
+        for prefix in [".agents", ".claude"] {
+            let skill = root.join(prefix).join("skills/opengrep/SKILL.md");
+            let license = root.join(prefix).join("skills/opengrep/LICENSE");
+            assert_eq!(
+                std::fs::read_to_string(&skill).unwrap(),
+                include_str!("../templates/skills/opengrep/SKILL.md")
+            );
+            assert_eq!(
+                std::fs::read_to_string(license).unwrap(),
+                include_str!("../templates/skills/opengrep/LICENSE")
+            );
+            std::fs::write(skill, "local customization").unwrap();
+        }
+        bootstrap(root).unwrap();
+        for prefix in [".agents", ".claude"] {
+            assert_eq!(
+                std::fs::read_to_string(root.join(prefix).join("skills/opengrep/SKILL.md"))
+                    .unwrap(),
+                "local customization"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_does_not_install_opengrep_skills_when_sast_is_disabled() {
+        let dir = fresh_repo();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".sscsb")).unwrap();
+        std::fs::write(
+            root.join(".sscsb/config.toml"),
+            "[controls.sast]\nenabled = false\n",
+        )
+        .unwrap();
+        bootstrap(root).unwrap();
+        for prefix in [".agents", ".claude"] {
+            assert!(!root.join(prefix).join("skills/opengrep").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_preserves_the_native_opengrep_skill_symlink_layout() {
+        let dir = fresh_repo();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".agents/skills/opengrep")).unwrap();
+        std::fs::create_dir_all(root.join(".claude/skills")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../.agents/skills/opengrep",
+            root.join(".claude/skills/opengrep"),
+        )
+        .unwrap();
+        bootstrap(root).unwrap();
+        let alias = root.join(".claude/skills/opengrep");
+        assert!(std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(alias.join("SKILL.md")).unwrap(),
+            include_str!("../templates/skills/opengrep/SKILL.md")
+        );
+        std::fs::write(alias.join("SKILL.md"), "local customization").unwrap();
+        bootstrap(root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join(".agents/skills/opengrep/SKILL.md")).unwrap(),
+            "local customization"
         );
     }
 

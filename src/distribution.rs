@@ -1476,7 +1476,7 @@ pub fn verify_maintainer_mfa(ctx: &Ctx, cfg: &Config) -> VerifyResult {
                      and update `attested`. A stale claim about a publishing account is exactly \
                      as actionable as an expired signing key",
                     target.registry(),
-                    account.identity,
+                    "[identity withheld]",
                     mfa.label()
                 ));
             }
@@ -1488,7 +1488,7 @@ pub fn verify_maintainer_mfa(ctx: &Ctx, cfg: &Config) -> VerifyResult {
                     "{} account `{}`: claims `{}` ({resistance}), confirmed {days}d ago — a \
                      self-declared claim, documented, never a substitute for the API reads above",
                     target.registry(),
-                    account.identity,
+                    "[identity withheld]",
                     mfa.label()
                 ));
             }
@@ -1499,7 +1499,7 @@ pub fn verify_maintainer_mfa(ctx: &Ctx, cfg: &Config) -> VerifyResult {
                      cannot go stale, which is exactly why it also cannot be trusted; add the \
                      day you last checked, as YYYY-MM-DD",
                     target.registry(),
-                    account.identity,
+                    "[identity withheld]",
                     mfa.label()
                 ));
             }
@@ -1864,8 +1864,8 @@ pub fn verify_publish_tokens(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     }
 
     // Declared tokens: expiry is the part sscsb can actually evaluate.
-    for token in &policy.tokens {
-        let label = format!("{} token ({})", token.target.registry(), token.purpose);
+    for (index, token) in policy.tokens.iter().enumerate() {
+        let label = format!("{} token #{}", token.target.registry(), index + 1);
         let state = evaluate_expiry(token.expires.as_deref(), today, max_age);
         let (line, failed) = expiry_line(&label, &state);
         messages.push(line);
@@ -1897,7 +1897,7 @@ pub fn verify_publish_tokens(ctx: &Ctx, cfg: &Config) -> VerifyResult {
             ));
         }
         match token.stored_in.as_deref() {
-            Some(where_) => messages.push(format!("  stored in {where_}")),
+            Some(_) => messages.push("  storage location declared (value withheld)".to_string()),
             None => messages.push(
                 "  no `stored_in` — say where the secret actually lives, or nobody can revoke \
                  it in a hurry"
@@ -2573,19 +2573,23 @@ pub fn render_status(ctx: &Ctx) -> Result<String> {
         for a in &policy.accounts {
             let _ = writeln!(
                 out,
-                "  account  {:<12} {} — mfa {} (attested {})",
+                "  account  {:<12} [identity withheld] — mfa {} (attested {})",
                 a.target.id(),
-                a.identity,
-                a.mfa.label(),
+                match a.mfa {
+                    MfaClaim::WebauthnOnly => "webauthn-only",
+                    MfaClaim::Webauthn => "webauthn",
+                    MfaClaim::Totp => "totp",
+                    MfaClaim::None => "none",
+                },
                 a.attested.as_deref().unwrap_or("never")
             );
         }
-        for t in &policy.tokens {
+        for (index, t) in policy.tokens.iter().enumerate() {
             let _ = writeln!(
                 out,
-                "  token    {:<12} {} — expires {}",
+                "  token    {:<12} #{} [purpose withheld] — expires {}",
                 t.target.id(),
-                t.purpose,
+                index + 1,
                 t.expires.as_deref().unwrap_or("never stated")
             );
         }
@@ -4585,6 +4589,48 @@ mod tests {
 
     // ─────────────────────── reporting surfaces ────────────────────────────
 
+    #[test]
+    fn dist_status_withholds_free_form_claim_values() {
+        let dir = repo();
+        let root = dir.path();
+        write(root, "thing.nuspec", "<package/>\n");
+        bootstrapped(root);
+        write(
+            root,
+            ".sscsb/policy/distribution.toml",
+            r#"
+[[account]]
+target = "chocolatey"
+identity = "private-account-marker"
+mfa = "totp"
+attested = "2026-01-15"
+[[token]]
+target = "chocolatey"
+purpose = "private-purpose-marker"
+stored_in = "private-storage-marker"
+expires = "2026-12-31"
+"#,
+        );
+        let ctx = Ctx::discover(root).unwrap();
+        let mut text = render_status(&ctx).unwrap();
+        for result in [
+            verify_maintainer_mfa(&ctx, ctx.require_config().unwrap()),
+            verify_publish_tokens(&ctx, ctx.require_config().unwrap()),
+        ] {
+            text.push_str(&result.messages.join("\n"));
+        }
+        for private in [
+            "private-account-marker",
+            "private-purpose-marker",
+            "private-storage-marker",
+        ] {
+            assert!(!text.contains(private), "free-form claim leaked");
+        }
+        assert!(text.contains("chocolatey"));
+        assert!(text.contains("2026-12-31"));
+        assert!(text.contains("mfa totp"));
+    }
+
     /// `dist status` renders declared claims, not just the empty case — the
     /// branch an operator who HAS done the policy work actually sees.
     #[test]
@@ -4603,7 +4649,8 @@ mod tests {
         let text = render_status(&ctx).unwrap();
         assert!(text.contains("Declared claims"), "{text}");
         assert!(text.contains("account  chocolatey"), "{text}");
-        assert!(text.contains("pkg-owner"), "{text}");
+        assert!(text.contains("[identity withheld]"), "{text}");
+        assert!(!text.contains("pkg-owner"));
         assert!(text.contains("mfa totp (attested 2026-01-15)"), "{text}");
         assert!(text.contains("token    chocolatey"), "{text}");
         assert!(text.contains("expires 2026-12-31"), "{text}");

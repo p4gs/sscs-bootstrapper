@@ -68,6 +68,11 @@ classes.
 `.sscsb/policy/signing-model.toml`), every CI workflow, and every generated
 config file. Your edits survive indefinitely.
 
+When `sast` is enabled, `init` also installs OpenGrep's official native Agent
+Skill and MIT license under `.agents/skills/opengrep/` and
+`.claude/skills/opengrep/`. Existing skills are kept. The bundled upstream
+revision is documented in `templates/skills/opengrep/UPSTREAM.md`.
+
 **Rewritten every run — edits here are silently discarded:**
 
 - `.sscsb/hooks/pre-commit`
