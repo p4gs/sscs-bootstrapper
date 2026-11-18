@@ -109,6 +109,11 @@ versions.
 
 ### Changed
 
+- Replace unmaintained Chrono with Jiff while preserving UTC timestamps and
+  policy expiry/freshness behavior (RUSTSEC-2026-0543).
+- Resolve dependencies within the declared Rust 1.85 minimum and prefer
+  compatible versions when refreshing lockfiles.
+
 - **The `SKILL.md`-is-not-a-release-asset-yet disclosure is gone, because it
   stopped being true.** `release.yml` had staged and signed `SKILL.md` for
   several releases, but no *published* tag carried it, so `docs/skill.md`,
