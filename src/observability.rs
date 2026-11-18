@@ -232,7 +232,7 @@ pub fn vex_create(ctx: &Ctx, args: &VexArgs) -> Result<std::path::PathBuf> {
         .origin_slug()
         .map(|s| format!("https://github.com/{s}"))
         .unwrap_or_else(|| "sscsb".to_string());
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::datetime::now_rfc3339();
     let mut statement = serde_json::json!({
         "vulnerability": { "name": args.vuln },
         "products": [{ "@id": args.product }],
