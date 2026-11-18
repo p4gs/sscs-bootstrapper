@@ -2571,16 +2571,21 @@ pub fn render_status(ctx: &Ctx) -> Result<String> {
     } else {
         out.push_str("Declared claims\n");
         for a in &policy.accounts {
+            let _ = write!(
+                out,
+                "  account  {:<12} [identity withheld] — mfa ",
+                a.target.id()
+            );
+            // Mechanism names are literal labels, never policy string values.
+            match a.mfa {
+                MfaClaim::WebauthnOnly => out.push_str("webauthn-only"),
+                MfaClaim::Webauthn => out.push_str("webauthn"),
+                MfaClaim::Totp => out.push_str("totp"),
+                MfaClaim::None => out.push_str("none"),
+            }
             let _ = writeln!(
                 out,
-                "  account  {:<12} [identity withheld] — mfa {} (attested {})",
-                a.target.id(),
-                match a.mfa {
-                    MfaClaim::WebauthnOnly => "webauthn-only",
-                    MfaClaim::Webauthn => "webauthn",
-                    MfaClaim::Totp => "totp",
-                    MfaClaim::None => "none",
-                },
+                " (attested {})",
                 a.attested.as_deref().unwrap_or("never")
             );
         }
@@ -4056,18 +4061,15 @@ mod tests {
         );
         let ctx = bootstrapped(root);
         let text = render_status(&ctx).unwrap();
-        assert!(text.contains("crates-io"), "{text}");
-        assert!(text.contains("Cargo.toml"), "{text}");
-        assert!(text.contains("publish-crates.yml installed"), "{text}");
-        assert!(
-            text.contains("No [[account]] or [[token]] claims"),
-            "{text}"
-        );
+        assert!(text.contains("crates-io"));
+        assert!(text.contains("Cargo.toml"));
+        assert!(text.contains("publish-crates.yml installed"));
+        assert!(text.contains("No [[account]] or [[token]] claims"));
 
         std::fs::remove_file(root.join(".github/workflows/publish-crates.yml")).unwrap();
         let ctx = Ctx::discover(root).unwrap();
         let text = render_status(&ctx).unwrap();
-        assert!(text.contains("MISSING — run `sscsb init`"), "{text}");
+        assert!(text.contains("MISSING — run `sscsb init`"));
     }
 
     #[test]
@@ -4075,8 +4077,8 @@ mod tests {
         let dir = repo();
         let ctx = bootstrapped(dir.path());
         let text = render_status(&ctx).unwrap();
-        assert!(text.contains("No publish target detected"), "{text}");
-        assert!(text.contains("pyproject.toml with [project]"), "{text}");
+        assert!(text.contains("No publish target detected"));
+        assert!(text.contains("pyproject.toml with [project]"));
     }
 
     // ───────────────── gh / npm paths, with fake tools on PATH ─────────────
@@ -4631,33 +4633,37 @@ expires = "2026-12-31"
         assert!(text.contains("mfa totp"));
     }
 
-    /// `dist status` renders declared claims, not just the empty case — the
-    /// branch an operator who HAS done the policy work actually sees.
+    /// The declared-claims status keeps public MFA labels and dates, withholds
+    /// identity/purpose, and never dumps the report into a failing assertion.
     #[test]
     fn dist_status_renders_declared_accounts_and_tokens() {
         let dir = repo();
         let root = dir.path();
         write(root, "thing.nuspec", "<package/>\n");
         bootstrapped(root);
-        write(
-            root,
-            ".sscsb/policy/distribution.toml",
-            "[[account]]\ntarget = \"chocolatey\"\nidentity = \"pkg-owner\"\nmfa = \"totp\"\nattested = \"2026-01-15\"\n\n\
-             [[token]]\ntarget = \"chocolatey\"\npurpose = \"push key\"\nscoped = true\nexpires = \"2026-12-31\"\n",
-        );
-        let ctx = Ctx::discover(root).unwrap();
-        let text = render_status(&ctx).unwrap();
-        assert!(text.contains("Declared claims"), "{text}");
-        assert!(text.contains("account  chocolatey"), "{text}");
-        assert!(text.contains("[identity withheld]"), "{text}");
-        assert!(!text.contains("pkg-owner"));
-        assert!(text.contains("mfa totp (attested 2026-01-15)"), "{text}");
-        assert!(text.contains("token    chocolatey"), "{text}");
-        assert!(text.contains("expires 2026-12-31"), "{text}");
-        assert!(
-            text.contains("no OIDC path in the ecosystem"),
-            "Chocolatey's gap belongs in the summary too: {text}"
-        );
+        for factor in ["webauthn-only", "webauthn", "totp", "none"] {
+            write(
+                root,
+                ".sscsb/policy/distribution.toml",
+                &format!(
+                    "[[account]]\ntarget = \"chocolatey\"\nidentity = \"pkg-owner\"\nmfa = \"{factor}\"\nattested = \"2026-01-15\"\n\n\
+                     [[token]]\ntarget = \"chocolatey\"\npurpose = \"push key\"\nscoped = true\nexpires = \"2026-12-31\"\n"
+                ),
+            );
+            let ctx = Ctx::discover(root).unwrap();
+            let text = render_status(&ctx).unwrap();
+            assert!(text.contains("Declared claims"));
+            assert!(text.contains("account  chocolatey"));
+            assert!(text.contains("[identity withheld]"));
+            assert!(!text.contains("pkg-owner"));
+            assert!(text.contains(&format!("mfa {factor} (attested 2026-01-15)")));
+            assert!(text.contains("token    chocolatey"));
+            assert!(text.contains("expires 2026-12-31"));
+            assert!(
+                text.contains("no OIDC path in the ecosystem"),
+                "Chocolatey's gap belongs in the summary too"
+            );
+        }
     }
 
     /// A declared token with none of the compensating controls is reported as

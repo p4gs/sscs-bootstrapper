@@ -47,7 +47,8 @@ Anti-criteria: no weakened gates, scanner suppression, identity reclassification
 AI use of a human signing key, or breaking command/config changes.
 Commits needing a human signature are prepared for the human; this run cannot sign.
 
-Current implementation: root changes are staged on `fix/security-release-20261116`.
+Current implementation: the root code is human-signed and published on
+`fix/security-release-20261116` as PR82, head 92c793f.
 OpenGrep 2.0.0 is upstream latest; Linux asset `opengrep_linux_x86` and digest
 `37e93f4da5fd04a18c5c1febbdd12f7e98dfccd4d0c9cf2593bcb25eeb462da0`
 match upstream release metadata. Verified macOS arm64 digest is
@@ -185,6 +186,57 @@ rejected before execution by automatic approval review for protected-branch
 review controls. Main is untouched. Explicit authorization for that exact
 fast-forward and for sending the prepared Socket report is pending.
 
+2026-11-18: Justin ran the Chrono signing launcher. Independent verification
+confirms the approved key/principal and sealed trees for root
+`92c793ff9ed9edf70166f0d7eb270711b0eb64ba`, PR80
+`19a636428e191bc215e56cfafe81c734d2699c91`, and PR81
+`d07b3a85d007be011d0c2872ffe0f4ec39228fd2`. All eight approved commits are
+intact. The updated Rust heads are published; all pre-push gates passed.
+The root OpenGrep/security changes are PR82. The signed directory fix is
+`p4gs/p4gs.github.io#61`, head ba163e8, with 15 passing checks and one neutral
+external signing-enforcer. Action PR13 still has 18 passing checks and one
+neutral. No main branch was updated and no merge/release was performed.
+
+OSV now passes on the actual PR80/81/82 heads, as do Trivy and OpenGrep. The
+Rust test/coverage/fuzz and remaining CodeQL jobs are being watched. CodeQL's
+generic no-new-alerts check is not substituted for proof that the original
+sensitive logging paths are closed. OpenGrep's upstream latest release was
+rechecked on Nov18 and remains 2.0.0.
+
+The detailed current Socket check reports additional capability alerts for
+Jiff and its conditional portable-atomic dependencies, as well as Rustls's
+key-log anomaly. The earlier Rustls-only summary is superseded. Feature/target
+reachability and source evidence are under independent review; no capability
+is labelled harmless merely because tests or vulnerability scans passed.
+The vendor report must cover those findings before any send request is acted
+on. No ignore/risk-acceptance comment or policy relaxation was made.
+
+The actual Rust CodeQL SARIF for PR82 is analysis2198540927 on merge
+8d4afab. It has 15 cleartext-logging results, not a clean result. Every flow
+starts at the inline string-valued match that renders public MFA mechanism
+names in render_status; sinks include the CLI and test failure diagnostics.
+The next code change preserves those labels using explicit literal writes,
+so enum data is not passed as a formatted string value, and removes raw-status
+test panic messages while retaining their assertions. SEC-2 stays pending
+until fresh final-head CodeQL proves the remaining flows are closed.
+
+The constant-label correction passes all 77 distribution tests, now exercising
+all four MFA labels with the same dates/spacing/newline and withheld identities
+and purposes. Strict all-target clippy and formatting pass. Independent review
+found no blocker and confirmed all assertions remain; raw report panic dumps
+were removed. This is a separate root-only draft; no existing human-signed
+commit was amended. One more human signature and fresh head CodeQL are needed
+for this discovered formatter issue.
+
+Independent Socket source review is complete. On the queried supported targets,
+the portable-atomic packages are not selected; Jiff's selected features are
+std/alloc, with TZ discovery/database features disabled. Included private file
+helpers have callers in disabled backends. No Jiff process-spawn API was found
+in the inspected published Rust sources; the vendor must identify its shell
+indicator. Rustls' selected client configuration uses NoKeyLog. These are review
+facts, not a claim that Socket has cleared its check. The complete unsent vendor
+report is `.sscsb/out/reviews/socket-source-review-20261118.md`.
+
 Read-only environment diagnosis found active Little Snitch 6.5. Its blocking
 role is still unproven: filtered log access was denied, and Network Monitor
 could be shown/focused but its Search input did not accept documented automated
@@ -197,10 +249,11 @@ an unowned existing global `/Users/p4gs/.agents/skills/opengrep` collision;
 no apply/reset/overwrite was attempted. This host-integration finding does not
 invalidate the successful project-local native-skill installation tests.
 
-Human input pending: the Chrono follow-up signing batch, permission for the
-exact PR13 fast-forward, and separate permission to send
-`socket-rustls-review.md` from Primary Gmail. The
-signing message does not authorize that email. The report traces ureq's default TLS
+Human input pending: the root-only formatter correction signature, permission
+for ready companion-PR protected-ref updates, and separate permission to send
+the completed Socket source-evidence report from Primary Gmail. The Chrono
+signatures are complete. Signing did not authorize merging or that email.
+The report traces ureq's default TLS
 client to Rustls NoKeyLog; no ignore/risk acceptance was used. No email was sent,
 no merge/release performed. The three human signatures and action feature-branch
 publications are verified above. PR77, PR79, PR80 and PR81
