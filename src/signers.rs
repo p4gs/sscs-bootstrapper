@@ -16,7 +16,7 @@ use crate::controls::{Outcome, VerifyResult};
 use crate::exec;
 use crate::hooks::{self, Signer, SignerClass};
 use anyhow::{Context as _, Result};
-use chrono::NaiveDate;
+use jiff::civil::Date;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -42,14 +42,14 @@ pub enum ExpiryState {
 
 /// Pure expiry evaluation so tests can pin "today" rather than depend on the
 /// wall clock. `max_age_days <= 0` disables the window-too-long check.
-pub fn evaluate_expiry(expires: Option<&str>, today: NaiveDate, max_age_days: i64) -> ExpiryState {
+pub fn evaluate_expiry(expires: Option<&str>, today: Date, max_age_days: i64) -> ExpiryState {
     let Some(raw) = expires else {
         return ExpiryState::Unset;
     };
-    let Ok(date) = NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d") else {
+    let Ok(date) = Date::strptime("%Y-%m-%d", raw.trim()) else {
         return ExpiryState::Unparseable;
     };
-    let days = (date - today).num_days();
+    let days = i64::from((date - today).get_days());
     if days < 0 {
         ExpiryState::Expired { days_ago: -days }
     } else if max_age_days > 0 && days > max_age_days {
@@ -135,7 +135,7 @@ pub fn verify_agent_signing_control(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     let require_sigs = cfg
         .control_opt_bool(CONTROL, "require_agent_signatures")
         .unwrap_or(false);
-    let today = chrono::Utc::now().date_naive();
+    let today = crate::datetime::today_utc();
 
     let mut messages = vec![
         format!("allowed backends: {}", allowed_backends.join(", ")),
@@ -290,7 +290,7 @@ pub fn describe_signers(ctx: &Ctx) -> Result<Vec<String>> {
             "no signers configured — add one with `sscsb signers add` (see docs/signing.md)".into(),
         ]);
     }
-    let today = chrono::Utc::now().date_naive();
+    let today = crate::datetime::today_utc();
     let mut out = Vec::new();
     for s in &signers {
         let backend = s.backend.as_deref().unwrap_or("-");
@@ -372,7 +372,7 @@ pub fn add_signer(ctx: &Ctx, cfg: &Config, spec: &NewSigner) -> Result<String> {
     }
     if let Some(exp) = &spec.expires {
         anyhow::ensure!(
-            NaiveDate::parse_from_str(exp.trim(), "%Y-%m-%d").is_ok(),
+            Date::strptime("%Y-%m-%d", exp.trim()).is_ok(),
             "`expires` must be a YYYY-MM-DD date (got `{exp}`)"
         );
     }
@@ -741,8 +741,35 @@ pub fn agent_key_setup_guidance(backend: &str) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
-    fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    fn ymd(y: i16, m: i8, d: i8) -> Date {
+        Date::new(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn expiry_preserves_calendar_validity_and_exact_window_boundaries() {
+        let before_leap_day = ymd(2024, 2, 28);
+        assert_eq!(
+            evaluate_expiry(Some("2024-02-29"), before_leap_day, 1),
+            ExpiryState::Valid { days_left: 1 }
+        );
+        assert_eq!(
+            evaluate_expiry(Some("2024-02-29"), ymd(2024, 2, 29), 1),
+            ExpiryState::Valid { days_left: 0 }
+        );
+        assert_eq!(
+            evaluate_expiry(Some("2024-03-01"), before_leap_day, 1),
+            ExpiryState::WindowTooLong {
+                days_left: 2,
+                max: 1
+            }
+        );
+        for invalid in ["2026-02-29", "2024-02-30", "2024-13-01"] {
+            assert_eq!(
+                evaluate_expiry(Some(invalid), before_leap_day, 1),
+                ExpiryState::Unparseable,
+                "{invalid}"
+            );
+        }
     }
 
     // ─────────────────── real-signature policy-gate fixtures ────────────────
@@ -1208,7 +1235,7 @@ mod tests {
         assert_eq!(
             evaluate_expiry(Some("2099-01-01"), today, 0),
             ExpiryState::Valid {
-                days_left: (ymd(2099, 1, 1) - today).num_days()
+                days_left: i64::from((ymd(2099, 1, 1) - today).get_days())
             }
         );
     }

@@ -31,7 +31,7 @@ introducing new vulns or breaking changes, and all code scanning errors are
 fully fixed. A new release is cut. Additional request: install the latest
 OpenGrep and its native Agent Skills (`npx skills add opengrep/skills`).
 
-- [x] SEC-1: Both Cargo lockfiles resolve known advisories to patched versions (fresh Trivy and OSV results show zero vulnerabilities).
+- [x] SEC-1: Both Cargo lockfiles resolve known advisories without suppression (Nov 17 follow-up OSV inventories root147/fuzz143 packages and Trivy covers both lockfiles, all zero findings).
 - [ ] SEC-2: Distribution status/verifiers withhold free-form sensitive policy values (regression tests pass; fresh CodeQL still required).
 - [ ] SEC-3: Every open PR has passing checks and no unresolved warnings before merging (current head checks/reviews).
 - [ ] SEC-4: Current main has successful scanner runs with no analysis errors and patched dependencies (post-merge evidence).
@@ -39,6 +39,9 @@ OpenGrep and its native Agent Skills (`npx skills add opengrep/skills`).
 - [ ] SEC-6: Release build, hermetic tests, lint, format and existing coverage gates pass (local and CI evidence).
 - [ ] SEC-7: A new release has verified artifacts, signatures and provenance (release workflow and downloads).
 - [ ] SEC-8: Action and directory classify all controls, score all six phases and verify committed evidence without weakening unknown-control rejection (local tests pass; real workflow runs remain).
+- [x] SEC-9: Root and fuzz dependency graphs contain no unmaintained Chrono package (both lockfile inventories and fresh OSV scan).
+- [x] SEC-10: UTC record timestamps and policy date/expiry/freshness behavior remain compatible after date-library replacement (fixed-clock, calendar-validity and exact expiry-window tests pass; independent equivalence review is clean for the documented contract).
+- [x] SEC-11: The replacement date dependency supports the existing Rust 1.85 minimum (upstream manifest and real cargo +1.85.0 check --locked pass).
 
 Anti-criteria: no weakened gates, scanner suppression, identity reclassification,
 AI use of a human signing key, or breaking command/config changes.
@@ -141,6 +144,47 @@ both carrying the final action pin. Its sealed trees and receipt live in the
 ignored review packet under `integration-signing*`; no unsigned fallback or
 agent-launched signing is permitted.
 
+The second human batch completed before the newly observed CI finding:
+root `4552bf50dd3e225edc7c0c553fca8126aaa63998` and directory
+`ba163e8d22e46aaffaf56a398832f9f748654688` independently verify against the
+approved key and sealed trees. The five signed commits remain intact.
+Fresh PR80/81 OSV jobs report RUSTSEC-2026-0543 against Chrono 0.4.45.
+RustSec now marks all Chrono versions unmaintained, with no patched version;
+this is a maintenance advisory, not an identified exploit in this application.
+The remediation is a maintained date library, preserving UTC formats and
+date-only security-policy validation; no advisory ignore or gate change.
+Jiff 1.0.0's official manifest retains Rust 1.85 and its std-only feature set
+provides the UTC functionality used here. A follow-up draft will be tested
+before any new human signature request. PR80/81 Socket checks also still fail.
+
+Chrono follow-up validation is now complete. Jiff 1.0.0 uses only std/alloc;
+`datetime.rs` preserves UTC dates and AutoSi RFC3339 precision with +00:00.
+The pre-existing ICU2.2/idna_adapter1.2.2 lock required Rust1.86; Cargo's
+compatible-version fallback now resolves maintained ICU2.1/idna_adapter1.2.1,
+and the actual Rust1.85 compiler check passes. No rust-version bypass is used.
+Normal `deps approve cargo:jiff` succeeded with the rebuilt CLI; the obsolete
+Chrono approval was removed. No --force or --offline approval was needed.
+
+Evidence: chrono-migration-unit-final.log has 964 passing unit tests. On the
+final compatible graph, datetime3, signers21 (including the added leap/invalid
+calendar and exact-window cases), signing_setup72 and distribution77 pass;
+PR81's 90 hook tests and PR80's locked build pass. Strict all-target clippy,
+format and actual CLI signers/dist-status acceptance pass. Fresh OSV inventories
+147/143 packages and Trivy examines both locks, with zero findings in each.
+Independent review found no blocker and compared 12 parse cases, 7 timestamp
+cases and 4 date differences against old Chrono. The documented four-digit
+date contract is preserved; +10000 dates are outside that contract and are
+rejected by Jiff. No policy-parser padding restriction was added.
+
+The follow-up is staged separately on root, PR80 and PR81 for one human
+signing batch; the five existing signed commits remain unchanged. Release and
+fresh follow-up-head CI are still required. PR13 has all checks passing (the
+external signing-enforcer is neutral, not claimed as a verified gate; the SSH
+signature itself was independently verified). A direct main fast-forward was
+rejected before execution by automatic approval review for protected-branch
+review controls. Main is untouched. Explicit authorization for that exact
+fast-forward and for sending the prepared Socket report is pending.
+
 Read-only environment diagnosis found active Little Snitch 6.5. Its blocking
 role is still unproven: filtered log access was denied, and Network Monitor
 could be shown/focused but its Search input did not accept documented automated
@@ -153,8 +197,9 @@ an unowned existing global `/Users/p4gs/.agents/skills/opengrep` collision;
 no apply/reset/overwrite was attempted. This host-integration finding does not
 invalidate the successful project-local native-skill installation tests.
 
-Human input pending: root/directory human signatures, and separate permission
-to send `socket-rustls-review.md` from Primary Gmail. The
+Human input pending: the Chrono follow-up signing batch, permission for the
+exact PR13 fast-forward, and separate permission to send
+`socket-rustls-review.md` from Primary Gmail. The
 signing message does not authorize that email. The report traces ureq's default TLS
 client to Rustls NoKeyLog; no ignore/risk acceptance was used. No email was sent,
 no merge/release performed. The three human signatures and action feature-branch
@@ -174,6 +219,9 @@ new notes remain Unreleased.
 | SEC-7 | manual | Inspect release workflow and verify downloaded assets/signatures/provenance | new release exists and verifies |
 | SEC-8 | bash | bun test scripts in the companion action; bun test in directory/site | compatibility and evidence regressions pass |
 | SEC-8 | manual | Inspect companion latest/build CI and actual directory scan | current controls scored honestly |
+| SEC-9 | manual | Inspect cargo metadata for root/fuzz and fresh OSV results | no Chrono dependency or advisory |
+| SEC-10 | bash | hermetic cargo test --locked --lib | date guards and wire formats retain behavior |
+| SEC-11 | bash | cargo +1.85.0 check --locked | existing supported compiler still builds |
 
 Still required: finish coverage, obtain human signatures, publish and verify
 all proposed heads, resolve Socket with evidence, publish the final action pins,

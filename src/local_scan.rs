@@ -741,7 +741,9 @@ pub fn prepare(ctx: &Ctx, home: &Path) -> Result<Prepared> {
         record_version: RECORD_VERSION,
         lane: "local",
         namespace: NAMESPACE,
-        generated_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        generated_at: jiff::Timestamp::now()
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+            .to_string(),
         sscsb_version: env!("CARGO_PKG_VERSION"),
         repo: RecordRepo {
             owner: owner.to_string(),

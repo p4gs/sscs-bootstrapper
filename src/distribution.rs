@@ -40,7 +40,7 @@ use crate::controls::{Outcome, VerifyResult};
 use crate::exec;
 use crate::signers::{evaluate_expiry, ExpiryState};
 use anyhow::{Context as _, Result};
-use chrono::NaiveDate;
+use jiff::civil::Date;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -671,7 +671,7 @@ fn opt_date(table: &toml::Table, key: &str, kind: &str) -> Result<Option<String>
         toml::Value::Datetime(d) => d.to_string(),
         other => anyhow::bail!("`{kind} {key}` must be a YYYY-MM-DD date, found {other}"),
     };
-    NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+    Date::strptime("%Y-%m-%d", raw.trim())
         .with_context(|| format!("`{kind} {key} = \"{raw}\"` is not a YYYY-MM-DD date"))?;
     Ok(Some(raw.trim().to_string()))
 }
@@ -1380,7 +1380,7 @@ pub fn verify_maintainer_mfa(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     let max_age = cfg
         .control_opt_int(id, "max_attestation_age_days")
         .unwrap_or(180);
-    let today = chrono::Utc::now().date_naive();
+    let today = crate::datetime::today_utc();
     let targets = distinct_targets(&detected);
 
     let mut messages = Vec::new();
@@ -1457,9 +1457,9 @@ pub fn verify_maintainer_mfa(ctx: &Ctx, cfg: &Config) -> VerifyResult {
         // `YYYY-MM-DD` when the policy was loaded, so a malformed date is
         // already a hard Fail on every phase-6 control.
         let stale = account.attested.as_deref().and_then(|raw| {
-            NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+            Date::strptime("%Y-%m-%d", raw)
                 .ok()
-                .map(|d| (today - d).num_days())
+                .map(|d| i64::from((today - d).get_days()))
         });
         let mfa = account.mfa;
         let resistance = if mfa.phishing_resistant() {
@@ -1786,7 +1786,7 @@ pub fn verify_publish_tokens(ctx: &Ctx, cfg: &Config) -> VerifyResult {
         Err(r) => return r,
     };
     let max_age = cfg.control_opt_int(id, "max_token_age_days").unwrap_or(90);
-    let today = chrono::Utc::now().date_naive();
+    let today = crate::datetime::today_utc();
     let mut messages = Vec::new();
     let mut outcome = Outcome::Pass;
 
@@ -2367,7 +2367,7 @@ pub fn verify_dist_manifests(ctx: &Ctx, _cfg: &Config) -> VerifyResult {
         .iter()
         .any(|d| matches!(d.target, PublishTarget::Chocolatey | PublishTarget::WinGet));
     if windows {
-        let today = chrono::Utc::now().date_naive();
+        let today = crate::datetime::today_utc();
         if policy.signing.authenticode {
             let subject = policy.signing.subject.as_deref().unwrap_or("(no subject)");
             let state = evaluate_expiry(policy.signing.expires.as_deref(), today, 0);
@@ -2628,8 +2628,8 @@ mod tests {
     use super::*;
     use crate::audit::{audit_workflow, Severity};
 
-    fn today() -> NaiveDate {
-        NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()
+    fn today() -> Date {
+        Date::new(2026, 6, 1).unwrap()
     }
 
     fn empty_policy() -> Policy {
@@ -3375,7 +3375,7 @@ mod tests {
         bootstrapped(root);
 
         // Fresh: reported, never a pass it could not earn.
-        let fresh = chrono::Utc::now().date_naive() - chrono::Duration::days(5);
+        let fresh = crate::datetime::today_utc() - jiff::Span::new().days(5);
         write(
             root,
             ".sscsb/policy/distribution.toml",
@@ -3394,7 +3394,7 @@ mod tests {
 
         // Stale: the claim is older than the window, so it FAILS — an expired
         // assertion about a publishing account is as actionable as an expired key.
-        let stale = chrono::Utc::now().date_naive() - chrono::Duration::days(400);
+        let stale = crate::datetime::today_utc() - jiff::Span::new().days(400);
         write(
             root,
             ".sscsb/policy/distribution.toml",
@@ -3428,11 +3428,11 @@ mod tests {
         let root = dir.path();
         write(root, "pyproject.toml", "[project]\nname = \"p\"\n");
         bootstrapped(root);
-        let today = chrono::Utc::now().date_naive();
+        let today = crate::datetime::today_utc();
 
         // A date in the FUTURE is not freshness — it is a claim about a check
         // that has not happened. It must not read as the healthiest state.
-        let tomorrow = today + chrono::Duration::days(1);
+        let tomorrow = today + jiff::Span::new().days(1);
         write(
             root,
             ".sscsb/policy/distribution.toml",
@@ -3475,7 +3475,7 @@ mod tests {
         let root = dir.path();
         write(root, "pyproject.toml", "[project]\nname = \"p\"\n");
         bootstrapped(root);
-        let fresh = chrono::Utc::now().date_naive();
+        let fresh = crate::datetime::today_utc();
         write(
             root,
             ".sscsb/policy/distribution.toml",
@@ -3556,7 +3556,7 @@ mod tests {
         write(root, "thing.nuspec", "<package/>\n");
         bootstrapped(root);
 
-        let expired = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        let expired = crate::datetime::today_utc() - jiff::Span::new().days(3);
         write(
             root,
             ".sscsb/policy/distribution.toml",
@@ -3573,7 +3573,7 @@ mod tests {
             r.messages
         );
 
-        let live = chrono::Utc::now().date_naive() + chrono::Duration::days(30);
+        let live = crate::datetime::today_utc() + jiff::Span::new().days(30);
         write(
             root,
             ".sscsb/policy/distribution.toml",
@@ -3944,7 +3944,7 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Info, "{:?}", r.messages);
         assert!(r.messages.join("\n").contains("no `[signing]` block"));
 
-        let expired = chrono::Utc::now().date_naive() - chrono::Duration::days(10);
+        let expired = crate::datetime::today_utc() - jiff::Span::new().days(10);
         write(
             root,
             ".sscsb/policy/distribution.toml",
