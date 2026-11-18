@@ -31,7 +31,7 @@ use crate::context::Ctx;
 use crate::controls::{Outcome, VerifyResult};
 use crate::exec;
 use anyhow::Result;
-use chrono::NaiveDate;
+use jiff::civil::Date;
 use std::path::{Path, PathBuf};
 
 pub const CONTROL: &str = "signing-model";
@@ -829,19 +829,19 @@ impl AttestationFreshness {
 /// confirmation recorded exactly that many days ago is still fresh.
 pub fn evaluate_attestation_freshness(
     recorded: Option<&str>,
-    today: NaiveDate,
+    today: Date,
     stale_after_days: i64,
 ) -> AttestationFreshness {
     let Some(raw) = recorded else {
         return AttestationFreshness::Unset;
     };
-    let Ok(date) = NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d") else {
+    let Ok(date) = Date::strptime("%Y-%m-%d", raw.trim()) else {
         return AttestationFreshness::Unparseable;
     };
     // NOTE the operand order: `today - date`, days SINCE the confirmation.
     // `evaluate_expiry` computes `date - today`; that inversion is the bug this
     // function exists to prevent.
-    let days_old = (today - date).num_days();
+    let days_old = i64::from((today - date).get_days());
     if days_old < 0 {
         AttestationFreshness::FutureDated {
             days_ahead: -days_old,
@@ -863,7 +863,7 @@ pub fn evaluate_attestation_freshness(
 fn lane_attestation_report(
     policy: &toml::Table,
     env: Environment,
-    today: NaiveDate,
+    today: Date,
 ) -> (bool, Vec<String>) {
     let keys = lane_attestation_keys(env);
     let lane = policy.get(env.id()).and_then(|v| v.as_table());
@@ -1514,9 +1514,8 @@ pub fn cmd_signing_setup(
     // --confirm stamps the guided lane's attestations with today's date.
     if confirm && !lane_attestation_keys(env).is_empty() {
         if apply {
-            let today = chrono::Utc::now()
-                .date_naive()
-                .format("%Y-%m-%d")
+            let today = crate::datetime::today_utc()
+                .strftime("%Y-%m-%d")
                 .to_string();
             record_lane_attestation(ctx, env, &today)?;
             println!(
@@ -1648,7 +1647,7 @@ fn guided_lane_report(ctx: &Ctx, env: Environment) -> SetupReport {
 pub fn cmd_signing_verify(ctx: &Ctx) -> Result<i32> {
     let paths = SigningPaths::real()?;
     let policy = read_signing_policy(ctx);
-    let today = chrono::Utc::now().date_naive();
+    let today = crate::datetime::today_utc();
 
     println!("sscsb signing verify — five-environment commit-signing report card\n");
     let mut worst_fail = false;
@@ -1789,7 +1788,7 @@ pub fn verify_signing_model_control(ctx: &Ctx, _cfg: &Config) -> VerifyResult {
         }
     };
     let policy = read_signing_policy(ctx);
-    let today = chrono::Utc::now().date_naive();
+    let today = crate::datetime::today_utc();
     let mut messages = Vec::new();
     let mut violation = false;
     let mut pending = false;
@@ -2859,8 +2858,8 @@ mod tests {
 
     // ──────────────── attestation freshness (the --confirm window) ───────────
 
-    fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    fn ymd(y: i16, m: i8, d: i8) -> Date {
+        Date::new(y, m, d).unwrap()
     }
 
     #[test]
@@ -3085,9 +3084,8 @@ mod tests {
         // never returns Configured and codespaces' is a constant
         // GuidedPending, so a fully set-up machine still read Degraded and the
         // control could never go green.
-        let today = chrono::Utc::now()
-            .date_naive()
-            .format("%Y-%m-%d")
+        let today = crate::datetime::today_utc()
+            .strftime("%Y-%m-%d")
             .to_string();
         let (_m, repo) = fully_configured_machine(&today);
         let ctx = scratch_ctx(repo.path());
@@ -3109,9 +3107,9 @@ mod tests {
         // The passing verdict is earned, not a freebie: age the confirmations
         // past the window on an otherwise identical machine and the control
         // must fall back to Degraded and say which key went stale.
-        let stale = (chrono::Utc::now().date_naive()
-            - chrono::Duration::days(ATTESTATION_STALE_DAYS + 1))
-        .format("%Y-%m-%d")
+        let stale = (crate::datetime::today_utc()
+            - jiff::Span::new().days(ATTESTATION_STALE_DAYS + 1))
+        .strftime("%Y-%m-%d")
         .to_string();
         let (_m, repo) = fully_configured_machine(&stale);
         let ctx = scratch_ctx(repo.path());
@@ -3135,9 +3133,8 @@ mod tests {
         // one does. Remove the repo-side attribution block the cloud lane is
         // actually able to probe, keep every confirmation fresh, and the lane
         // must still refuse to count.
-        let today = chrono::Utc::now()
-            .date_naive()
-            .format("%Y-%m-%d")
+        let today = crate::datetime::today_utc()
+            .strftime("%Y-%m-%d")
             .to_string();
         let (_m, repo) = fully_configured_machine(&today);
         std::fs::write(
@@ -3357,9 +3354,8 @@ mod tests {
     /// that silently signs as the human must FAIL the control, not pass it.
     #[test]
     fn signing_model_control_fails_when_the_agent_key_is_the_human_key_under_another_name() {
-        let today = chrono::Utc::now()
-            .date_naive()
-            .format("%Y-%m-%d")
+        let today = crate::datetime::today_utc()
+            .strftime("%Y-%m-%d")
             .to_string();
         let (m, repo) = fully_configured_machine(&today);
         // Re-point the agent at the human's own key, spelled as its private
@@ -3516,9 +3512,8 @@ mod tests {
     /// And the control must agree: a null attribution cannot be attested past.
     #[test]
     fn an_attestation_cannot_paper_over_a_null_attribution_block() {
-        let today = chrono::Utc::now()
-            .date_naive()
-            .format("%Y-%m-%d")
+        let today = crate::datetime::today_utc()
+            .strftime("%Y-%m-%d")
             .to_string();
         let (_m, repo) = fully_configured_machine(&today);
         std::fs::write(
