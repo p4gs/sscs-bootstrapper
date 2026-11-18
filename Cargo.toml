@@ -11,7 +11,7 @@ publish = false
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+jiff = { version = "1.0", default-features = false, features = ["std"] }
 clap = { version = "4.5", features = ["derive"] }
 hex = "0.4"
 serde = { version = "1.0", features = ["derive"] }
@@ -38,7 +38,7 @@ yaml-rust2 = "0.10"
 # `chmod u+w`. Ownership is capability, so the owner comparison needs the
 # EFFECTIVE uid, which std does not expose.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1", features = ["fs", "process"] }
+rustix = { version = "1.1.6", features = ["fs", "process"] }
 
 [dev-dependencies]
 assert_cmd = "2.1"
