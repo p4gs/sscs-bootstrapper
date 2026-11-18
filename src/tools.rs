@@ -109,7 +109,7 @@ pub const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         id: "opengrep",
         bin: "opengrep",
-        pinned_version: "1.25.0",
+        pinned_version: "2.0.0",
         version_args: &["--version"],
         homepage: "https://github.com/opengrep/opengrep",
         brew: None,

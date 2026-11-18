@@ -1,0 +1,3 @@
+[resolver]
+# Preserve the package's declared minimum Rust version when refreshing locks.
+incompatible-rust-versions = "fallback"
