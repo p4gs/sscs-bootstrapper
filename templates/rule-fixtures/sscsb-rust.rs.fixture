@@ -1,0 +1,107 @@
+// Parser-only fixtures. This module is excluded from compilation and never run.
+#[cfg(any())]
+mod parser_fixtures {
+    fn representative_calls() {
+        // ruleid: sscsb-rust-process-arguments
+        let _ = std::env::args();
+        // ruleid: sscsb-rust-process-arguments
+        let _ = std::env::args_os();
+        // ok: sscsb-rust-process-arguments
+        let _ = std::env::vars();
+
+        // ruleid: sscsb-rust-current-executable
+        let _ = std::env::current_exe();
+        // ok: sscsb-rust-current-executable
+        let _ = std::env::current_dir();
+
+        // ruleid: sscsb-rust-shared-temp-directory
+        let _ = std::env::temp_dir();
+        // ok: sscsb-rust-shared-temp-directory
+        let _ = tempfile::tempdir();
+
+        // ruleid: sscsb-rust-legacy-digest
+        let _ = md5::compute(b"fixture");
+        // ruleid: sscsb-rust-legacy-digest
+        let _ = sha1::Sha1::new();
+        // ok: sscsb-rust-legacy-digest
+        let _ = sha2::Sha256::new();
+
+        // ruleid: sscsb-rust-tls-verification-disabled
+        let _ = example_builder.danger_accept_invalid_certs(true);
+        // ruleid: sscsb-rust-tls-verification-disabled
+        let _ = example_builder.danger_accept_invalid_hostnames(true);
+        // ruleid: sscsb-rust-tls-verification-disabled
+        example_context.set_verify(openssl::ssl::SslVerifyMode::NONE);
+        // ok: sscsb-rust-tls-verification-disabled
+        let _ = example_builder.danger_accept_invalid_certs(false);
+        // ok: sscsb-rust-tls-verification-disabled
+        example_context.set_verify(openssl::ssl::SslVerifyMode::PEER);
+
+        // ruleid: sscsb-rust-custom-certificate-verifier
+        let _ = example_builder.dangerous().with_custom_certificate_verifier(verifier);
+        // ok: sscsb-rust-custom-certificate-verifier
+        let _ = example_builder.with_root_certificates(root_store);
+
+        // ruleid: sscsb-rust-http-sensitive-header
+        headers.insert(reqwest::header::AUTHORIZATION, HeaderValue::from_static("test fixture"));
+        // ok: sscsb-rust-http-sensitive-header
+        headers.insert(reqwest::header::USER_AGENT, HeaderValue::from_static("test fixture"));
+        // ok: sscsb-rust-http-sensitive-header
+        headers.insert(reqwest::header::AUTHORIZATION, pre_marked_value);
+
+        // ruleid: sscsb-rust-unsafe-code
+        let _ = unsafe { fixture_operation() };
+        // ok: sscsb-rust-unsafe-code
+        let _ = fixture_operation();
+
+        // ruleid: sscsb-rust-dynamic-executable
+        let _ = std::process::Command::new(tool);
+        // ok: sscsb-rust-dynamic-executable
+        let _ = std::process::Command::new("git");
+        // ok: sscsb-rust-dynamic-executable
+        let _ = std::process::Command::new(r#"git"#);
+
+        // ruleid: sscsb-rust-child-loader-env
+        command.env("LD_LIBRARY_PATH", approved_example_path);
+        // ok: sscsb-rust-child-loader-env
+        command.env("LANG", "C");
+
+        // ruleid: sscsb-rust-raw-socket
+        let _ = std::net::TcpStream::connect("127.0.0.1:0");
+        // ok: sscsb-rust-raw-socket
+        let _ = std::net::Ipv4Addr::LOCALHOST;
+
+        // ruleid: sscsb-rust-http-egress
+        let _ = reqwest::Client::builder();
+        // ruleid: sscsb-rust-http-egress
+        let _ = ureq::builder();
+        // ok: sscsb-rust-http-egress
+        let _ = url::Url::parse("https://example.invalid");
+
+        // ruleid: sscsb-rust-interpreter-process
+        let _ = std::process::Command::new("python3");
+        // ok: sscsb-rust-interpreter-process
+        let _ = std::process::Command::new("git");
+
+        // ruleid: sscsb-rust-command-search-path
+        command.env("PATH", approved_example_path);
+        // ok: sscsb-rust-command-search-path
+        command.env("TZ", "UTC");
+
+        // ruleid: sscsb-rust-credential-path
+        let _ = ".ssh";
+        // ok: sscsb-rust-credential-path
+        let _ = ".cache/documents";
+
+        // ruleid: sscsb-rust-file-deletion
+        let _ = std::fs::remove_file(scratch_fixture_path);
+        // ok: sscsb-rust-file-deletion
+        let _ = std::fs::metadata(scratch_fixture_path);
+    }
+
+    // U+200E in a string constant; does not reorder code.
+    // ruleid: sscsb-rust-bidi-control
+    const DIRECTION_MARK_FIXTURE: &str = "‎";
+    // ok: sscsb-rust-bidi-control
+    const VISIBLE_ESCAPE: &str = "\u{200e}";
+}

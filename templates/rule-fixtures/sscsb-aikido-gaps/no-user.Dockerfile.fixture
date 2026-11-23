@@ -1,0 +1,3 @@
+# ruleid: sscsb-aikido-docker-user-review
+FROM scratch
+COPY fixture /fixture

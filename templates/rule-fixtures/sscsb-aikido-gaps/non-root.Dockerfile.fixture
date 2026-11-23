@@ -1,0 +1,4 @@
+# ok: sscsb-aikido-docker-user-review
+FROM scratch
+COPY fixture /fixture
+USER 65532:65532

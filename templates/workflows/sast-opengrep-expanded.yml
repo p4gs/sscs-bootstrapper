@@ -1,0 +1,56 @@
+# sscsb: additional Rust, Actions and container rules. Findings are advisory.
+name: SAST expanded (OpenGrep)
+on:
+  push:
+    branches: ["{{default_branch}}"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  OPENGREP_VERSION: v2.0.0
+
+jobs:
+  opengrep-expanded:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install cosign (verifies the OpenGrep release below)
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Install pinned OpenGrep and verify signature (cosign keyless)
+        run: |
+          curl -fsSL -o opengrep \
+            "https://github.com/opengrep/opengrep/releases/download/${OPENGREP_VERSION}/opengrep_linux_x86"
+          curl -fsSL -o opengrep.sig \
+            "https://github.com/opengrep/opengrep/releases/download/${OPENGREP_VERSION}/opengrep_linux_x86.sig"
+          curl -fsSL -o opengrep.cert \
+            "https://github.com/opengrep/opengrep/releases/download/${OPENGREP_VERSION}/opengrep_linux_x86.cert"
+          cosign verify-blob opengrep \
+            --signature opengrep.sig \
+            --certificate opengrep.cert \
+            --certificate-identity-regexp "^https://github\.com/opengrep/opengrep/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          chmod +x opengrep && sudo mv opengrep /usr/local/bin/
+      - name: Report expanded findings without blocking on matches
+        run: |
+          test -f .sscsb/rules-expanded/sscsb-rust.yaml
+          test -f .sscsb/rules-expanded/sscsb-aikido-gaps.yaml
+          opengrep scan --config .sscsb/rules-expanded \
+            --exclude .sscsb/rules-expanded --exclude .sscsb/rules \
+            --sarif-output=opengrep-expanded.sarif .
+      - name: Upload expanded SARIF
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          sarif_file: opengrep-expanded.sarif
+          category: opengrep-expanded

@@ -1,0 +1,18 @@
+name: Fixture only
+on: workflow_dispatch
+# ruleid: sscsb-aikido-workflow-write-all
+permissions: write-all
+jobs:
+  broad-read:
+    runs-on: ubuntu-latest
+    # ruleid: sscsb-aikido-workflow-read-all
+    permissions: read-all
+    steps:
+      - run: echo fixture
+  explicit:
+    runs-on: ubuntu-latest
+    # ok: sscsb-aikido-workflow-write-all, sscsb-aikido-workflow-read-all
+    permissions:
+      contents: read
+    steps:
+      - run: echo fixture

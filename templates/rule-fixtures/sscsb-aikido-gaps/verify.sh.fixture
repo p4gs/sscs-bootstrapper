@@ -1,0 +1,6 @@
+#!/bin/sh
+# Scan-only fixture. These commands are not run.
+# ok: sscsb-aikido-archive-verification-review
+curl -fsSLO "https://example.invalid/reviewed.tar.gz"
+expect "reviewed.tar.gz" d654f678b709eb53c393d38519d5ed7d2e57205529404018614cfefa0fb2b5ca
+tar -xzf "reviewed.tar.gz"

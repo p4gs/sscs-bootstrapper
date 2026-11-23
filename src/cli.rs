@@ -109,7 +109,11 @@ enum Command {
         strict: bool,
     },
     /// Run SAST (OpenGrep default; engine configurable)
-    Sast,
+    Sast {
+        /// Run the additional built-in rules in report-only mode
+        #[arg(long)]
+        expanded: bool,
+    },
     /// Package-trust operations
     Deps {
         #[command(subcommand)]
@@ -482,7 +486,7 @@ pub fn run() -> Result<ExitCode> {
                 cmd_scan(&cwd, vex.as_deref(), grype)
             }
         }
-        Command::Sast => cmd_sast(&cwd),
+        Command::Sast { expanded } => cmd_sast(&cwd, expanded),
         Command::Deps { action } => cmd_deps(&cwd, action),
         Command::Receipt { action } => cmd_receipt(&cwd, action),
         Command::Provenance { action } => cmd_provenance(&cwd, action),
@@ -1029,10 +1033,15 @@ fn cmd_scan(cwd: &std::path::Path, vex: Option<&std::path::Path>, grype: bool) -
     ok()
 }
 
-fn cmd_sast(cwd: &std::path::Path) -> Result<ExitCode> {
+fn cmd_sast(cwd: &std::path::Path, expanded: bool) -> Result<ExitCode> {
     let ctx = Ctx::discover(cwd)?;
     let cfg = ctx.require_config()?;
-    let scan = sast::run_sast(&ctx, cfg, &ctx.root)?;
+    let scan = if expanded {
+        println!("expanded SAST (report-only; findings do not block)");
+        sast::run_expanded_sast(&ctx, cfg)?
+    } else {
+        sast::run_sast(&ctx, cfg, &ctx.root)?
+    };
     // What the engine could not read is stated before what it found: a scan
     // that skipped part of the tree has not cleared that part of the tree, and
     // "0 finding(s)" alone would say otherwise.
@@ -1049,7 +1058,13 @@ fn cmd_sast(cwd: &std::path::Path) -> Result<ExitCode> {
     for f in scan.findings.iter().take(50) {
         println!("  {}", f.render());
     }
-    if scan.blocking().next().is_some() {
+    if expanded && scan.findings.len() > 50 {
+        println!(
+            "  … {} more finding(s); see the expanded CI SARIF for the full report",
+            scan.findings.len() - 50
+        );
+    }
+    if !expanded && scan.blocking().next().is_some() {
         return fail(1);
     }
     ok()

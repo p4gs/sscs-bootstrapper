@@ -1,0 +1,20 @@
+// This source is a scan fixture only and is not compiled or executed.
+fn boundary_examples(repo_root: &std::path::Path, name: &str) {
+    // ruleid: sscsb-aikido-repo-path-direct-io
+    let _ = std::fs::read_to_string(repo_root.join(name));
+    // ok: sscsb-aikido-repo-path-direct-io
+    let _ = repo_file::read_text(repo_root, name.as_ref());
+    // ok: sscsb-aikido-repo-path-direct-io
+    let _ = std::fs::read_to_string(name);
+
+    // ruleid: sscsb-aikido-git-variable-operand
+    let _ = std::process::Command::new("git").args(["show", name]);
+    // ok: sscsb-aikido-git-variable-operand
+    let _ = std::process::Command::new("git").args(["show", "--end-of-options", name]);
+    // ok: sscsb-aikido-git-variable-operand
+    let _ = std::process::Command::new("git").args(["status", name]);
+    // ruleid: sscsb-aikido-git-variable-operand
+    let _ = crate::exec::git(&["show", name], repo_root);
+    // ok: sscsb-aikido-git-variable-operand
+    let _ = crate::exec::git(&["show", "--end-of-options", name], repo_root);
+}

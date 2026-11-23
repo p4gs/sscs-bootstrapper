@@ -65,11 +65,11 @@ fn rules_arg(ctx: &Ctx, cfg: &Config) -> String {
 /// any file that is actually part of the project.
 fn exclude_args(cfg: &Config) -> Vec<String> {
     let rules = rules_dir(cfg);
-    if rules == "auto" {
-        Vec::new()
-    } else {
-        vec!["--exclude".to_string(), rules]
+    let mut excludes = vec!["--exclude".to_string(), EXPANDED_RULES_DIR.to_string()];
+    if rules != "auto" && rules != EXPANDED_RULES_DIR {
+        excludes.extend(["--exclude".to_string(), rules]);
     }
+    excludes
 }
 
 /// Severity labels that are advisory — reported, never blocking.
@@ -147,10 +147,36 @@ impl SastScan {
 /// Run the configured engine over `target`. Returns what it found AND what it
 /// could not read.
 pub fn run_sast(ctx: &Ctx, cfg: &Config, target: &Path) -> Result<SastScan> {
+    run_sast_pack(ctx, cfg, target, rules_arg(ctx, cfg), exclude_args(cfg))
+}
+
+const EXPANDED_RULES_DIR: &str = ".sscsb/rules-expanded";
+
+/// Run the shipped additional rules without changing the configured gate.
+pub fn run_expanded_sast(ctx: &Ctx, cfg: &Config) -> Result<SastScan> {
+    let rules = ctx.root.join(EXPANDED_RULES_DIR);
+    for name in ["sscsb-rust.yaml", "sscsb-aikido-gaps.yaml"] {
+        anyhow::ensure!(
+            rules.join(name).is_file(),
+            "expanded SAST rules missing at {} — run `sscsb init` with SAST enabled",
+            rules.join(name).display()
+        );
+    }
+    let excludes = ["--exclude", EXPANDED_RULES_DIR, "--exclude", ".sscsb/rules"]
+        .map(str::to_owned)
+        .into();
+    run_sast_pack(ctx, cfg, &ctx.root, rules.display().to_string(), excludes)
+}
+
+fn run_sast_pack(
+    ctx: &Ctx,
+    cfg: &Config,
+    target: &Path,
+    rules: String,
+    excludes: Vec<String>,
+) -> Result<SastScan> {
     let engine = engine(cfg);
-    let rules = rules_arg(ctx, cfg);
     let target_arg = target.display().to_string();
-    let excludes = exclude_args(cfg);
     match engine.as_str() {
         "opengrep" => {
             if !tools::is_available("opengrep") {
@@ -1096,16 +1122,19 @@ pub(crate) mod tests {
         let excludes = exclude_args(cfg);
         assert_eq!(
             excludes,
-            vec!["--exclude".to_string(), ".sscsb/rules".to_string()]
+            ["--exclude", EXPANDED_RULES_DIR, "--exclude", ".sscsb/rules"].map(str::to_owned)
         );
 
-        // …and `rules = "auto"` (the registry) has no local directory to exclude.
+        // Registry mode still excludes the installed expanded rule definitions.
         let text = std::fs::read_to_string(ctx.config_path())
             .unwrap()
             .replace("rules = \".sscsb/rules\"", "rules = \"auto\"");
         std::fs::write(ctx.config_path(), text).unwrap();
         let ctx_auto = Ctx::discover(dir.path()).unwrap();
-        assert!(exclude_args(ctx_auto.require_config().unwrap()).is_empty());
+        assert_eq!(
+            exclude_args(ctx_auto.require_config().unwrap()),
+            ["--exclude", EXPANDED_RULES_DIR].map(str::to_owned)
+        );
 
         if !tools::is_available("opengrep") {
             return;
