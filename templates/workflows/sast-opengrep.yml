@@ -44,12 +44,12 @@ jobs:
             --certificate-identity-regexp "^https://github\.com/opengrep/opengrep/" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com
           chmod +x opengrep && sudo mv opengrep /usr/local/bin/
-      # --exclude .sscsb/rules: a scanner must not scan its own rule definitions.
+      # Exclude the baseline and expanded rule definitions from scan targets.
       # A rule file necessarily contains the pattern text it matches on, so any
       # finding there is false by construction.
       - name: Run OpenGrep
         run: |
-          opengrep scan --config .sscsb/rules --exclude .sscsb/rules \
+          opengrep scan --config .sscsb/rules --exclude .sscsb/rules --exclude .sscsb/rules-expanded \
             --sarif-output=opengrep.sarif --error .
       - name: Upload SARIF
         if: always()

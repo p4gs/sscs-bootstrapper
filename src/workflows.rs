@@ -118,6 +118,21 @@ pub const ARTIFACTS: &[Artifact] = &[
         content: include_str!("../templates/rules/sscsb-default.yaml"),
     },
     Artifact {
+        control: "sast",
+        dest: ".sscsb/rules-expanded/sscsb-rust.yaml",
+        content: include_str!("../templates/rules-expanded/sscsb-rust.yaml"),
+    },
+    Artifact {
+        control: "sast",
+        dest: ".sscsb/rules-expanded/sscsb-aikido-gaps.yaml",
+        content: include_str!("../templates/rules-expanded/sscsb-aikido-gaps.yaml"),
+    },
+    Artifact {
+        control: "sast",
+        dest: ".github/workflows/sast-opengrep-expanded.yml",
+        content: include_str!("../templates/workflows/sast-opengrep-expanded.yml"),
+    },
+    Artifact {
         control: "codeql",
         dest: ".github/workflows/codeql.yml",
         content: include_str!("../templates/workflows/codeql.yml"),

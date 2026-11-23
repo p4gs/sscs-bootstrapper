@@ -10,6 +10,11 @@ versions.
 
 ### Added
 
+- `sscsb sast --expanded` and a separate advisory OpenGrep SARIF workflow
+  report 23 additional Rust, GitHub Actions, and Dockerfile review checks.
+  Bootstrap installs the local packs without changing the default SAST gate.
+  See the [coverage and Aikido crosswalk](docs/sast-rust-coverage.md).
+
 - `sscsb init` installs the official OpenGrep Agent Skill and its MIT license
   for Claude Code and Agent Skills-compatible clients. The bundled source is
   pinned to upstream revision `bfbc2419225e8884a343c312b2d3b05c2106fa45`;

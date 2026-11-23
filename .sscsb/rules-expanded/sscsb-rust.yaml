@@ -1,0 +1,237 @@
+# SSCSB optional Rust review rules. Checks report patterns, not exploitability.
+rules:
+  - id: sscsb-rust-process-arguments
+    languages: [rust]
+    severity: INFO
+    message: Process arguments are external input. Parse them before using them in commands, paths, or policy decisions.
+    metadata:
+      kind: review
+    pattern-either:
+      - pattern: std::env::args()
+      - pattern: std::env::args_os()
+      - pattern: env::args()
+      - pattern: env::args_os()
+
+  - id: sscsb-rust-current-executable
+    languages: [rust]
+    severity: INFO
+    message: Review uses of the current executable path. Do not treat it as proof of a trusted installation or executable identity.
+    metadata:
+      kind: review
+    pattern-either:
+      - pattern: std::env::current_exe()
+      - pattern: env::current_exe()
+
+  - id: sscsb-rust-shared-temp-directory
+    languages: [rust]
+    severity: WARNING
+    message: An OS temporary directory can be shared. Use a securely created file or private temporary directory instead of assuming a joined path is private.
+    metadata:
+      kind: review
+    pattern-either:
+      - pattern: std::env::temp_dir()
+      - pattern: env::temp_dir()
+
+  - id: sscsb-rust-legacy-digest
+    languages: [rust]
+    severity: WARNING
+    message: MD5 and SHA-1 are not suitable for security integrity checks. Prefer a modern digest when the result crosses a trust boundary.
+    metadata:
+      kind: review
+    pattern-either:
+      - pattern: md5::compute(...)
+      - pattern: md5::Context::new()
+      - pattern: md5::Md5::new()
+      - pattern: md5::Md5::digest(...)
+      - pattern: sha1::Sha1::new()
+      - pattern: sha1::Sha1::digest(...)
+      - pattern: openssl::hash::MessageDigest::md5()
+      - pattern: openssl::hash::MessageDigest::sha1()
+      - pattern: openssl::sha::sha1(...)
+      - pattern: openssl::sha::Sha1::new()
+      - pattern: ring::digest::SHA1_FOR_LEGACY_USE_ONLY
+
+  - id: sscsb-rust-tls-verification-disabled
+    languages: [rust]
+    severity: ERROR
+    message: This setting explicitly turns off a TLS identity check. Keep default certificate and hostname validation or configure the intended trust roots.
+    metadata:
+      kind: security
+      cwe: CWE-295
+    pattern-either:
+      - pattern: $BUILDER.danger_accept_invalid_certs(true)
+      - pattern: $BUILDER.danger_accept_invalid_hostnames(true)
+      - patterns:
+          - pattern: $BUILDER.set_verify($MODE)
+          - metavariable-regex:
+              metavariable: $MODE
+              regex: '^(?:openssl::ssl::|ssl::)?SslVerifyMode::NONE$'
+
+  - id: sscsb-rust-custom-certificate-verifier
+    languages: [rust]
+    severity: WARNING
+    message: A custom TLS certificate verifier replaces default checks. Review chain, hostname, and signature verification as a unit.
+    metadata:
+      kind: review
+      cwe: CWE-295
+    pattern-either:
+      - pattern: $CLIENT.dangerous().set_certificate_verifier(...)
+      - pattern: $BUILDER.dangerous().with_custom_certificate_verifier(...)
+      - pattern: rustls::client::danger::DangerousClientConfig
+      - pattern: rustls::client::DangerousClientConfig
+
+  - id: sscsb-rust-http-sensitive-header
+    languages: [rust]
+    severity: WARNING
+    message: Review redaction for an authentication or cookie header constructed inline. Prefer a dedicated authentication builder or explicitly mark its value sensitive.
+    metadata:
+      kind: review
+    patterns:
+      - pattern-either:
+          - pattern: $REQUEST.header($HEADER, $VALUE)
+          - pattern: $HEADERS.insert($HEADER, $VALUE)
+          - pattern: $HEADERS.append($HEADER, $VALUE)
+      - metavariable-regex:
+          metavariable: $HEADER
+          regex: '(?i)^(?:(?:[A-Za-z_][A-Za-z0-9_]*::)*(?:authorization|proxy_authorization|cookie|set_cookie)|"(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key)")$'
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: '^(?:r?#*"|(?:[A-Za-z_][A-Za-z0-9_]*::)*HeaderValue::from_(?:static|str|bytes)\b|format!\s*\()'
+
+  - id: sscsb-rust-unsafe-code
+    languages: [rust]
+    severity: WARNING
+    message: Review the safety invariants of this unsafe operation or declaration; prefer safe interfaces where practical.
+    metadata:
+      kind: review
+    pattern-either:
+      - pattern: unsafe { ... }
+      - pattern: unsafe fn $FUNC(...) { ... }
+      - pattern: unsafe impl $TRAIT for $TYPE { ... }
+
+  - id: sscsb-rust-bidi-control
+    languages: [generic]
+    paths:
+      include:
+        - '**/*.rs'
+    severity: WARNING
+    message: A literal Unicode direction-control character can make reviewing source ambiguous. Prefer a visible escape when the character is intentional.
+    metadata:
+      kind: review
+    pattern-regex: '[\x{061C}\x{200E}\x{200F}\x{202A}-\x{202E}\x{2066}-\x{2069}]'
+
+  - id: sscsb-rust-dynamic-executable
+    languages: [rust]
+    severity: WARNING
+    message: The executable name is computed. Review where it comes from and restrict it to known tools or trusted paths.
+    metadata:
+      kind: review
+    patterns:
+      - pattern-either:
+          - pattern: std::process::Command::new($PROGRAM)
+          - pattern: tokio::process::Command::new($PROGRAM)
+          - pattern: Command::new($PROGRAM)
+      - metavariable-regex:
+          metavariable: $PROGRAM
+          regex: '^(?!r\#*"|").+'
+
+  - id: sscsb-rust-child-loader-env
+    languages: [rust]
+    severity: WARNING
+    message: A child-process library loader override can change which code runs. Verify the value and the directory ownership.
+    metadata:
+      kind: review
+    patterns:
+      - pattern: $COMMAND.env($KEY, ...)
+      - metavariable-regex:
+          metavariable: $KEY
+          regex: '^"(?:LD_PRELOAD|LD_LIBRARY_PATH|DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH)"$'
+
+  - id: sscsb-rust-raw-socket
+    languages: [rust]
+    severity: INFO
+    message: A direct socket opens a network boundary. Review destination policy and input limits; the socket itself is not a vulnerability.
+    metadata:
+      kind: review
+    pattern-either:
+      - pattern: std::net::TcpStream::connect(...)
+      - pattern: TcpStream::connect(...)
+      - pattern: std::net::UdpSocket::bind(...)
+      - pattern: UdpSocket::bind(...)
+      - pattern: socket2::Socket::new(...)
+      - pattern: socket2::Socket::new_raw(...)
+
+  - id: sscsb-rust-http-egress
+    languages: [rust]
+    severity: INFO
+    message: This constructs an outbound HTTP client or request. Review endpoint, redirect, credential, and timeout policy for the call site.
+    metadata:
+      kind: review
+    pattern-either:
+      - pattern: reqwest::get(...)
+      - pattern: reqwest::blocking::get(...)
+      - pattern: reqwest::Client::new()
+      - pattern: reqwest::Client::builder()
+      - pattern: reqwest::blocking::Client::new()
+      - pattern: reqwest::blocking::Client::builder()
+      - pattern: ureq::builder()
+      - pattern: ureq::Agent::new_with_defaults()
+      - pattern: ureq::get(...)
+      - pattern: ureq::post(...)
+      - pattern: ureq::put(...)
+      - pattern: ureq::delete(...)
+      - pattern: ureq::request(...)
+
+  - id: sscsb-rust-interpreter-process
+    languages: [rust]
+    severity: WARNING
+    message: A child interpreter or downloader creates a distinct trust boundary. Keep arguments structured and review code, files, and destinations it can consume.
+    metadata:
+      kind: review
+    patterns:
+      - pattern-either:
+          - pattern: std::process::Command::new($PROGRAM)
+          - pattern: tokio::process::Command::new($PROGRAM)
+          - pattern: Command::new($PROGRAM)
+      - metavariable-regex:
+          metavariable: $PROGRAM
+          regex: '^"(?:[^"]*[/\\])?(?:sh|bash|zsh|fish|dash|cmd|powershell|pwsh|python[0-9.]*|node|deno|ruby|perl|curl|wget)(?:\.exe)?"$'
+
+  - id: sscsb-rust-command-search-path
+    languages: [rust]
+    severity: WARNING
+    message: This overrides executable lookup. Restrict search order to trusted directories, or use a validated absolute executable path.
+    metadata:
+      kind: review
+    pattern-either:
+      - pattern: $COMMAND.env("PATH", ...)
+      - pattern: std::env::set_var("PATH", ...)
+      - pattern: env::set_var("PATH", ...)
+
+  - id: sscsb-rust-credential-path
+    languages: [rust]
+    severity: INFO
+    message: A reference to credential storage deserves review. Limit reads and writes to the user-authorized operation; avoid exposing the data in logs or uploads.
+    metadata:
+      kind: review
+    patterns:
+      - pattern: $PATH
+      - metavariable-regex:
+          metavariable: $PATH
+          regex: '^(?:r#*)?"(?:[^"\r\n]*[/\\])?(?:\.ssh|\.gnupg|\.aws|\.kube|\.docker|\.azure|\.netrc|\.npmrc|credentials\.json|id_ed25519|id_rsa)(?:[/\\][^"\r\n]*)?"#*$'
+
+  - id: sscsb-rust-file-deletion
+    languages: [rust]
+    severity: WARNING
+    message: Review the deletion target for intended ownership and confinement. Recursive removal warrants additional care.
+    metadata:
+      kind: review
+    pattern-either:
+      - pattern: std::fs::remove_file(...)
+      - pattern: fs::remove_file(...)
+      - pattern: std::fs::remove_dir(...)
+      - pattern: fs::remove_dir(...)
+      - pattern: std::fs::remove_dir_all(...)
+      - pattern: fs::remove_dir_all(...)
+      - pattern: tokio::fs::remove_file(...)
+      - pattern: tokio::fs::remove_dir_all(...)

@@ -1,0 +1,18 @@
+#!/bin/sh
+# Scan-only fixture. These commands are not run.
+# ruleid: sscsb-aikido-archive-verification-review
+curl -fsSLO "https://example.invalid/sample.tar.gz"
+tar -xzf sample.tar.gz
+
+# A fetched checksum alone does not demonstrate a separate trust source.
+# ruleid: sscsb-aikido-archive-verification-review
+curl -fsSLO "https://example.invalid/checksum-case.tar.gz"
+curl -fsSLO "https://example.invalid/checksum-case.txt"
+sha256sum --check checksum-case.txt
+tar -xzf checksum-case.tar.gz
+
+# A pinned check after extraction does not provide the ordering of interest.
+# ruleid: sscsb-aikido-archive-verification-review
+curl -fsSLO "https://example.invalid/late-case.tar.gz"
+tar -xzf late-case.tar.gz
+expect "late-case.tar.gz" d654f678b709eb53c393d38519d5ed7d2e57205529404018614cfefa0fb2b5ca

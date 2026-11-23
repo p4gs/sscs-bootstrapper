@@ -13,3 +13,8 @@ templates/rules/
 
 # Build output.
 target/
+
+# Expanded rule sources and their intentionally flagged test fixtures.
+templates/rules-expanded/
+templates/rule-fixtures/
+.sscsb/rules-expanded/

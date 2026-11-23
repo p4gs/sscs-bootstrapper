@@ -58,6 +58,70 @@ fn init_sscsb(repo: &Path) {
     sscsb(repo).arg("init").assert().success();
 }
 
+#[test]
+fn expanded_sast_installs_and_reports_without_changing_the_default_gate() {
+    let dir = throwaway_repo();
+    let repo = dir.path();
+    init_sscsb(repo);
+    let pack = repo.join(".sscsb/rules-expanded");
+    assert_eq!(
+        std::fs::read_to_string(pack.join("sscsb-rust.yaml")).unwrap(),
+        include_str!("../.sscsb/rules-expanded/sscsb-rust.yaml")
+    );
+    assert_eq!(
+        std::fs::read_to_string(pack.join("sscsb-aikido-gaps.yaml")).unwrap(),
+        include_str!("../.sscsb/rules-expanded/sscsb-aikido-gaps.yaml")
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".github/workflows/sast-opengrep-expanded.yml")).unwrap(),
+        include_str!("../.github/workflows/sast-opengrep-expanded.yml")
+    );
+    assert_eq!(
+        include_str!("../.github/workflows/sast-opengrep-expanded.yml"),
+        include_str!("../templates/workflows/sast-opengrep-expanded.yml")
+            .replace("{{default_branch}}", "main")
+    );
+
+    let marker = "SSCSB_EXPANDED_TEST_MARKER";
+    let marker_rule = format!(
+        "rules:\n  - id: advisory-test-marker\n    languages: [generic]\n    severity: ERROR\n    message: Integration test marker\n    pattern-regex: {marker}\n"
+    );
+    std::fs::write(pack.join("review-test.yaml"), marker_rule).unwrap();
+    std::fs::write(repo.join("sample.rs"), format!("// {marker}\n")).unwrap();
+    git_ok(repo, &["add", "sample.rs"]);
+    if tool_available("opengrep") {
+        sscsb(repo)
+            .args(["sast", "--expanded"])
+            .assert()
+            .success()
+            .stdout(predicates::str::contains("advisory-test-marker"));
+        sscsb(repo)
+            .arg("sast")
+            .assert()
+            .success()
+            .stdout(predicates::str::contains("0 finding(s)"));
+    } else {
+        sscsb(repo)
+            .args(["sast", "--expanded"])
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("opengrep"));
+    }
+    let local_edit = "# local customization, preserved across re-init\n";
+    std::fs::write(pack.join("sscsb-rust.yaml"), local_edit).unwrap();
+    init_sscsb(repo);
+    assert_eq!(
+        std::fs::read_to_string(pack.join("sscsb-rust.yaml")).unwrap(),
+        local_edit
+    );
+    std::fs::remove_file(pack.join("sscsb-rust.yaml")).unwrap();
+    sscsb(repo)
+        .args(["sast", "--expanded"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("expanded SAST rules missing"));
+}
+
 fn tool_available(bin: &str) -> bool {
     Command::new(bin)
         .arg("--help")

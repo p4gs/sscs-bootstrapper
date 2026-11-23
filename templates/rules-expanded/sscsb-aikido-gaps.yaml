@@ -1,0 +1,140 @@
+# Opt-in syntactic review checks; none establishes exploitability.
+rules:
+  - id: sscsb-aikido-repo-path-direct-io
+    message: Direct filesystem access on a path joined to a repository root. Review whether every relevant component is bounded to that root and whether links must be rejected. This match does not assess prior guards or explicit operator-path contracts.
+    severity: WARNING
+    languages: [rust]
+    metadata:
+      category: security
+      confidence: LOW
+      cwe: ["CWE-22: Improper Limitation of a Pathname to a Restricted Directory"]
+    patterns:
+      - pattern-either:
+          - pattern: std::fs::read($ROOT.join($PART))
+          - pattern: std::fs::read_to_string($ROOT.join($PART))
+          - pattern: std::fs::write($ROOT.join($PART), $DATA)
+          - pattern: std::fs::File::open($ROOT.join($PART))
+          - pattern: std::fs::read(&$ROOT.join($PART))
+          - pattern: std::fs::read_to_string(&$ROOT.join($PART))
+          - pattern: std::fs::write(&$ROOT.join($PART), $DATA)
+          - pattern: std::fs::File::open(&$ROOT.join($PART))
+          - patterns:
+              - pattern: |
+                  let $PATH = $ROOT.join($PART);
+                  ...
+                  std::fs::$SINK(&$PATH, ...);
+              - metavariable-regex:
+                  metavariable: $SINK
+                  regex: ^(?:read|read_to_string|write)$
+      - metavariable-regex:
+          metavariable: $ROOT
+          regex: '^(?:root|repo_root|ctx\.root|ctx\.sscsb_dir\(\))$'
+      - pattern-not-inside: |
+          mod tests {
+            ...
+          }
+
+  - id: sscsb-aikido-git-variable-operand
+    message: Git receives a variable operand immediately after a literal subcommand. Review whether the operand is independently validated or passed after the correct Git delimiter for its expected type. Separate argv entries prevent shell interpolation, but do not establish Git argument intent.
+    severity: WARNING
+    languages: [rust]
+    metadata:
+      category: security
+      confidence: LOW
+      cwe: ["CWE-88: Improper Neutralization of Argument Delimiters in a Command"]
+    patterns:
+      - pattern-either:
+          - pattern: std::process::Command::new("git").args([$SUB, $ARG, ...])
+          - pattern: std::process::Command::new("git").arg($SUB).arg($ARG)
+          - pattern: crate::exec::git(&[$SUB, $ARG, ...], $CWD)
+          - pattern: crate::exec::git_raw(&[$SUB, $ARG, ...], $CWD)
+          - pattern: exec::git(&[$SUB, $ARG, ...], $CWD)
+          - pattern: exec::git_raw(&[$SUB, $ARG, ...], $CWD)
+      - pattern-not-inside: |
+          mod tests {
+            ...
+          }
+      - metavariable-regex:
+          metavariable: $SUB
+          regex: '^"(?:show|log|diff|rev-list|rev-parse|cat-file|checkout|switch)"$'
+      - metavariable-regex:
+          metavariable: $ARG
+          regex: '^&?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$'
+
+  - id: sscsb-aikido-workflow-write-all
+    message: This workflow or job explicitly grants write-all permissions. Prefer explicit minimum permissions per job; use the workflow audit for wider coverage.
+    severity: WARNING
+    languages: [yaml]
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: ["CWE-250: Execution with Unnecessary Privileges"]
+    paths:
+      include:
+        - "**/.github/workflows/*.yml"
+        - "**/.github/workflows/*.yaml"
+        - "**/templates/workflows/*.yml"
+        - "**/templates/workflows/*.yaml"
+        - "**/sscsb-aikido-workflow.yaml"
+    pattern: "permissions: write-all"
+
+  - id: sscsb-aikido-workflow-read-all
+    message: This workflow or job explicitly grants read-all permissions. Review whether explicit minimum reads suffice. A job-level permission block replaces the workflow default.
+    severity: INFO
+    languages: [yaml]
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: ["CWE-250: Execution with Unnecessary Privileges"]
+    paths:
+      include:
+        - "**/.github/workflows/*.yml"
+        - "**/.github/workflows/*.yaml"
+        - "**/templates/workflows/*.yml"
+        - "**/templates/workflows/*.yaml"
+        - "**/sscsb-aikido-workflow.yaml"
+    pattern: "permissions: read-all"
+
+  - id: sscsb-aikido-archive-verification-review
+    message: A remote tarball is downloaded and then extracted with no recognized same-file pinned digest between those commands. Review how integrity and provenance are independently bound before use. This narrow matcher does not validate arbitrary shell or helper semantics.
+    severity: WARNING
+    languages: [generic]
+    metadata:
+      category: security
+      confidence: LOW
+      cwe: ["CWE-494: Download of Code Without Integrity Check"]
+    paths:
+      include:
+        - "**/.github/workflows/*.yml"
+        - "**/.github/workflows/*.yaml"
+        - "**/.github/actions/*/action.yml"
+        - "**/.github/actions/*/action.yaml"
+        - "**/templates/workflows/*.yml"
+        - "**/templates/workflows/*.yaml"
+        - "**/*.sh"
+    # Scope: curl short-option remote-name output, matching tar -x[f/z] spelling
+    # within six lines. The two suppressors recognize a literal digest and the
+    # same basename; fetched checksum manifests alone do not suppress review.
+    pattern-regex: |-
+      (?mx) ^[ \t]*curl[ \t]+-[A-Za-z]*O[A-Za-z]*[ \t]+"?https://[^\r\n" \t]+/(?<archive>[A-Za-z0-9_.${}-]+\.(?:tar\.gz|tgz))"?[ \t]*(?:[#][^\r\n]*)?\r?\n
+      (?!(?:(?![ \t]*tar[ \t]+-[A-Za-z]*x[A-Za-z]*f[A-Za-z]*[ \t]+"?\k<archive>"?(?=[ \t\r\n]|\z))[^\r\n]*\r?\n){0,5}[ \t]*(?:expect[ \t]+"?\k<archive>"?[ \t]+[A-Fa-f0-9]{64}|echo[ \t]+"[A-Fa-f0-9]{64}[ \t]+\k<archive>"[ \t]*\|[ \t]*sha256sum[ \t]+(?:--check|-c))[ \t]*(?:[#][^\r\n]*)?\r?\n)
+      (?:[^\r\n]*\r?\n){0,5}[ \t]*tar[ \t]+-[A-Za-z]*x[A-Za-z]*f[A-Za-z]*[ \t]+"?\k<archive>"?(?=[ \t\r\n]|\z)
+
+  - id: sscsb-aikido-docker-user-review
+    message: No USER in this single-stage Dockerfile, or an explicit root identity is the last USER in the default final stage. Review effective identity and document build-only exceptions. An inherited identity or a build selecting a different target is not inferred.
+    severity: WARNING
+    languages: [generic]
+    metadata:
+      category: security
+      confidence: LOW
+      cwe: ["CWE-250: Execution with Unnecessary Privileges"]
+    paths:
+      include:
+        - "**/Dockerfile"
+        - "**/Dockerfile.*"
+        - "**/*.Dockerfile"
+    # Cover single-stage files, including shipped template paths. Treat inherited
+    # image metadata and complex multistage/heredoc syntax as outside this rule.
+    pattern-either:
+      - pattern-regex: '(?im)\A(?:[ \t]*(?:[#][^\r\n]*)?\r?\n)*\K[ \t]*FROM[ \t]+[^\r\n]+(?:\r?\n(?![ \t]*(?:FROM|USER)(?:[ \t]|\r?$))[^\r\n]*)*\r?\n?\z'
+      - pattern-regex: '(?im)^[ \t]*USER[ \t]+(?:root|0+)(?::[^\r\n \t]+)?[ \t]*(?:\r?$)(?:\r?\n(?![ \t]*(?:FROM|USER)(?:[ \t]|\r?$))[^\r\n]*)*\r?\n?\z'

@@ -47,6 +47,26 @@ sscsb sast
 catches `curl … | sh` install steps, which is the shape half of AI-suggested setup
 instructions take. `rules = "auto"` opts into the registry instead.
 
+### Expanded review pack
+
+Run `sscsb init` with SAST enabled to install the additional rule files and a
+separate CI workflow. Existing rule files, workflows and local configuration
+are preserved. Read the [rule inventory and Aikido gap analysis](sast-rust-coverage.md)
+for provenance, coverage and intentional limitations.
+
+```sh
+sscsb sast --expanded   # Report the additional rules without blocking on findings
+```
+
+This option does not change the configured default SAST gate, pre-commit rules,
+or selector in `.sscsb/config.toml`. It reports the expanded pack only; run
+`sscsb sast` for the configured baseline. Missing rules or a scanner failure
+still return an error. GitHub runs the expanded rules with the same pinned
+OpenGrep version as the baseline and uploads a separate SARIF category; findings
+do not fail that job. Do not make the expanded job a required check if you want
+it to stay independent of the existing merge gate. Keep dependency and secret
+checks separate from this source analysis.
+
 In pre-commit, SAST runs over the **staged** files, and blocking-severity findings
 block the commit. `INFO`, `WARNING`, `LOW` and `MEDIUM` are advisory and do not. A
 pre-commit hook that blocks on everything gets disabled by the second day; the
