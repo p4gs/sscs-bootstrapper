@@ -14,6 +14,20 @@ the first one that reads the code.
 
 ## SAST: OpenGrep by default
 
+The pinned OpenGrep release is **2.0.0** (verified against upstream on
+2026-11-16). The generated SAST workflow installs its signed Linux binary;
+the repository's CI installer checks the release asset's SHA-256 before use.
+`sscsb tools` names the pin and upstream download location for local installs.
+
+With `sast` enabled, `sscsb init` also installs OpenGrep's official native Agent
+Skill under `.agents/skills/opengrep/` and `.claude/skills/opengrep/`, including
+its MIT license. This is the skill from `npx skills add opengrep/skills` (also
+available through `bunx skills add opengrep/skills`), bundled at upstream commit
+`bfbc2419225e8884a343c312b2d3b05c2106fa45`. Installation needs no network or
+package manager and preserves existing files. As with all generated workflows,
+an existing SAST workflow is kept; review its diff before updating its pin and
+the 2.0 Linux asset name (`opengrep_linux_x86`).
+
 **OpenGrep** is the default engine — the open fork of Semgrep, with rules that stay
 open. **Semgrep** is a one-line switch if you want the commercial registry:
 

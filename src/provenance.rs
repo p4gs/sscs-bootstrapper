@@ -286,7 +286,7 @@ pub fn create_receipt(ctx: &Ctx, commit: &str, out_dir: &Path) -> Result<std::pa
             "aiRole": claim.role,
             "patchSha256": patch_digest,
             "generatedBy": format!("sscsb {}", env!("CARGO_PKG_VERSION")),
-            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "timestamp": crate::datetime::now_rfc3339(),
         }
     });
     std::fs::create_dir_all(out_dir)?;

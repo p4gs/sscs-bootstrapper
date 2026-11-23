@@ -38,7 +38,7 @@ jobs:
           persist-credentials: false
       - name: SSCS Bootstrapper Scan
         id: scan
-        uses: p4gs/sscsb-action@4365f191590c96c2239902de7861f46d3e704909 # v1 line, post-#1: signed records + Sigstore-verified install
+        uses: p4gs/sscsb-action@e10a1ea4f0018549e39a0aa8aaf50ea405c80824 # v1 line: all 54 controls, six phases, committed evidence
         with:
           sscsb-version: latest
           submit: "false"

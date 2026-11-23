@@ -40,7 +40,7 @@ use crate::controls::{Outcome, VerifyResult};
 use crate::exec;
 use crate::signers::{evaluate_expiry, ExpiryState};
 use anyhow::{Context as _, Result};
-use chrono::NaiveDate;
+use jiff::civil::Date;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -671,7 +671,7 @@ fn opt_date(table: &toml::Table, key: &str, kind: &str) -> Result<Option<String>
         toml::Value::Datetime(d) => d.to_string(),
         other => anyhow::bail!("`{kind} {key}` must be a YYYY-MM-DD date, found {other}"),
     };
-    NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+    Date::strptime("%Y-%m-%d", raw.trim())
         .with_context(|| format!("`{kind} {key} = \"{raw}\"` is not a YYYY-MM-DD date"))?;
     Ok(Some(raw.trim().to_string()))
 }
@@ -1380,7 +1380,7 @@ pub fn verify_maintainer_mfa(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     let max_age = cfg
         .control_opt_int(id, "max_attestation_age_days")
         .unwrap_or(180);
-    let today = chrono::Utc::now().date_naive();
+    let today = crate::datetime::today_utc();
     let targets = distinct_targets(&detected);
 
     let mut messages = Vec::new();
@@ -1457,9 +1457,9 @@ pub fn verify_maintainer_mfa(ctx: &Ctx, cfg: &Config) -> VerifyResult {
         // `YYYY-MM-DD` when the policy was loaded, so a malformed date is
         // already a hard Fail on every phase-6 control.
         let stale = account.attested.as_deref().and_then(|raw| {
-            NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+            Date::strptime("%Y-%m-%d", raw)
                 .ok()
-                .map(|d| (today - d).num_days())
+                .map(|d| i64::from((today - d).get_days()))
         });
         let mfa = account.mfa;
         let resistance = if mfa.phishing_resistant() {
@@ -1476,7 +1476,7 @@ pub fn verify_maintainer_mfa(ctx: &Ctx, cfg: &Config) -> VerifyResult {
                      and update `attested`. A stale claim about a publishing account is exactly \
                      as actionable as an expired signing key",
                     target.registry(),
-                    account.identity,
+                    "[identity withheld]",
                     mfa.label()
                 ));
             }
@@ -1488,7 +1488,7 @@ pub fn verify_maintainer_mfa(ctx: &Ctx, cfg: &Config) -> VerifyResult {
                     "{} account `{}`: claims `{}` ({resistance}), confirmed {days}d ago — a \
                      self-declared claim, documented, never a substitute for the API reads above",
                     target.registry(),
-                    account.identity,
+                    "[identity withheld]",
                     mfa.label()
                 ));
             }
@@ -1499,7 +1499,7 @@ pub fn verify_maintainer_mfa(ctx: &Ctx, cfg: &Config) -> VerifyResult {
                      cannot go stale, which is exactly why it also cannot be trusted; add the \
                      day you last checked, as YYYY-MM-DD",
                     target.registry(),
-                    account.identity,
+                    "[identity withheld]",
                     mfa.label()
                 ));
             }
@@ -1786,7 +1786,7 @@ pub fn verify_publish_tokens(ctx: &Ctx, cfg: &Config) -> VerifyResult {
         Err(r) => return r,
     };
     let max_age = cfg.control_opt_int(id, "max_token_age_days").unwrap_or(90);
-    let today = chrono::Utc::now().date_naive();
+    let today = crate::datetime::today_utc();
     let mut messages = Vec::new();
     let mut outcome = Outcome::Pass;
 
@@ -1864,8 +1864,8 @@ pub fn verify_publish_tokens(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     }
 
     // Declared tokens: expiry is the part sscsb can actually evaluate.
-    for token in &policy.tokens {
-        let label = format!("{} token ({})", token.target.registry(), token.purpose);
+    for (index, token) in policy.tokens.iter().enumerate() {
+        let label = format!("{} token #{}", token.target.registry(), index + 1);
         let state = evaluate_expiry(token.expires.as_deref(), today, max_age);
         let (line, failed) = expiry_line(&label, &state);
         messages.push(line);
@@ -1897,7 +1897,7 @@ pub fn verify_publish_tokens(ctx: &Ctx, cfg: &Config) -> VerifyResult {
             ));
         }
         match token.stored_in.as_deref() {
-            Some(where_) => messages.push(format!("  stored in {where_}")),
+            Some(_) => messages.push("  storage location declared (value withheld)".to_string()),
             None => messages.push(
                 "  no `stored_in` — say where the secret actually lives, or nobody can revoke \
                  it in a hurry"
@@ -2367,7 +2367,7 @@ pub fn verify_dist_manifests(ctx: &Ctx, _cfg: &Config) -> VerifyResult {
         .iter()
         .any(|d| matches!(d.target, PublishTarget::Chocolatey | PublishTarget::WinGet));
     if windows {
-        let today = chrono::Utc::now().date_naive();
+        let today = crate::datetime::today_utc();
         if policy.signing.authenticode {
             let subject = policy.signing.subject.as_deref().unwrap_or("(no subject)");
             let state = evaluate_expiry(policy.signing.expires.as_deref(), today, 0);
@@ -2571,21 +2571,30 @@ pub fn render_status(ctx: &Ctx) -> Result<String> {
     } else {
         out.push_str("Declared claims\n");
         for a in &policy.accounts {
+            let _ = write!(
+                out,
+                "  account  {:<12} [identity withheld] — mfa ",
+                a.target.id()
+            );
+            // Mechanism names are literal labels, never policy string values.
+            match a.mfa {
+                MfaClaim::WebauthnOnly => out.push_str("webauthn-only"),
+                MfaClaim::Webauthn => out.push_str("webauthn"),
+                MfaClaim::Totp => out.push_str("totp"),
+                MfaClaim::None => out.push_str("none"),
+            }
             let _ = writeln!(
                 out,
-                "  account  {:<12} {} — mfa {} (attested {})",
-                a.target.id(),
-                a.identity,
-                a.mfa.label(),
+                " (attested {})",
                 a.attested.as_deref().unwrap_or("never")
             );
         }
-        for t in &policy.tokens {
+        for (index, t) in policy.tokens.iter().enumerate() {
             let _ = writeln!(
                 out,
-                "  token    {:<12} {} — expires {}",
+                "  token    {:<12} #{} [purpose withheld] — expires {}",
                 t.target.id(),
-                t.purpose,
+                index + 1,
                 t.expires.as_deref().unwrap_or("never stated")
             );
         }
@@ -2624,8 +2633,8 @@ mod tests {
     use super::*;
     use crate::audit::{audit_workflow, Severity};
 
-    fn today() -> NaiveDate {
-        NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()
+    fn today() -> Date {
+        Date::new(2026, 6, 1).unwrap()
     }
 
     fn empty_policy() -> Policy {
@@ -3371,7 +3380,7 @@ mod tests {
         bootstrapped(root);
 
         // Fresh: reported, never a pass it could not earn.
-        let fresh = chrono::Utc::now().date_naive() - chrono::Duration::days(5);
+        let fresh = crate::datetime::today_utc() - jiff::Span::new().days(5);
         write(
             root,
             ".sscsb/policy/distribution.toml",
@@ -3390,7 +3399,7 @@ mod tests {
 
         // Stale: the claim is older than the window, so it FAILS — an expired
         // assertion about a publishing account is as actionable as an expired key.
-        let stale = chrono::Utc::now().date_naive() - chrono::Duration::days(400);
+        let stale = crate::datetime::today_utc() - jiff::Span::new().days(400);
         write(
             root,
             ".sscsb/policy/distribution.toml",
@@ -3424,11 +3433,11 @@ mod tests {
         let root = dir.path();
         write(root, "pyproject.toml", "[project]\nname = \"p\"\n");
         bootstrapped(root);
-        let today = chrono::Utc::now().date_naive();
+        let today = crate::datetime::today_utc();
 
         // A date in the FUTURE is not freshness — it is a claim about a check
         // that has not happened. It must not read as the healthiest state.
-        let tomorrow = today + chrono::Duration::days(1);
+        let tomorrow = today + jiff::Span::new().days(1);
         write(
             root,
             ".sscsb/policy/distribution.toml",
@@ -3471,7 +3480,7 @@ mod tests {
         let root = dir.path();
         write(root, "pyproject.toml", "[project]\nname = \"p\"\n");
         bootstrapped(root);
-        let fresh = chrono::Utc::now().date_naive();
+        let fresh = crate::datetime::today_utc();
         write(
             root,
             ".sscsb/policy/distribution.toml",
@@ -3552,7 +3561,7 @@ mod tests {
         write(root, "thing.nuspec", "<package/>\n");
         bootstrapped(root);
 
-        let expired = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        let expired = crate::datetime::today_utc() - jiff::Span::new().days(3);
         write(
             root,
             ".sscsb/policy/distribution.toml",
@@ -3569,7 +3578,7 @@ mod tests {
             r.messages
         );
 
-        let live = chrono::Utc::now().date_naive() + chrono::Duration::days(30);
+        let live = crate::datetime::today_utc() + jiff::Span::new().days(30);
         write(
             root,
             ".sscsb/policy/distribution.toml",
@@ -3940,7 +3949,7 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Info, "{:?}", r.messages);
         assert!(r.messages.join("\n").contains("no `[signing]` block"));
 
-        let expired = chrono::Utc::now().date_naive() - chrono::Duration::days(10);
+        let expired = crate::datetime::today_utc() - jiff::Span::new().days(10);
         write(
             root,
             ".sscsb/policy/distribution.toml",
@@ -4052,18 +4061,15 @@ mod tests {
         );
         let ctx = bootstrapped(root);
         let text = render_status(&ctx).unwrap();
-        assert!(text.contains("crates-io"), "{text}");
-        assert!(text.contains("Cargo.toml"), "{text}");
-        assert!(text.contains("publish-crates.yml installed"), "{text}");
-        assert!(
-            text.contains("No [[account]] or [[token]] claims"),
-            "{text}"
-        );
+        assert!(text.contains("crates-io"));
+        assert!(text.contains("Cargo.toml"));
+        assert!(text.contains("publish-crates.yml installed"));
+        assert!(text.contains("No [[account]] or [[token]] claims"));
 
         std::fs::remove_file(root.join(".github/workflows/publish-crates.yml")).unwrap();
         let ctx = Ctx::discover(root).unwrap();
         let text = render_status(&ctx).unwrap();
-        assert!(text.contains("MISSING — run `sscsb init`"), "{text}");
+        assert!(text.contains("MISSING — run `sscsb init`"));
     }
 
     #[test]
@@ -4071,8 +4077,8 @@ mod tests {
         let dir = repo();
         let ctx = bootstrapped(dir.path());
         let text = render_status(&ctx).unwrap();
-        assert!(text.contains("No publish target detected"), "{text}");
-        assert!(text.contains("pyproject.toml with [project]"), "{text}");
+        assert!(text.contains("No publish target detected"));
+        assert!(text.contains("pyproject.toml with [project]"));
     }
 
     // ───────────────── gh / npm paths, with fake tools on PATH ─────────────
@@ -4585,10 +4591,8 @@ mod tests {
 
     // ─────────────────────── reporting surfaces ────────────────────────────
 
-    /// `dist status` renders declared claims, not just the empty case — the
-    /// branch an operator who HAS done the policy work actually sees.
     #[test]
-    fn dist_status_renders_declared_accounts_and_tokens() {
+    fn dist_status_withholds_free_form_claim_values() {
         let dir = repo();
         let root = dir.path();
         write(root, "thing.nuspec", "<package/>\n");
@@ -4596,21 +4600,70 @@ mod tests {
         write(
             root,
             ".sscsb/policy/distribution.toml",
-            "[[account]]\ntarget = \"chocolatey\"\nidentity = \"pkg-owner\"\nmfa = \"totp\"\nattested = \"2026-01-15\"\n\n\
-             [[token]]\ntarget = \"chocolatey\"\npurpose = \"push key\"\nscoped = true\nexpires = \"2026-12-31\"\n",
+            r#"
+[[account]]
+target = "chocolatey"
+identity = "private-account-marker"
+mfa = "totp"
+attested = "2026-01-15"
+[[token]]
+target = "chocolatey"
+purpose = "private-purpose-marker"
+stored_in = "private-storage-marker"
+expires = "2026-12-31"
+"#,
         );
         let ctx = Ctx::discover(root).unwrap();
-        let text = render_status(&ctx).unwrap();
-        assert!(text.contains("Declared claims"), "{text}");
-        assert!(text.contains("account  chocolatey"), "{text}");
-        assert!(text.contains("pkg-owner"), "{text}");
-        assert!(text.contains("mfa totp (attested 2026-01-15)"), "{text}");
-        assert!(text.contains("token    chocolatey"), "{text}");
-        assert!(text.contains("expires 2026-12-31"), "{text}");
-        assert!(
-            text.contains("no OIDC path in the ecosystem"),
-            "Chocolatey's gap belongs in the summary too: {text}"
-        );
+        let mut text = render_status(&ctx).unwrap();
+        for result in [
+            verify_maintainer_mfa(&ctx, ctx.require_config().unwrap()),
+            verify_publish_tokens(&ctx, ctx.require_config().unwrap()),
+        ] {
+            text.push_str(&result.messages.join("\n"));
+        }
+        for private in [
+            "private-account-marker",
+            "private-purpose-marker",
+            "private-storage-marker",
+        ] {
+            assert!(!text.contains(private), "free-form claim leaked");
+        }
+        assert!(text.contains("chocolatey"));
+        assert!(text.contains("2026-12-31"));
+        assert!(text.contains("mfa totp"));
+    }
+
+    /// The declared-claims status keeps public MFA labels and dates, withholds
+    /// identity/purpose, and never dumps the report into a failing assertion.
+    #[test]
+    fn dist_status_renders_declared_accounts_and_tokens() {
+        let dir = repo();
+        let root = dir.path();
+        write(root, "thing.nuspec", "<package/>\n");
+        bootstrapped(root);
+        for factor in ["webauthn-only", "webauthn", "totp", "none"] {
+            write(
+                root,
+                ".sscsb/policy/distribution.toml",
+                &format!(
+                    "[[account]]\ntarget = \"chocolatey\"\nidentity = \"pkg-owner\"\nmfa = \"{factor}\"\nattested = \"2026-01-15\"\n\n\
+                     [[token]]\ntarget = \"chocolatey\"\npurpose = \"push key\"\nscoped = true\nexpires = \"2026-12-31\"\n"
+                ),
+            );
+            let ctx = Ctx::discover(root).unwrap();
+            let text = render_status(&ctx).unwrap();
+            assert!(text.contains("Declared claims"));
+            assert!(text.contains("account  chocolatey"));
+            assert!(text.contains("[identity withheld]"));
+            assert!(!text.contains("pkg-owner"));
+            assert!(text.contains(&format!("mfa {factor} (attested 2026-01-15)")));
+            assert!(text.contains("token    chocolatey"));
+            assert!(text.contains("expires 2026-12-31"));
+            assert!(
+                text.contains("no OIDC path in the ecosystem"),
+                "Chocolatey's gap belongs in the summary too"
+            );
+        }
     }
 
     /// A declared token with none of the compensating controls is reported as
