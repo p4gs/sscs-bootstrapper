@@ -85,7 +85,27 @@ pub fn run_with_stdin(
     cwd: Option<&Path>,
     stdin: Option<&[u8]>,
 ) -> Result<CmdOutput> {
-    let raw = run_raw(bin, args, cwd, stdin)?;
+    run_text(bin, args, cwd, stdin, &[])
+}
+
+/// Apply child-only variables without changing the hook process environment.
+pub fn run_env(
+    bin: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    env: &[(&str, &std::ffi::OsStr)],
+) -> Result<CmdOutput> {
+    run_text(bin, args, cwd, None, env)
+}
+
+fn run_text(
+    bin: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    stdin: Option<&[u8]>,
+    env: &[(&str, &std::ffi::OsStr)],
+) -> Result<CmdOutput> {
+    let raw = run_raw(bin, args, cwd, stdin, env)?;
     Ok(CmdOutput {
         status: raw.status,
         signal: raw.signal,
@@ -96,7 +116,7 @@ pub fn run_with_stdin(
 
 /// Run `bin`, capturing stdout as raw bytes. See [`RawOutput`].
 pub fn run_bytes(bin: &str, args: &[&str], cwd: Option<&Path>) -> Result<RawOutput> {
-    run_raw(bin, args, cwd, None)
+    run_raw(bin, args, cwd, None, &[])
 }
 
 fn run_raw(
@@ -104,9 +124,10 @@ fn run_raw(
     args: &[&str],
     cwd: Option<&Path>,
     stdin: Option<&[u8]>,
+    env: &[(&str, &std::ffi::OsStr)],
 ) -> Result<RawOutput> {
     let mut cmd = Command::new(bin);
-    cmd.args(args);
+    cmd.args(args).envs(env.iter().copied());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }

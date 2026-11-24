@@ -948,13 +948,14 @@ pub fn branch_of_ref(r: &str) -> Option<&str> {
 
 const ZERO_SHA_PREFIX: &str = "0000000";
 
-pub fn hook_pre_push(ctx: &Ctx, _remote: &str, stdin: &str) -> Result<i32> {
+pub fn hook_pre_push(ctx: &Ctx, push_url: &str, stdin: &str) -> Result<i32> {
     let Some(cfg) = ctx.config.as_ref() else {
         return Ok(0);
     };
     let updates = parse_push_lines(stdin);
     let protected = cfg.protected_branches();
     let mut problems: Vec<String> = Vec::new();
+    let mut gitleaks_exclusions = None;
 
     for u in &updates {
         if u.local_sha.starts_with(ZERO_SHA_PREFIX) {
@@ -972,7 +973,11 @@ pub fn hook_pre_push(ctx: &Ctx, _remote: &str, stdin: &str) -> Result<i32> {
                 .control_opt_bool("secrets", "pre_push_range_scan")
                 .unwrap_or(true)
         {
-            match range_secret_scan(ctx, cfg, u) {
+            match range_secret_scan(ctx, cfg, u, || {
+                gitleaks_exclusions
+                    .get_or_insert_with(|| gitleaks_excluded_tips(ctx, push_url, &updates))
+                    .as_slice()
+            }) {
                 Ok(findings) => problems.extend(findings),
                 Err(err) => {
                     if cfg.fail_open() {
@@ -1292,8 +1297,8 @@ fn trailer_identity_email(value: &str) -> Option<String> {
         .then(|| candidate.to_string())
 }
 
-/// `git log` revision arguments naming exactly the commits this push would
-/// publish — and nothing else.
+/// Local-tracking revision arguments used to approximate the TruffleHog
+/// single-commit cutoff for a first push.
 ///
 /// A branch with no remote counterpart yet arrives on pre-push stdin carrying
 /// the ZERO sha as `remote_sha`. Read literally that says "no lower bound",
@@ -1309,8 +1314,7 @@ fn trailer_identity_email(value: &str) -> Option<String> {
 ///
 /// `<tip> --not --remotes` is the bound: everything reachable from the tip
 /// that is not already on a remote-tracking ref. [`commits_in_range`] already
-/// uses exactly that definition for the signing gate, so both pre-push gates
-/// now answer for the same range instead of two different ones.
+/// uses that same local approximation for first-push signing checks.
 fn outgoing_rev_args(u: &RefUpdate) -> Result<Vec<String>> {
     // Same fail-closed argument as `commits_in_range`: these shas arrive on
     // pre-push stdin, `git log` and `git rev-list` inherit git's diff options
@@ -1363,6 +1367,137 @@ fn range_since_commit(ctx: &Ctx, u: &RefUpdate) -> Result<Option<String>> {
     Ok(parents.split_whitespace().next().map(str::to_string))
 }
 
+/// The hook's second positional argument is the actual push URL, which can
+/// differ from the remote's name and fetch URL. Local tracking refs are not
+/// evidence that the destination already has an object.
+fn destination_refs(ctx: &Ctx, push_url: &str, updates: &[RefUpdate]) -> Option<BTreeSet<String>> {
+    if push_url.is_empty() {
+        return None;
+    }
+    // Query the literal endpoint. Decline this supplementary evidence if
+    // Git would apply another rewrite or interpret the URL as a remote name.
+    let resolved = exec::git_raw(&["ls-remote", "--get-url", "--", push_url], &ctx.root).ok()?;
+    if !resolved.success() || resolved.stdout.trim_end_matches(['\r', '\n']) != push_url {
+        return None;
+    }
+    // Don't start arbitrary remote helpers or follow HTTP redirects just to
+    // collect exclusions. Don't expose raw errors (the URL may carry credentials).
+    let out = exec::git_raw(
+        &[
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.https.allow=always",
+            "-c",
+            "protocol.ssh.allow=always",
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "http.followRedirects=false",
+            "ls-remote",
+            "--refs",
+            "--",
+            push_url,
+        ],
+        &ctx.root,
+    )
+    .ok()?;
+    if !out.success() {
+        return None;
+    }
+    let mut refs = BTreeMap::new();
+    for line in out.stdout.lines() {
+        let (oid, name) = line.split_once('\t')?;
+        if !valid_push_oid(oid)
+            || is_zero_oid(oid)
+            || !name.starts_with("refs/")
+            || refs.insert(name, oid).is_some()
+        {
+            return None;
+        }
+    }
+    // Reject a contradictory snapshot, e.g. a race or a server whose push
+    // and read advertisements differ. Keep only the push's own old tips.
+    if updates.iter().any(|u| {
+        let observed = refs.get(u.remote_ref.as_str()).copied();
+        observed != (!is_zero_oid(&u.remote_sha)).then_some(u.remote_sha.as_str())
+    }) {
+        return None;
+    }
+    Some(refs.into_values().map(str::to_string).collect())
+}
+
+fn valid_push_oid(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64) && exec::is_object_name(oid)
+}
+
+fn is_zero_oid(oid: &str) -> bool {
+    valid_push_oid(oid) && oid.bytes().all(|b| b == b'0')
+}
+
+fn gitleaks_excluded_tips(ctx: &Ctx, push_url: &str, updates: &[RefUpdate]) -> Vec<String> {
+    if updates.iter().any(|u| !valid_push_oid(&u.remote_sha)) {
+        return Vec::new();
+    }
+    // Bound the single argv value Gitleaks accepts. In a repository with
+    // more tips, omitting excess tips only makes the scan broader.
+    const MAX_TIPS: usize = 384;
+    let mut tips = updates
+        .iter()
+        .filter(|u| !is_zero_oid(&u.remote_sha))
+        .map(|u| u.remote_sha.clone())
+        .take(MAX_TIPS)
+        .collect::<BTreeSet<_>>();
+    if let Some(refs) = destination_refs(ctx, push_url, updates) {
+        for oid in refs {
+            if tips.len() >= MAX_TIPS {
+                break;
+            }
+            tips.insert(oid);
+        }
+    }
+    // Use only locally inspectable commit objects (including peeled tags).
+    // Missing objects and refs to non-commits supply no exclusion.
+    tips.into_iter()
+        .filter_map(|oid| {
+            let peeled = exec::git(
+                &[
+                    "--no-replace-objects",
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &format!("{oid}^{{commit}}"),
+                ],
+                &ctx.root,
+            )
+            .ok()?;
+            valid_push_oid(&peeled).then_some(peeled)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn gitleaks_log_opts(local_sha: &str, excluded: &[String]) -> Result<String> {
+    anyhow::ensure!(
+        valid_push_oid(local_sha) && !is_zero_oid(local_sha),
+        "invalid pre-push object ID for Gitleaks"
+    );
+    // This is the merge diff FORMAT, not --first-parent traversal. Scan
+    // merge-authored changes without dropping commits on any merged branch.
+    let mut opts = format!("{local_sha} --diff-merges=first-parent");
+    for oid in excluded {
+        write!(opts, " ^{oid}").expect("format into String");
+    }
+    Ok(opts)
+}
+
+fn gitleaks_git_failed(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.contains("ERR [git]") || line.contains("stderr is not empty"))
+}
+
 /// Secret scan over the outgoing commit range (TruffleHog git mode +
 /// Gitleaks log-opts).
 ///
@@ -1372,7 +1507,12 @@ fn range_since_commit(ctx: &Ctx, u: &RefUpdate) -> Result<Option<String>> {
 /// turned gitleaks OFF in its own `.sscsb/config.toml` was still
 /// gitleaks-scanned on push, and blocked by the tool it had explicitly
 /// disabled. Found in four separate repositories on the same day.
-fn range_secret_scan(ctx: &Ctx, cfg: &Config, u: &RefUpdate) -> Result<Vec<String>> {
+fn range_secret_scan<'a>(
+    ctx: &Ctx,
+    cfg: &Config,
+    u: &RefUpdate,
+    gitleaks_exclusions: impl FnOnce() -> &'a [String],
+) -> Result<Vec<String>> {
     let want_th = cfg
         .control_opt_bool("secrets", "trufflehog")
         .unwrap_or(true);
@@ -1419,9 +1559,17 @@ fn range_secret_scan(ctx: &Ctx, cfg: &Config, u: &RefUpdate) -> Result<Vec<Strin
             let report = tempfile::NamedTempFile::new()?;
             let report_arg = report.path().display().to_string();
             let exit_arg = GITLEAKS_FINDINGS_EXIT.to_string();
-            let log_opts_arg = format!("--log-opts={}", outgoing_rev_args(u)?.join(" "));
+            let log_opts_arg = format!(
+                "--log-opts={}",
+                gitleaks_log_opts(&u.local_sha, gitleaks_exclusions())?
+            );
             let root_arg = ctx.root.display().to_string();
-            let out = exec::run(
+            // Git's local replace refs and grafts aren't the history that
+            // actually goes to the destination. Apply the restriction only
+            // to Gitleaks and its child Git process.
+            let graft_dir = tempfile::tempdir()?;
+            let absent_graft_file = graft_dir.path().join("disabled");
+            let out = exec::run_env(
                 "gitleaks",
                 &[
                     "git",
@@ -1437,7 +1585,17 @@ fn range_secret_scan(ctx: &Ctx, cfg: &Config, u: &RefUpdate) -> Result<Vec<Strin
                     &report_arg,
                 ],
                 None,
+                &[
+                    ("GIT_NO_REPLACE_OBJECTS", std::ffi::OsStr::new("1")),
+                    ("GIT_GRAFT_FILE", absent_graft_file.as_os_str()),
+                ],
             )?;
+            // Some Gitleaks releases log an underlying Git failure but
+            // still return 0. Never treat that as a clean scan.
+            anyhow::ensure!(
+                !gitleaks_git_failed(&out.stderr),
+                "Gitleaks could not read the outgoing Git history"
+            );
             match out.status {
                 0 => {}
                 code if code == GITLEAKS_FINDINGS_EXIT => {
@@ -1741,7 +1899,7 @@ mod tests {
     }
 
     fn pre_push(ctx: &Ctx, stdin: &str) -> i32 {
-        crate::sast::tests::serialized(|| hook_pre_push(ctx, "origin", stdin).unwrap())
+        crate::sast::tests::serialized(|| hook_pre_push(ctx, "", stdin).unwrap())
     }
 
     #[test]
@@ -3897,6 +4055,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         ctx: &Ctx,
         u: &RefUpdate,
         logs: &Path,
+        push_url: &str,
     ) -> (Result<Vec<String>>, Vec<String>, Vec<String>) {
         let th_log = logs.join("trufflehog.argv");
         let gl_log = logs.join("gitleaks.argv");
@@ -3907,7 +4066,8 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
                 "gitleaks",
                 &recording_shim(&gl_log, "gitleaks version 8.30.1"),
             );
-            range_secret_scan(ctx, cfg, u)
+            let exclusions = gitleaks_excluded_tips(ctx, push_url, std::slice::from_ref(u));
+            range_secret_scan(ctx, cfg, u, || &exclusions)
         });
         (out, recorded_args(&th_log), recorded_args(&gl_log))
     }
@@ -3944,7 +4104,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
 
         // Both switches at their default `true`: both scanners run.
         let (_d, ctx, u) = repo_with_one_commit();
-        let (out, th, gl) = range_scan_with_fake_tools(&ctx, &u, logs.path());
+        let (out, th, gl) = range_scan_with_fake_tools(&ctx, &u, logs.path(), "");
         out.expect("range scan must succeed when both scanners are available");
         assert!(
             scanned(&th, TH_SCAN_FLAG),
@@ -3969,7 +4129,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
         std::fs::write(ctx2.config_path(), cfg_text).unwrap();
         let ctx2 = Ctx::discover(&ctx2.root).unwrap();
 
-        let (out, th, gl) = range_scan_with_fake_tools(&ctx2, &u2, logs_off.path());
+        let (out, th, gl) = range_scan_with_fake_tools(&ctx2, &u2, logs_off.path(), "");
         out.expect("trufflehog is still enabled, so the range scan must succeed");
         assert!(
             scanned(&th, TH_SCAN_FLAG),
@@ -3979,6 +4139,213 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
             !scanned(&gl, GL_SCAN_FLAG),
             "[controls.secrets] gitleaks = false must keep gitleaks out of the pre-push \
              range scan, but it was invoked with {gl:?}"
+        );
+    }
+
+    // Seed a disposable bare destination without invoking push or a hook.
+    fn bare_destination(ctx: &Ctx, refs: &[(&str, &str)]) -> tempfile::TempDir {
+        let dest = tempfile::tempdir().unwrap();
+        exec::git(&["init", "--bare"], dest.path()).unwrap();
+        for (name, oid) in refs {
+            exec::git(
+                &[
+                    "fetch",
+                    "--no-tags",
+                    ctx.root.to_str().unwrap(),
+                    &format!("{oid}:{name}"),
+                ],
+                dest.path(),
+            )
+            .unwrap();
+        }
+        dest
+    }
+
+    #[test]
+    fn gitleaks_blocks_an_internal_git_failure_even_when_scanner_exits_zero() {
+        let (_dir, ctx, update) = repo_with_one_commit();
+        let cfg = ctx.config.as_ref().unwrap();
+        let result = crate::testutil::with_env(|lock| {
+            let dir = tempfile::tempdir().unwrap();
+            lock.fake_tool(
+                "trufflehog",
+                &recording_shim(&dir.path().join("trufflehog.argv"), "trufflehog 3.95.9"),
+            );
+            lock.fake_tool("gitleaks", "#!/bin/sh\nif [ \"$1\" = git ]; then echo '10:00AM ERR [git] fatal: bad object' >&2; fi\necho 'gitleaks version 8.30.1'\nexit 0\n");
+            range_secret_scan(&ctx, cfg, &update, || &[])
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("could not read the outgoing Git history"));
+    }
+
+    #[test]
+    fn gitleaks_uses_the_push_url_and_ignores_other_or_stale_tracking_refs() {
+        let (_dir, ctx, mut update) = repo_with_one_commit();
+        let base = update.local_sha.clone();
+        let destination = bare_destination(&ctx, &[("refs/heads/main", &base)]);
+        write_file(&ctx, "next.txt", "outgoing change\n");
+        stage(&ctx, "next.txt");
+        git_ok(&ctx, &["commit", "-m", "new", "--no-verify"]);
+        update.local_sha = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+
+        let fetch_repo = bare_destination(&ctx, &[("refs/heads/main", &update.local_sha)]);
+        let push_url = destination.path().to_str().unwrap();
+        git_ok(
+            &ctx,
+            &[
+                "remote",
+                "add",
+                "origin",
+                fetch_repo.path().to_str().unwrap(),
+            ],
+        );
+        git_ok(&ctx, &["remote", "set-url", "--push", "origin", push_url]);
+        git_ok(
+            &ctx,
+            &["update-ref", "refs/remotes/origin/main", &update.local_sha],
+        );
+        git_ok(
+            &ctx,
+            &["update-ref", "refs/remotes/other/main", &update.local_sha],
+        );
+
+        let excluded = gitleaks_excluded_tips(&ctx, push_url, std::slice::from_ref(&update));
+        assert_eq!(excluded, vec![base.clone()]);
+
+        // If the read view contradicts the receive-pack old tip, preserve
+        // only the original push's evidence and conservatively scan more.
+        update.remote_ref = "refs/heads/main".into();
+        assert!(gitleaks_excluded_tips(&ctx, push_url, std::slice::from_ref(&update)).is_empty());
+        update.remote_sha = base.clone();
+        assert_eq!(
+            gitleaks_excluded_tips(&ctx, "", std::slice::from_ref(&update)),
+            vec![base]
+        );
+    }
+
+    #[test]
+    fn gitleaks_multi_ref_covers_only_destination_commit_history() {
+        let (_dir, ctx, mut update) = repo_with_one_commit();
+        let base = update.local_sha.clone();
+        git_ok(
+            &ctx,
+            &[
+                "tag",
+                "--no-sign",
+                "-a",
+                "published",
+                "-m",
+                "test tag",
+                &base,
+            ],
+        );
+        let tag = exec::git(&["rev-parse", "refs/tags/published"], &ctx.root).unwrap();
+        let blob = exec::git(&["rev-parse", "HEAD:README.md"], &ctx.root).unwrap();
+        let dest = bare_destination(
+            &ctx,
+            &[("refs/tags/published", &tag), ("refs/tags/blob", &blob)],
+        );
+        // An advertised unrelated commit can be absent from this clone.
+        exec::git(&["config", "user.name", "Test"], dest.path()).unwrap();
+        exec::git(
+            &["config", "user.email", "test@example.invalid"],
+            dest.path(),
+        )
+        .unwrap();
+        let remote_only = exec::git(
+            &[
+                "commit-tree",
+                &format!("{base}^{{tree}}"),
+                "-m",
+                "remote only",
+            ],
+            dest.path(),
+        )
+        .unwrap();
+        exec::git(
+            &["update-ref", "refs/heads/unrelated", &remote_only],
+            dest.path(),
+        )
+        .unwrap();
+
+        let copy = update;
+        let mut updates = vec![copy];
+        git_ok(&ctx, &["checkout", "-b", "side"]);
+        write_file(&ctx, "side.txt", "side change\n");
+        stage(&ctx, "side.txt");
+        git_ok(&ctx, &["commit", "-m", "side", "--no-verify"]);
+        let side = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+        git_ok(&ctx, &["checkout", "main"]);
+        write_file(&ctx, "main.txt", "main change\n");
+        stage(&ctx, "main.txt");
+        git_ok(&ctx, &["commit", "-m", "main", "--no-verify"]);
+        let main = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+        git_ok(&ctx, &["merge", "--no-ff", "--no-commit", "side"]);
+        write_file(&ctx, "merge.txt", "merge change\n");
+        stage(&ctx, "merge.txt");
+        git_ok(&ctx, &["commit", "-m", "merge", "--no-verify"]);
+        let merge = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+        update = RefUpdate {
+            local_ref: "refs/heads/main".into(),
+            local_sha: merge.clone(),
+            remote_ref: "refs/heads/main".into(),
+            remote_sha: ZERO.into(),
+        };
+        updates.push(update);
+        let excluded = gitleaks_excluded_tips(&ctx, dest.path().to_str().unwrap(), &updates);
+        assert_eq!(excluded, vec![base.clone()]);
+        let scoped = |tip: &str| {
+            let opts = gitleaks_log_opts(tip, &excluded).unwrap();
+            let mut args = vec!["log", "-p", "--format=%H"];
+            args.extend(opts.split_whitespace());
+            exec::git(&args, &ctx.root).unwrap()
+        };
+        assert!(
+            scoped(&base).is_empty(),
+            "new ref to published commit scans no commits"
+        );
+        let diff = scoped(&merge);
+        for expected in [&main, &side, &merge, "+merge change"] {
+            assert!(
+                diff.contains(expected),
+                "missing outgoing commit/change: {expected}"
+            );
+        }
+        assert!(!diff.contains(&base));
+
+        // Drive the pre-push hook, not just the revision helper: both
+        // updates must use the same advertised destination exclusions.
+        let logs = tempfile::tempdir().unwrap();
+        let gitleaks_log = logs.path().join("gitleaks.argv");
+        let stdin = format!(
+            "refs/heads/main {base} refs/heads/feature/published {ZERO}\n             refs/heads/main {merge} refs/heads/feature/merge {ZERO}\n"
+        );
+        crate::testutil::with_env(|lock| {
+            lock.fake_tool(
+                "trufflehog",
+                &recording_shim(&logs.path().join("trufflehog.argv"), "trufflehog 3.95.9"),
+            );
+            lock.fake_tool(
+                "gitleaks",
+                &recording_shim(&gitleaks_log, "gitleaks version 8.30.1"),
+            );
+            assert_eq!(
+                hook_pre_push(&ctx, dest.path().to_str().unwrap(), &stdin).unwrap(),
+                0
+            );
+        });
+        let actual = recorded_args(&gitleaks_log)
+            .into_iter()
+            .filter(|arg| arg.starts_with("--log-opts="))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                format!("--log-opts={base} --diff-merges=first-parent ^{base}"),
+                format!("--log-opts={merge} --diff-merges=first-parent ^{base}"),
+            ]
         );
     }
 
@@ -4017,6 +4384,7 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
             );
         }
         let tip = exec::git(&["rev-parse", "HEAD"], &ctx.root).unwrap();
+        let destination = bare_destination(&ctx, &[("refs/heads/main", &published)]);
 
         let outgoing: Vec<String> =
             exec::git(&["rev-list", &format!("{published}..{tip}")], &ctx.root)
@@ -4039,7 +4407,8 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
             remote_sha: ZERO.into(),
         };
         let logs = tempfile::tempdir().unwrap();
-        let (out, th, gl) = range_scan_with_fake_tools(&ctx, &u, logs.path());
+        let (out, th, gl) =
+            range_scan_with_fake_tools(&ctx, &u, logs.path(), destination.path().to_str().unwrap());
         out.expect("range scan must succeed");
 
         // What gitleaks was actually pointed at, resolved by git itself —
@@ -4049,7 +4418,11 @@ ssh_public_key = "ssh-ed25519 AAAAAIKEY agent@example.com"
             .find_map(|a| a.strip_prefix("--log-opts="))
             .expect("gitleaks must receive --log-opts");
         let mut rev = vec!["rev-list"];
-        rev.extend(log_opts.split_whitespace());
+        rev.extend(
+            log_opts
+                .split_whitespace()
+                .filter(|arg| !arg.starts_with("--diff-merges=")),
+        );
         let gl_scanned: Vec<String> = exec::git(&rev, &ctx.root)
             .unwrap()
             .lines()

@@ -975,11 +975,11 @@ fn cmd_hook(cwd: &std::path::Path, event: HookEvent) -> Result<ExitCode> {
     let code = match event {
         HookEvent::PreCommit => hooks::hook_pre_commit(&ctx)?,
         HookEvent::CommitMsg { message_file } => hooks::hook_commit_msg(&ctx, &message_file)?,
-        HookEvent::PrePush { remote, url: _ } => {
+        HookEvent::PrePush { remote: _, url } => {
             let mut stdin = String::new();
             use std::io::Read;
             std::io::stdin().read_to_string(&mut stdin)?;
-            hooks::hook_pre_push(&ctx, &remote, &stdin)?
+            hooks::hook_pre_push(&ctx, &url, &stdin)?
         }
     };
     Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
