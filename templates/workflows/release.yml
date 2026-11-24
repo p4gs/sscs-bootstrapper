@@ -16,6 +16,8 @@
 #                release itself, so the intoto file can travel to the DRAFT
 #                below like any other asset instead of being attached after
 #                publish (which immutability forbids)
+#   builder    → verifies the exact GitHub-reported reusable workflow path,
+#                tag and commit for this run attempt, before publish.
 #   gate       → .github/workflows/deploy-gate.yml (reusable): re-checks the
 #                checksums, verifies every Cosign bundle against THIS
 #                workflow's identity at THIS tag, and verifies both store
@@ -46,6 +48,9 @@
 # referenced by @vX.Y.Z tag — slsa-verifier validates the trusted builder's
 # ref and the build fails on SHA or short-tag refs (upstream README;
 # slsa-verifier issue #12). Every other action here is SHA-pinned.
+# The upstream tag is not immutable. The builder check compares the actual
+# workflow selected for this attempt, not the tag’s current lookup result.
+# It guards publication, not the earlier execution of the reusable workflow.
 #
 # Build fan-out: each target is built on a runner that can produce it, then the
 # single `release` job collects every tarball and performs ALL release writes.
@@ -290,12 +295,55 @@ jobs:
       base64-subjects: "${{ needs.release.outputs.hashes }}"
       upload-assets: false
 
+  # Ask GitHub what ran; a tag lookup or generator output would not establish
+  # which revision GitHub resolved for this attempt. Keep the approved SHA in
+  # sync with the full-SemVer call above and BUILDER_ID in deploy-gate.yml.
+  builder:
+    name: Verify reusable SLSA builder revision
+    needs: provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Confirm GitHub resolved the approved builder for this attempt
+        id: builder-revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILDER_PATH: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml
+          BUILDER_TAG: v2.1.0
+          BUILDER_SHA: f7dd8c54c2067bafc12ca7a55595d5ee9b75204a
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoint="repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+          if ! gh api --method GET -H 'X-GitHub-Api-Version: 2022-11-28' "$endpoint" \
+            | jq -es '
+              length == 1 and (.[0] |
+              .id == (env.GITHUB_RUN_ID | tonumber) and
+              .run_attempt == (env.GITHUB_RUN_ATTEMPT | tonumber) and
+              .repository.full_name == env.GITHUB_REPOSITORY and
+              .event == "push" and
+              .path == ".github/workflows/release.yml" and
+              .head_branch == env.GITHUB_REF_NAME and
+              .head_sha == env.GITHUB_SHA and
+              (.referenced_workflows | map(select(.path == (env.BUILDER_PATH + "@" + env.BUILDER_TAG)))
+                | length == 1 and .[0].ref == ("refs/tags/" + env.BUILDER_TAG) and .[0].sha == env.BUILDER_SHA))
+            ' >/dev/null; then
+            echo "::error::GitHub did not confirm the approved SLSA builder revision for this release attempt"
+            exit 1
+          fi
+
   # The verification gate is the repository's ONE provenance-verify
   # implementation (deploy-gate.yml), called as a reusable workflow so the
   # checks that guard publishing are the checks anyone can read there.
   gate:
     name: verify before publish
-    needs: [release, provenance]
+    needs: [release, provenance, builder]
     permissions:
       contents: read # read the run's artifacts + the attestation store; nothing else
     uses: ./.github/workflows/deploy-gate.yml
