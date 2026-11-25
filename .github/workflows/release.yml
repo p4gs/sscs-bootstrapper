@@ -81,66 +81,12 @@ jobs:
   # uploads as dist/*.tar.gz under a `build-*` artifact name is what the
   # `release` job below collects, checksums, attests, signs and ships.
   build:
-    name: build (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
+    name: Build and smoke-test release archives
     permissions:
       contents: read
-    strategy:
-      fail-fast: true # never publish a partial platform set
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-    steps:
-      - name: Harden runner
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
-        with:
-          egress-policy: audit
-      - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-      # The runner ships a stable Rust toolchain; --locked pins to the committed
-      # lockfile. `rustup target add` is a no-op for a runner's native target and
-      # supplies the std for the one cross case (x86_64 macOS from an arm64 host,
-      # which Xcode's bundled SDKs support directly).
-      - name: Add target
-        env:
-          TARGET: ${{ matrix.target }}
-        run: rustup target add "$TARGET"
-      - name: Build sscsb release binary
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          cargo build --release --locked --target "$TARGET"
-          mkdir -p dist
-          tar -C "target/${TARGET}/release" -czf "dist/sscsb-${GITHUB_REF_NAME}-${TARGET}.tar.gz" sscsb
-      - name: Verify the tarball contains a runnable binary
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          tar -tzf "dist/sscsb-${GITHUB_REF_NAME}-${TARGET}.tar.gz" | grep -qx sscsb \
-            || { echo "::error::tarball for $TARGET has no sscsb entry"; exit 1; }
-          # Only the host-native artifact can be executed here; a cross-built one
-          # is checked structurally above. Never claim more than was proven.
-          if [ "$TARGET" = "$(rustc -vV | awk '/^host:/{print $2}')" ]; then
-            "target/${TARGET}/release/sscsb" --version
-          else
-            echo "::notice::$TARGET is cross-built on this runner; skipping execution check"
-          fi
-      - name: Upload build artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: build-${{ matrix.target }}
-          path: dist/*.tar.gz
-          if-no-files-found: error
-          retention-days: 1
+    uses: ./.github/workflows/release-build.yml
+    with:
+      production-release: true
   # sscsb:customize-end build
 
   release:

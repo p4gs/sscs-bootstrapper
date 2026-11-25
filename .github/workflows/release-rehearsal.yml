@@ -1,0 +1,73 @@
+# Read-only GitHub API permissions by design. Artifacts stay in this run;
+# this lane does not sign, attest, create a draft, or publish releases.
+name: Release package rehearsal
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and smoke-test release archives
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-build.yml
+    with:
+      production-release: false
+
+  checksums:
+    name: Verify the three archived platforms
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Download the exact run's package artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: build-*
+          merge-multiple: true
+      - name: Check identities, checksums and read-back
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          shopt -s nullglob dotglob
+          files=(*)
+          arm=(sscsb-v*-aarch64-apple-darwin.tar.gz)
+          if [[ "${#files[@]}" -ne 3 || "${#arm[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one archive for each of three platforms"
+            exit 1
+          fi
+          if [[ ! "${arm[0]}" =~ ^sscsb-v([0-9]+[.][0-9]+[.][0-9]+)-aarch64-apple-darwin[.]tar[.]gz$ ]]; then
+            echo "::error::Invalid rehearsal package name"
+            exit 1
+          fi
+          prefix="sscsb-v${BASH_REMATCH[1]}"
+          expected=(
+            "$prefix-aarch64-apple-darwin.tar.gz"
+            "$prefix-x86_64-apple-darwin.tar.gz"
+            "$prefix-x86_64-unknown-linux-gnu.tar.gz"
+          )
+          for archive in "${expected[@]}"; do
+            if [[ ! -f "$archive" || -L "$archive" ]]; then
+              echo "::error::Missing expected rehearsal package $archive"
+              exit 1
+            fi
+          done
+          sha256sum -- "${expected[@]}" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+      - name: Retain checksum evidence with this run
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rehearsal-sha256s
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
