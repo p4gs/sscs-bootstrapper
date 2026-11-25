@@ -25,8 +25,9 @@
 
 use assert_cmd::Command;
 use sha2::Digest as _;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use yaml_rust2::{Yaml, YamlLoader};
 
 const SKILL_DOC_MD: &str = include_str!("../docs/skill.md");
 const TEMPLATE_SKILL_MD: &str = include_str!("../templates/skills/sscsb/SKILL.md");
@@ -114,7 +115,8 @@ fn assert_states(doc_name: &str, doc: &str, claim: &str) {
 // one. A heading contradicted its own body.
 //
 // Counts cannot be asserted from memory, so they are not asserted at all here:
-// the release is REPLAYED from `release.yml`'s own rules — the build matrix,
+// the release is REPLAYED from the actual workflow rules — the build matrix
+// in the production workflow's reusable build,
 // the exact-count guard, the checksum loop, the literal files staged into
 // `dist/`, the signing loop's skip pattern and the subject-set exclusion — and
 // every documented number is checked against what that yields. Change the
@@ -208,20 +210,67 @@ impl Replay {
     }
 }
 
+fn workflow_yaml(path: &str, source: &str) -> Yaml {
+    let mut docs = YamlLoader::load_from_str(source)
+        .unwrap_or_else(|e| panic!("{path} must be valid YAML: {e}"));
+    assert_eq!(docs.len(), 1, "{path} must contain one YAML document");
+    docs.remove(0)
+}
+
+fn release_targets(release: &str) -> Vec<String> {
+    let release = workflow_yaml("release.yml", release);
+    let build = &release["jobs"]["build"];
+    let reference = build["uses"]
+        .as_str()
+        .expect("release.yml must call a reusable build workflow");
+    let name = reference
+        .strip_prefix("./.github/workflows/")
+        .filter(|name| {
+            name.ends_with(".yml")
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        })
+        .expect("release.yml must call a workflow from this checkout");
+    assert_eq!(
+        build["with"]["production-release"].as_bool(),
+        Some(true),
+        "release.yml must enable the production build's tag guard"
+    );
+
+    let path = format!(".github/workflows/{name}");
+    let reusable = workflow_yaml(&path, &workflow(&path));
+    assert!(
+        !reusable["on"]["workflow_call"].is_badvalue(),
+        "{path} must be callable"
+    );
+    let entries = reusable["jobs"]["build"]["strategy"]["matrix"]["include"]
+        .as_vec()
+        .unwrap_or_else(|| panic!("{path} must declare build-matrix targets"));
+    let mut targets = BTreeSet::new();
+    for entry in entries {
+        let target = entry["target"]
+            .as_str()
+            .filter(|target| !target.is_empty())
+            .unwrap_or_else(|| panic!("{path} build-matrix row must name a target"));
+        assert!(
+            targets.insert(target.to_owned()),
+            "{path} declares duplicate target {target}"
+        );
+    }
+    assert!(
+        !targets.is_empty(),
+        "{path} must include at least one target"
+    );
+    targets.into_iter().collect()
+}
+
 fn replay() -> Replay {
     let yml = workflow(".github/workflows/release.yml");
 
     // 1. the build fan-out — one tarball per matrix target, and the release job
     //    refuses to continue unless it collected exactly that many.
-    let targets: Vec<String> = yml
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("- target: "))
-        .map(|t| t.trim().to_string())
-        .collect();
-    assert!(
-        !targets.is_empty(),
-        "release.yml must declare build-matrix targets"
-    );
+    let targets = release_targets(&yml);
     let required: usize = yml
         .lines()
         .find_map(|l| l.trim().strip_prefix("if [ ${#artifacts[@]} -ne "))
