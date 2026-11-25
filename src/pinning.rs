@@ -5,8 +5,8 @@
 //! scripts — plus the surface neither tool reads: a package manifest with no
 //! committed lockfile.
 //!
-//! Every subject is a committed file (`git ls-files`), so the verdict is a
-//! property of the repository, never of the machine that ran the scan.
+//! Subjects are tracked in the Git index. Inspect their index blobs and guarded
+//! working copies, without mistaking unavailable evidence for a clean check.
 //!
 //! Severity policy. A floating base image, a download piped into a shell or
 //! executed without verification, and an install with no version at all are
@@ -19,9 +19,9 @@
 use crate::audit::{jobs, steps, Finding, Severity};
 use crate::context::Ctx;
 use crate::controls::{Outcome, VerifyResult};
-use crate::exec;
+use crate::index_file::{self, Entries};
 use anyhow::Result;
-use yaml_rust2::YamlLoader;
+use std::path::Path;
 
 /// Verification steps that, appearing anywhere in the same script as a
 /// download, mean the download is checked before it is executed. Any one
@@ -317,8 +317,13 @@ fn audit_install(file: &str, context: &str, line: &str, findings: &mut Vec<Findi
 
 /// Workflow and composite-action `run:` bodies.
 fn audit_yaml_runs(file: &str, text: &str, composite: bool, findings: &mut Vec<Finding>) {
-    let Ok(docs) = YamlLoader::load_from_str(text) else {
-        return; // `actions-audit` reports unparseable workflows.
+    let Ok(docs) = crate::audit::parse_workflow_yaml(text) else {
+        findings.push(Finding::new(
+            Severity::Error,
+            file,
+            "workflow/action YAML unavailable or invalid; run steps were not assessed".into(),
+        ));
+        return;
     };
     for doc in &docs {
         if composite {
@@ -456,95 +461,155 @@ const MANIFEST_LOCKS: &[(&str, &[&str])] = &[
 /// A crate declaring `[package.metadata] cargo-fuzz = true` is exempt by the
 /// tool's own convention: cargo-fuzz ignores `Cargo.lock`, and the crate is
 /// never built for release.
-fn audit_lockfiles(
+fn require_lockfile(
     ctx: &Ctx,
-    tracked: &[&str],
-    findings: &mut Vec<Finding>,
-    info: &mut Vec<String>,
+    tracked: &Entries,
+    path: &str,
+    manifest: &str,
+    locks: &[&str],
+    content: &str,
+    report: &mut PinningReport,
 ) {
-    let has = |p: &str| tracked.contains(&p);
-    for (manifest, locks) in MANIFEST_LOCKS {
-        for path in tracked.iter().filter(|t| basename(t) == *manifest) {
-            let dir = path.strip_suffix(manifest).unwrap_or("");
-            let nested = !dir.is_empty();
-            let text = std::fs::read_to_string(ctx.root.join(path)).unwrap_or_default();
-            if *manifest == "Cargo.toml" {
-                if is_cargo_fuzz_crate(&text) {
-                    info.push(format!(
-                        "{path}: cargo-fuzz crate — no lockfile by the fuzzer's own convention"
-                    ));
-                    continue;
-                }
-                if nested && !text.contains("[workspace]") {
-                    continue; // a workspace member pins through the root lockfile
-                }
-            } else if nested {
-                continue; // v1 scopes non-Cargo manifests to the repository root
-            }
-            let pinned = locks.iter().any(|l| has(&format!("{dir}{l}")));
-            if !pinned {
-                findings.push(Finding::new(
-                    Severity::Error,
-                    file_or_root(path),
-                    format!(
-                        "`{path}` has no committed lockfile ({}) — every install resolves \
-                         versions afresh; commit the lockfile",
-                        locks.join(" / ")
-                    ),
-                ));
-            }
+    let dir = path.strip_suffix(manifest).unwrap_or("");
+    if manifest == "Cargo.toml" {
+        let Some(table) = content.parse::<toml::Table>().ok() else {
+            report.findings.push(Finding::new(
+                Severity::Error,
+                path,
+                "invalid Cargo manifest; applicable lockfiles could not be determined".into(),
+            ));
+            return;
+        };
+        if table
+            .get("package")
+            .and_then(|p| p.get("metadata"))
+            .and_then(|m| m.get("cargo-fuzz"))
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+        {
+            report.info.push(format!(
+                "{path}: cargo-fuzz crate — no lockfile by the fuzzer's own convention"
+            ));
+            return;
         }
+        if !dir.is_empty() && !table.contains_key("workspace") {
+            return; // a workspace member pins through the root lockfile
+        }
+    } else if !dir.is_empty() {
+        return; // v1 scopes non-Cargo manifests to the repository root
+    }
+    let missing = !locks
+        .iter()
+        .any(|lock| tracked.contains_key(&format!("{dir}{lock}")));
+    let pinned = !missing
+        && locks.iter().any(|lock| {
+            let relative = format!("{dir}{lock}");
+            tracked.get(&relative).is_some_and(|entry| {
+                entry.may_open_worktree_path()
+                    && entry.blob(&ctx.root).is_ok()
+                    && crate::repo_file::read(&ctx.root, Path::new(&relative))
+                        .is_ok_and(|bytes| bytes.is_some())
+            })
+        });
+    if !pinned {
+        let detail = if missing {
+            "has no committed lockfile"
+        } else {
+            "has no readable regular lockfile in both the Git index and worktree"
+        };
+        report.findings.push(Finding::new(
+            Severity::Error,
+            path,
+            format!(
+                "`{path}` {detail} ({}) — stage a regular lockfile for review",
+                locks.join(" / ")
+            ),
+        ));
     }
 }
 
-fn file_or_root(path: &str) -> &str {
-    path
+#[derive(Default)]
+struct PinningReport {
+    findings: Vec<Finding>,
+    info: Vec<String>,
 }
 
-fn is_cargo_fuzz_crate(text: &str) -> bool {
-    let mut in_metadata = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_metadata = t == "[package.metadata]";
-            continue;
-        }
-        if in_metadata && t.starts_with("cargo-fuzz") && t.contains("true") {
-            return true;
-        }
+impl PinningReport {
+    fn unavailable(&mut self, path: &str, layer: &str) {
+        self.findings.push(Finding::new(
+            Severity::Error,
+            path,
+            format!(
+                "could not read regular tracked evidence from {layer}; this input was not assessed"
+            ),
+        ));
     }
-    false
 }
 
-/// Every finding for the repository, in tracked-file order.
+fn audit_file(ctx: &Ctx, tracked: &Entries, path: &str, text: &str, report: &mut PinningReport) {
+    let name = basename(path);
+    if is_dockerfile(name) {
+        audit_dockerfile(path, text, &mut report.findings);
+        audit_dockerfile_runs(path, text, &mut report.findings);
+    } else if is_workflow(path) {
+        audit_yaml_runs(path, text, false, &mut report.findings);
+    } else if is_composite_action(path) {
+        audit_yaml_runs(path, text, true, &mut report.findings);
+    } else if is_shell_script(name) {
+        audit_shell(path, "script", text, &mut report.findings);
+    } else if name.starts_with("requirements") && name.ends_with(".txt") {
+        audit_requirements(path, text, &mut report.findings);
+    }
+    if let Some((manifest, locks)) = MANIFEST_LOCKS.iter().find(|(m, _)| name == *m) {
+        require_lockfile(ctx, tracked, path, manifest, locks, text, report);
+    }
+}
+
+/// Audit both the exact stage-0 snapshot and corresponding current files.
+/// An unreadable blob/checkout is a finding, but does not hide other results.
 pub fn audit_repo(ctx: &Ctx) -> Result<(Vec<Finding>, Vec<String>)> {
-    let tracked_z = exec::git(&["ls-files", "-z"], &ctx.root)?;
-    let tracked: Vec<&str> = tracked_z.split('\0').filter(|f| !f.is_empty()).collect();
-    let mut findings = Vec::new();
-    let mut info = Vec::new();
-    for path in &tracked {
+    let tracked = index_file::index(&ctx.root)?;
+    let mut report = PinningReport::default();
+    for (path, entry) in &tracked {
         let name = basename(path);
-        let full = ctx.root.join(path);
-        if !full.is_file() {
+        let manifest = MANIFEST_LOCKS
+            .iter()
+            .any(|(m, _)| name == *m && (*m == "Cargo.toml" || path == *m));
+        if !(is_dockerfile(name)
+            || is_workflow(path)
+            || is_composite_action(path)
+            || is_shell_script(name)
+            || (name.starts_with("requirements") && name.ends_with(".txt"))
+            || manifest)
+        {
             continue;
         }
-        let read = || std::fs::read_to_string(&full).unwrap_or_default();
-        if is_dockerfile(name) {
-            let text = read();
-            audit_dockerfile(path, &text, &mut findings);
-            audit_dockerfile_runs(path, &text, &mut findings);
-        } else if is_workflow(path) {
-            audit_yaml_runs(path, &read(), false, &mut findings);
-        } else if is_composite_action(path) {
-            audit_yaml_runs(path, &read(), true, &mut findings);
-        } else if is_shell_script(name) {
-            audit_shell(path, "script", &read(), &mut findings);
-        } else if name.starts_with("requirements") && name.ends_with(".txt") {
-            audit_requirements(path, &read(), &mut findings);
+        let indexed = entry.text(&ctx.root);
+        let local = entry
+            .may_open_worktree_path()
+            .then(|| crate::repo_file::read_text(&ctx.root, Path::new(path)))
+            .transpose()
+            .map(Option::flatten);
+        match &indexed {
+            Ok(text) => audit_file(ctx, &tracked, path, text, &mut report),
+            Err(_) => report.unavailable(path, "the Git index"),
+        }
+        match local {
+            Ok(Some(text)) if indexed.as_ref().is_ok_and(|other| other == &text) => {}
+            Ok(Some(text)) => {
+                report.info.push(format!(
+                    "{path}: also assessed current worktree bytes (not the indexed snapshot)"
+                ));
+                let start = report.findings.len();
+                audit_file(ctx, &tracked, path, &text, &mut report);
+                for finding in &mut report.findings[start..] {
+                    finding.message = format!("worktree: {}", finding.message);
+                }
+            }
+            _ => report.unavailable(path, "the worktree"),
         }
     }
-    audit_lockfiles(ctx, &tracked, &mut findings, &mut info);
-    Ok((findings, info))
+    Ok((report.findings, report.info))
 }
 
 /// `verify dependency-pinning`.
@@ -581,7 +646,7 @@ pub fn verify_dependency_pinning(ctx: &Ctx) -> VerifyResult {
     }
     if messages.is_empty() {
         messages.push(
-            "base images digest-pinned, downloads verified, installs pinned, lockfiles committed"
+            "base images digest-pinned, downloads checked, installs pinned, lockfiles committed or staged (Git index and worktree)"
                 .into(),
         );
     }
@@ -599,6 +664,7 @@ fn severity_label(s: &Severity) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec;
 
     fn findings_of(f: impl FnOnce(&mut Vec<Finding>)) -> Vec<Finding> {
         let mut v = Vec::new();
@@ -824,6 +890,62 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Pass, "{:?}", r.messages);
         assert_eq!(r.messages.len(), 1);
         assert!(r.messages[0].contains("[info] fuzz/Cargo.toml"));
+    }
+
+    #[test]
+    fn tracked_evidence_checks_both_layers_and_keeps_other_findings() {
+        let (_dir, ctx) = repo_with(&[
+            ("Dockerfile", "FROM alpine:3.19\n"),
+            ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+            ("Cargo.lock", "version = 3\n"),
+        ]);
+        std::fs::write(ctx.root.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::remove_file(ctx.root.join("Cargo.lock")).unwrap();
+        let result = verify_dependency_pinning(&ctx);
+        assert_eq!(result.outcome, Outcome::Fail);
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("not digest-pinned")));
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("no readable regular lockfile")));
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("also assessed current worktree")));
+    }
+
+    #[test]
+    fn malformed_yaml_is_not_a_clean_pinning_result() {
+        let (_dir, ctx) = repo_with(&[(".github/workflows/ci.yml", "jobs: [\n")]);
+        let result = verify_dependency_pinning(&ctx);
+        assert_eq!(result.outcome, Outcome::Fail);
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("YAML unavailable or invalid")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn linked_tracked_inputs_cannot_stand_in_for_regular_evidence() {
+        let (_dir, ctx) = repo_with(&[
+            ("Dockerfile", "FROM scratch\n"),
+            ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+            ("Cargo.lock", "version = 3\n"),
+            ("inert.txt", "FROM scratch\n"),
+        ]);
+        std::fs::remove_file(ctx.root.join("Dockerfile")).unwrap();
+        std::os::unix::fs::symlink("inert.txt", ctx.root.join("Dockerfile")).unwrap();
+        exec::git(&["add", "Dockerfile"], &ctx.root).unwrap();
+        let result = verify_dependency_pinning(&ctx);
+        assert_eq!(result.outcome, Outcome::Fail);
+        assert!(result
+            .messages
+            .iter()
+            .any(|m| m.contains("Dockerfile") && m.contains("Git index")));
     }
 
     /// The verification most workflows actually write — compute the digest,

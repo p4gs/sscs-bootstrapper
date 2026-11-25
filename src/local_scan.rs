@@ -692,15 +692,55 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
+// Git metadata controls what the directory can fetch. A checked-out pathname,
+// including one hidden from status by a local index setting, does not by
+// itself establish the committed trust-anchor bytes.
+fn committed_anchor(ctx: &Ctx, commit: &str) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid recorded commit object id for approved-signer anchor"
+    );
+    let tree = exec::git_bytes(
+        &[
+            "--no-replace-objects",
+            "ls-tree",
+            "-z",
+            "--full-tree",
+            commit,
+            "--",
+            ANCHOR_PATH,
+        ],
+        &ctx.root,
+    )?;
+    anyhow::ensure!(
+        tree.success()
+            && (tree.stdout.starts_with(b"100644 blob ")
+                || tree.stdout.starts_with(b"100755 blob ")),
+        "the approved-signer anchor is not a committed regular file at {commit}"
+    );
+    let object = format!("{commit}:{ANCHOR_PATH}");
+    let committed = exec::git_bytes(
+        &["--no-replace-objects", "cat-file", "blob", &object],
+        &ctx.root,
+    )?;
+    anyhow::ensure!(
+        committed.success(),
+        "could not read the committed approved-signer anchor"
+    );
+    Ok(committed.stdout)
+}
+
 /// Run every guard rail and assemble the `local` block. Nothing is written and
 /// nothing is signed until this returns `Ok`.
 pub fn prepare(ctx: &Ctx, home: &Path) -> Result<Prepared> {
     let signing = resolve_signing(ctx, home)?;
 
     let anchor_path = ctx.root.join(ANCHOR_PATH);
-    let anchor = std::fs::read_to_string(&anchor_path).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot read the approved-signer anchor at .sscsb/policy/allowed_signers ({e}).\n\
+    let anchor = crate::repo_file::read_text(&ctx.root, Path::new(ANCHOR_PATH))
+        .and_then(|value| value.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound)))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot read the approved-signer anchor at .sscsb/policy/allowed_signers ({e}).\n\
              That file IS the trust anchor for a local record — the directory fetches it from your \
              public repository at the recorded commit to check the signature. Generate it and \
              commit it:\n\
@@ -708,8 +748,8 @@ pub fn prepare(ctx: &Ctx, home: &Path) -> Result<Prepared> {
              \x20   git add .sscsb/policy/allowed_signers\n\
              \x20   git commit -m 'policy: commit the approved-signer anchor'\n\
              See {SIGNING_DOC}."
-        )
-    })?;
+            )
+        })?;
     let signer = match_allowed_signer(
         &parse_allowed_signers(&anchor),
         &signing.key_material,
@@ -725,6 +765,11 @@ pub fn prepare(ctx: &Ctx, home: &Path) -> Result<Prepared> {
     if commit.len() != 40 || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
         anyhow::bail!("HEAD did not resolve to a 40-character commit id (got `{commit}`)");
     }
+
+    anyhow::ensure!(
+        committed_anchor(ctx, &commit)? == anchor.as_bytes(),
+        "the approved-signer anchor does not match the recorded commit {commit}"
+    );
 
     let slug = ctx.origin_slug().ok_or_else(|| {
         anyhow::anyhow!(
@@ -861,14 +906,10 @@ pub fn sign_record(
     results: &[VerifyResult],
     home: &Path,
 ) -> Result<SignedRecord> {
-    let out_dir = ctx.root.join(OUT_DIR);
-    std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
-    let record_path = ctx.root.join(RECORD_PATH);
-    let signature_path = ctx.root.join(SIGNATURE_PATH);
-    if let Some(parent) = record_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
+    let record_rel = Path::new(RECORD_PATH);
+    let signature_rel = Path::new(SIGNATURE_PATH);
+    let record_path = ctx.root.join(record_rel);
+    let signature_path = ctx.root.join(signature_rel);
 
     // The clean-tree check ran BEFORE the controls did, so that a maintainer
     // whose key is not in the anchor learns it in a second rather than after a
@@ -886,16 +927,29 @@ pub fn sign_record(
         ));
     }
 
-    let record = machine::local_record_json(cfg, results, &prepared.block)?;
-    std::fs::write(&record_path, &record)
-        .with_context(|| format!("writing {}", record_path.display()))?;
-    // A stale signature from an earlier run must never be mistaken for this
-    // one's if signing fails part-way — at EITHER name a signer might use.
-    for candidate in signature_candidates(&record_path) {
-        let _ = std::fs::remove_file(candidate);
-    }
+    anyhow::ensure!(
+        exec::git(&["rev-parse", "HEAD"], &ctx.root)? == prepared.block.repo.commit,
+        "HEAD changed while the controls ran; refusing to sign a record for a different commit"
+    );
 
-    let (key_file, temporary) = key_file_for(&prepared.signing, home, &out_dir)?;
+    let record = machine::local_record_json(cfg, results, &prepared.block)?;
+    // A stale signature from an earlier run must never be mistaken for this
+    // one's if signing fails part-way, under EITHER former output name.
+    for candidate in signature_candidates(record_rel) {
+        crate::repo_file::remove_if_exists(&ctx.root, &candidate)
+            .with_context(|| format!("clearing old signature {}", candidate.display()))?;
+    }
+    crate::repo_file::write(&ctx.root, record_rel, record.as_bytes())
+        .with_context(|| format!("writing {}", record_path.display()))?;
+
+    // The signer chooses and opens its own output path. Give it only a
+    // private OS temporary directory, not a checkout-owned path. Both signer
+    // suffix conventions remain supported; publish bytes through repo_file.
+    let scratch = tempfile::tempdir().context("creating private signing scratch directory")?;
+    let scratch_name = record_rel.file_name().context("missing record filename")?;
+    let scratch_record = scratch.path().join(scratch_name);
+    std::fs::write(&scratch_record, record.as_bytes()).context("writing private signing buffer")?;
+    let (key_file, _) = key_file_for(&prepared.signing, home, scratch.path())?;
     let out = exec::run(
         &prepared.signing.program,
         &[
@@ -905,7 +959,9 @@ pub fn sign_record(
             NAMESPACE,
             "-f",
             key_file.to_str().context("signing key path is not UTF-8")?,
-            record_path.to_str().context("record path is not UTF-8")?,
+            scratch_record
+                .to_str()
+                .context("record path is not UTF-8")?,
         ],
         Some(&ctx.root),
     )
@@ -916,9 +972,6 @@ pub fn sign_record(
             prepared.signing.program
         )
     })?;
-    if temporary {
-        let _ = std::fs::remove_file(&key_file);
-    }
     if !out.success() {
         anyhow::bail!(
             "signing the record failed ({}): {}\n\
@@ -931,8 +984,17 @@ pub fn sign_record(
             prepared.signing.signing_key
         );
     }
-    let candidates = signature_candidates(&record_path);
-    let written = candidates.iter().find(|p| p.is_file()).ok_or_else(|| {
+    let candidates = signature_candidates(Path::new(scratch_name));
+    let mut signature = None;
+    for candidate in &candidates {
+        let value = crate::repo_file::read_text(scratch.path(), candidate)
+            .with_context(|| format!("reading signer output {}", candidate.display()))?;
+        if value.is_some() {
+            signature = value;
+            break;
+        }
+    }
+    let signature = signature.ok_or_else(|| {
         anyhow::anyhow!(
             "the signer `{}` reported success but wrote no signature (looked at {}). \
              See {SIGNING_DOC}.",
@@ -944,17 +1006,10 @@ pub fn sign_record(
                 .join(", ")
         )
     })?;
-    if written != &signature_path {
-        std::fs::rename(written, &signature_path).with_context(|| {
-            format!(
-                "moving the signature from {} to {}",
-                written.display(),
-                signature_path.display()
-            )
-        })?;
-    }
-    let signature = std::fs::read_to_string(&signature_path)
-        .with_context(|| format!("reading {}", signature_path.display()))?;
+    anyhow::ensure!(
+        crate::repo_file::write_if_absent(&ctx.root, signature_rel, signature.as_bytes())?,
+        "signature destination changed while signing; refusing to overwrite it"
+    );
 
     Ok(SignedRecord {
         record_path,
@@ -974,23 +1029,32 @@ pub fn sign_record(
 /// shim writing a malformed blob) into a local error instead of a rejected
 /// submission.
 pub fn verify_signature(ctx: &Ctx, prepared: &Prepared, signed: &SignedRecord) -> Result<String> {
+    // Verify the same in-memory bytes that were signed and the same allowed
+    // signer bytes whose digest is in the record. Do not ask ssh-keygen to
+    // reopen paths controlled by the checkout.
+    let scratch = tempfile::tempdir().context("creating private verification scratch")?;
+    let anchor_path = scratch.path().join("allowed_signers");
+    let signature_path = scratch.path().join("record.sig");
+    let anchor = committed_anchor(ctx, &prepared.block.repo.commit)?;
+    anyhow::ensure!(
+        sha256_hex(&anchor) == prepared.block.allowed_signers.sha256,
+        "the committed approved-signer anchor does not match the signed record"
+    );
+    std::fs::write(&anchor_path, anchor)?;
+    std::fs::write(&signature_path, signed.signature.as_bytes())?;
     let out = exec::run_with_stdin(
         "ssh-keygen",
         &[
             "-Y",
             "verify",
             "-f",
-            prepared
-                .anchor_path
-                .to_str()
-                .context("anchor path is not UTF-8")?,
+            anchor_path.to_str().context("anchor path is not UTF-8")?,
             "-I",
             &prepared.block.signer.principal,
             "-n",
             NAMESPACE,
             "-s",
-            signed
-                .signature_path
+            signature_path
                 .to_str()
                 .context("signature path is not UTF-8")?,
         ],
@@ -1008,6 +1072,16 @@ pub fn verify_signature(ctx: &Ctx, prepared: &Prepared, signed: &SignedRecord) -
             out.termination(),
             out.stderr.trim(),
             prepared.block.signer.fingerprint
+        );
+    }
+    for (path, expected) in [
+        (RECORD_PATH, signed.record.as_bytes()),
+        (SIGNATURE_PATH, signed.signature.as_bytes()),
+    ] {
+        let saved = crate::repo_file::read(&ctx.root, Path::new(path))?;
+        anyhow::ensure!(
+            saved.as_deref() == Some(expected),
+            "saved local scan artifact {path} differs from the verified bytes"
         );
     }
     Ok(out.stdout.trim().to_string())

@@ -1200,17 +1200,6 @@ fn a_key_outside_a_pyprojects_dependency_tables_is_never_read_as_a_package() {
         "a pyproject declaring nothing declares NO pypi packages: {current:?}"
     );
 
-    // Same shape, but the TOML does not parse. A content sniff cannot rescue
-    // this case — only the filename can — and line-scanning it invents the
-    // same phantom package.
-    write(&ctx, "pyproject.toml", "name = \"throwaway\"\n[project\n");
-    let current = deps::current_deps(&ctx).unwrap();
-    assert!(
-        !current.iter().any(|d| d.starts_with("pypi:")),
-        "an unparseable pyproject declares no packages, it does not invent \
-         them from its own source text: {current:?}"
-    );
-
     // The fix must not blind the parser: a real declaration is still seen.
     write(
         &ctx,
@@ -1235,6 +1224,20 @@ fn a_key_outside_a_pyprojects_dependency_tables_is_never_read_as_a_package() {
     assert!(
         current.contains("pypi:requests") && current.contains("pypi:flask"),
         "requirements.txt is line-oriented and must still parse: {current:?}"
+    );
+}
+
+#[test]
+fn a_malformed_pyproject_fails_instead_of_inventing_or_omitting_packages() {
+    let (_d, ctx) = repo();
+    write(&ctx, "pyproject.toml", "name = \"throwaway\"\n[project\n");
+
+    // A parse failure is neither evidence of a package named `name` nor
+    // evidence that the project's dependency set is empty.
+    let error = deps::current_deps(&ctx).unwrap_err().to_string();
+    assert!(
+        error.contains("cannot parse worktree manifest pyproject.toml"),
+        "{error}"
     );
 }
 

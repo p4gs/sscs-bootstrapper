@@ -30,11 +30,13 @@ use crate::config::Config;
 use crate::context::Ctx;
 use crate::controls::{Outcome, VerifyResult};
 use crate::exec;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use jiff::civil::Date;
 use std::path::{Path, PathBuf};
 
 pub const CONTROL: &str = "signing-model";
+const SIGNING_POLICY: &str = ".sscsb/policy/signing-model.toml";
+const CLAUDE_REPO_SETTINGS: &str = ".claude/settings.json";
 
 // ───────────────────────────── environments ─────────────────────────────────
 
@@ -573,28 +575,31 @@ fn has_attribution_block(settings_json: &str) -> bool {
 /// App installation and signing mode are setup/verify concerns.
 pub fn probe_cloud_claude(ctx: &Ctx) -> EnvStatus {
     let mut details = Vec::new();
-    let repo_settings = ctx.root.join(".claude/settings.json");
-    let mut state = EnvState::GuidedPending;
-
-    if let Ok(s) = std::fs::read_to_string(&repo_settings) {
-        if has_attribution_block(&s) {
+    let state = match crate::repo_file::read_text(&ctx.root, Path::new(CLAUDE_REPO_SETTINGS)) {
+        Ok(Some(s)) if has_attribution_block(&s) => {
             details.push(".claude/settings.json attribution block present (syncs to cloud)".into());
-            state = EnvState::Configured;
-        } else {
+            EnvState::Configured
+        }
+        Ok(Some(_)) => {
             details.push(
                 ".claude/settings.json exists but has no attribution block — cloud commits \
                  won't carry the session-provenance trailers"
                     .into(),
             );
-            state = EnvState::Partial;
+            EnvState::Partial
         }
-    } else {
-        details.push(
-            "no repo-level .claude/settings.json — cloud sessions get no attribution config \
-             (only repo-level settings sync to cloud containers)"
-                .into(),
-        );
-    }
+        Ok(None) => {
+            details.push(
+                "no repo-level .claude/settings.json — cloud sessions get no attribution config \
+                 (only repo-level settings sync to cloud containers)"
+                    .into(),
+            );
+            EnvState::GuidedPending
+        }
+        Err(_) => {
+            EnvState::Unknown("could not safely read repository .claude/settings.json".into())
+        }
+    };
     details.push(
         "cloud invariant: keys never enter the sandbox; use the forge App identity (never \
          a personal token) and land merges from the human-local lane"
@@ -695,7 +700,7 @@ pub fn probe_env(ctx: &Ctx, paths: &SigningPaths, env: Environment) -> EnvStatus
 /// web/App setting that has no read API. Reuses the signers.rs freshness model:
 /// a dated confirmation that goes stale (default 180d) and must be re-confirmed.
 pub fn signing_model_policy_path(ctx: &Ctx) -> PathBuf {
-    ctx.sscsb_dir().join("policy").join("signing-model.toml")
+    ctx.root.join(SIGNING_POLICY)
 }
 
 pub const SIGNING_MODEL_TEMPLATE: &str = r#"# sscsb signing-model attestations.
@@ -731,8 +736,9 @@ fn lane_attestation_keys(env: Environment) -> &'static [&'static str] {
 
 /// Read `[lane]` → {key: value} from the policy file (absent → empty).
 fn read_signing_policy(ctx: &Ctx) -> toml::Table {
-    std::fs::read_to_string(signing_model_policy_path(ctx))
+    crate::repo_file::read_text(&ctx.root, Path::new(SIGNING_POLICY))
         .ok()
+        .flatten()
         .and_then(|s| s.parse::<toml::Table>().ok())
         .unwrap_or_default()
 }
@@ -740,10 +746,7 @@ fn read_signing_policy(ctx: &Ctx) -> toml::Table {
 /// Stamp today's date into every attestation key for `env`, preserving other
 /// lanes. Returns the ISO date used.
 fn record_lane_attestation(ctx: &Ctx, env: Environment, today: &str) -> Result<()> {
-    let path = signing_model_policy_path(ctx);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let path = Path::new(SIGNING_POLICY);
     // An existing store that will not parse is a HARD ERROR, never a default.
     //
     // `.ok().and_then(parse.ok()).unwrap_or_default()` silently yields a BLANK
@@ -753,13 +756,13 @@ fn record_lane_attestation(ctx: &Ctx, env: Environment, today: &str) -> Result<(
     // so a syntax slip is the expected route in. `merge_git_config_env` is the
     // right model for this in the same file: it bails on malformed JSON
     // precisely so it cannot clobber.
-    let mut doc = if path.exists() {
-        let text = std::fs::read_to_string(&path).map_err(|e| {
-            anyhow::anyhow!(
-                "refusing to overwrite {}: it exists but could not be read ({e})",
-                path.display()
-            )
-        })?;
+    let data = crate::repo_file::read_text(&ctx.root, path).with_context(|| {
+        format!(
+            "refusing to overwrite {}: it could not be read",
+            path.display()
+        )
+    })?;
+    let mut doc = if let Some(text) = data {
         if text.trim().is_empty() {
             toml_edit::DocumentMut::new()
         } else {
@@ -779,7 +782,7 @@ fn record_lane_attestation(ctx: &Ctx, env: Environment, today: &str) -> Result<(
     for key in lane_attestation_keys(env) {
         doc[lane][key] = toml_edit::value(today);
     }
-    std::fs::write(&path, doc.to_string())?;
+    crate::repo_file::write(&ctx.root, path, doc.to_string().as_bytes())?;
     Ok(())
 }
 
@@ -1537,8 +1540,10 @@ pub fn cmd_signing_setup(
 /// (the one thing that syncs to cloud containers), then guide App auth.
 pub fn setup_cloud_claude(ctx: &Ctx, apply: bool) -> Result<SetupReport> {
     let mut r = SetupReport::default();
-    let repo_settings = ctx.root.join(".claude/settings.json");
-    let existing = std::fs::read_to_string(&repo_settings).unwrap_or_default();
+    let repo_settings = Path::new(CLAUDE_REPO_SETTINGS);
+    let existing = crate::repo_file::read_text(&ctx.root, repo_settings)
+        .context("reading repository .claude/settings.json")?
+        .unwrap_or_default();
     if has_attribution_block(&existing) {
         r.note_already(".claude/settings.json already has an attribution block");
     } else if apply {
@@ -1554,15 +1559,12 @@ pub fn setup_cloud_claude(ctx: &Ctx, apply: bool) -> Result<SetupReport> {
                 "attribution".into(),
                 serde_json::json!({ "sessionUrl": true }),
             );
-        if let Some(parent) = repo_settings.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let mut out = serde_json::to_string_pretty(&root)?;
         out.push('\n');
-        std::fs::write(&repo_settings, out)?;
+        crate::repo_file::write(&ctx.root, repo_settings, out.as_bytes())?;
         r.note_changed(format!(
             "wrote attribution block → {} (syncs the Claude-Session trailer to cloud)",
-            repo_settings.display()
+            ctx.root.join(repo_settings).display()
         ));
     } else {
         r.note_changed("[dry-run] would write .claude/settings.json attribution block");
@@ -2741,6 +2743,36 @@ mod tests {
             .guided
             .iter()
             .any(|g| g.title.contains("Authorize the Claude GitHub App")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cloud_settings_and_lane_record_reject_linked_components() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = scratch_ctx(tmp.path());
+        let inert = tmp.path().join("inert");
+        std::fs::create_dir_all(&inert).unwrap();
+        let settings = inert.join("settings.json");
+        let raw_settings = r#"{"attribution":{"sessionUrl":true}}"#;
+        std::fs::write(&settings, raw_settings).unwrap();
+        symlink(&inert, tmp.path().join(".claude")).unwrap();
+
+        assert!(setup_cloud_claude(&ctx, true).is_err());
+        assert!(matches!(
+            probe_cloud_claude(&ctx).state,
+            EnvState::Unknown(_)
+        ));
+        assert_eq!(std::fs::read_to_string(settings).unwrap(), raw_settings);
+
+        let policy = inert.join("signing-model.toml");
+        let raw_policy = "[github-web]\nvigilant_mode = \"2026-01-01\"\n";
+        std::fs::write(&policy, raw_policy).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".sscsb/policy")).unwrap();
+        symlink(&policy, signing_model_policy_path(&ctx)).unwrap();
+        assert!(record_lane_attestation(&ctx, Environment::GithubWeb, "2026-01-02").is_err());
+        assert!(read_signing_policy(&ctx).is_empty());
+        assert_eq!(std::fs::read_to_string(policy).unwrap(), raw_policy);
     }
 
     #[test]

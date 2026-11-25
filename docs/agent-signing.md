@@ -108,8 +108,10 @@ sscsb signers check --github-app agent[bot]  # verify server-side signing
 - `expires` (a `YYYY-MM-DD` date) is reported by `sscsb verify agent-signing`; a key
   past its date **fails** the control, and a validity window longer than
   `max_key_age_days` (default 90) **degrades** it. Rotate agent keys often.
-- `attestation_file` points at an out-of-band hardware-residence proof (e.g.
-  `ssh-keygen -O write-attestation`). If present, sscsb records its path and sha256 and
+- `attestation_file` is a repository-relative path to an out-of-band
+  hardware-residence proof (e.g. `ssh-keygen -O write-attestation`).
+  Use a regular file within the checkout, with no symlink components.
+  If present, sscsb records its path and sha256 and
   reports `hardware=attested`; if absent, `hardware=declared`. In v1 this is
   **artifact tracking, not chain verification** — and it can **never** elevate a
   signer's class or flip a gate outcome.

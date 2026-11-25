@@ -49,16 +49,21 @@ pub fn shim_script(event: &str) -> String {
 
 /// Install shims into `.sscsb/hooks` and point `core.hooksPath` at them.
 pub fn install_hooks(ctx: &Ctx) -> Result<Vec<String>> {
-    let hooks_dir = ctx.sscsb_dir().join("hooks");
-    std::fs::create_dir_all(&hooks_dir)?;
     let mut written = Vec::new();
     for event in HOOK_EVENTS {
-        let path = hooks_dir.join(event);
-        std::fs::write(&path, shim_script(event))?;
-        make_executable(&path)?;
-        written.push(format!(".sscsb/hooks/{event}"));
+        let rel = format!(".sscsb/hooks/{event}");
+        crate::repo_file::write_executable(
+            &ctx.root,
+            Path::new(&rel),
+            shim_script(event).as_bytes(),
+        )
+        .with_context(|| format!("installing repository hook {rel}"))?;
+        written.push(rel);
     }
-    exec::git(&["config", "core.hooksPath", ".sscsb/hooks"], &ctx.root)?;
+    exec::git(
+        &["config", "--local", "core.hooksPath", ".sscsb/hooks"],
+        &ctx.root,
+    )?;
     // Point signature verification at the policy-generated allowed_signers
     // file (absolute path: git resolves relative paths from the cwd, which is
     // unreliable inside hooks).
@@ -66,6 +71,7 @@ pub fn install_hooks(ctx: &Ctx) -> Result<Vec<String>> {
     exec::git(
         &[
             "config",
+            "--local",
             "gpg.ssh.allowedSignersFile",
             &signers.display().to_string(),
         ],
@@ -74,7 +80,7 @@ pub fn install_hooks(ctx: &Ctx) -> Result<Vec<String>> {
     Ok(written)
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn make_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(path)?.permissions();
@@ -83,7 +89,7 @@ fn make_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn make_executable(_path: &Path) -> Result<()> {
     // Git for Windows executes hooks through its own sh; no chmod needed.
     Ok(())
@@ -348,14 +354,18 @@ fn allowed_signers_content_inner(signers: &[Signer], include_agents: bool) -> St
 /// whether the `agent-signing` control is enabled; with it off, output is the
 /// historical human/ci-only file.
 pub fn regenerate_allowed_signers(ctx: &Ctx, include_agents: bool) -> Result<()> {
-    let policy_dir = ctx.sscsb_dir().join("policy");
-    std::fs::create_dir_all(&policy_dir)?;
-    let signers = load_signers(&signers_path(ctx))?;
-    std::fs::write(
-        policy_dir.join("allowed_signers"),
-        allowed_signers_content_with_agents(&signers, include_agents),
-    )?;
-    Ok(())
+    let rel = Path::new(".sscsb/policy/signers.toml");
+    let signers = crate::repo_file::read_text(&ctx.root, rel)
+        .context("reading repository signer policy")?
+        .map(|text| parse_signers(&text).context("parsing repository signer policy"))
+        .transpose()?
+        .unwrap_or_default();
+    crate::repo_file::write(
+        &ctx.root,
+        Path::new(".sscsb/policy/allowed_signers"),
+        allowed_signers_content_with_agents(&signers, include_agents).as_bytes(),
+    )
+    .context("regenerating repository allowed_signers")
 }
 
 /// Whether the (default-off) `agent-signing` control is enabled.

@@ -10,7 +10,8 @@
 # Deliberately NOT installed: guacone, vexctl, witness, sighthound. Their absence
 # is what exercises the degrade branches, and those are part of the contract too.
 #
-# Every download is checksum-verified. Nothing here is piped into a shell.
+# Every directly downloaded binary/archive is checksum-verified. Nothing here
+# is piped into a shell. The Semgrep Python install is version-pinned only.
 name: Setup sscsb tools
 description: Install the pinned external tools sscsb orchestrates (checksum-verified)
 
@@ -43,15 +44,15 @@ runs:
             || { echo "::error::checksum mismatch for $1"; exit 1; }
         }
 
-        # ── gitleaks / trufflehog (upstream publish a checksums.txt) ──────────
+        # ── gitleaks / trufflehog ───────────────────────────────────────────
+        # Pin the archive digests here rather than trusting a checksum manifest
+        # fetched from the same release at install time.
         curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-        curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
-        grep "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum --check
+        expect "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
         tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
 
         curl -fsSLO "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz"
-        curl -fsSLO "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_checksums.txt"
-        grep "trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz" "trufflehog_${TRUFFLEHOG_VERSION}_checksums.txt" | sha256sum --check
+        expect "trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz" f6d1106b85107d79527ed7a5b98b592beadd8b770dc3c9e8c1ad99e1b2cf127e
         tar -xzf "trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz" trufflehog
 
         # ── syft / grype / trivy / oras (tarballs, sha256 from upstream) ──────
@@ -93,7 +94,7 @@ runs:
         chmod +x gitleaks trufflehog syft grype trivy oras osv-scanner cosign slsa-verifier opengrep
         sudo mv gitleaks trufflehog syft grype trivy oras osv-scanner cosign slsa-verifier opengrep /usr/local/bin/
 
-        # semgrep is a Python package; pip pins the exact version.
+        # Semgrep itself is version-pinned; pip transitives are not hash-locked.
         python3 -m pip install --quiet "semgrep==${SEMGREP_VERSION}"
 
         # Fail loudly if anything did not land — a silently absent tool would
