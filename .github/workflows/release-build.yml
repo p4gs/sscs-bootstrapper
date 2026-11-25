@@ -1,0 +1,85 @@
+# Shared by the production release and the read-only package rehearsal.
+name: Build and smoke-test release archives
+on:
+  workflow_call:
+    inputs:
+      production-release:
+        description: Require a release tag matching the package version
+        type: boolean
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true # never publish a partial platform set
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Build, archive and smoke-test the native binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PRODUCTION_RELEASE: ${{ inputs.production-release }}
+        run: |
+          set -euo pipefail
+          native="$(rustc -vV | awk '/^host:/{print $2}')"
+          if [[ "$TARGET" != "$native" ]]; then
+            echo "::error::Expected a native $TARGET runner, got $native"
+            exit 1
+          fi
+          # Derive filenames from a validated package version, not a branch name.
+          version="$(cargo metadata --no-deps --locked --format-version 1 |
+            jq -er '[.packages[] | select(.name == "sscsb") | .version] |
+                     if length == 1 then .[0] else error("expected one sscsb package") end')"
+          if [[ ! "$version" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+            echo "::error::Expected a numeric sscsb package version"
+            exit 1
+          fi
+          if [[ "$PRODUCTION_RELEASE" == true && "${GITHUB_REF:-}" != "refs/tags/v$version" ]]; then
+            echo "::error::Release tag must match package version v$version"
+            exit 1
+          fi
+          cargo build --release --locked --target "$TARGET"
+          mkdir -p dist
+          archive="dist/sscsb-v$version-$TARGET.tar.gz"
+          tar -C "target/${TARGET}/release" -czf "$archive" sscsb
+          if [[ "$(tar -tzf "$archive")" != sscsb ]]; then
+            echo "::error::Expected exactly one sscsb archive entry"
+            exit 1
+          fi
+          smoke="$(mktemp -d)"
+          trap 'rm -rf -- "$smoke"' EXIT
+          tar -xzf "$archive" -C "$smoke"
+          cmp "target/${TARGET}/release/sscsb" "$smoke/sscsb"
+          reported="$("$smoke/sscsb" --version)"
+          test "$reported" = "sscsb $version"
+          printf '%s (%s)\n' "$reported" "$native"
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
