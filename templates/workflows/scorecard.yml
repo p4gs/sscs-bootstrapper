@@ -8,7 +8,8 @@ on:
   push:
     branches: ["{{default_branch}}"]
 
-permissions: read-all
+# No default scopes; the analysis job explicitly grants publishing scopes.
+permissions: {}
 
 jobs:
   analysis:

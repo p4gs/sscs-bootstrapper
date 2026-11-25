@@ -155,9 +155,11 @@ OpenSSF Scorecard's Pinned-Dependencies check reads three things `actions-audit`
 was never scoped for: Dockerfile base images, shell downloads, and package
 installs typed into a script. `dependency-pinning` reads all three, in workflow
 `run:` steps, composite-action steps, Dockerfile `RUN` lines and committed shell
-scripts — and one thing neither tool reads: a package manifest with no committed
-lockfile. Every subject is a committed file, so the verdict is a property of the
-repository, never of the scanning machine.
+scripts — and one thing neither tool reads: a package manifest with no tracked
+lockfile. It checks exact Git index blobs and the corresponding current worktree
+files, so it sees staged changes and tracked edits before staging. Untracked
+inputs are out of scope. A relevant path that cannot be read as an ordinary
+file in either layer is a finding, not clean evidence.
 
 What fails: a `FROM image:tag` with no `@sha256:` digest (a variable, `scratch`
 and a stage alias are fine); a download piped straight into a shell; a downloaded
@@ -166,7 +168,8 @@ file made executable with no `sha256sum --check`, `cosign verify-blob`,
 `pip install`, `go install` or `npm install <name>` that names no version at all,
 or a range or tag instead of one; a root `package.json`, `Cargo.toml`,
 `pyproject.toml` or `go.mod` — or a nested `Cargo.toml` declaring a workspace —
-with no committed lockfile. A `pip` or `npm` install pinned to an exact version
+with no readable regular lockfile in the Git index and worktree. A `pip` or
+`npm` install pinned to an exact version
 but not a hash, and a `requirements.txt` with versions but no `--hash=` lines,
 are warnings: they name one release, which is a real decision, and hash pinning
 is the stricter form the message asks for.

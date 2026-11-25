@@ -124,7 +124,7 @@ const YAML_PARSE_BUDGET: Duration = Duration::from_secs(2);
 
 /// Parse untrusted workflow/action YAML: refuse the measured amplification
 /// shape outright, then apply the CPU-time backstop for anything else.
-fn parse_workflow_yaml(content: &str) -> Result<Vec<Yaml>> {
+pub(crate) fn parse_workflow_yaml(content: &str) -> Result<Vec<Yaml>> {
     parse_workflow_yaml_with_budget(content, YAML_PARSE_BUDGET)
 }
 

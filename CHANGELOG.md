@@ -70,6 +70,11 @@ versions.
 
 ### Fixed
 
+- Keep checkout-owned bootstrap and signed scan outputs within the repository
+  rather than writing through linked paths. Preserve safe existing files.
+- Report missing, linked, or unreadable evidence instead of returning a clean
+  dependency-pinning or publishing-credential verification result.
+
 - Update Rustls to 0.23.46, rustls-webpki to 0.103.17, webpki-roots to
   1.0.12, and rustix to 1.1.6 to address current security advisories (SEC-1).
 - Withhold free-form account identities and token purposes from distribution

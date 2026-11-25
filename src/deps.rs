@@ -8,7 +8,7 @@ use crate::controls::{Outcome, VerifyResult};
 use crate::exec;
 use anyhow::{Context as _, Result};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const MANIFEST_FILES: &[&str] = &[
     "Cargo.toml",
@@ -877,8 +877,15 @@ fn parse_go(content: &str) -> BTreeSet<String> {
 
 // ─────────────────────────── Approval baseline ──────────────────────────────
 
+const PACKAGES_POLICY: &str = ".sscsb/policy/packages.toml";
+
 pub fn packages_policy_path(ctx: &Ctx) -> PathBuf {
-    ctx.sscsb_dir().join("policy").join("packages.toml")
+    ctx.root.join(PACKAGES_POLICY)
+}
+
+fn read_packages_policy(ctx: &Ctx) -> Result<Option<String>> {
+    crate::repo_file::read_text(&ctx.root, Path::new(PACKAGES_POLICY))
+        .with_context(|| format!("reading {PACKAGES_POLICY}"))
 }
 
 pub const PACKAGES_TEMPLATE: &str = r#"# sscsb approved-packages baseline.
@@ -898,13 +905,16 @@ pub const PACKAGES_TEMPLATE: &str = r#"# sscsb approved-packages baseline.
 "#;
 
 pub fn load_approved(ctx: &Ctx) -> Result<BTreeSet<String>> {
-    let path = packages_policy_path(ctx);
-    if !path.is_file() {
-        return Ok(BTreeSet::new());
-    }
-    let table: toml::Table = std::fs::read_to_string(&path)?
+    Ok(approved_from_policy(ctx)?.unwrap_or_default())
+}
+
+fn approved_from_policy(ctx: &Ctx) -> Result<Option<BTreeSet<String>>> {
+    let Some(text) = read_packages_policy(ctx)? else {
+        return Ok(None);
+    };
+    let table: toml::Table = text
         .parse()
-        .with_context(|| format!("parsing {}", path.display()))?;
+        .with_context(|| format!("parsing {PACKAGES_POLICY}"))?;
     let mut out = BTreeSet::new();
     if let Some(approved) = table.get("approved").and_then(|v| v.as_table()) {
         for (eco, list) in approved {
@@ -917,7 +927,7 @@ pub fn load_approved(ctx: &Ctx) -> Result<BTreeSet<String>> {
             }
         }
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// Reasons a package should not be blindly approved. Empty ⇒ safe to approve.
@@ -1062,13 +1072,7 @@ pub fn approve_package(ctx: &Ctx, qualified: &str) -> Result<()> {
     if !valid.contains(&eco) {
         anyhow::bail!("unknown ecosystem `{eco}` — one of {}", valid.join("|"));
     }
-    let path = packages_policy_path(ctx);
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    let text = if path.is_file() {
-        std::fs::read_to_string(&path)?
-    } else {
-        PACKAGES_TEMPLATE.to_string()
-    };
+    let text = read_packages_policy(ctx)?.unwrap_or_else(|| PACKAGES_TEMPLATE.to_string());
     let mut doc: toml_edit::DocumentMut = text.parse()?;
     let approved = doc
         .entry("approved")
@@ -1086,67 +1090,71 @@ pub fn approve_package(ctx: &Ctx, qualified: &str) -> Result<()> {
     if !arr.iter().any(|v| v.as_str() == Some(name)) {
         arr.push(name);
     }
-    std::fs::write(&path, doc.to_string())?;
+    crate::repo_file::write(
+        &ctx.root,
+        Path::new(PACKAGES_POLICY),
+        doc.to_string().as_bytes(),
+    )
+    .with_context(|| format!("writing {PACKAGES_POLICY}"))?;
     Ok(())
 }
 
-/// Current deps across every manifest in the repo — nested ones included — each
-/// keeping the source it was declared with.
-///
-/// The source is the half [`current_deps`] throws away, and throwing it away is
-/// what let `deps check` ask the public registry about a `path` dependency.
-/// A `BTreeSet`, so the same dependency declared in two manifests of one
-/// ecosystem (requirements.txt and pyproject.toml both naming `requests`) is
-/// one target, not two registry lookups.
+/// Current worktree declarations for Git-indexed manifests (including nested
+/// and staged-new files) plus any present regular root manifests. The index
+/// excludes incidental filesystem content such as build outputs and vendor
+/// directories; its entries select the paths, not the working contents.
+/// Keeping the source distinguishes registry packages from local and Git
+/// dependencies when checking names or baselining.
 pub fn current_dep_specs(ctx: &Ctx) -> Result<BTreeSet<(Ecosystem, DepSpec)>> {
     let mut out = BTreeSet::new();
-    for (eco, file) in manifest_paths(ctx)? {
-        let content = std::fs::read_to_string(ctx.root.join(&file))
-            .with_context(|| format!("reading manifest {file}"))?;
-        for spec in parse_dep_specs(eco, &file, &content) {
-            out.insert((eco, spec));
+    // Git selects applicable paths, but baseline/check-current assess working
+    // edits. A staged-only dependency is handled by the separate commit gate.
+    let index = crate::index_file::index(&ctx.root)?;
+    for (file, entry) in &index {
+        let Some(eco) = Ecosystem::of_manifest(file) else {
+            continue;
+        };
+        anyhow::ensure!(
+            entry.regular() && entry.may_open_worktree_path(),
+            "manifest {file} is not an unambiguous regular index entry"
+        );
+        let content = read_manifest(ctx, file)?
+            .with_context(|| format!("tracked manifest {file} is missing from the worktree"))?;
+        out.extend(
+            current_manifest_specs(eco, file, &content)?
+                .into_iter()
+                .map(|spec| (eco, spec)),
+        );
+    }
+    // Before the first commit (and for unstaged root bootstrap), preserve optional
+    // regular root manifests. Untracked nested manifests are still out of scope.
+    for &file in MANIFEST_FILES {
+        if index.contains_key(file) {
+            continue;
+        }
+        if let (Some(eco), Some(content)) =
+            (Ecosystem::of_manifest(file), read_manifest(ctx, file)?)
+        {
+            out.extend(
+                current_manifest_specs(eco, file, &content)?
+                    .into_iter()
+                    .map(|spec| (eco, spec)),
+            );
         }
     }
     Ok(out)
 }
 
-/// Every dependency manifest in the repo, repo-relative — not only the ones at
-/// the root.
-///
-/// The root-only read was half of a disagreement with the commit gate, which
-/// matches a staged file by BASENAME *anywhere* in the tree. `sscsb deps
-/// baseline` blessed the root manifest, never saw `sub/package.json`, and the
-/// gate then blocked the commit on a dependency from it that `baseline` had no
-/// way to approve — leaving `sscsb deps approve`, one package at a time, as the
-/// only route out. Monorepos are the common case, not the exotic one.
-///
-/// The search universe is deliberately **git's**, not the filesystem's. The gate
-/// can only ever see a path git is tracking or staging, so `git ls-files` — which
-/// lists the INDEX, and therefore staged-new files too — is exactly the set that
-/// can reach it. It also excludes, for free and by the repo's own rules, every
-/// directory a filesystem walk would have to exclude by hand: `node_modules/`,
-/// `target/`, `.venv/`, vendored trees. Baselining those would approve thousands
-/// of packages nobody is committing.
-///
-/// Root manifests are unioned in unconditionally, so a repo whose first commit
-/// has not happened yet still baselines exactly as it did before.
-fn manifest_paths(ctx: &Ctx) -> Result<BTreeSet<(Ecosystem, String)>> {
-    let mut out: BTreeSet<(Ecosystem, String)> = MANIFEST_FILES
-        .iter()
-        .filter(|mf| ctx.root.join(mf).is_file())
-        .filter_map(|mf| Ecosystem::of_manifest(mf).map(|eco| (eco, (*mf).to_string())))
-        .collect();
-    let tracked = exec::git(&["ls-files", "-z"], &ctx.root)?;
-    for file in tracked.split('\0').filter(|f| !f.is_empty()) {
-        // `of_manifest` is the same table `is_dependency_manifest` consults, so
-        // asking it directly both filters and classifies in one step.
-        if let Some(eco) = Ecosystem::of_manifest(file) {
-            if ctx.root.join(file).is_file() {
-                out.insert((eco, file.to_string()));
-            }
-        }
+fn read_manifest(ctx: &Ctx, file: &str) -> Result<Option<String>> {
+    crate::repo_file::read_text(&ctx.root, Path::new(file))
+        .with_context(|| format!("reading worktree manifest {file}"))
+}
+
+fn current_manifest_specs(eco: Ecosystem, file: &str, content: &str) -> Result<BTreeSet<DepSpec>> {
+    if let Some(err) = manifest_parse_error(eco, file, content) {
+        anyhow::bail!("cannot parse worktree manifest {file}: {err}");
     }
-    Ok(out)
+    Ok(parse_dep_specs(eco, file, content))
 }
 
 /// Current dependency NAMES across every manifest in the repo (qualified
@@ -1681,37 +1689,32 @@ pub fn verify_package_trust(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     }
     messages.push("new-package approval gate enforced in commit-msg hook".into());
     messages.extend(hooks.messages.iter().cloned());
-    let outcome = if packages_policy_path(ctx).is_file() {
-        // A baseline that cannot be parsed is not a baseline of zero packages —
-        // it is a baseline nobody can read, and the commit gate that consumes it
-        // cannot evaluate. Swallowing the error into `0 package(s)` reported the
-        // broken state as PASS.
-        match load_approved(ctx) {
-            Ok(approved) => {
-                messages.push(format!(
-                    "approved baseline present ({} package(s))",
-                    approved.len()
-                ));
-                Outcome::Pass
-            }
-            Err(err) => {
-                messages.push(format!(
-                    "approved baseline UNREADABLE — the commit gate cannot evaluate it: {err:#}"
-                ));
-                messages.push(
-                    "fix .sscsb/policy/packages.toml (or delete it and re-run \
-                     `sscsb deps baseline`) — nothing was verified"
-                        .into(),
-                );
-                Outcome::Degraded
-            }
+    let outcome = match approved_from_policy(ctx) {
+        Ok(Some(approved)) => {
+            messages.push(format!(
+                "approved baseline present ({} package(s))",
+                approved.len()
+            ));
+            Outcome::Pass
         }
-    } else {
-        messages.push(
-            "no approved-packages baseline yet — run `sscsb deps baseline` to bless current deps"
-                .into(),
-        );
-        Outcome::Degraded
+        Ok(None) => {
+            messages.push(
+                "no approved-packages baseline yet — run `sscsb deps baseline` to bless current deps"
+                    .into(),
+            );
+            Outcome::Degraded
+        }
+        Err(err) => {
+            messages.push(format!(
+                "approved baseline UNREADABLE — the commit gate cannot evaluate it: {err:#}"
+            ));
+            messages.push(
+                "fix .sscsb/policy/packages.toml (or delete it and re-run \
+                 `sscsb deps baseline`) — nothing was verified"
+                    .into(),
+            );
+            Outcome::Degraded
+        }
     };
     // Report what the two toggles actually DO now, including when they are off —
     // a check the user switched off must be visible in the posture, not silently
@@ -2609,6 +2612,49 @@ mod tests {
                 .any(|d| d.starts_with("pypi:") || d.starts_with("go:")),
             "no requirements.txt/go.mod present: {deps:?}"
         );
+    }
+
+    #[test]
+    fn tracked_manifest_uses_worktree_edits_and_requires_current_evidence() {
+        let (_dir, ctx) = repo_ctx();
+        let file = "member/package.json";
+        write_file(&ctx, file, r#"{"dependencies":{"old":"1"}}"#);
+        stage(&ctx, file);
+        write_file(&ctx, file, r#"{"dependencies":{"new":"1"}}"#);
+        write_file(
+            &ctx,
+            "untracked/package.json",
+            r#"{"dependencies":{"ignored":"1"}}"#,
+        );
+        assert_eq!(
+            current_deps(&ctx).unwrap(),
+            BTreeSet::from(["npm:new".into()])
+        );
+        std::fs::remove_file(ctx.root.join(file)).unwrap();
+        assert!(format!("{:#}", current_deps(&ctx).unwrap_err())
+            .contains("tracked manifest member/package.json is missing"));
+    }
+
+    #[test]
+    fn malformed_or_non_file_root_manifest_is_not_empty_evidence() {
+        let (_dir, ctx) = repo_ctx();
+        write_file(&ctx, "package.json", "{ invalid");
+        assert!(format!("{:#}", current_deps(&ctx).unwrap_err())
+            .contains("cannot parse worktree manifest package.json"));
+        std::fs::remove_file(ctx.root.join("package.json")).unwrap();
+        std::fs::create_dir(ctx.root.join("package.json")).unwrap();
+        assert!(format!("{:#}", current_deps(&ctx).unwrap_err())
+            .contains("reading worktree manifest package.json"));
+    }
+
+    #[test]
+    fn dependency_policy_reports_non_file_as_unreadable() {
+        let (_dir, ctx) = repo_ctx();
+        std::fs::remove_file(packages_policy_path(&ctx)).unwrap();
+        std::fs::create_dir_all(packages_policy_path(&ctx)).unwrap();
+        assert!(load_approved(&ctx).is_err());
+        assert!(approve_package(&ctx, "cargo:serde").is_err());
+        assert!(packages_policy_path(&ctx).is_dir());
     }
 
     /// M9: `deps check` and `deps baseline` only ever read ROOT manifests, while
