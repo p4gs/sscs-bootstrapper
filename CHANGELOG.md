@@ -8,6 +8,8 @@ versions.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-25
+
 ### Added
 
 - `sscsb sast --expanded` and a separate advisory OpenGrep SARIF workflow
@@ -70,6 +72,8 @@ versions.
 
 ### Fixed
 
+- Update locked `zerovec` to 0.11.8 and `zerovec-derive` to 0.11.5, with no new
+  direct dependency and no change to the Rust 1.85 minimum.
 - Keep checkout-owned bootstrap and signed scan outputs within the repository
   rather than writing through linked paths. Preserve safe existing files.
 - Report missing, linked, or unreadable evidence instead of returning a clean
@@ -133,6 +137,10 @@ versions.
 
 ### Changed
 
+- Use the same native build and package smoke test for the production release
+  and the non-publishing, read-only [release rehearsal](docs/release-rehearsal.md).
+  The rehearsal checks macOS ARM, macOS Intel, and Linux x64 archives and their
+  checksums without creating a tag, signing, attesting, or publishing.
 - Replace unmaintained Chrono with Jiff while preserving UTC timestamps and
   policy expiry/freshness behavior (RUSTSEC-2026-0543; SEC-9, SEC-10).
 - Resolve dependencies within the declared Rust 1.85 minimum and prefer
