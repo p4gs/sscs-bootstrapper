@@ -8,7 +8,7 @@
 use crate::config::Config;
 use crate::context::Ctx;
 use crate::controls::{Outcome, VerifyResult};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::path::Path;
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -316,8 +316,10 @@ pub fn install_all(ctx: &Ctx, cfg: &Config) -> Result<Vec<String>> {
             ));
             continue;
         }
-        let dest = ctx.root.join(artifact.dest);
-        if dest.exists() {
+        let dest = Path::new(artifact.dest);
+        if crate::repo_file::exists(&ctx.root, dest)
+            .with_context(|| format!("checking {}", artifact.dest))?
+        {
             lines.push(format!(
                 "keep {} (exists — delete to regenerate)",
                 artifact.dest
@@ -337,9 +339,6 @@ pub fn install_all(ctx: &Ctx, cfg: &Config) -> Result<Vec<String>> {
                 continue;
             }
         }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let resolved = if wants_ids(artifact.content) {
             ids.get_or_insert_with(|| {
                 (slug != PLACEHOLDER_SLUG)
@@ -350,10 +349,14 @@ pub fn install_all(ctx: &Ctx, cfg: &Config) -> Result<Vec<String>> {
         } else {
             None
         };
-        std::fs::write(
-            &dest,
-            render_with_ids(artifact.content, &slug, &branch, resolved),
-        )?;
+        let rendered = render_with_ids(artifact.content, &slug, &branch, resolved);
+        if !write_if_absent(&ctx.root, artifact.dest, &rendered)? {
+            lines.push(format!(
+                "keep {} (exists — delete to regenerate)",
+                artifact.dest
+            ));
+            continue;
+        }
         lines.push(format!("write {}", artifact.dest));
         if wants_ids(artifact.content) && resolved.is_none() {
             let owner = slug.split('/').next().unwrap_or(&slug);
@@ -3574,15 +3577,8 @@ pub fn verify_pr_template(ctx: &Ctx) -> VerifyResult {
 
 /// Also expose the templates dir installer for non-artifact extras.
 pub fn write_if_absent(root: &Path, rel: &str, content: &str) -> Result<bool> {
-    let dest = root.join(rel);
-    if dest.exists() {
-        return Ok(false);
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&dest, content)?;
-    Ok(true)
+    crate::repo_file::write_if_absent(root, Path::new(rel), content.as_bytes())
+        .with_context(|| format!("installing repository artifact {rel}"))
 }
 
 #[cfg(test)]

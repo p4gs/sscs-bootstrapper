@@ -208,6 +208,14 @@ pub const OVERRIDE_MANIFEST: &str = "distribution.toml [targets] override";
 /// means the answer is unknown, and the caller degrades rather than reporting
 /// "no targets".
 pub fn detect_targets(root: &Path, overrides: &Policy) -> Result<Vec<DetectedTarget>> {
+    detect_targets_impl(root, overrides, false)
+}
+
+fn detect_targets_impl(
+    root: &Path,
+    overrides: &Policy,
+    strict: bool,
+) -> Result<Vec<DetectedTarget>> {
     let mut found: Vec<DetectedTarget> = Vec::new();
     let mut dirs: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
     for _ in 0..=SCAN_DEPTH {
@@ -220,13 +228,54 @@ pub fn detect_targets(root: &Path, overrides: &Policy) -> Result<Vec<DetectedTar
             for entry in entries {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
-                if path.is_dir() {
+                let kind = entry.file_type()?;
+                if if strict { kind.is_dir() } else { path.is_dir() } {
                     if !SKIP_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
                         next.push(path);
                     }
                     continue;
                 }
-                if let Some(d) = classify_manifest(root, &path, &name) {
+                let evidence = if strict
+                    && matches!(
+                        name.as_str(),
+                        "Cargo.toml" | "package.json" | "pyproject.toml"
+                    ) {
+                    let relative = path.strip_prefix(root)?;
+                    let message = || {
+                        format!(
+                            "{}: publish-target manifest is unavailable",
+                            relative.display()
+                        )
+                    };
+                    let text = crate::repo_file::read_text(root, relative)
+                        .with_context(message)?
+                        .with_context(message)?;
+                    if name == "package.json" {
+                        anyhow::ensure!(
+                            serde_json::from_str::<serde_json::Value>(&text)
+                                .is_ok_and(|value| value.is_object()),
+                            "{}: could not parse JSON manifest",
+                            relative.display()
+                        );
+                    } else {
+                        anyhow::ensure!(
+                            text.parse::<toml::Table>().is_ok(),
+                            "{}: could not parse TOML manifest",
+                            relative.display()
+                        );
+                    }
+                    Some(text)
+                } else {
+                    None
+                };
+                if let Some(d) = classify_manifest(root, &path, &name, || {
+                    evidence.or_else(|| std::fs::read_to_string(&path).ok())
+                }) {
+                    anyhow::ensure!(
+                        !strict || kind.is_file(),
+                        "{}: publish-target evidence is not a regular file",
+                        d.manifest
+                    );
                     found.push(d);
                 }
             }
@@ -271,13 +320,17 @@ pub fn detect_targets(root: &Path, overrides: &Policy) -> Result<Vec<DetectedTar
 }
 
 /// Classify one file as a publish-target manifest, or not.
-fn classify_manifest(root: &Path, path: &Path, name: &str) -> Option<DetectedTarget> {
+fn classify_manifest(
+    root: &Path,
+    path: &Path,
+    name: &str,
+    read: impl FnOnce() -> Option<String>,
+) -> Option<DetectedTarget> {
     let rel = path
         .strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/");
-    let read = || std::fs::read_to_string(path).ok();
     match name {
         "Cargo.toml" => {
             let text = read()?;
@@ -509,6 +562,17 @@ pub fn load_policy(path: &Path) -> Result<Policy> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     parse_policy(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Read the optional repository policy without following checkout links.
+fn load_repo_policy(ctx: &Ctx) -> Result<Policy> {
+    const PATH: &str = ".sscsb/policy/distribution.toml";
+    let text = crate::repo_file::read_text(&ctx.root, Path::new(PATH))
+        .context("could not safely read distribution policy")?;
+    text.as_deref()
+        .map(parse_policy)
+        .transpose()
+        .map(|policy| policy.unwrap_or_default())
 }
 
 pub fn parse_policy(text: &str) -> Result<Policy> {
@@ -788,7 +852,7 @@ pub fn install_templates(ctx: &Ctx, cfg: &Config) -> Result<Vec<String>> {
             "skip publish workflows (control trusted-publishing disabled)".to_string(),
         ]);
     }
-    let policy = load_policy(&policy_path(ctx))?;
+    let policy = load_repo_policy(ctx)?;
     let detected = detect_targets(&ctx.root, &policy)?;
     let slug = cfg
         .github_repo()
@@ -799,21 +863,18 @@ pub fn install_templates(ctx: &Ctx, cfg: &Config) -> Result<Vec<String>> {
         if !detected.iter().any(|d| d.target == artifact.target) {
             continue;
         }
-        let dest = ctx.root.join(artifact.dest);
-        if dest.exists() {
+        let rendered = crate::workflows::render(artifact.content, &slug, &branch);
+        if !crate::repo_file::write_if_absent(
+            &ctx.root,
+            Path::new(artifact.dest),
+            rendered.as_bytes(),
+        )? {
             lines.push(format!(
                 "keep {} (exists — delete to regenerate)",
                 artifact.dest
             ));
             continue;
         }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(
-            &dest,
-            crate::workflows::render(artifact.content, &slug, &branch),
-        )?;
         lines.push(format!(
             "write {} ({} target detected)",
             artifact.dest,
@@ -848,6 +909,141 @@ fn workflow_files(root: &Path) -> Vec<(String, String)> {
     }
     out.sort();
     out
+}
+
+/// Unlike the advisory caller, publish-tokens must distinguish an empty
+/// workflow inventory from any unreadable or linked part of that inventory.
+fn token_workflow_files(root: &Path) -> (Vec<(String, String)>, Vec<String>) {
+    let mut workflows = Vec::new();
+    let mut gaps = Vec::new();
+    for relative in [".github", ".github/workflows"] {
+        let metadata = std::fs::symlink_metadata(root.join(relative));
+        match metadata {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (workflows, gaps),
+            _ => {
+                gaps.push(format!(
+                    "could not safely list {relative}; workflow evidence unavailable"
+                ));
+                return (workflows, gaps);
+            }
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(root.join(".github/workflows")) else {
+        gaps.push("could not list workflow evidence".into());
+        return (workflows, gaps);
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            gaps.push("could not inspect a workflow directory entry".into());
+            continue;
+        };
+        let name = entry.file_name();
+        let path = Path::new(".github/workflows").join(&name);
+        if !matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        match crate::repo_file::read_text(root, &path) {
+            Ok(Some(text)) => workflows.push((path.display().to_string(), text)),
+            _ => gaps.push(format!(
+                "{}: could not safely read workflow evidence",
+                path.display()
+            )),
+        }
+    }
+    workflows.sort();
+    gaps.sort();
+    (workflows, gaps)
+}
+
+type Snapshot = Result<crate::index_file::Entries>;
+
+fn checked_token_snapshots(
+    ctx: &Ctx,
+    head: &Snapshot,
+    index: &Snapshot,
+    policy: &Policy,
+    targets: &mut Vec<DetectedTarget>,
+    workflows: &mut Vec<(String, String)>,
+    gaps: &mut Vec<String>,
+) {
+    let mut workflow_versions: BTreeSet<(String, String)> = workflows.iter().cloned().collect();
+    for (layer, snapshot) in [("HEAD", head), ("the Git index", index)] {
+        let Ok(entries) = snapshot else { continue };
+        for (path, entry) in entries {
+            let rel = Path::new(path);
+            let Some(name) = rel.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let is_workflow = rel.parent() == Some(Path::new(".github/workflows"))
+                && (name.ends_with(".yml") || name.ends_with(".yaml"));
+            // Match the worktree detector's depth and directory scope.
+            let manifest_scope = rel.parent().is_some_and(|p| {
+                p.components().count() <= SCAN_DEPTH
+                    && p.components().all(|c| {
+                        c.as_os_str()
+                            .to_str()
+                            .is_some_and(|s| !s.starts_with('.') && !SKIP_DIRS.contains(&s))
+                    })
+            });
+            let textual = matches!(name, "Cargo.toml" | "package.json" | "pyproject.toml");
+            let marker = classify_manifest(&ctx.root, &ctx.root.join(rel), name, || None);
+            let is_manifest = manifest_scope && (textual || marker.is_some());
+            if !is_workflow && !is_manifest {
+                continue;
+            }
+            if layer != "HEAD"
+                && head
+                    .as_ref()
+                    .ok()
+                    .and_then(|files| files.get(path))
+                    .is_some_and(|other| entry.same_blob(other))
+            {
+                continue;
+            }
+            let Ok(text) = entry.text(&ctx.root) else {
+                gaps.push(format!(
+                    "{path}: no readable regular workflow/manifest evidence at {layer}"
+                ));
+                continue;
+            };
+            if !entry.may_open_worktree_path()
+                || !crate::repo_file::exists(&ctx.root, rel).is_ok_and(|exists| exists)
+            {
+                gaps.push(format!("{path}: no current worktree evidence (assessed the tracked snapshot where available)"));
+            }
+            if is_workflow {
+                if workflow_versions.insert((path.clone(), text.clone())) {
+                    workflows.push((format!("{path} ({layer})"), text));
+                }
+            } else {
+                let valid = match name {
+                    "package.json" => serde_json::from_str::<serde_json::Value>(&text)
+                        .is_ok_and(|v| v.is_object()),
+                    "Cargo.toml" | "pyproject.toml" => text.parse::<toml::Table>().is_ok(),
+                    _ => true,
+                };
+                if !valid {
+                    gaps.push(format!("{path}: unreadable manifest format at {layer}"));
+                    continue;
+                }
+                if let Some(target) =
+                    classify_manifest(&ctx.root, &ctx.root.join(rel), name, || Some(text))
+                {
+                    if policy.target_mode(target.target) != TargetMode::Off
+                        && !targets
+                            .iter()
+                            .any(|d| d.target == target.target && d.manifest == target.manifest)
+                    {
+                        targets.push(target);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Does this workflow text reference `secrets.<NAME>` for any of `names`?
@@ -1777,54 +1973,59 @@ const CREDENTIAL_FILES: &[(&str, &str)] = &[
 /// expiry of every token the maintainer deliberately kept.
 pub fn verify_publish_tokens(ctx: &Ctx, cfg: &Config) -> VerifyResult {
     let id = "publish-tokens";
-    let policy = match policy_or_fail(ctx, id) {
-        Ok(p) => p,
-        Err(r) => return r,
+    let mut messages = Vec::new();
+    let mut outcome = Outcome::Pass;
+    let policy = match load_repo_policy(ctx) {
+        Ok(policy) => policy,
+        Err(_) => {
+            outcome = Outcome::Fail;
+            messages.push("distribution policy invalid or unreadable: .sscsb/policy/distribution.toml was not assessed".into());
+            Policy::default()
+        }
     };
-    let detected = match detect_or_degrade(ctx, &policy, id) {
-        Ok(d) => d,
-        Err(r) => return r,
+    let mut detected = match detect_targets_impl(&ctx.root, &policy, true) {
+        Ok(detected) => detected,
+        Err(_) => {
+            outcome = outcome.weakest(Outcome::Degraded);
+            messages.push(
+                "could not safely determine publish targets; manifest evidence unavailable".into(),
+            );
+            Vec::new()
+        }
     };
     let max_age = cfg.control_opt_int(id, "max_token_age_days").unwrap_or(90);
     let today = crate::datetime::today_utc();
-    let mut messages = Vec::new();
-    let mut outcome = Outcome::Pass;
 
-    // A committed credential is a hard failure whether or not this repository
-    // publishes anything: the token is live the moment the file is pushed, and
-    // "we do not publish from here" has never stopped anyone reading it.
-    let tracked = tracked_files(ctx);
-    for (name, marker) in CREDENTIAL_FILES {
-        let suffix = format!("/{name}");
-        for path in tracked
-            .iter()
-            .filter(|p| p.as_str() == *name || p.ends_with(&suffix))
-        {
-            let text = std::fs::read_to_string(ctx.root.join(path)).unwrap_or_default();
-            if text.lines().any(|l| {
-                let l = l.trim();
-                !l.starts_with('#') && !l.starts_with(';') && l.contains(marker)
-            }) {
-                outcome = outcome.weakest(Outcome::Fail);
-                messages.push(format!(
-                    "{path} is COMMITTED and carries `{marker}` — that is a live publishing \
-                     credential in the repository's history. Revoke it at the registry first \
-                     (it is already compromised), then untrack the file and add it to \
-                     .gitignore. Rewriting history does not un-leak it"
-                ));
-            }
-        }
+    // Read Git's bytes, not a possibly missing/edited checkout of that path.
+    // Check HEAD independently: staging a removal does not erase past exposure.
+    let head = crate::index_file::head(&ctx.root);
+    let index = crate::index_file::index(&ctx.root);
+    scan_credential_files(&head, &index, ctx, &mut outcome, &mut messages);
+    let (mut workflows, mut gaps) = token_workflow_files(&ctx.root);
+    checked_token_snapshots(
+        ctx,
+        &head,
+        &index,
+        &policy,
+        &mut detected,
+        &mut workflows,
+        &mut gaps,
+    );
+    gaps.sort_unstable();
+    gaps.dedup();
+    if !gaps.is_empty() {
+        outcome = outcome.weakest(Outcome::Degraded);
+        messages.extend(gaps);
     }
 
     if detected.is_empty() && policy.tokens.is_empty() {
         if outcome == Outcome::Pass {
             return no_targets(id);
         }
-        return VerifyResult::new(id, outcome, messages);
+        return token_check_result(id, outcome, messages);
     }
 
     // A long-lived registry secret on a path where OIDC exists.
-    let workflows = workflow_files(&ctx.root);
     for target in distinct_targets(&detected) {
         let secrets_here: Vec<(String, Vec<String>)> = workflows
             .iter()
@@ -1913,23 +2114,75 @@ pub fn verify_publish_tokens(ctx: &Ctx, cfg: &Config) -> VerifyResult {
                 .to_string(),
         );
     }
-    VerifyResult::new(id, outcome, messages)
+    token_check_result(id, outcome, messages)
 }
 
-/// Files tracked at HEAD. An untracked `.npmrc` in a working tree is the
-/// maintainer's own business; a committed one is everyone's.
-fn tracked_files(ctx: &Ctx) -> Vec<String> {
-    exec::git_raw(&["ls-files"], &ctx.root)
-        .ok()
-        .filter(|o| o.success())
-        .map(|o| {
-            o.stdout
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+fn token_check_result(id: &'static str, outcome: Outcome, messages: Vec<String>) -> VerifyResult {
+    if outcome == Outcome::Degraded {
+        VerifyResult::degraded(id, "scan-error", messages)
+    } else {
+        VerifyResult::new(id, outcome, messages)
+    }
+}
+
+fn scan_credential_files(
+    head: &Snapshot,
+    index: &Snapshot,
+    ctx: &Ctx,
+    outcome: &mut Outcome,
+    messages: &mut Vec<String>,
+) {
+    for (layer, snapshot) in [("HEAD", head), ("the Git index", index)] {
+        let Ok(entries) = snapshot else {
+            *outcome = outcome.clone().weakest(Outcome::Degraded);
+            messages.push(format!(
+                "could not inventory credentials from {layer}; evidence unavailable"
+            ));
+            continue;
+        };
+        for (path, entry) in entries {
+            let Some((_, marker)) = CREDENTIAL_FILES.iter().find(|(name, _)| {
+                path == name
+                    || path
+                        .strip_suffix(name)
+                        .is_some_and(|prefix| prefix.ends_with('/'))
+            }) else {
+                continue;
+            };
+            if layer != "HEAD"
+                && head
+                    .as_ref()
+                    .ok()
+                    .and_then(|files| files.get(path))
+                    .is_some_and(|other| entry.same_blob(other))
+            {
+                continue;
+            }
+            let Ok(text) = entry.text(&ctx.root) else {
+                *outcome = outcome.clone().weakest(Outcome::Degraded);
+                messages.push(format!(
+                    "{path}: could not read regular credential evidence from {layer}"
+                ));
+                continue;
+            };
+            if !text.lines().any(|line| {
+                let line = line.trim();
+                !line.starts_with('#') && !line.starts_with(';') && line.contains(marker)
+            }) {
+                continue;
+            }
+            *outcome = outcome.clone().weakest(Outcome::Fail);
+            if layer == "HEAD" {
+                messages.push(format!(
+                    "{path} is COMMITTED at HEAD and carries `{marker}` — treat it as exposed. Revoke it at the registry first, then untrack the file and add it to .gitignore. Rewriting history does not un-leak it"
+                ));
+            } else {
+                messages.push(format!(
+                    "{path} is staged in the Git index and carries `{marker}` — remove the value before committing; rotate it if it has already been shared"
+                ));
+            }
+        }
+    }
 }
 
 // ────────────────────────── 5. publish-provenance ───────────────────────────
@@ -3527,6 +3780,9 @@ mod tests {
         crate::exec::git(&["add", "-A"], root).unwrap();
         crate::exec::git(&["commit", "--no-verify", "-m", "fixture"], root).unwrap();
 
+        // A local/staged removal does not erase exposure in the current commit.
+        std::fs::remove_file(root.join(".npmrc")).unwrap();
+        exec::git(&["add", "-u", "--", ".npmrc"], root).unwrap();
         let ctx = Ctx::discover(root).unwrap();
         let r = verify_publish_tokens(&ctx, ctx.require_config().unwrap());
         assert_eq!(r.outcome, Outcome::Fail);
@@ -3536,6 +3792,77 @@ mod tests {
             joined.contains("Revoke it at the registry first"),
             "the only correct first step for a leaked credential: {joined}"
         );
+    }
+
+    #[test]
+    fn staged_credentials_are_reported_without_mislabeling_them_committed() {
+        let dir = repo();
+        let ctx = bootstrapped(dir.path());
+        write(dir.path(), "nested config/.npmrc", "_authToken=EXAMPLE\n");
+        exec::git(&["add", "nested config/.npmrc"], dir.path()).unwrap();
+        write(dir.path(), "nested config/.npmrc", "# only local comment\n");
+        let r = verify_publish_tokens(&ctx, ctx.require_config().unwrap());
+        assert_eq!(r.outcome, Outcome::Fail);
+        let report = r.messages.join("\n");
+        assert!(report.contains("nested config/.npmrc is staged"));
+        assert!(!report.contains("COMMITTED") && !report.contains("EXAMPLE"));
+    }
+
+    #[test]
+    fn staged_workflow_and_manifest_are_checked_without_the_worktree_copies() {
+        let dir = repo();
+        let ctx = bootstrapped(dir.path());
+        let manifest = "nested/package.json";
+        let workflow = ".github/workflows/fixture.yml";
+        write(dir.path(), manifest, r#"{"name":"example"}"#);
+        write(
+            dir.path(), workflow,
+            "name: fixture\njobs:\n  inspect:\n    env:\n      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n",
+        );
+        exec::git(&["add", manifest, workflow], dir.path()).unwrap();
+        for path in [manifest, workflow] {
+            std::fs::remove_file(dir.path().join(path)).unwrap();
+        }
+        let result = verify_publish_tokens(&ctx, ctx.require_config().unwrap());
+        assert_eq!(result.outcome, Outcome::Fail);
+        let lines = result.messages.join("\n");
+        assert!(lines.contains("fixture.yml (the Git index)"));
+        assert!(lines.contains("secret is avoidable"));
+        assert!(lines.contains("nested/package.json: no current worktree evidence"));
+    }
+
+    #[test]
+    fn unavailable_manifest_and_workflow_evidence_do_not_pass() {
+        let dir = repo();
+        let ctx = bootstrapped(dir.path());
+        write(dir.path(), "package.json", "{");
+        std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+        std::fs::write(dir.path().join(".github/workflows/unreadable.yml"), [0xff]).unwrap();
+        let result = verify_publish_tokens(&ctx, ctx.require_config().unwrap());
+        assert_eq!(result.outcome, Outcome::Degraded);
+        let lines = result.messages.join("\n");
+        assert!(lines.contains("manifest evidence unavailable"));
+        assert!(lines.contains("unreadable.yml"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_workflow_and_credential_are_unavailable_without_following() {
+        let dir = repo();
+        let ctx = bootstrapped(dir.path());
+        write(dir.path(), "inert.txt", "example notes");
+        std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+        for name in [".npmrc", ".github/workflows/unavailable.yml"] {
+            std::os::unix::fs::symlink(dir.path().join("inert.txt"), dir.path().join(name))
+                .unwrap();
+        }
+        exec::git(&["add", ".npmrc"], dir.path()).unwrap();
+        let result = verify_publish_tokens(&ctx, ctx.require_config().unwrap());
+        assert_eq!(result.outcome, Outcome::Degraded);
+        let lines = result.messages.join("\n");
+        assert!(lines.contains(".npmrc: could not read regular credential evidence"));
+        assert!(lines.contains("unavailable.yml: could not safely read workflow evidence"));
+        assert!(!lines.contains("example notes"));
     }
 
     #[test]

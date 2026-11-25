@@ -83,13 +83,13 @@ pub fn evaluate_attestation(
     let Some(rel) = attestation_file else {
         return Ok(AttestationState::Declared);
     };
-    let path = root.join(rel);
-    if !path.is_file() {
+    let Some(bytes) = crate::repo_file::read(root, Path::new(rel))
+        .context("reading repository-relative attestation file")?
+    else {
         return Ok(AttestationState::Missing {
             path: rel.to_string(),
         });
-    }
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    };
     Ok(AttestationState::Attested {
         sha256: hex::encode(Sha256::digest(&bytes)),
     })
@@ -1238,6 +1238,18 @@ mod tests {
                 days_left: i64::from((ymd(2099, 1, 1) - today).get_days())
             }
         );
+    }
+
+    #[test]
+    fn attestation_lookup_requires_a_repository_relative_path() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = root.path().join("evidence.bin");
+        std::fs::write(&fixture, b"local test evidence").unwrap();
+        assert!(evaluate_attestation(root.path(), fixture.to_str()).is_err());
+        assert!(matches!(
+            evaluate_attestation(root.path(), Some("evidence.bin")).unwrap(),
+            AttestationState::Attested { .. }
+        ));
     }
 
     #[test]

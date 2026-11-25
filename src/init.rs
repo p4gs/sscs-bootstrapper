@@ -32,8 +32,9 @@ use crate::controls;
 use crate::deps;
 use crate::exec;
 use crate::hooks;
+use crate::repo_file;
 use crate::workflows;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::path::Path;
 
 /// The ignore rule `init` ensures is in force for `.sscsb/out/`.
@@ -90,24 +91,26 @@ fn ensure_out_ignored(ctx: &Ctx) -> Result<Option<String>> {
         ),
     }
 
-    let path = ctx.root.join(".gitignore");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let path = Path::new(".gitignore");
+    let existing = repo_file::read(&ctx.root, path)
+        .context("reading repository .gitignore")?
+        .unwrap_or_default();
 
     let mut next = existing.clone();
     if !next.is_empty() {
         // Never glue our rule onto the user's last line: a file saved without
         // a trailing newline would otherwise turn `target/` into
         // `target/# sscsb: …`, silently dropping one of their rules.
-        if !next.ends_with('\n') {
-            next.push('\n');
+        if !next.ends_with(b"\n") {
+            next.push(b'\n');
         }
-        next.push('\n');
+        next.push(b'\n');
     }
-    next.push_str(OUT_IGNORE_HEADER);
-    next.push('\n');
-    next.push_str(OUT_IGNORE_RULE);
-    next.push('\n');
-    std::fs::write(&path, next)?;
+    next.extend_from_slice(OUT_IGNORE_HEADER.as_bytes());
+    next.push(b'\n');
+    next.extend_from_slice(OUT_IGNORE_RULE.as_bytes());
+    next.push(b'\n');
+    repo_file::write(&ctx.root, path, &next)?;
 
     Ok(Some(if existing.is_empty() {
         format!("write .gitignore ({OUT_IGNORE_RULE} — generated output, not policy)")
@@ -119,19 +122,32 @@ fn ensure_out_ignored(ctx: &Ctx) -> Result<Option<String>> {
 /// Bootstrap `cwd`'s repository. Returns the log of what was written or kept.
 pub fn bootstrap(cwd: &Path) -> Result<Vec<String>> {
     let mut log = Vec::new();
+    // Inspect the checkout-owned path before general context discovery reads
+    // it. In particular, a linked config is not an existing config to keep.
+    let root =
+        exec::git(&["rev-parse", "--show-toplevel"], cwd).context("not inside a git repository")?;
+    let root = Path::new(&root);
+    let rel = Path::new(".sscsb/config.toml");
+    let config_exists = repo_file::exists(root, rel).context("checking .sscsb/config.toml")?;
     let ctx = Ctx::discover(cwd)?;
-
-    let config_path = ctx.config_path();
-    if config_path.is_file() {
-        log.push("keep .sscsb/config.toml (exists)".to_string());
+    let wrote_config = if config_exists {
+        false
     } else {
-        std::fs::create_dir_all(ctx.sscsb_dir())?;
         let slug = ctx.origin_slug();
-        std::fs::write(&config_path, config::default_config_toml(slug.as_deref()))?;
+        repo_file::write_if_absent(
+            root,
+            rel,
+            config::default_config_toml(slug.as_deref()).as_bytes(),
+        )
+        .context("writing .sscsb/config.toml")?
+    };
+    if wrote_config {
         log.push(format!(
             "write .sscsb/config.toml ({} controls, secure defaults)",
             controls::CONTROLS.len()
         ));
+    } else {
+        log.push("keep .sscsb/config.toml (exists)".to_string());
     }
 
     // Reload so the context sees the config we just wrote.
@@ -187,6 +203,18 @@ pub fn bootstrap(cwd: &Path) -> Result<Vec<String>> {
     // putting them in ARTIFACTS would turn older repos with valid SAST into gaps.
     if cfg.control_enabled_or_default("sast") {
         for prefix in [".agents", ".claude"] {
+            // Preserve the native in-repo alias by leaving it alone; only
+            // the guarded .agents destination is ever written. Arbitrary
+            // skill links do not grant permission to write through them.
+            if prefix == ".claude"
+                && std::fs::read_link(ctx.root.join(".claude/skills/opengrep"))
+                    .ok()
+                    .as_deref()
+                    == Some(Path::new("../../.agents/skills/opengrep"))
+            {
+                log.push("keep .claude/skills/opengrep (native in-repo alias)".into());
+                continue;
+            }
             for (name, content) in [
                 (
                     "SKILL.md",
@@ -332,6 +360,29 @@ mod tests {
             std::fs::read_to_string(root.join(".agents/skills/opengrep/SKILL.md")).unwrap(),
             "local customization"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_refuses_linked_checkout_config_directory() {
+        let repo = fresh_repo();
+        let inert = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(inert.path(), repo.path().join(".sscsb")).unwrap();
+
+        assert!(bootstrap(repo.path()).is_err());
+        assert!(std::fs::read_dir(inert.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn bootstrap_preserves_opaque_ignore_bytes() {
+        let repo = fresh_repo();
+        let original = b"# comment with legacy encoding: \xff\ntarget/";
+        std::fs::write(repo.path().join(".gitignore"), original).unwrap();
+
+        bootstrap(repo.path()).unwrap();
+        let updated = std::fs::read(repo.path().join(".gitignore")).unwrap();
+        assert!(updated.starts_with(original));
+        assert!(updated.ends_with(b".sscsb/out/\n"));
     }
 
     #[test]

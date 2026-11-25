@@ -779,12 +779,16 @@ fn cmd_scan_local(
             println!("{body}");
             return verify_exit(failed, degraded, strict);
         }
-        let body_path = ctx
-            .root
-            .join(local_scan::OUT_DIR)
-            .join("scan-local-submission.md");
-        std::fs::write(&body_path, &body)?;
-        let body_arg = body_path
+        let rel = std::path::Path::new(local_scan::OUT_DIR).join("scan-local-submission.md");
+        let body_path = ctx.root.join(&rel);
+        crate::repo_file::write(&ctx.root, &rel, body.as_bytes())
+            .context("saving the submission body for manual recovery")?;
+        // gh reads the bytes by path; use an identical private copy so
+        // checkout changes cannot redirect the body read after validation.
+        let scratch = tempfile::tempdir().context("creating private submission scratch")?;
+        let private_body = scratch.path().join("body.md");
+        std::fs::write(&private_body, body.as_bytes())?;
+        let body_arg = private_body
             .to_str()
             .context("submission body path is not UTF-8")?;
         let args = local_scan::submit_args(&title, body_arg);

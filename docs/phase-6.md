@@ -188,8 +188,11 @@ is pushed, and "we do not publish from here" has never stopped anyone reading
 it. The remediation says revoke first: rewriting history does not un-leak a
 secret that has already been fetched.
 
-Only files **tracked at HEAD** count. An untracked `.npmrc` in a working tree
-is the maintainer's own business.
+The check reads exact credential file blobs from **HEAD and the Git index**.
+A staged-only match is not labelled committed: remove it before committing,
+and rotate it if it has already been shared. Staging a deletion cannot hide
+evidence already present at HEAD. An untracked `.npmrc` is outside this check;
+it does not scan all repository history.
 
 **A long-lived secret on a path where OIDC exists is a failure.** If a workflow
 publishes to crates.io, npm or PyPI using `secrets.CARGO_REGISTRY_TOKEN`,
@@ -197,10 +200,12 @@ publishes to crates.io, npm or PyPI using `secrets.CARGO_REGISTRY_TOKEN`,
 entirely — and a `[[token]]` entry explaining why it is kept does not make a
 removable credential necessary.
 
-This check looks at **every** workflow in the repository, not only the template
-sscsb installs. The interesting case is the `release.yml` that was already
-there doing `npm publish` with a stored token; a check that graded only its own
-output would call that repository clean.
+This check looks at workflows and publish manifests in the worktree and their
+tracked snapshots at HEAD and in the index, not only the template sscsb installs.
+A malformed manifest, unresolved tracked input, or linked/unreadable workflow
+cannot count as clean evidence. With no confirmed failure, a gap degrades the
+result (nonzero with `--strict`). A normal newly generated workflow can still be
+assessed before its first commit.
 
 It also keys on the literal `secrets.` prefix, because Trusted Publishing and
 the anti-pattern use the *same environment variable name*. `CARGO_REGISTRY_TOKEN:
