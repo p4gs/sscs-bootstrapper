@@ -1,0 +1,198 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="714" viewBox="0 0 880 714" role="img" aria-labelledby="t d" font-family="system-ui, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, &quot;Noto Sans&quot;, Helvetica, Arial, sans-serif">
+<title id="t">SSCS Bootstrapper: SDLC stages, supply chain threats and sscsb mitigations</title>
+<desc id="d">1. Developer workstation (IDE · AI coding agents · MCP · extensions). Threat: Poisoned extension, MCP server or agent skill; an AI agent slips in a secret or curl | sh. Mitigated by: Fail-closed hooks · AI dependency &amp; command gate. Opt-in: Bumblebee scans MCP servers, extensions, skills. Not covered: agent sandboxing, prompt injection. 2. Source control (git · branches · pull requests). Threat: Unsigned, unreviewed or AI-signed commit lands on main; a secret gets committed. Mitigated by: Hardware-backed, human-only signing at pre-push; TruffleHog + Gitleaks at pre-commit &amp; pre-push; Branch-protection audit · AI-provenance trailers. 3. Dependencies (npm · PyPI · crates.io · images). Threat: Typosquatted, hallucinated or malicious package; a known-vulnerable version. Mitigated by: Package trust: does it exist? look-alike? approved?; Syft SBOM · Trivy + OSV-Scanner · Renovate pins. Opt-in: Socket Firewall blocks malware at install time. 4. CI/CD build (GitHub Actions · runners). Threat: Hijacked action tag or poisoned workflow; tampered build, exfiltrated CI credentials. Mitigated by: Actions SHA-pinned, least-privilege, audited; Harden-Runner egress monitoring on every job; Octo STS short-lived tokens instead of PATs. 5. Test &amp; analysis (SAST · CodeQL · fuzzing). Threat: Injected vulnerability in first-party code; pull_request_target or script injection. Mitigated by: OpenGrep SAST in pre-commit and CI; CodeQL on PRs · extended workflow audit. Opt-in: ClusterFuzzLite continuous fuzzing. 6. Release &amp; publish (artifacts · package registries). Threat: Artifact with no provable origin; stolen publish token or maintainer account. Mitigated by: Keyless Cosign + SLSA L3, verified before publish; Trusted Publishing (OIDC) · maintainer MFA check; Checksum-pinned Homebrew &amp; WinGet manifests. 7. Deploy &amp; run (production · your users). Threat: A new CVE in what already shipped goes unnoticed; attack on the running workload. Mitigated by: OpenVEX: auditable “not exploitable” answers. Opt-in: Dependency-Track + GUAC watch shipped SBOMs. Not covered: runtime or admission control.</desc>
+<style>
+.a{animation-duration:.5s;animation-timing-function:cubic-bezier(.2,.7,.2,1);animation-fill-mode:both;transform-box:fill-box;transform-origin:center}
+.fade{animation-name:fade}.slideL{animation-name:slideL;animation-duration:.45s}.slideR{animation-name:slideR}
+.pop{animation-name:pop;animation-duration:.4s}.shield{animation-name:shield;animation-duration:.45s}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+@keyframes slideL{from{opacity:0;transform:translateX(-12px)}to{opacity:1;transform:none}}
+@keyframes slideR{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:none}}
+@keyframes pop{from{opacity:0;transform:scale(.5)}70%{transform:scale(1.12)}to{opacity:1;transform:none}}
+@keyframes shield{from{opacity:0;transform:scale(1.45)}60%{opacity:1;transform:scale(.92)}to{opacity:1;transform:none}}
+.packet{animation:packet 7s cubic-bezier(.45,0,.55,1) 5.4s infinite}
+@keyframes packet{0%{opacity:0;transform:none}8%{opacity:1}88%{opacity:1}100%{opacity:0;transform:translateY(480px)}}
+@media (prefers-reduced-motion:reduce){.a,.packet{animation:none!important}.packet{display:none}}
+</style>
+<rect x="0.5" y="0.5" width="879" height="713" rx="14" fill="#161b22" stroke="#30363d"/>
+<g class="a fade" style="animation-delay:0.00s">
+<text x="24" y="38" font-size="18" font-weight="700" fill="#e6edf3">Where supply chain attacks land, and where <tspan fill="#4493f8">sscsb</tspan> stops them</text>
+<text x="24" y="60" font-size="12" fill="#9198a1">Seven SDLC stages, the threats that target each one, and the sscsb controls that answer them</text>
+<text x="24" y="90" font-size="10" font-weight="700" letter-spacing="1.2" fill="#6e7681">SDLC STAGE</text>
+<text x="240" y="90" font-size="10" font-weight="700" letter-spacing="1.2" fill="#6e7681">THREAT</text>
+<text x="514" y="90" font-size="10" font-weight="700" letter-spacing="1.2" fill="#6e7681">SSCSB MITIGATION</text>
+</g>
+<g class="a fade" style="animation-delay:0.50s"><line x1="36" y1="126" x2="36" y2="606" stroke="#30363d" stroke-width="2" stroke-linecap="round"/></g>
+<g class="a pop" style="animation-delay:0.50s"><circle cx="36" cy="126" r="12" fill="#4493f8"/><text x="36" y="130.5" font-size="12" font-weight="700" text-anchor="middle" fill="#0d1117">1</text></g>
+<g class="a fade" style="animation-delay:0.55s">
+<text x="58" y="130.5" font-size="13" font-weight="700" fill="#e6edf3">Developer workstation</text>
+<text x="58" y="147" font-size="11" fill="#9198a1">IDE · AI coding agents · MCP ·</text>
+<text x="58" y="161" font-size="11" fill="#9198a1">extensions</text>
+</g>
+<g class="a slideL" style="animation-delay:0.60s">
+<rect x="240" y="104" width="230" height="72" rx="9" fill="#2b1418" stroke="#5b2329"/>
+<rect x="240" y="114" width="3" height="52" rx="1.5" fill="#f85149"/>
+<text x="256" y="128.0" font-size="11.5" fill="#ffa198">Poisoned extension, MCP server or</text>
+<text x="256" y="144.0" font-size="11.5" fill="#ffa198">agent skill; an AI agent slips in a</text>
+<text x="256" y="160.0" font-size="11.5" fill="#ffa198">secret or curl | sh</text>
+</g>
+<g class="a fade" style="animation-delay:0.85s"><line x1="470" y1="140.0" x2="514" y2="140.0" stroke="#30363d" stroke-width="1.5" stroke-dasharray="3 3"/></g>
+<g class="a shield" style="animation-delay:1.10s"><path transform="translate(481,127.0)" d="M11 0 L22 4.2 V11.5 C22 18.6 17.3 23.8 11 26 C4.7 23.8 0 18.6 0 11.5 V4.2 Z" fill="#161b22" stroke="#d29922" stroke-width="2" stroke-linejoin="round"/><path transform="translate(481,127.0)" d="M6.5 13 L9.8 16.3 L15.8 9.6" fill="none" stroke="#d29922" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="a slideR" style="animation-delay:1.20s">
+<rect x="514" y="104" width="342" height="72" rx="9" fill="#0d1117" stroke="#30363d"/>
+<circle cx="532" cy="121.0" r="4" fill="none" stroke="#d29922" stroke-width="1.5"/><path d="M532 117.0 A4 4 0 0 1 532 125.0 Z" fill="#d29922"/>
+<text x="544" y="125.0" font-size="11.5" fill="#e6edf3">Bumblebee scans MCP servers, extensions, skills</text>
+<circle cx="532" cy="140.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="144.0" font-size="11.5" fill="#e6edf3">Fail-closed hooks · AI dependency &amp; command gate</text>
+<circle cx="532" cy="159.0" r="4" fill="none" stroke="#6e7681" stroke-width="1.5"/>
+<text x="544" y="163.0" font-size="11.5" fill="#9198a1">Not covered: agent sandboxing, prompt injection</text>
+</g>
+<g class="a pop" style="animation-delay:1.05s"><circle cx="36" cy="206" r="12" fill="#4493f8"/><text x="36" y="210.5" font-size="12" font-weight="700" text-anchor="middle" fill="#0d1117">2</text></g>
+<g class="a fade" style="animation-delay:1.10s">
+<text x="58" y="210.5" font-size="13" font-weight="700" fill="#e6edf3">Source control</text>
+<text x="58" y="227" font-size="11" fill="#9198a1">git · branches · pull requests</text>
+</g>
+<g class="a slideL" style="animation-delay:1.15s">
+<rect x="240" y="184" width="230" height="72" rx="9" fill="#2b1418" stroke="#5b2329"/>
+<rect x="240" y="194" width="3" height="52" rx="1.5" fill="#f85149"/>
+<text x="256" y="208.0" font-size="11.5" fill="#ffa198">Unsigned, unreviewed or AI-signed</text>
+<text x="256" y="224.0" font-size="11.5" fill="#ffa198">commit lands on main; a secret</text>
+<text x="256" y="240.0" font-size="11.5" fill="#ffa198">gets committed</text>
+</g>
+<g class="a fade" style="animation-delay:1.40s"><line x1="470" y1="220.0" x2="514" y2="220.0" stroke="#30363d" stroke-width="1.5" stroke-dasharray="3 3"/></g>
+<g class="a shield" style="animation-delay:1.65s"><path transform="translate(481,207.0)" d="M11 0 L22 4.2 V11.5 C22 18.6 17.3 23.8 11 26 C4.7 23.8 0 18.6 0 11.5 V4.2 Z" fill="#161b22" stroke="#3fb950" stroke-width="2" stroke-linejoin="round"/><path transform="translate(481,207.0)" d="M6.5 13 L9.8 16.3 L15.8 9.6" fill="none" stroke="#3fb950" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="a slideR" style="animation-delay:1.75s">
+<rect x="514" y="184" width="342" height="72" rx="9" fill="#0d1117" stroke="#30363d"/>
+<circle cx="532" cy="201.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="205.0" font-size="11.5" fill="#e6edf3">Hardware-backed, human-only signing at pre-push</text>
+<circle cx="532" cy="220.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="224.0" font-size="11.5" fill="#e6edf3">TruffleHog + Gitleaks at pre-commit &amp; pre-push</text>
+<circle cx="532" cy="239.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="243.0" font-size="11.5" fill="#e6edf3">Branch-protection audit · AI-provenance trailers</text>
+</g>
+<g class="a pop" style="animation-delay:1.60s"><circle cx="36" cy="286" r="12" fill="#4493f8"/><text x="36" y="290.5" font-size="12" font-weight="700" text-anchor="middle" fill="#0d1117">3</text></g>
+<g class="a fade" style="animation-delay:1.65s">
+<text x="58" y="290.5" font-size="13" font-weight="700" fill="#e6edf3">Dependencies</text>
+<text x="58" y="307" font-size="11" fill="#9198a1">npm · PyPI · crates.io · images</text>
+</g>
+<g class="a slideL" style="animation-delay:1.70s">
+<rect x="240" y="264" width="230" height="72" rx="9" fill="#2b1418" stroke="#5b2329"/>
+<rect x="240" y="274" width="3" height="52" rx="1.5" fill="#f85149"/>
+<text x="256" y="288.0" font-size="11.5" fill="#ffa198">Typosquatted, hallucinated or</text>
+<text x="256" y="304.0" font-size="11.5" fill="#ffa198">malicious package; a</text>
+<text x="256" y="320.0" font-size="11.5" fill="#ffa198">known-vulnerable version</text>
+</g>
+<g class="a fade" style="animation-delay:1.95s"><line x1="470" y1="300.0" x2="514" y2="300.0" stroke="#30363d" stroke-width="1.5" stroke-dasharray="3 3"/></g>
+<g class="a shield" style="animation-delay:2.20s"><path transform="translate(481,287.0)" d="M11 0 L22 4.2 V11.5 C22 18.6 17.3 23.8 11 26 C4.7 23.8 0 18.6 0 11.5 V4.2 Z" fill="#161b22" stroke="#3fb950" stroke-width="2" stroke-linejoin="round"/><path transform="translate(481,287.0)" d="M6.5 13 L9.8 16.3 L15.8 9.6" fill="none" stroke="#3fb950" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="a slideR" style="animation-delay:2.30s">
+<rect x="514" y="264" width="342" height="72" rx="9" fill="#0d1117" stroke="#30363d"/>
+<circle cx="532" cy="281.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="285.0" font-size="11.5" fill="#e6edf3">Package trust: does it exist? look-alike? approved?</text>
+<circle cx="532" cy="300.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="304.0" font-size="11.5" fill="#e6edf3">Syft SBOM · Trivy + OSV-Scanner · Renovate pins</text>
+<circle cx="532" cy="319.0" r="4" fill="none" stroke="#d29922" stroke-width="1.5"/><path d="M532 315.0 A4 4 0 0 1 532 323.0 Z" fill="#d29922"/>
+<text x="544" y="323.0" font-size="11.5" fill="#e6edf3">Socket Firewall blocks malware at install time</text>
+</g>
+<g class="a pop" style="animation-delay:2.15s"><circle cx="36" cy="366" r="12" fill="#4493f8"/><text x="36" y="370.5" font-size="12" font-weight="700" text-anchor="middle" fill="#0d1117">4</text></g>
+<g class="a fade" style="animation-delay:2.20s">
+<text x="58" y="370.5" font-size="13" font-weight="700" fill="#e6edf3">CI/CD build</text>
+<text x="58" y="387" font-size="11" fill="#9198a1">GitHub Actions · runners</text>
+</g>
+<g class="a slideL" style="animation-delay:2.25s">
+<rect x="240" y="344" width="230" height="72" rx="9" fill="#2b1418" stroke="#5b2329"/>
+<rect x="240" y="354" width="3" height="52" rx="1.5" fill="#f85149"/>
+<text x="256" y="368.0" font-size="11.5" fill="#ffa198">Hijacked action tag or poisoned</text>
+<text x="256" y="384.0" font-size="11.5" fill="#ffa198">workflow; tampered build,</text>
+<text x="256" y="400.0" font-size="11.5" fill="#ffa198">exfiltrated CI credentials</text>
+</g>
+<g class="a fade" style="animation-delay:2.50s"><line x1="470" y1="380.0" x2="514" y2="380.0" stroke="#30363d" stroke-width="1.5" stroke-dasharray="3 3"/></g>
+<g class="a shield" style="animation-delay:2.75s"><path transform="translate(481,367.0)" d="M11 0 L22 4.2 V11.5 C22 18.6 17.3 23.8 11 26 C4.7 23.8 0 18.6 0 11.5 V4.2 Z" fill="#161b22" stroke="#3fb950" stroke-width="2" stroke-linejoin="round"/><path transform="translate(481,367.0)" d="M6.5 13 L9.8 16.3 L15.8 9.6" fill="none" stroke="#3fb950" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="a slideR" style="animation-delay:2.85s">
+<rect x="514" y="344" width="342" height="72" rx="9" fill="#0d1117" stroke="#30363d"/>
+<circle cx="532" cy="361.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="365.0" font-size="11.5" fill="#e6edf3">Actions SHA-pinned, least-privilege, audited</text>
+<circle cx="532" cy="380.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="384.0" font-size="11.5" fill="#e6edf3">Harden-Runner egress monitoring on every job</text>
+<circle cx="532" cy="399.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="403.0" font-size="11.5" fill="#e6edf3">Octo STS short-lived tokens instead of PATs</text>
+</g>
+<g class="a pop" style="animation-delay:2.70s"><circle cx="36" cy="446" r="12" fill="#4493f8"/><text x="36" y="450.5" font-size="12" font-weight="700" text-anchor="middle" fill="#0d1117">5</text></g>
+<g class="a fade" style="animation-delay:2.75s">
+<text x="58" y="450.5" font-size="13" font-weight="700" fill="#e6edf3">Test &amp; analysis</text>
+<text x="58" y="467" font-size="11" fill="#9198a1">SAST · CodeQL · fuzzing</text>
+</g>
+<g class="a slideL" style="animation-delay:2.80s">
+<rect x="240" y="424" width="230" height="72" rx="9" fill="#2b1418" stroke="#5b2329"/>
+<rect x="240" y="434" width="3" height="52" rx="1.5" fill="#f85149"/>
+<text x="256" y="448.0" font-size="11.5" fill="#ffa198">Injected vulnerability in first-party</text>
+<text x="256" y="464.0" font-size="11.5" fill="#ffa198">code; pull_request_target or script</text>
+<text x="256" y="480.0" font-size="11.5" fill="#ffa198">injection</text>
+</g>
+<g class="a fade" style="animation-delay:3.05s"><line x1="470" y1="460.0" x2="514" y2="460.0" stroke="#30363d" stroke-width="1.5" stroke-dasharray="3 3"/></g>
+<g class="a shield" style="animation-delay:3.30s"><path transform="translate(481,447.0)" d="M11 0 L22 4.2 V11.5 C22 18.6 17.3 23.8 11 26 C4.7 23.8 0 18.6 0 11.5 V4.2 Z" fill="#161b22" stroke="#3fb950" stroke-width="2" stroke-linejoin="round"/><path transform="translate(481,447.0)" d="M6.5 13 L9.8 16.3 L15.8 9.6" fill="none" stroke="#3fb950" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="a slideR" style="animation-delay:3.40s">
+<rect x="514" y="424" width="342" height="72" rx="9" fill="#0d1117" stroke="#30363d"/>
+<circle cx="532" cy="441.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="445.0" font-size="11.5" fill="#e6edf3">OpenGrep SAST in pre-commit and CI</text>
+<circle cx="532" cy="460.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="464.0" font-size="11.5" fill="#e6edf3">CodeQL on PRs · extended workflow audit</text>
+<circle cx="532" cy="479.0" r="4" fill="none" stroke="#d29922" stroke-width="1.5"/><path d="M532 475.0 A4 4 0 0 1 532 483.0 Z" fill="#d29922"/>
+<text x="544" y="483.0" font-size="11.5" fill="#e6edf3">ClusterFuzzLite continuous fuzzing</text>
+</g>
+<g class="a pop" style="animation-delay:3.25s"><circle cx="36" cy="526" r="12" fill="#4493f8"/><text x="36" y="530.5" font-size="12" font-weight="700" text-anchor="middle" fill="#0d1117">6</text></g>
+<g class="a fade" style="animation-delay:3.30s">
+<text x="58" y="530.5" font-size="13" font-weight="700" fill="#e6edf3">Release &amp; publish</text>
+<text x="58" y="547" font-size="11" fill="#9198a1">artifacts · package registries</text>
+</g>
+<g class="a slideL" style="animation-delay:3.35s">
+<rect x="240" y="504" width="230" height="72" rx="9" fill="#2b1418" stroke="#5b2329"/>
+<rect x="240" y="514" width="3" height="52" rx="1.5" fill="#f85149"/>
+<text x="256" y="528.0" font-size="11.5" fill="#ffa198">Artifact with no provable origin;</text>
+<text x="256" y="544.0" font-size="11.5" fill="#ffa198">stolen publish token or maintainer</text>
+<text x="256" y="560.0" font-size="11.5" fill="#ffa198">account</text>
+</g>
+<g class="a fade" style="animation-delay:3.60s"><line x1="470" y1="540.0" x2="514" y2="540.0" stroke="#30363d" stroke-width="1.5" stroke-dasharray="3 3"/></g>
+<g class="a shield" style="animation-delay:3.85s"><path transform="translate(481,527.0)" d="M11 0 L22 4.2 V11.5 C22 18.6 17.3 23.8 11 26 C4.7 23.8 0 18.6 0 11.5 V4.2 Z" fill="#161b22" stroke="#3fb950" stroke-width="2" stroke-linejoin="round"/><path transform="translate(481,527.0)" d="M6.5 13 L9.8 16.3 L15.8 9.6" fill="none" stroke="#3fb950" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="a slideR" style="animation-delay:3.95s">
+<rect x="514" y="504" width="342" height="72" rx="9" fill="#0d1117" stroke="#30363d"/>
+<circle cx="532" cy="521.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="525.0" font-size="11.5" fill="#e6edf3">Keyless Cosign + SLSA L3, verified before publish</text>
+<circle cx="532" cy="540.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="544.0" font-size="11.5" fill="#e6edf3">Trusted Publishing (OIDC) · maintainer MFA check</text>
+<circle cx="532" cy="559.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="563.0" font-size="11.5" fill="#e6edf3">Checksum-pinned Homebrew &amp; WinGet manifests</text>
+</g>
+<g class="a pop" style="animation-delay:3.80s"><circle cx="36" cy="606" r="12" fill="#4493f8"/><text x="36" y="610.5" font-size="12" font-weight="700" text-anchor="middle" fill="#0d1117">7</text></g>
+<g class="a fade" style="animation-delay:3.85s">
+<text x="58" y="610.5" font-size="13" font-weight="700" fill="#e6edf3">Deploy &amp; run</text>
+<text x="58" y="627" font-size="11" fill="#9198a1">production · your users</text>
+</g>
+<g class="a slideL" style="animation-delay:3.90s">
+<rect x="240" y="584" width="230" height="72" rx="9" fill="#2b1418" stroke="#5b2329"/>
+<rect x="240" y="594" width="3" height="52" rx="1.5" fill="#f85149"/>
+<text x="256" y="608.0" font-size="11.5" fill="#ffa198">A new CVE in what already</text>
+<text x="256" y="624.0" font-size="11.5" fill="#ffa198">shipped goes unnoticed; attack on</text>
+<text x="256" y="640.0" font-size="11.5" fill="#ffa198">the running workload</text>
+</g>
+<g class="a fade" style="animation-delay:4.15s"><line x1="470" y1="620.0" x2="514" y2="620.0" stroke="#30363d" stroke-width="1.5" stroke-dasharray="3 3"/></g>
+<g class="a shield" style="animation-delay:4.40s"><path transform="translate(481,607.0)" d="M11 0 L22 4.2 V11.5 C22 18.6 17.3 23.8 11 26 C4.7 23.8 0 18.6 0 11.5 V4.2 Z" fill="#161b22" stroke="#d29922" stroke-width="2" stroke-linejoin="round"/><path transform="translate(481,607.0)" d="M6.5 13 L9.8 16.3 L15.8 9.6" fill="none" stroke="#d29922" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="a slideR" style="animation-delay:4.50s">
+<rect x="514" y="584" width="342" height="72" rx="9" fill="#0d1117" stroke="#30363d"/>
+<circle cx="532" cy="601.0" r="4.5" fill="#3fb950"/>
+<text x="544" y="605.0" font-size="11.5" fill="#e6edf3">OpenVEX: auditable “not exploitable” answers</text>
+<circle cx="532" cy="620.0" r="4" fill="none" stroke="#d29922" stroke-width="1.5"/><path d="M532 616.0 A4 4 0 0 1 532 624.0 Z" fill="#d29922"/>
+<text x="544" y="624.0" font-size="11.5" fill="#e6edf3">Dependency-Track + GUAC watch shipped SBOMs</text>
+<circle cx="532" cy="639.0" r="4" fill="none" stroke="#6e7681" stroke-width="1.5"/>
+<text x="544" y="643.0" font-size="11.5" fill="#9198a1">Not covered: runtime or admission control</text>
+</g>
+<g class="a fade" style="animation-delay:4.95s">
+<circle cx="29" cy="682.0" r="4.5" fill="#3fb950"/>
+<text x="39" y="686" font-size="11" fill="#9198a1">on by default</text>
+<circle cx="142.90625" cy="682.0" r="4" fill="none" stroke="#d29922" stroke-width="1.5"/><path d="M142.90625 678.0 A4 4 0 0 1 142.90625 686.0 Z" fill="#d29922"/>
+<text x="152.90625" y="686" font-size="11" fill="#9198a1">opt-in with sscsb enable</text>
+<circle cx="317.296875" cy="682.0" r="4" fill="none" stroke="#6e7681" stroke-width="1.5"/>
+<text x="327.296875" y="686" font-size="11" fill="#9198a1">not covered</text>
+<text x="856" y="686" font-size="11" text-anchor="end" fill="#6e7681">54 toggleable controls · sscsb verify proves each one runs</text>
+</g>
+<circle class="packet" cx="36" cy="126" r="3" fill="#4493f8" opacity="0"/>
+</svg>
