@@ -10,6 +10,13 @@
 [![SLSA Build Level 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev/spec/v1.0/levels#build-l3)
 [![Renovate enabled](https://img.shields.io/badge/renovate-enabled-brightgreen.svg)](https://docs.renovatebot.com/)
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/sscs-threat-map-dark.svg">
+    <img src="docs/images/sscs-threat-map-light.svg" width="880" alt="Seven SDLC stages, the supply chain threats that target each one, and the sscsb controls that answer them. 1, developer workstation: poisoned extensions, MCP servers or agent skills are scanned by Bumblebee (opt-in); fail-closed hooks and the AI dependency and command gate are on by default; agent sandboxing and prompt injection are not covered. 2, source control: hardware-backed, human-only signing, TruffleHog and Gitleaks secret blocking, branch-protection audit and AI-provenance trailers. 3, dependencies: the package-trust gate, Syft SBOMs, Trivy and OSV-Scanner, Renovate pins, and Socket Firewall (opt-in). 4, CI/CD build: SHA-pinned least-privilege Actions, Harden-Runner and Octo STS short-lived tokens. 5, test and analysis: OpenGrep SAST, CodeQL, the extended workflow audit and ClusterFuzzLite (opt-in). 6, release and publish: keyless Cosign and SLSA L3 provenance verified before publish, Trusted Publishing, maintainer MFA and checksum-pinned manifests. 7, deploy and run: OpenVEX, Dependency-Track and GUAC (opt-in); runtime protection and admission control are not covered.">
+  </picture>
+</p>
+
 > `sscsb` now dogfoods its own generated output: `.github/workflows/`,
 > `.sscsb/`, `.gitleaks.toml`, `.trufflehog.yaml`, and `renovate.json5` are
 > committed, not gitignored, so every badge above tracks a workflow that
